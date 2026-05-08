@@ -1,0 +1,19 @@
+{
+  "id": 6,
+  "name": "Linux-xterm-basic-dark-256",
+  "platform": "Linux",
+  "terminal": "xterm",
+  "theme": "dark",
+  "color_capability": "256-color",
+  "env": {
+    "TERM": "xterm-256color",
+    "COLORFGBG": "15;0"
+  },
+  "is_wsl": false,
+  "osc11_result": null,
+  "isatty": true,
+  "expected_theme": "dark",
+  "expects_white_panel": true,
+  "expects_neutral_palette": false,
+  "forbidden_ansi": ["\u001b[2;37m", "\u001b[2;30m"]
+}

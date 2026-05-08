@@ -1,0 +1,17 @@
+{
+  "refresh_policy": "manual_reviewed_only",
+  "schema_version": 1,
+  "snapshot": {
+    "bundled_json_sha256": "4cc9e1a33ef6f2c1f8310b58c24beb97a29fc7f60bac05f2dce7890dd7a0067b",
+    "bundled_json_size_bytes": 1417019,
+    "fetched_at_utc": "2026-05-01T12:01:31Z",
+    "top_level_entry_count": 2692
+  },
+  "source": "bundled_litellm_snapshot",
+  "upstream": {
+    "blob_url": "https://github.com/BerriAI/litellm/blob/eab0075353abba12428a3712c6bfce5704576e67/model_prices_and_context_window.json",
+    "commit_sha": "eab0075353abba12428a3712c6bfce5704576e67",
+    "path": "model_prices_and_context_window.json",
+    "repo": "https://github.com/BerriAI/litellm"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "id": 8,
+  "name": "Windows-Terminal-dark",
+  "platform": "Windows",
+  "terminal": "Windows Terminal",
+  "theme": "dark",
+  "color_capability": "truecolor",
+  "env": {
+    "WT_SESSION": "matrix-session",
+    "TERM": "xterm-256color",
+    "COLORTERM": "truecolor"
+  },
+  "windows_terminal_settings": {
+    "scheme_name": "One Half Dark",
+    "background": "#0c0c0c"
+  },
+  "is_wsl": false,
+  "osc11_result": null,
+  "isatty": true,
+  "expected_theme": "dark",
+  "expects_white_panel": true,
+  "expects_neutral_palette": false,
+  "forbidden_ansi": ["\u001b[2;37m", "\u001b[2;30m"]
+}

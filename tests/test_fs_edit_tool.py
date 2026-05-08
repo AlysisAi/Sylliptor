@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+import io
+from pathlib import Path
+
+import pytest
+from rich.console import Console
+
+from sylliptor_agent_cli.agent_loop import build_tools
+from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.session_store import SessionStore
+from sylliptor_agent_cli.surface.noop_surface import NoopSurface
+from sylliptor_agent_cli.tools.fs import FsError, fs_edit
+
+
+def _store(root: Path) -> SessionStore:
+    return SessionStore(
+        enabled=False,
+        sessions_dir=root / "sessions",
+        session_id="fs-edit-test",
+        cwd=str(root),
+        repo_root=str(root),
+    )
+
+
+def test_fs_edit_single_replacement(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    path.write_text("alpha\nbeta\n", encoding="utf-8", newline="\n")
+
+    result = fs_edit(
+        root=tmp_path,
+        path="demo.txt",
+        edits=[{"op": "replace_exact", "target": "beta", "replacement": "gamma"}],
+    )
+
+    assert result == {
+        "path": "demo.txt",
+        "applied_edits": 1,
+        "changed": True,
+        "bytes": len(b"alpha\ngamma\n"),
+    }
+    assert path.read_text(encoding="utf-8") == "alpha\ngamma\n"
+
+
+def test_fs_edit_replace_alias_maps_to_replace_exact(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    path.write_text("alpha\nbeta\n", encoding="utf-8")
+
+    result = fs_edit(
+        root=tmp_path,
+        path="demo.txt",
+        edits=[{"op": "replace", "target": "beta", "replacement": "gamma"}],
+    )
+
+    assert result["changed"] is True
+    assert path.read_text(encoding="utf-8") == "alpha\ngamma\n"
+
+
+def test_fs_edit_applies_multiple_edits_in_order(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    path.write_text("mid\nend\n", encoding="utf-8", newline="\n")
+
+    result = fs_edit(
+        root=tmp_path,
+        path="demo.txt",
+        edits=[
+            {"op": "prepend", "content": "start\n"},
+            {"op": "insert_after_exact", "target": "mid\n", "content": "after-mid\n"},
+            {"op": "replace_exact", "target": "end", "replacement": "finish"},
+        ],
+    )
+
+    assert result["applied_edits"] == 3
+    assert path.read_text(encoding="utf-8") == "start\nmid\nafter-mid\nfinish\n"
+
+
+def test_fs_edit_insert_before_and_after_exact(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    path.write_text("A\nB\n", encoding="utf-8")
+
+    fs_edit(
+        root=tmp_path,
+        path="demo.txt",
+        edits=[
+            {"op": "insert_before_exact", "target": "B", "content": "before-"},
+            {"op": "insert_after_exact", "target": "B", "content": "-after"},
+        ],
+    )
+
+    assert path.read_text(encoding="utf-8") == "A\nbefore-B-after\n"
+
+
+def test_fs_edit_append_and_prepend(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    path.write_text("body", encoding="utf-8")
+
+    fs_edit(
+        root=tmp_path,
+        path="demo.txt",
+        edits=[
+            {"op": "prepend", "content": "head\n"},
+            {"op": "append", "content": "\nfoot"},
+        ],
+    )
+
+    assert path.read_text(encoding="utf-8") == "head\nbody\nfoot"
+
+
+def test_fs_edit_preserves_existing_crlf_newlines(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    path.write_bytes(b"alpha\r\nbeta\r\n")
+
+    fs_edit(
+        root=tmp_path,
+        path="demo.txt",
+        edits=[{"op": "replace_exact", "target": "beta", "replacement": "gamma"}],
+    )
+
+    assert path.read_bytes() == b"alpha\r\ngamma\r\n"
+
+
+def test_fs_edit_is_all_or_nothing_on_failure(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    original = "alpha\nbeta\n"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(FsError, match="target matched 0 times"):
+        fs_edit(
+            root=tmp_path,
+            path="demo.txt",
+            edits=[
+                {"op": "replace_exact", "target": "alpha", "replacement": "ALPHA"},
+                {"op": "replace_exact", "target": "missing", "replacement": "x"},
+            ],
+        )
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_fs_edit_zero_match_failure(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    path.write_text("alpha\n", encoding="utf-8")
+
+    with pytest.raises(FsError, match="target matched 0 times; expected exactly 1"):
+        fs_edit(
+            root=tmp_path,
+            path="demo.txt",
+            edits=[{"op": "replace_exact", "target": "beta", "replacement": "gamma"}],
+        )
+
+
+def test_fs_edit_ambiguous_match_failure(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    path.write_text("repeat\nrepeat\n", encoding="utf-8")
+
+    with pytest.raises(FsError, match="target matched 2 times; expected exactly 1"):
+        fs_edit(
+            root=tmp_path,
+            path="demo.txt",
+            edits=[{"op": "replace_exact", "target": "repeat", "replacement": "done"}],
+        )
+
+
+def test_fs_edit_expected_match_count_allows_multiple_matches(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    path.write_text("repeat\nrepeat\n", encoding="utf-8")
+
+    fs_edit(
+        root=tmp_path,
+        path="demo.txt",
+        edits=[
+            {
+                "op": "replace_exact",
+                "target": "repeat",
+                "replacement": "done",
+                "expected_match_count": 2,
+            }
+        ],
+    )
+
+    assert path.read_text(encoding="utf-8") == "done\ndone\n"
+
+
+def test_build_tools_registers_fs_edit_and_emits_diff_preview(tmp_path: Path) -> None:
+    class RecordingSurface(NoopSurface):
+        def __init__(self) -> None:
+            self.patch_events = []
+
+        def on_patch_generated(self, event):  # type: ignore[no-untyped-def]
+            self.patch_events.append(event)
+
+    path = tmp_path / "demo.txt"
+    path.write_text("before\n", encoding="utf-8")
+    surface = RecordingSurface()
+    tools = build_tools(
+        root=tmp_path,
+        console=Console(file=io.StringIO(), force_terminal=False),
+        surface=surface,
+        store=_store(tmp_path),
+        mode="auto",
+        yes=True,
+        cfg=AppConfig(model="test-model"),
+        non_interactive=True,
+    )
+
+    assert "fs_edit" in tools
+    schema = tools["fs_edit"].as_openai_tool()["function"]["parameters"]
+    assert schema["required"] == ["path", "edits"]
+    op_enum = schema["properties"]["edits"]["items"]["properties"]["op"].get("enum") or []
+    assert "replace" in op_enum
+
+    result = tools["fs_edit"].run(
+        {
+            "path": "demo.txt",
+            "edits": [{"op": "replace_exact", "target": "before", "replacement": "after"}],
+        }
+    )
+
+    assert result["changed"] is True
+    assert len(surface.patch_events) == 1
+    event = surface.patch_events[0]
+    assert event.files == ["demo.txt"]
+    assert event.summary == "1 file changed via fs_edit (demo.txt)"
+    assert "-before" in event.diff
+    assert "+after" in event.diff

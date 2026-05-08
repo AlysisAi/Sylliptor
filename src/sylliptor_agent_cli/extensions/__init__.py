@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+from .activation import (
+    ActivationDecision,
+    WorkspaceTrustPromptFn,
+    WorkspaceTrustPromptRequest,
+    resolve_active_plugins,
+)
+from .install import (
+    ComponentInstallSummary,
+    EnableResult,
+    PermissionsSummary,
+    PluginInstallError,
+    PluginInstallResult,
+    PluginUninstallResult,
+    TrustPromptRequest,
+    disable_plugin,
+    enable_plugin,
+    install_plugin,
+    uninstall_plugin,
+)
+from .manifest import PluginManifest, PluginManifestError, load_manifest
+from .models import (
+    ExtensionState,
+    ProjectExtensionOverrides,
+    RegistryEntry,
+    RegistryFile,
+    normalize_extension_id,
+    plugin_slug_from_id,
+)
+from .registry import find_by_id, load_registry, search
+from .state import (
+    compute_effective_enabled,
+    load_global_state,
+    load_project_overrides,
+    load_project_state,
+    save_global_state,
+    save_project_state,
+)
+from .workspace_trust import (
+    WORKSPACE_TRUST_SCHEMA_VERSION,
+    WorkspaceTrustEntry,
+    WorkspaceTrustState,
+    grant_workspace_trust,
+    is_workspace_trusted,
+    load_workspace_trust,
+    workspace_trust_key,
+    workspace_trust_path,
+)
+
+__all__ = [
+    "ActivationDecision",
+    "ComponentInstallSummary",
+    "EnableResult",
+    "PluginManifest",
+    "PluginManifestError",
+    "PermissionsSummary",
+    "PluginInstallError",
+    "PluginInstallResult",
+    "PluginUninstallResult",
+    "TrustPromptRequest",
+    "WORKSPACE_TRUST_SCHEMA_VERSION",
+    "WorkspaceTrustEntry",
+    "WorkspaceTrustPromptFn",
+    "WorkspaceTrustPromptRequest",
+    "WorkspaceTrustState",
+    "ExtensionState",
+    "ProjectExtensionOverrides",
+    "RegistryEntry",
+    "RegistryFile",
+    "compute_effective_enabled",
+    "disable_plugin",
+    "enable_plugin",
+    "find_by_id",
+    "grant_workspace_trust",
+    "is_workspace_trusted",
+    "load_global_state",
+    "load_project_overrides",
+    "load_project_state",
+    "load_registry",
+    "load_workspace_trust",
+    "normalize_extension_id",
+    "plugin_slug_from_id",
+    "resolve_active_plugins",
+    "save_global_state",
+    "save_project_state",
+    "search",
+    "install_plugin",
+    "load_manifest",
+    "uninstall_plugin",
+    "workspace_trust_key",
+    "workspace_trust_path",
+]

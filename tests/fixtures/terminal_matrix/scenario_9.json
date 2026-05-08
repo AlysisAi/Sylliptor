@@ -1,0 +1,24 @@
+{
+  "id": 9,
+  "name": "Windows-Terminal-light",
+  "platform": "Windows",
+  "terminal": "Windows Terminal",
+  "theme": "light",
+  "color_capability": "truecolor",
+  "env": {
+    "WT_SESSION": "matrix-session",
+    "TERM": "xterm-256color",
+    "COLORTERM": "truecolor"
+  },
+  "windows_terminal_settings": {
+    "scheme_name": "One Half Light",
+    "background": "#ffffff"
+  },
+  "is_wsl": false,
+  "osc11_result": null,
+  "isatty": true,
+  "expected_theme": "light",
+  "expects_white_panel": false,
+  "expects_neutral_palette": false,
+  "forbidden_ansi": ["\u001b[2;37m", "\u001b[2;30m"]
+}

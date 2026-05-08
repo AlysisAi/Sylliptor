@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtualenv
+.venv/
+venv/
+.tmp_ci*/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.sylliptor/
+.sylliptor_data_demo/
+.sylliptor_data_demo_verify/
+.sylliptor_images/
+sylliptor-feedback/
+reports/
+
+# Claude Code local config
+.claude/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets / env
+.env
+.env.*

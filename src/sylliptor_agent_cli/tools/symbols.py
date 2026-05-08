@@ -1,0 +1,1070 @@
+from __future__ import annotations
+
+import ast
+import fnmatch
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from ..runtime_artifacts import RUNTIME_ARTIFACT_DIR_NAMES
+
+
+class SymbolSearchError(RuntimeError):
+    pass
+
+
+_SUPPORTED_KINDS = {"function", "class", "method", "constant"}
+_DEFAULT_MAX_RESULTS = 100
+_MAX_RESULTS = 200
+_MAX_FILE_BYTES = 512 * 1024
+_MAX_INLINE_CHARS = 240
+_MAX_NOTE_PATHS = 3
+_DEFAULT_SKIP_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "dist",
+    "build",
+} | set(RUNTIME_ARTIFACT_DIR_NAMES)
+_SUPPORTED_SUFFIX_TO_BACKEND = {
+    ".py": "python_ast",
+    ".js": "js_ts_heuristic",
+    ".jsx": "js_ts_heuristic",
+    ".ts": "js_ts_heuristic",
+    ".tsx": "js_ts_heuristic",
+    ".mjs": "js_ts_heuristic",
+    ".cjs": "js_ts_heuristic",
+}
+_JS_TS_BLOCK_KEYWORDS = {"if", "for", "while", "switch", "catch", "function", "class"}
+_JS_TS_FUNCTION_RE = re.compile(
+    r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\("
+)
+_JS_TS_CLASS_RE = re.compile(r"^(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)\b")
+_JS_TS_CONST_DECL_RE = re.compile(r"^(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\b(.*)$")
+_JS_TS_FUNCTION_EXPR_RE = re.compile(r"^(?:async\s+)?function\b")
+_JS_TS_METHOD_RE = re.compile(
+    r"^(?:(?:public|private|protected|static|async|readonly|override|get|set)\s+)*"
+    r"(?:\*\s*)?([A-Za-z_$][\w$]*)\s*(?:<[^>{}]*>)?\s*\("
+)
+_JS_TS_CLASS_FIELD_RE = re.compile(
+    r"^(?:(?:public|private|protected|readonly|static|async|declare|override)\s+)*"
+    r"([A-Za-z_$][\w$]*)\s*(?:\?)?(.*)$"
+)
+_JS_TS_PENDING_ASSIGNMENT_MAX_LINES = 8
+
+
+@dataclass(frozen=True)
+class _SymbolEntry:
+    path: str
+    line: int
+    kind: str
+    name: str
+    simple_name: str
+    signature: str
+
+
+@dataclass(frozen=True)
+class _JsTsClassScope:
+    name: str
+    body_depth: int
+
+
+@dataclass
+class _JsTsPendingAssignment:
+    line: int
+    kind: str
+    name: str
+    simple_name: str
+    signature_lines: list[str]
+    rhs_fragments: list[str]
+    scope_depth: int
+    fallback_kind: str | None = None
+
+
+def _clip_inline(text: str, *, max_chars: int = _MAX_INLINE_CHARS) -> str:
+    compact = " ".join(str(text).split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[:max_chars].rstrip() + "...(truncated)"
+
+
+def _resolve_under_root(root: Path, user_path: str) -> Path:
+    root_abs = root.resolve()
+    target = (root_abs / user_path).resolve()
+    try:
+        target.relative_to(root_abs)
+    except ValueError as e:
+        raise SymbolSearchError(f"root_path escapes root: {user_path}") from e
+    return target
+
+
+def _rel_path(root: Path, path: Path) -> str:
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return os.fspath(path).replace("\\", "/")
+    return os.fspath(rel).replace("\\", "/")
+
+
+def _matches_globs(rel_path: str, globs: list[str] | None) -> bool:
+    if not globs:
+        return True
+    return any(fnmatch.fnmatchcase(rel_path, pattern) for pattern in globs)
+
+
+def _iter_candidate_files(*, root: Path, base: Path, globs: list[str] | None) -> list[Path]:
+    if base.is_file():
+        rel = _rel_path(root, base)
+        return [base] if _matches_globs(rel, globs) else []
+
+    candidates: list[Path] = []
+    for current_root, dirnames, filenames in os.walk(base):
+        dirnames[:] = sorted(dirname for dirname in dirnames if dirname not in _DEFAULT_SKIP_DIRS)
+        for filename in sorted(filenames):
+            path = Path(current_root) / filename
+            rel = _rel_path(root, path)
+            if _matches_globs(rel, globs):
+                candidates.append(path)
+    return candidates
+
+
+def _safe_unparse(node: ast.AST) -> str:
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return "..."
+
+
+def _format_arg(arg: ast.arg) -> str:
+    text = arg.arg
+    if arg.annotation is not None:
+        text += f": {_safe_unparse(arg.annotation)}"
+    return text
+
+
+def _format_function_signature(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    display_name: str,
+) -> str:
+    params: list[str] = []
+    posonlyargs = getattr(node.args, "posonlyargs", [])
+    for arg in posonlyargs:
+        params.append(_format_arg(arg))
+    if posonlyargs:
+        params.append("/")
+
+    for arg in node.args.args:
+        params.append(_format_arg(arg))
+
+    if node.args.vararg is not None:
+        params.append(f"*{_format_arg(node.args.vararg)}")
+    elif node.args.kwonlyargs:
+        params.append("*")
+
+    for arg in node.args.kwonlyargs:
+        params.append(_format_arg(arg))
+
+    if node.args.kwarg is not None:
+        params.append(f"**{_format_arg(node.args.kwarg)}")
+
+    prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+    signature = f"{prefix} {display_name}({', '.join(params)})"
+    if node.returns is not None:
+        signature += f" -> {_safe_unparse(node.returns)}"
+    return _clip_inline(signature)
+
+
+def _format_class_signature(node: ast.ClassDef) -> str:
+    bases = [_safe_unparse(base) for base in node.bases]
+    signature = f"class {node.name}"
+    if bases:
+        signature += f"({', '.join(bases)})"
+    return _clip_inline(signature)
+
+
+def _extract_assign_names(target: ast.expr) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: list[str] = []
+        for element in target.elts:
+            names.extend(_extract_assign_names(element))
+        return names
+    return []
+
+
+def _extract_constant_entries(
+    *,
+    rel_path: str,
+    node: ast.Assign | ast.AnnAssign,
+    source_lines: list[str],
+) -> list[_SymbolEntry]:
+    if isinstance(node, ast.Assign):
+        names: list[str] = []
+        for target in node.targets:
+            names.extend(_extract_assign_names(target))
+    else:
+        names = _extract_assign_names(node.target)
+
+    signature = ""
+    if 1 <= node.lineno <= len(source_lines):
+        signature = _clip_inline(source_lines[node.lineno - 1].strip())
+
+    out: list[_SymbolEntry] = []
+    for name in names:
+        if not name.isupper():
+            continue
+        out.append(
+            _SymbolEntry(
+                path=rel_path,
+                line=node.lineno,
+                kind="constant",
+                name=name,
+                simple_name=name,
+                signature=signature,
+            )
+        )
+    return out
+
+
+def _extract_python_symbols(*, root: Path, path: Path, text: str) -> list[_SymbolEntry]:
+    rel_path = _rel_path(root, path)
+    tree = ast.parse(text, filename=rel_path)
+    source_lines = text.splitlines()
+    symbols: list[_SymbolEntry] = []
+
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            symbols.append(
+                _SymbolEntry(
+                    path=rel_path,
+                    line=node.lineno,
+                    kind="class",
+                    name=node.name,
+                    simple_name=node.name,
+                    signature=_format_class_signature(node),
+                )
+            )
+            for body_item in node.body:
+                if not isinstance(body_item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                qualified_name = f"{node.name}.{body_item.name}"
+                symbols.append(
+                    _SymbolEntry(
+                        path=rel_path,
+                        line=body_item.lineno,
+                        kind="method",
+                        name=qualified_name,
+                        simple_name=body_item.name,
+                        signature=_format_function_signature(
+                            body_item,
+                            display_name=qualified_name,
+                        ),
+                    )
+                )
+            continue
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            symbols.append(
+                _SymbolEntry(
+                    path=rel_path,
+                    line=node.lineno,
+                    kind="function",
+                    name=node.name,
+                    simple_name=node.name,
+                    signature=_format_function_signature(node, display_name=node.name),
+                )
+            )
+            continue
+
+        if isinstance(node, ast.Assign):
+            symbols.extend(
+                _extract_constant_entries(
+                    rel_path=rel_path,
+                    node=node,
+                    source_lines=source_lines,
+                )
+            )
+            continue
+
+        if isinstance(node, ast.AnnAssign):
+            symbols.extend(
+                _extract_constant_entries(
+                    rel_path=rel_path,
+                    node=node,
+                    source_lines=source_lines,
+                )
+            )
+
+    return symbols
+
+
+def _sanitize_js_ts_line(
+    line: str,
+    *,
+    in_block_comment: bool,
+    in_backtick_string: bool,
+) -> tuple[str, bool, bool]:
+    out: list[str] = []
+    index = 0
+    quote: str | None = None
+    line_len = len(line)
+    while index < line_len:
+        ch = line[index]
+        nxt = line[index + 1] if index + 1 < line_len else ""
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if in_backtick_string:
+            if ch == "\\":
+                index += 2
+                continue
+            if ch == "`":
+                in_backtick_string = False
+            index += 1
+            continue
+
+        if quote is not None:
+            if ch == "\\":
+                index += 2
+                continue
+            if ch == quote:
+                quote = None
+            index += 1
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            index += 2
+            continue
+        if ch == "/" and nxt == "/":
+            break
+        if ch == "`":
+            in_backtick_string = True
+            index += 1
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+            index += 1
+            continue
+
+        out.append(ch)
+        index += 1
+
+    return "".join(out), in_block_comment, in_backtick_string
+
+
+def _consume_js_ts_identifier(text: str, start: int) -> int | None:
+    if start >= len(text):
+        return None
+    ch = text[start]
+    if ch != "_" and ch != "$" and not ch.isalpha():
+        return None
+    index = start + 1
+    while index < len(text):
+        ch = text[index]
+        if ch != "_" and ch != "$" and not ch.isalnum():
+            break
+        index += 1
+    return index
+
+
+def _consume_js_ts_parenthesized(text: str, start: int) -> int | None:
+    if start >= len(text) or text[start] != "(":
+        return None
+
+    depth = 0
+    for index in range(start, len(text)):
+        ch = text[index]
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+
+    return None
+
+
+def _consume_js_ts_generic_prefix(text: str, start: int) -> int | None:
+    if start >= len(text) or text[start] != "<":
+        return start
+
+    angle_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+
+    for index in range(start, len(text)):
+        ch = text[index]
+        prev = text[index - 1] if index > start else ""
+        if ch == "<":
+            angle_depth += 1
+            continue
+        if ch == ">" and angle_depth > 0 and prev != "=":
+            angle_depth -= 1
+            if angle_depth == 0 and paren_depth == 0 and bracket_depth == 0 and brace_depth == 0:
+                return index + 1
+            continue
+        if ch == "(":
+            paren_depth += 1
+            continue
+        if ch == ")" and paren_depth > 0:
+            paren_depth -= 1
+            continue
+        if ch == "[":
+            bracket_depth += 1
+            continue
+        if ch == "]" and bracket_depth > 0:
+            bracket_depth -= 1
+            continue
+        if ch == "{":
+            brace_depth += 1
+            continue
+        if ch == "}" and brace_depth > 0:
+            brace_depth -= 1
+
+    return None
+
+
+def _has_js_ts_top_level_arrow(text: str, start: int) -> bool:
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+    angle_depth = 0
+
+    for index in range(start, len(text)):
+        ch = text[index]
+        nxt = text[index + 1] if index + 1 < len(text) else ""
+        prev = text[index - 1] if index > start else ""
+
+        if ch == "(":
+            paren_depth += 1
+            continue
+        if ch == ")" and paren_depth > 0:
+            paren_depth -= 1
+            continue
+        if ch == "[":
+            bracket_depth += 1
+            continue
+        if ch == "]" and bracket_depth > 0:
+            bracket_depth -= 1
+            continue
+        if ch == "{":
+            brace_depth += 1
+            continue
+        if ch == "}" and brace_depth > 0:
+            brace_depth -= 1
+            continue
+        if ch == "<":
+            angle_depth += 1
+            continue
+        if ch == ">" and angle_depth > 0 and prev != "=":
+            angle_depth -= 1
+            continue
+        if (
+            ch == "="
+            and nxt == ">"
+            and paren_depth == 0
+            and bracket_depth == 0
+            and brace_depth == 0
+            and angle_depth == 0
+        ):
+            return True
+
+    return False
+
+
+def _looks_like_js_ts_arrow_rhs(value: str) -> bool:
+    candidate = value.strip()
+    if not candidate:
+        return False
+
+    if candidate.startswith("async "):
+        candidate = candidate[6:].lstrip()
+
+    generic_end = _consume_js_ts_generic_prefix(candidate, 0)
+    if generic_end is None:
+        return False
+    candidate = candidate[generic_end:].lstrip()
+    if not candidate:
+        return False
+
+    if candidate.startswith("("):
+        params_end = _consume_js_ts_parenthesized(candidate, 0)
+    else:
+        params_end = _consume_js_ts_identifier(candidate, 0)
+    if params_end is None:
+        return False
+
+    return _has_js_ts_top_level_arrow(candidate, params_end)
+
+
+def _is_js_ts_function_rhs(value: str) -> bool:
+    candidate = value.strip().rstrip(";").strip()
+    if _looks_like_js_ts_arrow_rhs(candidate):
+        return True
+    if _JS_TS_FUNCTION_EXPR_RE.match(candidate):
+        tail = candidate.partition("function")[2]
+        return ")" in tail or "{" in tail
+    return False
+
+
+def _looks_like_js_ts_multiline_function_rhs(value: str) -> bool:
+    candidate = value.strip()
+    if not candidate:
+        return True
+    prefixes = (
+        "(",
+        "async (",
+        "function",
+        "async function",
+        "<",
+        "async <",
+    )
+    return candidate.startswith(prefixes)
+
+
+def _split_js_ts_assignment(value: str) -> tuple[str, str] | None:
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+    angle_depth = 0
+
+    for index, ch in enumerate(value):
+        nxt = value[index + 1] if index + 1 < len(value) else ""
+        prev = value[index - 1] if index > 0 else ""
+
+        if ch == "(":
+            paren_depth += 1
+            continue
+        if ch == ")" and paren_depth > 0:
+            paren_depth -= 1
+            continue
+        if ch == "[":
+            bracket_depth += 1
+            continue
+        if ch == "]" and bracket_depth > 0:
+            bracket_depth -= 1
+            continue
+        if ch == "{":
+            brace_depth += 1
+            continue
+        if ch == "}" and brace_depth > 0:
+            brace_depth -= 1
+            continue
+        if ch == "<":
+            angle_depth += 1
+            continue
+        if ch == ">" and angle_depth > 0:
+            angle_depth -= 1
+            continue
+        if (
+            ch == "="
+            and paren_depth == 0
+            and bracket_depth == 0
+            and brace_depth == 0
+            and angle_depth == 0
+            and nxt != ">"
+            and nxt != "="
+            and prev not in {"!", "<", ">", "="}
+        ):
+            lhs = value[:index].strip()
+            rhs = value[index + 1 :].strip()
+            return lhs, rhs
+
+    return None
+
+
+def _parse_js_ts_const_assignment(line: str) -> tuple[str, str] | None:
+    match = _JS_TS_CONST_DECL_RE.match(line)
+    if match is None:
+        return None
+    assignment = _split_js_ts_assignment(match.group(2))
+    if assignment is None:
+        return None
+    _lhs, rhs = assignment
+    return match.group(1), rhs
+
+
+def _parse_js_ts_class_field_assignment(line: str) -> tuple[str, str] | None:
+    match = _JS_TS_CLASS_FIELD_RE.match(line)
+    if match is None:
+        return None
+    assignment = _split_js_ts_assignment(match.group(2))
+    if assignment is None:
+        return None
+    _lhs, rhs = assignment
+    return match.group(1), rhs
+
+
+def _js_ts_pending_signature(signature_lines: list[str]) -> str:
+    parts = [part for part in signature_lines if part]
+    return _clip_inline(" ".join(parts))
+
+
+def _js_ts_assignment_entry(
+    *,
+    rel_path: str,
+    line: int,
+    kind: str,
+    name: str,
+    simple_name: str,
+    signature_lines: list[str],
+) -> _SymbolEntry:
+    return _SymbolEntry(
+        path=rel_path,
+        line=line,
+        kind=kind,
+        name=name,
+        simple_name=simple_name,
+        signature=_js_ts_pending_signature(signature_lines),
+    )
+
+
+def _start_js_ts_pending_assignment(
+    *,
+    line: int,
+    kind: str,
+    name: str,
+    simple_name: str,
+    signature_line: str,
+    rhs_fragment: str,
+    scope_depth: int,
+    fallback_kind: str | None = None,
+) -> _JsTsPendingAssignment:
+    return _JsTsPendingAssignment(
+        line=line,
+        kind=kind,
+        name=name,
+        simple_name=simple_name,
+        signature_lines=[signature_line] if signature_line else [],
+        rhs_fragments=[rhs_fragment] if rhs_fragment else [],
+        scope_depth=scope_depth,
+        fallback_kind=fallback_kind,
+    )
+
+
+def _finalize_js_ts_pending_assignment(
+    *,
+    rel_path: str,
+    symbols: list[_SymbolEntry],
+    pending: _JsTsPendingAssignment | None,
+    resolved: bool,
+) -> None:
+    if pending is None:
+        return
+    if resolved:
+        symbols.append(
+            _js_ts_assignment_entry(
+                rel_path=rel_path,
+                line=pending.line,
+                kind=pending.kind,
+                name=pending.name,
+                simple_name=pending.simple_name,
+                signature_lines=pending.signature_lines,
+            )
+        )
+        return
+    if pending.fallback_kind is not None:
+        symbols.append(
+            _js_ts_assignment_entry(
+                rel_path=rel_path,
+                line=pending.line,
+                kind=pending.fallback_kind,
+                name=pending.name,
+                simple_name=pending.simple_name,
+                signature_lines=pending.signature_lines,
+            )
+        )
+
+
+def _append_js_ts_pending_assignment_line(
+    *,
+    rel_path: str,
+    symbols: list[_SymbolEntry],
+    pending: _JsTsPendingAssignment,
+    raw_signature_line: str,
+    rhs_fragment: str,
+) -> _JsTsPendingAssignment | None:
+    if raw_signature_line:
+        pending.signature_lines.append(raw_signature_line)
+    if rhs_fragment:
+        pending.rhs_fragments.append(rhs_fragment)
+
+    combined_rhs = " ".join(fragment for fragment in pending.rhs_fragments if fragment)
+    if _is_js_ts_function_rhs(combined_rhs):
+        _finalize_js_ts_pending_assignment(
+            rel_path=rel_path,
+            symbols=symbols,
+            pending=pending,
+            resolved=True,
+        )
+        return None
+
+    signature_line_count = len(pending.signature_lines)
+    if (
+        signature_line_count >= _JS_TS_PENDING_ASSIGNMENT_MAX_LINES
+        or rhs_fragment.rstrip().endswith(";")
+    ):
+        _finalize_js_ts_pending_assignment(
+            rel_path=rel_path,
+            symbols=symbols,
+            pending=pending,
+            resolved=False,
+        )
+        return None
+    return pending
+
+
+def _extract_js_ts_symbols(*, root: Path, path: Path, text: str) -> list[_SymbolEntry]:
+    rel_path = _rel_path(root, path)
+    symbols: list[_SymbolEntry] = []
+    brace_depth = 0
+    in_block_comment = False
+    in_backtick_string = False
+    pending_class_name: str | None = None
+    class_stack: list[_JsTsClassScope] = []
+    pending_assignment: _JsTsPendingAssignment | None = None
+
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        sanitized, in_block_comment, in_backtick_string = _sanitize_js_ts_line(
+            raw_line,
+            in_block_comment=in_block_comment,
+            in_backtick_string=in_backtick_string,
+        )
+        stripped = sanitized.strip()
+        if not stripped:
+            continue
+
+        depth_before = brace_depth
+        while class_stack and depth_before < class_stack[-1].body_depth:
+            class_stack.pop()
+
+        if pending_class_name is not None and depth_before == 0 and "{" in stripped:
+            class_stack.append(_JsTsClassScope(name=pending_class_name, body_depth=1))
+            pending_class_name = None
+
+        source_signature = _clip_inline(raw_line.strip())
+        consumed_by_pending = False
+
+        if pending_assignment is not None:
+            if depth_before != pending_assignment.scope_depth:
+                _finalize_js_ts_pending_assignment(
+                    rel_path=rel_path,
+                    symbols=symbols,
+                    pending=pending_assignment,
+                    resolved=False,
+                )
+                pending_assignment = None
+            else:
+                pending_assignment = _append_js_ts_pending_assignment_line(
+                    rel_path=rel_path,
+                    symbols=symbols,
+                    pending=pending_assignment,
+                    raw_signature_line=raw_line.strip(),
+                    rhs_fragment=stripped,
+                )
+                consumed_by_pending = True
+
+        if not consumed_by_pending and depth_before == 0:
+            function_match = _JS_TS_FUNCTION_RE.match(stripped)
+            if function_match:
+                function_name = function_match.group(1)
+                symbols.append(
+                    _SymbolEntry(
+                        path=rel_path,
+                        line=line_number,
+                        kind="function",
+                        name=function_name,
+                        simple_name=function_name,
+                        signature=source_signature,
+                    )
+                )
+            else:
+                class_match = _JS_TS_CLASS_RE.match(stripped)
+                if class_match:
+                    class_name = class_match.group(1)
+                    symbols.append(
+                        _SymbolEntry(
+                            path=rel_path,
+                            line=line_number,
+                            kind="class",
+                            name=class_name,
+                            simple_name=class_name,
+                            signature=source_signature,
+                        )
+                    )
+                    class_tail = stripped[class_match.end() :]
+                    if "{" in class_tail:
+                        class_stack.append(_JsTsClassScope(name=class_name, body_depth=1))
+                        pending_class_name = None
+                    else:
+                        pending_class_name = class_name
+                else:
+                    const_assignment = _parse_js_ts_const_assignment(stripped)
+                    if const_assignment is not None:
+                        const_name, const_value = const_assignment
+                        if _is_js_ts_function_rhs(const_value):
+                            symbols.append(
+                                _SymbolEntry(
+                                    path=rel_path,
+                                    line=line_number,
+                                    kind="function",
+                                    name=const_name,
+                                    simple_name=const_name,
+                                    signature=source_signature,
+                                )
+                            )
+                        elif _looks_like_js_ts_multiline_function_rhs(const_value):
+                            pending_assignment = _start_js_ts_pending_assignment(
+                                line=line_number,
+                                kind="function",
+                                name=const_name,
+                                simple_name=const_name,
+                                signature_line=raw_line.strip(),
+                                rhs_fragment=const_value,
+                                scope_depth=depth_before,
+                                fallback_kind="constant",
+                            )
+                        else:
+                            symbols.append(
+                                _SymbolEntry(
+                                    path=rel_path,
+                                    line=line_number,
+                                    kind="constant",
+                                    name=const_name,
+                                    simple_name=const_name,
+                                    signature=source_signature,
+                                )
+                            )
+
+        if not consumed_by_pending and class_stack and depth_before == class_stack[-1].body_depth:
+            class_name = class_stack[-1].name
+            field_assignment = _parse_js_ts_class_field_assignment(stripped)
+            if field_assignment is not None:
+                field_name, field_value = field_assignment
+                qualified_name = f"{class_name}.{field_name}"
+                if _is_js_ts_function_rhs(field_value):
+                    symbols.append(
+                        _SymbolEntry(
+                            path=rel_path,
+                            line=line_number,
+                            kind="method",
+                            name=qualified_name,
+                            simple_name=field_name,
+                            signature=source_signature,
+                        )
+                    )
+                elif _looks_like_js_ts_multiline_function_rhs(field_value):
+                    pending_assignment = _start_js_ts_pending_assignment(
+                        line=line_number,
+                        kind="method",
+                        name=qualified_name,
+                        simple_name=field_name,
+                        signature_line=raw_line.strip(),
+                        rhs_fragment=field_value,
+                        scope_depth=depth_before,
+                    )
+            if pending_assignment is None:
+                method_match = _JS_TS_METHOD_RE.match(stripped)
+                if method_match:
+                    method_name = method_match.group(1)
+                    if method_name not in _JS_TS_BLOCK_KEYWORDS:
+                        qualified_name = f"{class_name}.{method_name}"
+                        symbols.append(
+                            _SymbolEntry(
+                                path=rel_path,
+                                line=line_number,
+                                kind="method",
+                                name=qualified_name,
+                                simple_name=method_name,
+                                signature=source_signature,
+                            )
+                        )
+
+        brace_depth = max(0, brace_depth + stripped.count("{") - stripped.count("}"))
+        while class_stack and brace_depth < class_stack[-1].body_depth:
+            class_stack.pop()
+
+    if pending_assignment is not None:
+        _finalize_js_ts_pending_assignment(
+            rel_path=rel_path,
+            symbols=symbols,
+            pending=pending_assignment,
+            resolved=False,
+        )
+
+    return symbols
+
+
+def _matches_query(entry: _SymbolEntry, *, query: str, exact: bool) -> bool:
+    if exact:
+        return query == entry.name or query == entry.simple_name
+
+    query_cf = query.casefold()
+    return query_cf in entry.name.casefold() or query_cf in entry.simple_name.casefold()
+
+
+def _add_note(notes: list[str], message: str) -> None:
+    if message and message not in notes:
+        notes.append(message)
+
+
+def symbol_search(
+    *,
+    root: Path,
+    query: str,
+    kind: str | None = None,
+    root_path: str = ".",
+    globs: list[str] | None = None,
+    max_results: int = _DEFAULT_MAX_RESULTS,
+    exact: bool = False,
+) -> dict[str, Any]:
+    cleaned_query = str(query or "").strip()
+    if not cleaned_query:
+        raise SymbolSearchError("query must be a non-empty string")
+
+    cleaned_kind = str(kind or "").strip().lower() or None
+    if cleaned_kind is not None and cleaned_kind not in _SUPPORTED_KINDS:
+        allowed = ", ".join(sorted(_SUPPORTED_KINDS))
+        raise SymbolSearchError(f"Unsupported kind: {kind!r}. Expected one of: {allowed}")
+
+    base = _resolve_under_root(root, root_path)
+    if not base.exists():
+        raise SymbolSearchError(f"Not found: {root_path}")
+
+    cleaned_globs = [str(pattern) for pattern in (globs or []) if str(pattern).strip()]
+    safe_max_results = max(1, min(int(max_results), _MAX_RESULTS))
+    candidate_files = _iter_candidate_files(
+        root=root,
+        base=base,
+        globs=cleaned_globs or None,
+    )
+
+    matches: list[dict[str, Any]] = []
+    notes: list[str] = []
+    truncated = False
+    parsed_files = 0
+    parsed_backends: set[str] = set()
+    skipped_unsupported: list[str] = []
+    skipped_large: list[str] = []
+    skipped_unparsable: list[str] = []
+
+    for path in candidate_files:
+        rel_path = _rel_path(root, path)
+        backend = _SUPPORTED_SUFFIX_TO_BACKEND.get(path.suffix.lower())
+        if backend is None:
+            if len(skipped_unsupported) < _MAX_NOTE_PATHS:
+                skipped_unsupported.append(rel_path)
+            continue
+
+        try:
+            size = path.stat().st_size
+        except OSError:
+            if len(skipped_large) < _MAX_NOTE_PATHS:
+                skipped_large.append(rel_path)
+            continue
+        if size > _MAX_FILE_BYTES:
+            if len(skipped_large) < _MAX_NOTE_PATHS:
+                skipped_large.append(rel_path)
+            continue
+
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            if len(skipped_unparsable) < _MAX_NOTE_PATHS:
+                skipped_unparsable.append(rel_path)
+            continue
+
+        if backend == "python_ast":
+            try:
+                symbols = _extract_python_symbols(root=root, path=path, text=text)
+            except SyntaxError:
+                if len(skipped_unparsable) < _MAX_NOTE_PATHS:
+                    skipped_unparsable.append(rel_path)
+                continue
+        else:
+            symbols = _extract_js_ts_symbols(root=root, path=path, text=text)
+
+        parsed_files += 1
+        parsed_backends.add(backend)
+        for entry in symbols:
+            if cleaned_kind is not None and entry.kind != cleaned_kind:
+                continue
+            if not _matches_query(entry, query=cleaned_query, exact=exact):
+                continue
+            matches.append(
+                {
+                    "path": entry.path,
+                    "line": entry.line,
+                    "kind": entry.kind,
+                    "name": entry.name,
+                    "signature": entry.signature,
+                }
+            )
+            if len(matches) > safe_max_results:
+                truncated = True
+                break
+        if truncated:
+            break
+
+    if parsed_files == 0 and skipped_unsupported:
+        paths = ", ".join(skipped_unsupported)
+        _add_note(
+            notes,
+            f"Skipped unsupported file(s): {paths}",
+        )
+    if skipped_large:
+        paths = ", ".join(skipped_large)
+        _add_note(notes, f"Skipped large or unreadable source file(s): {paths}")
+    if skipped_unparsable:
+        paths = ", ".join(skipped_unparsable)
+        _add_note(notes, f"Skipped unparsable source file(s): {paths}")
+    if not candidate_files:
+        _add_note(notes, "No files matched the requested scope.")
+    elif parsed_files == 0 and not skipped_unsupported:
+        _add_note(notes, "No supported source files matched the requested scope.")
+
+    if parsed_backends == {"python_ast"}:
+        backend_name = "python_ast"
+    elif parsed_backends == {"js_ts_heuristic"}:
+        backend_name = "js_ts_heuristic"
+    elif parsed_backends:
+        backend_name = "mixed_static"
+    else:
+        backend_name = "python_ast"
+
+    root_abs = root.resolve()
+    scope_display = "."
+    try:
+        rel_base = base.resolve().relative_to(root_abs)
+    except ValueError:
+        scope_display = root_path
+    else:
+        if os.fspath(rel_base):
+            scope_display = os.fspath(rel_base).replace("\\", "/")
+
+    return {
+        "query": cleaned_query,
+        "kind": cleaned_kind,
+        "root_path": scope_display,
+        "globs": cleaned_globs or None,
+        "exact": bool(exact),
+        "matches": matches[:safe_max_results],
+        "truncated": truncated,
+        "notes": notes,
+        "backend": backend_name,
+        "parsed_files": parsed_files,
+    }

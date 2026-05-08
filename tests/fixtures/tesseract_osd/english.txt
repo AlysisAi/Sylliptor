@@ -1,0 +1,6 @@
+Page number: 0
+Orientation in degrees: 0
+Rotate: 0
+Orientation confidence: 12.34
+Script: Latin
+Script confidence: 8.91

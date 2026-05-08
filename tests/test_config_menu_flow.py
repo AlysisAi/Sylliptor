@@ -1,0 +1,659 @@
+from __future__ import annotations
+
+import io
+import os
+from pathlib import Path
+from typing import Any
+
+import pytest
+from click import Abort
+from rich.console import Console
+
+from sylliptor_agent_cli.cli_impl import config_menu as config_menu_mod
+from sylliptor_agent_cli.cli_impl.config_menu import ROLE_ORDER, thinking_label_from_cfg
+from sylliptor_agent_cli.config import (
+    AppConfig,
+    load_config,
+    save_config,
+)
+from sylliptor_agent_cli.profiles import ProfileSpec, add_profile, set_active_profile
+
+
+class PromptScript:
+    def __init__(self, answers: list[str]) -> None:
+        self.answers = list(answers)
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def __call__(self, text: str, *args: Any, **kwargs: Any) -> str:
+        del args
+        self.calls.append((text, kwargs))
+        if not self.answers:
+            raise AssertionError(f"Unexpected prompt: {text}")
+        return self.answers.pop(0)
+
+
+class InlineChoiceScript:
+    def __init__(self, answers: list[str | None]) -> None:
+        self.answers = list(answers)
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, **kwargs: Any) -> str | None:
+        self.calls.append(kwargs)
+        if not self.answers:
+            raise AssertionError(f"Unexpected inline picker: {kwargs}")
+        return self.answers.pop(0)
+
+
+class ConfirmScript:
+    def __init__(self, answers: list[bool]) -> None:
+        self.answers = list(answers)
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def __call__(self, text: str, *args: Any, **kwargs: Any) -> bool:
+        del args
+        self.calls.append((text, kwargs))
+        if not self.answers:
+            raise AssertionError(f"Unexpected confirm: {text}")
+        return self.answers.pop(0)
+
+
+def _patch_console(monkeypatch) -> io.StringIO:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    monkeypatch.setattr(config_menu_mod, "_resolve_console", lambda: console)
+    return output
+
+
+def _seed_config(tmp_path: Path, monkeypatch, *, model: str = "old") -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    cfg = load_config()
+    cfg.model = model
+    save_config(cfg)
+
+
+def _profile_edit_state() -> config_menu_mod.ConfigMenuState:
+    cfg = AppConfig(model="old")
+    add_profile(
+        cfg,
+        ProfileSpec(
+            name="anthropic",
+            base_url="https://api.anthropic.com/v1",
+            api_key_env="OLD_API_KEY_ENV",
+            default_model="claude-sonnet-4-6",
+            notes="old notes",
+        ),
+    )
+    set_active_profile(cfg, "anthropic")
+    return config_menu_mod.ConfigMenuState.from_cfg(cfg)
+
+
+def test_main_menu_save_when_no_changes_returns_no_save(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(["s"])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    def fail_confirm(*_args: Any, **_kwargs: Any) -> bool:
+        raise AssertionError("cancel confirmation should not be called")
+
+    monkeypatch.setattr(config_menu_mod, "_confirm_cancel_when_dirty", fail_confirm)
+
+    result = config_menu_mod.run_config_menu()
+
+    assert result.saved is True
+    assert result.changes == {}
+
+
+def test_main_menu_uses_inline_prompt(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    output = _patch_console(monkeypatch)
+    prompt = PromptScript(["q"])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    def fail_picker(**_kwargs: Any) -> str | None:
+        raise AssertionError("top-level menu should not use the inline section picker")
+
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", fail_picker)
+
+    result = config_menu_mod.run_config_menu()
+
+    assert result.saved is False
+    assert prompt.calls[0][0] == "Choice"
+    assert "1) Provider Profile" in output.getvalue()
+
+
+def test_default_section_updates_model(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(["3", "gpt-5", "", "60.0", "s"])
+    inline = InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE, "auto"])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
+
+    result = config_menu_mod.run_config_menu()
+
+    assert result.saved is True
+    assert load_config().model == "gpt-5"
+
+
+def test_thinking_pick_uses_inline_picker(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(["3", "", "60", "s"])
+    inline = InlineChoiceScript(["old", "high"])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
+
+    result = config_menu_mod.run_config_menu()
+
+    assert result.saved is True
+    assert thinking_label_from_cfg(load_config()) == "high"
+    assert inline.calls[0]["title"] == "Default Model"
+
+
+def test_router_section_persists_changes(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(["4", "", "144", "12", "s"])
+    inline = InlineChoiceScript(["code_only", "fixed"])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
+
+    result = config_menu_mod.run_config_menu()
+    cfg = load_config()
+
+    assert result.saved is True
+    assert cfg.routing_mode == "code_only"
+    assert cfg.step_budget_policy == "fixed"
+    assert cfg.max_steps == AppConfig().max_steps
+    assert cfg.task_max_steps == 144
+    assert cfg.subagent_max_steps == 12
+
+
+def test_subagent_role_override(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    answers: list[str] = ["5"]
+    for role in ROLE_ORDER:
+        answers.append("anthropic/claude-sonnet-4-6" if role == "coding" else "")
+        if role in config_menu_mod._ROLE_TEMPERATURE_FIELDS:
+            answers.append("")
+    answers.append("s")
+    prompt = PromptScript(answers)
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    result = config_menu_mod.run_config_menu()
+
+    role_models = load_config().extra_fields["role_models"]
+    assert result.saved is True
+    assert role_models["coding"] == "anthropic/claude-sonnet-4-6"
+    assert set(role_models) == {"coding"}
+
+
+def test_forge_role_override(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    answers = ["6"]
+    answers.extend("anthropic/claude-opus-4-7" if role == "planner" else "" for role in ROLE_ORDER)
+    answers.append("s")
+    prompt = PromptScript(answers)
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    result = config_menu_mod.run_config_menu()
+
+    forge_role_models = load_config().extra_fields["forge_role_models"]
+    assert result.saved is True
+    assert forge_role_models["planner"] == "anthropic/claude-opus-4-7"
+    assert set(forge_role_models) == {"planner"}
+
+
+def test_cancel_with_dirty_prompts_confirm(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(["3", "gpt-5", "", "60", "q"])
+    inline = InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE, "auto"])
+    confirm = ConfirmScript([True])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
+    monkeypatch.setattr(config_menu_mod.typer, "confirm", confirm)
+
+    result = config_menu_mod.run_config_menu()
+
+    assert result.saved is False
+    assert load_config().model == "old"
+    assert confirm.calls[0][0] == "Discard pending changes?"
+
+    output = _patch_console(monkeypatch)
+    prompt = PromptScript(["3", "gpt-5", "", "60", "q", "s"])
+    inline = InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE, "auto"])
+    confirm = ConfirmScript([False])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
+    monkeypatch.setattr(config_menu_mod.typer, "confirm", confirm)
+
+    result = config_menu_mod.run_config_menu()
+
+    assert result.saved is True
+    assert output.getvalue().count("Sylliptor Configuration") >= 2
+    assert load_config().model == "gpt-5"
+
+
+def test_auto_focus_api_key_runs_section_first(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(["", ""])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    result = config_menu_mod.run_config_menu(auto_focus="api_key")
+
+    assert result.saved is False
+    assert prompt.calls[0][0] == 'New API key (Enter to keep current, "clear" to remove)'
+
+
+def test_config_menu_provider_section_lists_profiles(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    cfg = load_config()
+    add_profile(cfg, ProfileSpec(name="anthropic", base_url="https://api.anthropic.com/v1/openai"))
+    save_config(cfg)
+    output = _patch_console(monkeypatch)
+    prompt = PromptScript(["1", "q"])
+    inline = InlineChoiceScript(["back"])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
+
+    result = config_menu_mod.run_config_menu()
+
+    assert result.saved is False
+    assert "anthropic" in output.getvalue()
+
+
+def test_config_menu_switch_active_profile_persists(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    cfg = load_config()
+    add_profile(cfg, ProfileSpec(name="openai", base_url="https://api.openai.com/v1"))
+    add_profile(cfg, ProfileSpec(name="anthropic", base_url="https://api.anthropic.com/v1/openai"))
+    set_active_profile(cfg, "openai")
+    save_config(cfg)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(["1", "s"])
+    inline = InlineChoiceScript(["switch", "anthropic"])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
+
+    result = config_menu_mod.run_config_menu()
+
+    assert result.saved is True
+    assert load_config().extra_fields["active_profile"] == "anthropic"
+
+
+def test_api_key_clear_flow_persists_removal(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(["2", "clear", "s"])
+    confirm = ConfirmScript([True])
+    cleared: list[str] = []
+
+    def clear_api_key() -> bool:
+        cleared.append("legacy")
+        return True
+
+    def clear_profile_key(profile_name: str) -> bool:
+        cleared.append(f"profile:{profile_name}")
+        return True
+
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod.typer, "confirm", confirm)
+    monkeypatch.setattr(config_menu_mod, "clear_persisted_api_key", clear_api_key)
+    monkeypatch.setattr(config_menu_mod, "clear_persisted_profile_key", clear_profile_key)
+
+    result = config_menu_mod.run_config_menu()
+
+    assert result.saved is True
+    assert result.api_key_changed is True
+    assert len(cleared) == 1
+    assert cleared[0] == "legacy" or cleared[0].startswith("profile:")
+    assert confirm.calls[0][0] == "Clear the stored API key?"
+
+
+def test_config_menu_add_custom_profile_persists(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(
+        [
+            "1",
+            "anthropic",
+            "https://api.anthropic.com/v1/openai",
+            "",
+            "s",
+        ]
+    )
+    inline = InlineChoiceScript(["add_custom"])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
+
+    result = config_menu_mod.run_config_menu()
+
+    cfg = load_config()
+    profiles = cfg.extra_fields["profiles"]
+    assert result.saved is True
+    assert "anthropic" in profiles
+    assert profiles["anthropic"]["base_url"] == "https://api.anthropic.com/v1/openai"
+    assert cfg.extra_fields["active_profile"] == "anthropic"
+
+
+def test_config_menu_remove_profile_persists(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    cfg = load_config()
+    add_profile(cfg, ProfileSpec(name="openai", base_url="https://api.openai.com/v1"))
+    add_profile(cfg, ProfileSpec(name="anthropic", base_url="https://api.anthropic.com/v1/openai"))
+    set_active_profile(cfg, "openai")
+    save_config(cfg)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(["1", "s"])
+    inline = InlineChoiceScript(["remove", "anthropic"])
+    confirm = ConfirmScript([True])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
+    monkeypatch.setattr(config_menu_mod.typer, "confirm", confirm)
+
+    result = config_menu_mod.run_config_menu()
+
+    profiles = load_config().extra_fields["profiles"]
+    assert result.saved is True
+    assert "anthropic" not in profiles
+    assert confirm.calls[0][0] == "Remove profile anthropic?"
+
+
+def test_profile_edit_accepts_env_var_name(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    state = _profile_edit_state()
+    prompt = PromptScript(
+        [
+            "",
+            "ANTHROPIC_API_KEY",
+            "",
+            "",
+            "",
+            "",
+            "production profile",
+        ]
+    )
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    config_menu_mod._run_profile_edit_current(state, console)
+
+    profile = ProfileSpec.from_dict("anthropic", state.profiles["anthropic"])
+    assert profile.api_key_env == "ANTHROPIC_API_KEY"
+    assert profile.notes == "production profile"
+    assert prompt.calls[1][0] == config_menu_mod._API_KEY_ENV_PROMPT
+    rendered = output.getvalue()
+    assert "Edit Profile: anthropic" in rendered
+    assert "API key env var NAME" in rendered
+    assert "Web search adapter" in rendered
+    assert "Web search model" in rendered
+    assert "The actual API key" in rendered
+    assert "This field is only the name of the env variable" in rendered
+
+
+def test_profile_edit_reprompts_invalid_web_search_adapter(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    state = _profile_edit_state()
+    prompt = PromptScript(
+        [
+            "",
+            "",
+            "",
+            "bad_adapter",
+            "groq_compound",
+            "",
+            "",
+            "",
+        ]
+    )
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    config_menu_mod._run_profile_edit_current(state, console)
+
+    profile = ProfileSpec.from_dict("anthropic", state.profiles["anthropic"])
+    assert profile.web_search_adapter == "groq_compound"
+    assert prompt.calls[3][0] == "Web search adapter"
+    assert prompt.calls[4][0] == "Web search adapter"
+    rendered = output.getvalue()
+    assert "web_search_adapter must be one of:" in rendered
+    assert "Allowed adapters:" in rendered
+
+
+def test_profile_edit_env_var_secret_paste_warns_and_reprompts(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    state = _profile_edit_state()
+    pasted_secret = "sk-ant-api03-" + ("X" * 40)
+    prompt = PromptScript(
+        [
+            "",
+            pasted_secret,
+            "ANTHROPIC_API_KEY",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+    )
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    config_menu_mod._run_profile_edit_current(state, console)
+
+    profile = ProfileSpec.from_dict("anthropic", state.profiles["anthropic"])
+    assert profile.api_key_env == "ANTHROPIC_API_KEY"
+    assert prompt.calls[2][0] == "Re-enter API key env var name (or 'force' to keep this value)"
+    rendered = output.getvalue()
+    assert "That looks like an API key, not a API key env var name." in rendered
+    assert "Keys here are written to plaintext profile config." in rendered
+
+
+def test_profile_edit_env_var_secret_paste_force_accepts_with_warning(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    state = _profile_edit_state()
+    pasted_secret = "sk-ant-api03-" + ("Y" * 40)
+    prompt = PromptScript(
+        [
+            "",
+            pasted_secret,
+            "force",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+    )
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    config_menu_mod._run_profile_edit_current(state, console)
+
+    profile = ProfileSpec.from_dict("anthropic", state.profiles["anthropic"])
+    assert profile.api_key_env == pasted_secret
+    assert "Confirmed: storing potentially-sensitive value in plaintext." in output.getvalue()
+
+
+def test_profile_edit_extra_headers_whole_secret_warns_and_reprompts(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    state = _profile_edit_state()
+    pasted_secret = "sk-ant-api03-" + ("H" * 40)
+    prompt = PromptScript(
+        [
+            "",
+            "ANTHROPIC_API_KEY",
+            "",
+            "",
+            "",
+            pasted_secret,
+            "X-Trace=1",
+            "",
+        ]
+    )
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    config_menu_mod._run_profile_edit_current(state, console)
+
+    profile = ProfileSpec.from_dict("anthropic", state.profiles["anthropic"])
+    assert profile.extra_headers == {"X-Trace": "1"}
+    assert prompt.calls[6][0] == "Re-enter Extra headers (or 'force' to keep this value)"
+    assert "That looks like an API key, not a Extra headers." in output.getvalue()
+
+
+def test_profile_edit_notes_secret_paste_warns_and_reprompts(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    state = _profile_edit_state()
+    pasted_secret = "sk-ant-api03-" + ("Z" * 40)
+    prompt = PromptScript(
+        [
+            "",
+            "ANTHROPIC_API_KEY",
+            "",
+            "",
+            "",
+            "",
+            pasted_secret,
+            "safe notes",
+        ]
+    )
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    config_menu_mod._run_profile_edit_current(state, console)
+
+    profile = ProfileSpec.from_dict("anthropic", state.profiles["anthropic"])
+    assert profile.notes == "safe notes"
+    assert prompt.calls[7][0] == "Re-enter Notes (or 'force' to keep this value)"
+    assert "That looks like an API key, not a Notes." in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("sk-ant-api03-" + ("A" * 32), True),
+        ("sk-" + ("B" * 32), True),
+        ("sk_" + ("C" * 32), True),
+        ("anthropic-" + ("D" * 24), True),
+        ("Bearer " + ("E" * 32), True),
+        ("ghp_" + ("F" * 32), True),
+        ("gho_" + ("G" * 32), True),
+        ("github_pat_" + ("H" * 32), True),
+        ("A" * 40, True),
+        ("", False),
+        ("sk-short", False),
+        ("ANTHROPIC_API_KEY", False),
+        ("claude-sonnet-4-6", False),
+        ("https://api.anthropic.com/v1", False),
+        ("this is a long non-secret note with spaces", False),
+    ],
+)
+def test_looks_like_secret(value: str, expected: bool) -> None:
+    assert config_menu_mod._looks_like_secret(value) is expected
+
+
+def test_section_abort_returns_to_top_level(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    output = _patch_console(monkeypatch)
+    answers = iter(["3", "q"])
+
+    def prompt(text: str, *args: Any, **kwargs: Any) -> str:
+        del args, kwargs
+        if text == "Model":
+            raise Abort()
+        return next(answers)
+
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(
+        config_menu_mod,
+        "_prompt_inline_choice",
+        InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE]),
+    )
+
+    result = config_menu_mod.run_config_menu()
+
+    assert result.saved is False
+    assert 'Section "Default Model" cancelled.' in output.getvalue()
+
+
+def test_save_and_exit_reports_permission_error_without_raising(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    output = _patch_console(monkeypatch)
+    state = config_menu_mod.ConfigMenuState.from_cfg(load_config())
+    state.set_field("model", "new")
+
+    def fail_save_config(_cfg: AppConfig) -> None:
+        raise PermissionError("read-only file system")
+
+    monkeypatch.setattr(config_menu_mod, "save_config", fail_save_config)
+
+    result = config_menu_mod._save_and_exit(
+        state,
+        load_config(),
+        config_menu_mod._resolve_console(),
+    )
+
+    assert result.saved is False
+    assert result.error is not None
+    assert "read-only file system" in result.error
+    assert "Failed to save config:" in output.getvalue()
+    assert "Check write permission on" in output.getvalue()
+
+
+def test_subagent_section_abort_rolls_back_partial_role_edits(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    state = config_menu_mod.ConfigMenuState.from_cfg(AppConfig(model="default"))
+    state.set_role_model("coding", "old-coding")
+    state.set_role_model("planner", "old-planner")
+    state.set_role_temperature("coding", "0.1")
+    state.set_role_temperature("planner", "0.2")
+    role_models_before = dict(state.role_models)
+    role_temperatures_before = dict(state.role_temperatures)
+    answers = iter(["new-coding", "0.7", "new-planner", "0.8"])
+
+    def prompt(text: str, *args: Any, **kwargs: Any) -> str:
+        del args, kwargs
+        if "Review model" in text:
+            raise Abort()
+        return next(answers)
+
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    config_menu_mod._run_subagent_section(state, console)
+
+    assert state.role_models == role_models_before
+    assert state.role_temperatures == role_temperatures_before
+    assert 'Section "Subagent model overrides" cancelled.' in output.getvalue()
+
+
+def test_forge_section_abort_rolls_back_partial_role_edits(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    state = config_menu_mod.ConfigMenuState.from_cfg(AppConfig(model="default"))
+    state.set_forge_role_model("coding", "old-coding")
+    state.set_forge_role_model("planner", "old-planner")
+    forge_role_models_before = dict(state.forge_role_models)
+    answers = iter(["new-coding", "new-planner"])
+
+    def prompt(text: str, *args: Any, **kwargs: Any) -> str:
+        del args, kwargs
+        if "Review model" in text:
+            raise Abort()
+        return next(answers)
+
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    config_menu_mod._run_forge_section(state, console)
+
+    assert state.forge_role_models == forge_role_models_before
+    assert 'Section "Forge model overrides" cancelled.' in output.getvalue()

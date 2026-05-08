@@ -1,0 +1,6 @@
+Page number: 0
+Orientation in degrees: 0
+Rotate: 0
+Orientation confidence: 9.50
+Script: Hiragana
+Script confidence: 13.20

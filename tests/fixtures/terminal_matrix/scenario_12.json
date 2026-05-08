@@ -1,0 +1,20 @@
+{
+  "id": 12,
+  "name": "any-non-tty-CI-pipe",
+  "platform": "any",
+  "terminal": "non-tty",
+  "theme": "n/a",
+  "color_capability": "none",
+  "env": {
+    "CI": "1",
+    "TERM": "dumb",
+    "NO_COLOR": "1"
+  },
+  "is_wsl": false,
+  "osc11_result": null,
+  "isatty": false,
+  "expected_theme": "neutral",
+  "expects_white_panel": false,
+  "expects_neutral_palette": true,
+  "forbidden_ansi": ["\u001b[2;37m", "\u001b[2;30m", "\u001b[97m", "\u001b[30m"]
+}

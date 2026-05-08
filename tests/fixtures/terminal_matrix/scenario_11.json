@@ -1,0 +1,25 @@
+{
+  "id": 11,
+  "name": "Windows-WSL-Windows-Terminal-light",
+  "platform": "Windows",
+  "terminal": "WSL+Windows Terminal",
+  "theme": "light",
+  "color_capability": "truecolor",
+  "env": {
+    "WSL_DISTRO_NAME": "Ubuntu",
+    "WSL_INTEROP": "/run/WSL/interop",
+    "TERM": "xterm-256color",
+    "COLORTERM": "truecolor"
+  },
+  "windows_terminal_settings": {
+    "scheme_name": "One Half Light",
+    "background": "#ffffff"
+  },
+  "is_wsl": true,
+  "osc11_result": null,
+  "isatty": true,
+  "expected_theme": "light",
+  "expects_white_panel": false,
+  "expects_neutral_palette": false,
+  "forbidden_ansi": ["\u001b[2;37m", "\u001b[2;30m"]
+}

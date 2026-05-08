@@ -1,0 +1,50 @@
+[
+  {
+    "id": "conventions_parser_tests",
+    "workspace": "workspaces/combined_repo",
+    "task": "Explain the repo's preferred way to run parser-focused tests before editing parser code.",
+    "invocation_mode": "normal",
+    "expected_skills": [],
+    "verification_command": "python -c \"from pathlib import Path; import sys; sys.exit(0 if Path('AGENTS.md').exists() else 1)\"",
+    "tags": ["conventions", "dogfood"],
+    "notes": "Conventions-helpful control case."
+  },
+  {
+    "id": "skills_parser_pytest_normal",
+    "workspace": "workspaces/combined_repo",
+    "task": "Investigate a pytest failure around parser whitespace handling and use any relevant skill if helpful.",
+    "invocation_mode": "normal",
+    "expected_skills": ["pytest"],
+    "verification_command": "python -c \"from pathlib import Path; import sys; sys.exit(0 if Path('tests/parser_checks.py').exists() else 1)\"",
+    "tags": ["skills", "dogfood"]
+  },
+  {
+    "id": "skills_parser_pytest_explicit",
+    "workspace": "workspaces/combined_repo",
+    "task": "Investigate the parser pytest failure and outline the next debugging steps.",
+    "invocation_mode": "explicit_skill",
+    "explicit_skill_name": "pytest",
+    "expected_skills": ["pytest"],
+    "verification_command": "python -c \"from pathlib import Path; import sys; sys.exit(0 if Path('tests/parser_checks.py').exists() else 1)\"",
+    "tags": ["skills", "explicit", "dogfood"]
+  },
+  {
+    "id": "negative_readme_summary",
+    "workspace": "workspaces/negative_control",
+    "task": "Summarize what this fixture workspace is for.",
+    "invocation_mode": "normal",
+    "expected_skills": [],
+    "verification_command": "python -c \"from pathlib import Path; import sys; sys.exit(0 if Path('README.md').exists() else 1)\"",
+    "tags": ["negative-control", "dogfood"]
+  },
+  {
+    "id": "empty_workspace_first_skill_authoring",
+    "workspace": "workspaces/empty_authoring",
+    "task": "Create the first reusable skill for pytest debugging in this workspace.",
+    "invocation_mode": "normal",
+    "expected_skills": [],
+    "verification_command": "python -c \"from pathlib import Path; import sys; sys.exit(0 if Path('README.md').exists() else 1)\"",
+    "tags": ["lifecycle", "authoring", "dogfood"],
+    "notes": "Future dogfooding hook for empty-workspace first-skill authoring behavior."
+  }
+]

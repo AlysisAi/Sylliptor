@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a reproducible bug in Sylliptor.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Please fill in
+        the sections below so we can reproduce and fix the issue.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A short, clear description of the bug.
+      placeholder: e.g. `sylliptor chat` crashes when the model returns no tool_calls.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, exact commands or actions that trigger the bug.
+      placeholder: |
+        1. Run `sylliptor config set model gpt-4.1-mini`
+        2. Run `sylliptor run "..."`
+        3. Observe the error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the full error message and stack trace if possible.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Sylliptor version
+      description: Output of `sylliptor --version` (or commit SHA if running from source).
+      placeholder: 0.1.4
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: 3.11.x
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Logs, config snippets, screenshots, anything else relevant.

@@ -1,0 +1,1024 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+from .direction_change import filter_obsolete_direction_paths
+from .swarm_scheduler import canonical_task_status
+from .task_readiness import (
+    has_runnable_local_file_scope,
+    task_readiness_warning,
+    task_requires_runnable_file_scope,
+)
+from .task_scope import (
+    extract_forbidden_repo_path_hints,
+    extract_repo_path_hints,
+    is_internal_sylliptor_path,
+    split_normalized_repo_path_list,
+)
+
+_GLOB_CHARS = ("*", "?", "[")
+_TASK_ID_HINT_RE = re.compile(r"\bT\d+\b", re.IGNORECASE)
+_NON_EXECUTABLE_OBSOLETE_STATUSES = frozenset({"superseded", "invalidated"})
+_SYMBOL_CANDIDATE_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b")
+_SYMBOL_SCAN_EXTENSIONS = frozenset(
+    {
+        ".cjs",
+        ".go",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".mts",
+        ".py",
+        ".rs",
+        ".ts",
+        ".tsx",
+    }
+)
+_SYMBOL_SCAN_EXCLUDED_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".sylliptor",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "target",
+        "vendor",
+    }
+)
+_SYMBOL_CANDIDATE_STOPWORDS = frozenset(
+    {
+        "add",
+        "and",
+        "blank",
+        "blanks",
+        "bug",
+        "class",
+        "code",
+        "def",
+        "description",
+        "file",
+        "fix",
+        "for",
+        "from",
+        "function",
+        "implement",
+        "module",
+        "old",
+        "output",
+        "return",
+        "test",
+        "tests",
+        "the",
+        "update",
+        "when",
+        "with",
+    }
+)
+_FILENAME_TOKEN_RE = re.compile(r"\b[a-z][a-z0-9_]{2,}\b", re.IGNORECASE)
+_MAX_SYMBOL_SCAN_FILES = 1500
+_MAX_SYMBOL_SCAN_BYTES = 512_000
+
+
+@dataclass(frozen=True)
+class PlanReconciliationResult:
+    changed: bool
+    warnings: list[str]
+    task_updates: dict[str, dict[str, Any]]
+
+    @property
+    def updated_task_ids(self) -> list[str]:
+        return list(self.task_updates)
+
+
+@dataclass(frozen=True)
+class _PathAnchorGroup:
+    task_ids: tuple[str, ...]
+    paths: tuple[str, ...]
+
+
+def summarize_plan_reconciliation(result: PlanReconciliationResult) -> str:
+    if result.task_updates:
+        return "reconciled tasks: " + ", ".join(result.updated_task_ids)
+    if result.warnings:
+        return f"reconciliation warnings: {len(result.warnings)}"
+    return "reconciliation made no changes"
+
+
+def reconcile_plan_with_workspace(
+    plan: dict[str, Any],
+    *,
+    workspace_root: Path,
+    workspace_context: dict[str, Any] | None = None,
+    user_text: str | None = None,
+    transcript_tail: list[dict[str, Any]] | None = None,
+    target_task_ids: set[str] | None = None,
+) -> PlanReconciliationResult:
+    tasks_raw = plan.get("tasks")
+    if not isinstance(tasks_raw, list):
+        return PlanReconciliationResult(
+            changed=False,
+            warnings=["Plan reconciliation skipped: tasks field is missing or invalid."],
+            task_updates={},
+        )
+
+    root = workspace_root.expanduser().resolve()
+    known_paths = _known_workspace_paths(workspace_context)
+    normalized_target_task_ids = (
+        {str(task_id).strip() for task_id in target_task_ids if str(task_id).strip()}
+        if target_task_ids is not None
+        else None
+    )
+    anchor_groups = _latest_path_anchor_groups(
+        transcript_tail=transcript_tail,
+        user_text=user_text,
+    )
+    changed = False
+    warnings: list[str] = []
+    task_updates: dict[str, dict[str, Any]] = {}
+
+    task_entries = [(index, task) for index, task in enumerate(tasks_raw) if isinstance(task, dict)]
+    task_count = len(task_entries)
+
+    for task_position, (index, task) in enumerate(task_entries):
+        task_id = _task_label(task=task, index=index)
+        if normalized_target_task_ids is not None and task_id not in normalized_target_task_ids:
+            continue
+        if (
+            canonical_task_status(str(task.get("status") or ""))
+            in _NON_EXECUTABLE_OBSOLETE_STATUSES
+        ):
+            continue
+        current_estimated = _string_list(task.get("estimated_files"))
+        current_write_scope = _string_list(task.get("write_scope"))
+        forbidden_path_identities = _task_forbidden_path_identities(
+            task=task,
+            user_text=user_text,
+        )
+        task_anchor_paths = [
+            path
+            for path in _select_task_anchor_paths(
+                task=task,
+                task_position=task_position,
+                task_count=task_count,
+                anchor_groups=anchor_groups,
+            )
+            if _path_identity_key(path) not in forbidden_path_identities
+        ]
+        task_anchor_set = set(task_anchor_paths)
+
+        normalized_estimated, dropped_estimated = split_normalized_repo_path_list(
+            task.get("estimated_files")
+        )
+        normalized_write_scope, dropped_write_scope = split_normalized_repo_path_list(
+            task.get("write_scope")
+        )
+
+        if dropped_estimated:
+            warnings.append(
+                f"Task {task_id}: dropped invalid estimated_files entries: "
+                + ", ".join(dropped_estimated)
+            )
+        if dropped_write_scope:
+            warnings.append(
+                f"Task {task_id}: dropped invalid write_scope entries: "
+                + ", ".join(dropped_write_scope)
+            )
+
+        estimated_files, dropped_internal_estimated = _drop_protected_paths(normalized_estimated)
+        write_scope, dropped_internal_write_scope = _drop_protected_paths(normalized_write_scope)
+        if dropped_internal_estimated:
+            warnings.append(
+                f"Task {task_id}: dropped protected estimated_files entries: "
+                + ", ".join(dropped_internal_estimated)
+            )
+        if dropped_internal_write_scope:
+            warnings.append(
+                f"Task {task_id}: dropped protected write_scope entries: "
+                + ", ".join(dropped_internal_write_scope)
+            )
+        estimated_files, dropped_forbidden_estimated = _drop_forbidden_paths(
+            estimated_files,
+            forbidden_path_identities,
+        )
+        if dropped_forbidden_estimated:
+            warnings.append(
+                f"Task {task_id}: dropped forbidden estimated_files entries: "
+                + ", ".join(dropped_forbidden_estimated)
+            )
+        write_scope, dropped_forbidden_write_scope = _drop_forbidden_paths(
+            write_scope,
+            forbidden_path_identities,
+        )
+        if dropped_forbidden_write_scope:
+            warnings.append(
+                f"Task {task_id}: dropped forbidden write_scope entries: "
+                + ", ".join(dropped_forbidden_write_scope)
+            )
+
+        if not estimated_files:
+            inferred_paths, ignored_hints = _infer_estimated_files(
+                task=task,
+                workspace_root=root,
+                known_paths=known_paths,
+                allowed_missing_paths=task_anchor_set,
+                latest_user_text=str(user_text or ""),
+            )
+            if inferred_paths:
+                estimated_files = inferred_paths
+                warnings.append(
+                    f"Task {task_id}: inferred estimated_files from task text: "
+                    + ", ".join(inferred_paths)
+                )
+            for hint in ignored_hints:
+                warnings.append(f"Task {task_id}: ignored suspicious inferred path hint: {hint}")
+
+        estimated_files, dropped_ungrounded_estimated = _drop_ungrounded_suspicious_paths(
+            paths=estimated_files,
+            workspace_root=root,
+            known_paths=known_paths,
+            allowed_missing_paths=task_anchor_set,
+        )
+        if dropped_ungrounded_estimated:
+            warnings.append(
+                f"Task {task_id}: dropped suspicious estimated_files entries not grounded in the "
+                "latest user request: " + ", ".join(dropped_ungrounded_estimated)
+            )
+            if not estimated_files:
+                inferred_paths, ignored_hints = _infer_estimated_files(
+                    task=task,
+                    workspace_root=root,
+                    known_paths=known_paths,
+                    allowed_missing_paths=task_anchor_set,
+                    latest_user_text=str(user_text or ""),
+                )
+                if inferred_paths:
+                    estimated_files = inferred_paths
+                    warnings.append(
+                        f"Task {task_id}: restored grounded estimated_files from task text: "
+                        + ", ".join(inferred_paths)
+                    )
+                for hint in ignored_hints:
+                    warnings.append(
+                        f"Task {task_id}: ignored suspicious inferred path hint: {hint}"
+                    )
+        explicit_task_paths, ignored_explicit_task_paths = _infer_estimated_files(
+            task=task,
+            workspace_root=root,
+            known_paths=known_paths,
+            allowed_missing_paths=task_anchor_set,
+            latest_user_text=str(user_text or ""),
+        )
+        added_explicit_estimated = [
+            path for path in explicit_task_paths if path not in estimated_files
+        ]
+        if added_explicit_estimated:
+            estimated_files = _dedupe_keep_order([*estimated_files, *added_explicit_estimated])
+            warnings.append(
+                f"Task {task_id}: added explicit task path hints to estimated_files: "
+                + ", ".join(added_explicit_estimated)
+            )
+        for hint in ignored_explicit_task_paths:
+            warnings.append(f"Task {task_id}: ignored suspicious inferred path hint: {hint}")
+
+        estimated_files, estimated_warning = _apply_task_anchor_paths(
+            current_paths=estimated_files,
+            anchor_paths=task_anchor_paths,
+            field_name="estimated_files",
+        )
+        if estimated_warning:
+            warnings.append(f"Task {task_id}: {estimated_warning}")
+        estimated_files, dropped_forbidden_estimated = _drop_forbidden_paths(
+            estimated_files,
+            forbidden_path_identities,
+        )
+        if dropped_forbidden_estimated:
+            warnings.append(
+                f"Task {task_id}: dropped forbidden estimated_files entries: "
+                + ", ".join(dropped_forbidden_estimated)
+            )
+
+        for path in estimated_files:
+            if path in task_anchor_set:
+                continue
+            if _is_suspicious_path(path=path, workspace_root=root, known_paths=known_paths):
+                warnings.append(
+                    f"Task {task_id}: estimated_files entry may be suspicious or missing: {path}"
+                )
+
+        if not write_scope and estimated_files:
+            write_scope = list(estimated_files)
+            warnings.append(
+                f"Task {task_id}: seeded write_scope from estimated_files: "
+                + ", ".join(estimated_files)
+            )
+
+        write_scope, dropped_ungrounded_write_scope = _drop_ungrounded_suspicious_paths(
+            paths=write_scope,
+            workspace_root=root,
+            known_paths=known_paths,
+            allowed_missing_paths=task_anchor_set,
+        )
+        if dropped_ungrounded_write_scope:
+            warnings.append(
+                f"Task {task_id}: dropped suspicious write_scope entries not grounded in the "
+                "latest user request: " + ", ".join(dropped_ungrounded_write_scope)
+            )
+            if not write_scope and estimated_files:
+                write_scope = list(estimated_files)
+                warnings.append(
+                    f"Task {task_id}: reseeded write_scope from grounded estimated_files: "
+                    + ", ".join(estimated_files)
+                )
+        added_explicit_write_scope = [
+            path
+            for path in explicit_task_paths
+            if path in estimated_files and path not in write_scope
+        ]
+        if added_explicit_write_scope:
+            write_scope = _dedupe_keep_order([*write_scope, *added_explicit_write_scope])
+            warnings.append(
+                f"Task {task_id}: added explicit task path hints to write_scope: "
+                + ", ".join(added_explicit_write_scope)
+            )
+
+        write_scope, write_scope_warning = _apply_task_anchor_paths(
+            current_paths=write_scope,
+            anchor_paths=task_anchor_paths,
+            field_name="write_scope",
+        )
+        if write_scope_warning:
+            warnings.append(f"Task {task_id}: {write_scope_warning}")
+        write_scope, dropped_forbidden_write_scope = _drop_forbidden_paths(
+            write_scope,
+            forbidden_path_identities,
+        )
+        if dropped_forbidden_write_scope:
+            warnings.append(
+                f"Task {task_id}: dropped forbidden write_scope entries: "
+                + ", ".join(dropped_forbidden_write_scope)
+            )
+
+        if not task_anchor_paths:
+            symbol_paths = _resolve_symbol_grounded_paths(task=task, workspace_root=root)
+            grounded_paths = symbol_paths or _resolve_named_code_file_paths(
+                task=task,
+                workspace_root=root,
+            )
+            if grounded_paths:
+                estimated_files, estimated_symbol_warning = _apply_symbol_grounded_paths(
+                    current_paths=estimated_files,
+                    symbol_paths=grounded_paths,
+                    workspace_root=root,
+                    task=task,
+                    field_name="estimated_files",
+                )
+                if estimated_symbol_warning:
+                    warnings.append(f"Task {task_id}: {estimated_symbol_warning}")
+                write_scope, write_symbol_warning = _apply_symbol_grounded_paths(
+                    current_paths=write_scope,
+                    symbol_paths=grounded_paths,
+                    workspace_root=root,
+                    task=task,
+                    field_name="write_scope",
+                )
+                if write_symbol_warning:
+                    warnings.append(f"Task {task_id}: {write_symbol_warning}")
+
+        for path in write_scope:
+            if path in task_anchor_set:
+                continue
+            if _is_suspicious_path(path=path, workspace_root=root, known_paths=known_paths):
+                warnings.append(
+                    f"Task {task_id}: write_scope entry may be suspicious or missing: {path}"
+                )
+
+        if task_requires_runnable_file_scope(
+            title=str(task.get("title") or "").strip(),
+            description=str(task.get("description") or "").strip(),
+            acceptance_criteria=_string_list(task.get("acceptance_criteria")),
+            estimated_files=estimated_files,
+            write_scope=write_scope,
+        ) and not has_runnable_local_file_scope(
+            estimated_files=estimated_files,
+            write_scope=write_scope,
+        ):
+            warnings.append(
+                task_readiness_warning(
+                    task_id=task_id,
+                    title=str(task.get("title") or "").strip(),
+                )
+            )
+
+        patch: dict[str, Any] = {}
+        if estimated_files != current_estimated:
+            task["estimated_files"] = estimated_files
+            patch["estimated_files"] = estimated_files
+        if write_scope != current_write_scope:
+            task["write_scope"] = write_scope
+            patch["write_scope"] = write_scope
+        if patch:
+            task_updates[task_id] = patch
+            changed = True
+
+    return PlanReconciliationResult(
+        changed=changed,
+        warnings=_dedupe_keep_order(warnings),
+        task_updates=task_updates,
+    )
+
+
+def _task_label(*, task: dict[str, Any], index: int) -> str:
+    task_id = str(task.get("id") or "").strip()
+    if task_id:
+        return task_id
+    title = str(task.get("title") or "").strip()
+    if title:
+        return title
+    return f"task[{index}]"
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _dedupe_keep_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        key = value.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(value)
+    return out
+
+
+def _path_identity_key(value: str) -> str:
+    normalized = str(value or "").strip().replace("\\", "/").rstrip("/")
+    if normalized.casefold() in {"readme", "readme.md"}:
+        return "__readme_alias__"
+    return normalized.casefold()
+
+
+def _drop_forbidden_paths(
+    paths: list[str], forbidden_paths: set[str]
+) -> tuple[list[str], list[str]]:
+    if not forbidden_paths:
+        return _dedupe_keep_order(paths), []
+    kept: list[str] = []
+    dropped: list[str] = []
+    for path in _dedupe_keep_order(paths):
+        if _path_identity_key(path) in forbidden_paths:
+            dropped.append(path)
+            continue
+        kept.append(path)
+    return kept, dropped
+
+
+def _task_forbidden_path_identities(*, task: dict[str, Any], user_text: str | None) -> set[str]:
+    acceptance = _string_list(task.get("acceptance_criteria"))
+    text = "\n".join(
+        [
+            str(task.get("title") or ""),
+            str(task.get("description") or ""),
+            *acceptance,
+            str(user_text or ""),
+        ]
+    )
+    return {_path_identity_key(path) for path in extract_forbidden_repo_path_hints(text)}
+
+
+def _candidate_user_messages(
+    *,
+    transcript_tail: list[dict[str, Any]] | None,
+    user_text: str | None,
+) -> list[str]:
+    messages: list[str] = []
+    latest = str(user_text or "").strip()
+    if latest:
+        messages.append(latest)
+    for item in reversed(transcript_tail or []):
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role != "user":
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        if messages and content == messages[-1]:
+            continue
+        messages.append(content)
+    return messages
+
+
+def _extract_task_ids(text: str) -> tuple[str, ...]:
+    seen: set[str] = set()
+    ids: list[str] = []
+    for match in _TASK_ID_HINT_RE.findall(text or ""):
+        task_id = match.upper()
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        ids.append(task_id)
+    return tuple(ids)
+
+
+def _extract_path_anchor_groups(text: str) -> list[_PathAnchorGroup]:
+    groups: list[_PathAnchorGroup] = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        forbidden = {_path_identity_key(path) for path in extract_forbidden_repo_path_hints(line)}
+        paths = tuple(
+            path
+            for path in filter_obsolete_direction_paths(
+                extract_repo_path_hints(line), latest_user_text=text, task_text=line
+            )[0]
+            if _path_identity_key(path) not in forbidden
+        )
+        if not paths:
+            continue
+        groups.append(
+            _PathAnchorGroup(
+                task_ids=_extract_task_ids(line),
+                paths=paths,
+            )
+        )
+    if groups:
+        return groups
+    forbidden = {_path_identity_key(path) for path in extract_forbidden_repo_path_hints(text or "")}
+    global_paths = tuple(
+        path
+        for path in filter_obsolete_direction_paths(
+            extract_repo_path_hints(text or ""), latest_user_text=text, task_text=text
+        )[0]
+        if _path_identity_key(path) not in forbidden
+    )
+    if not global_paths:
+        return []
+    return [_PathAnchorGroup(task_ids=(), paths=global_paths)]
+
+
+def _latest_path_anchor_groups(
+    *,
+    transcript_tail: list[dict[str, Any]] | None,
+    user_text: str | None,
+) -> list[_PathAnchorGroup]:
+    for message in _candidate_user_messages(
+        transcript_tail=transcript_tail,
+        user_text=user_text,
+    ):
+        groups = _extract_path_anchor_groups(message)
+        if groups:
+            return groups
+    return []
+
+
+def _select_task_anchor_paths(
+    *,
+    task: dict[str, Any],
+    task_position: int,
+    task_count: int,
+    anchor_groups: list[_PathAnchorGroup],
+) -> list[str]:
+    if not anchor_groups:
+        return []
+    task_id = str(task.get("id") or "").strip().upper()
+    if task_id:
+        matched = [
+            path for group in anchor_groups if task_id in group.task_ids for path in group.paths
+        ]
+        if matched:
+            return _dedupe_keep_order(matched)
+
+    if task_count == 1:
+        return _dedupe_keep_order([path for group in anchor_groups for path in group.paths])
+
+    anonymous_groups = [group for group in anchor_groups if not group.task_ids]
+    if len(anonymous_groups) == task_count:
+        return list(anonymous_groups[task_position].paths)
+    return []
+
+
+def _drop_protected_paths(paths: list[str]) -> tuple[list[str], list[str]]:
+    kept: list[str] = []
+    dropped: list[str] = []
+    for path in paths:
+        if is_internal_sylliptor_path(path) or path == ".git" or path.startswith(".git/"):
+            dropped.append(path)
+            continue
+        kept.append(path)
+    return _dedupe_keep_order(kept), dropped
+
+
+def _apply_task_anchor_paths(
+    *,
+    current_paths: list[str],
+    anchor_paths: list[str],
+    field_name: str,
+) -> tuple[list[str], str | None]:
+    normalized_current = _dedupe_keep_order(current_paths)
+    normalized_anchor = _dedupe_keep_order(anchor_paths)
+    if not normalized_anchor:
+        return normalized_current, None
+    if not normalized_current:
+        return normalized_anchor, (
+            f"restored {field_name} from explicit user grounding: " + ", ".join(normalized_anchor)
+        )
+    if any(path in normalized_current for path in normalized_anchor):
+        missing = [path for path in normalized_anchor if path not in normalized_current]
+        if not missing:
+            return normalized_current, None
+        return normalized_current + missing, (
+            f"added explicit user-grounded {field_name} entries: " + ", ".join(missing)
+        )
+    return normalized_anchor, (
+        f"replaced {field_name} with explicit user-grounded paths: "
+        + ", ".join(normalized_current)
+        + " -> "
+        + ", ".join(normalized_anchor)
+    )
+
+
+def _has_glob(path: str) -> bool:
+    return any(char in path for char in _GLOB_CHARS)
+
+
+def _glob_prefix(path: str) -> str:
+    prefix_chars: list[str] = []
+    for char in path:
+        if char in _GLOB_CHARS:
+            break
+        prefix_chars.append(char)
+    return "".join(prefix_chars).rstrip("/")
+
+
+def _known_workspace_paths(workspace_context: dict[str, Any] | None) -> set[str]:
+    if not isinstance(workspace_context, dict):
+        return set()
+    known: set[str] = set()
+    for rel_path in _string_list(workspace_context.get("readme_paths")):
+        known.add(rel_path)
+    for rel_path in _string_list(workspace_context.get("observed_paths")):
+        known.add(rel_path)
+    conventions_path = str(workspace_context.get("conventions_path") or "").strip()
+    if conventions_path:
+        known.add(conventions_path)
+    for entry in workspace_context.get("manifests") or []:
+        if not isinstance(entry, dict):
+            continue
+        rel_path = str(entry.get("path") or "").strip()
+        if rel_path:
+            known.add(rel_path)
+    for entry in workspace_context.get("top_level_entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        rel_path = str(entry.get("path") or "").strip()
+        if rel_path:
+            known.add(rel_path)
+    return known
+
+
+def _is_suspicious_path(
+    *,
+    path: str,
+    workspace_root: Path,
+    known_paths: set[str],
+) -> bool:
+    if path in known_paths:
+        return False
+    if _has_glob(path):
+        prefix = _glob_prefix(path)
+        if not prefix:
+            return False
+        prefix_path = (workspace_root / prefix).resolve()
+        return not prefix_path.exists() and not prefix_path.parent.exists()
+    candidate = (workspace_root / path).resolve()
+    return not candidate.exists() and not candidate.parent.exists()
+
+
+def _infer_estimated_files(
+    *,
+    task: dict[str, Any],
+    workspace_root: Path,
+    known_paths: set[str],
+    allowed_missing_paths: set[str] | None = None,
+    latest_user_text: str = "",
+) -> tuple[list[str], list[str]]:
+    title = str(task.get("title") or "").strip()
+    description = str(task.get("description") or "").strip()
+    acceptance = _string_list(task.get("acceptance_criteria"))
+    task_text = "\n".join([title, description, *acceptance]).strip()
+    hints = extract_repo_path_hints(task_text)
+    forbidden_hints = {
+        _path_identity_key(path)
+        for path in extract_forbidden_repo_path_hints(
+            "\n".join([task_text, str(latest_user_text or "")])
+        )
+    }
+    hints, obsolete_hints = filter_obsolete_direction_paths(
+        hints,
+        latest_user_text=latest_user_text,
+        task_text=task_text,
+    )
+    allowed_missing = {path for path in (allowed_missing_paths or set()) if path}
+    inferred: list[str] = []
+    ignored: list[str] = list(obsolete_hints)
+    for hint in hints:
+        if _has_glob(hint):
+            continue
+        if _path_identity_key(hint) in forbidden_hints:
+            ignored.append(hint)
+            continue
+        if is_internal_sylliptor_path(hint) or hint == ".git" or hint.startswith(".git/"):
+            ignored.append(hint)
+            continue
+        if hint in allowed_missing:
+            inferred.append(hint)
+            continue
+        if _is_suspicious_path(path=hint, workspace_root=workspace_root, known_paths=known_paths):
+            ignored.append(hint)
+            continue
+        inferred.append(hint)
+    return _dedupe_keep_order(inferred), _dedupe_keep_order(ignored)
+
+
+def _task_symbol_candidates(task: dict[str, Any]) -> list[str]:
+    text = "\n".join(
+        [
+            str(task.get("title") or ""),
+            str(task.get("description") or ""),
+            *[str(item) for item in _string_list(task.get("acceptance_criteria"))],
+        ]
+    )
+    candidates: list[str] = []
+    for raw in _SYMBOL_CANDIDATE_RE.findall(text):
+        symbol = raw.strip()
+        if not symbol:
+            continue
+        lowered = symbol.casefold()
+        if lowered in _SYMBOL_CANDIDATE_STOPWORDS:
+            continue
+        if symbol.isupper() and "_" not in symbol:
+            continue
+        if "_" not in symbol and not any(char.isupper() for char in symbol[1:]):
+            continue
+        candidates.append(symbol)
+    return _dedupe_keep_order(candidates)[:6]
+
+
+def _task_filename_candidates(task: dict[str, Any]) -> list[str]:
+    text = "\n".join(
+        [
+            str(task.get("title") or ""),
+            str(task.get("description") or ""),
+            *[str(item) for item in _string_list(task.get("acceptance_criteria"))],
+        ]
+    )
+    candidates: list[str] = []
+    for raw in _FILENAME_TOKEN_RE.findall(text):
+        token = raw.strip().casefold()
+        if not token or token in _SYMBOL_CANDIDATE_STOPWORDS:
+            continue
+        candidates.append(token)
+    return _dedupe_keep_order(candidates)[:10]
+
+
+def _iter_symbol_scan_files(workspace_root: Path) -> list[Path]:
+    files: list[Path] = []
+    try:
+        iterator = workspace_root.rglob("*")
+    except OSError:
+        return files
+    for path in iterator:
+        if len(files) >= _MAX_SYMBOL_SCAN_FILES:
+            break
+        try:
+            rel_parts = path.resolve().relative_to(workspace_root).parts
+        except (OSError, ValueError):
+            continue
+        if any(part in _SYMBOL_SCAN_EXCLUDED_DIRS for part in rel_parts):
+            continue
+        if not path.is_file():
+            continue
+        if path.suffix.casefold() not in _SYMBOL_SCAN_EXTENSIONS:
+            continue
+        files.append(path)
+    return files
+
+
+def _symbol_definition_regex(symbol: str, suffix: str) -> re.Pattern[str]:
+    escaped = re.escape(symbol)
+    if suffix == ".py":
+        return re.compile(rf"(?m)^\s*(?:async\s+def|def|class)\s+{escaped}\b")
+    if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts"}:
+        return re.compile(
+            rf"(?m)^\s*(?:export\s+)?(?:async\s+)?function\s+{escaped}\b"
+            rf"|^\s*(?:export\s+)?(?:const|let|var)\s+{escaped}\s*="
+            rf"|^\s*(?:export\s+)?class\s+{escaped}\b"
+        )
+    if suffix == ".go":
+        return re.compile(rf"(?m)^\s*func\s+(?:\([^)]*\)\s*)?{escaped}\b")
+    if suffix == ".rs":
+        return re.compile(
+            rf"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:fn|struct|enum|trait)\s+{escaped}\b"
+        )
+    return re.compile(rf"\b{escaped}\b")
+
+
+def _file_text(path: Path) -> str:
+    try:
+        if path.stat().st_size > _MAX_SYMBOL_SCAN_BYTES:
+            return ""
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def _resolve_symbol_grounded_paths(*, task: dict[str, Any], workspace_root: Path) -> list[str]:
+    symbols = _task_symbol_candidates(task)
+    if not symbols:
+        return []
+
+    paths_by_symbol: dict[str, list[str]] = {symbol: [] for symbol in symbols}
+    for path in _iter_symbol_scan_files(workspace_root):
+        text = _file_text(path)
+        if not text:
+            continue
+        suffix = path.suffix.casefold()
+        for symbol in symbols:
+            if not _symbol_definition_regex(symbol, suffix).search(text):
+                continue
+            try:
+                rel_path = path.resolve().relative_to(workspace_root).as_posix()
+            except (OSError, ValueError):
+                continue
+            paths_by_symbol[symbol].append(rel_path)
+
+    grounded: list[str] = []
+    for symbol in symbols:
+        symbol_paths = _dedupe_keep_order(paths_by_symbol.get(symbol, []))
+        if len(symbol_paths) == 1:
+            grounded.extend(symbol_paths)
+    return _dedupe_keep_order(grounded)[:3]
+
+
+def _resolve_named_code_file_paths(*, task: dict[str, Any], workspace_root: Path) -> list[str]:
+    candidates = _task_filename_candidates(task)
+    if not candidates:
+        return []
+
+    paths_by_stem: dict[str, list[str]] = {candidate: [] for candidate in candidates}
+    for path in _iter_symbol_scan_files(workspace_root):
+        stem = path.stem.casefold()
+        if stem not in paths_by_stem:
+            continue
+        try:
+            rel_path = path.resolve().relative_to(workspace_root).as_posix()
+        except (OSError, ValueError):
+            continue
+        if not is_code_implementation_path(rel_path):
+            continue
+        paths_by_stem[stem].append(rel_path)
+
+    grounded: list[str] = []
+    for candidate in candidates:
+        candidate_paths = _dedupe_keep_order(paths_by_stem.get(candidate, []))
+        if len(candidate_paths) == 1:
+            grounded.extend(candidate_paths)
+    return _dedupe_keep_order(grounded)[:3]
+
+
+def _is_probable_test_path(path: str) -> bool:
+    pure = PurePosixPath(path)
+    lowered_name = pure.name.casefold()
+    lowered_parts = {part.casefold() for part in pure.parts}
+    return (
+        "test" in lowered_parts
+        or "tests" in lowered_parts
+        or lowered_name.startswith("test_")
+        or lowered_name.endswith("_test.py")
+        or ".test." in lowered_name
+        or ".spec." in lowered_name
+    )
+
+
+def is_code_implementation_path(path: str) -> bool:
+    pure = PurePosixPath(path)
+    return pure.suffix.casefold() in _SYMBOL_SCAN_EXTENSIONS and not _is_probable_test_path(path)
+
+
+def _is_code_implementation_path(path: str) -> bool:
+    return is_code_implementation_path(path)
+
+
+def _path_contains_any_task_symbol(
+    *,
+    workspace_root: Path,
+    path: str,
+    task: dict[str, Any],
+) -> bool:
+    symbols = _task_symbol_candidates(task)
+    if not symbols:
+        return False
+    candidate = workspace_root / path
+    text = _file_text(candidate)
+    if not text:
+        return False
+    return any(re.search(rf"\b{re.escape(symbol)}\b", text) for symbol in symbols)
+
+
+def _apply_symbol_grounded_paths(
+    *,
+    current_paths: list[str],
+    symbol_paths: list[str],
+    workspace_root: Path,
+    task: dict[str, Any],
+    field_name: str,
+) -> tuple[list[str], str | None]:
+    normalized_current = _dedupe_keep_order(current_paths)
+    normalized_symbol_paths = _dedupe_keep_order(symbol_paths)
+    if not normalized_symbol_paths:
+        return normalized_current, None
+    if any(path in normalized_current for path in normalized_symbol_paths):
+        return normalized_current, None
+
+    implementation_paths = [
+        path for path in normalized_current if is_code_implementation_path(path)
+    ]
+    if implementation_paths and any(
+        _path_contains_any_task_symbol(
+            workspace_root=workspace_root,
+            path=path,
+            task=task,
+        )
+        for path in implementation_paths
+    ):
+        return normalized_current, None
+
+    if implementation_paths:
+        replacement: list[str] = []
+        inserted_symbols = False
+        for path in normalized_current:
+            if is_code_implementation_path(path):
+                if not inserted_symbols:
+                    replacement.extend(normalized_symbol_paths)
+                    inserted_symbols = True
+                continue
+            replacement.append(path)
+        replacement = _dedupe_keep_order(replacement)
+        return replacement, (
+            f"replaced symbol-mismatched {field_name} entries with repository symbol "
+            "definition path(s): "
+            + ", ".join(implementation_paths)
+            + " -> "
+            + ", ".join(normalized_symbol_paths)
+        )
+
+    replacement = _dedupe_keep_order([*normalized_current, *normalized_symbol_paths])
+    return replacement, (
+        f"added repository symbol definition path(s) to {field_name}: "
+        + ", ".join(normalized_symbol_paths)
+    )
+
+
+def _drop_ungrounded_suspicious_paths(
+    *,
+    paths: list[str],
+    workspace_root: Path,
+    known_paths: set[str],
+    allowed_missing_paths: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    allowed_missing = {path for path in (allowed_missing_paths or set()) if path}
+    if not allowed_missing:
+        return _dedupe_keep_order(paths), []
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    for path in _dedupe_keep_order(paths):
+        if path in allowed_missing:
+            kept.append(path)
+            continue
+        if _is_suspicious_path(path=path, workspace_root=workspace_root, known_paths=known_paths):
+            dropped.append(path)
+            continue
+        kept.append(path)
+    return kept, dropped

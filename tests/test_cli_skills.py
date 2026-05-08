@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import io
+from pathlib import Path
+
+from rich.console import Console
+from typer.testing import CliRunner
+
+from sylliptor_agent_cli import cli as cli_mod
+from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.skills import discover_skills
+
+
+def _write_skill(
+    root: Path,
+    rel_root: str,
+    bundle_name: str,
+    *,
+    name: str,
+    description: str,
+    body: str,
+) -> None:
+    bundle = root / rel_root / bundle_name
+    bundle.mkdir(parents=True, exist_ok=True)
+    (bundle / "SKILL.md").write_text(
+        (f"---\nname: {name}\ndescription: {description}\n---\n\n{body}\n"),
+        encoding="utf-8",
+    )
+
+
+def _write_invalid_utf8_skill(root: Path, rel_root: str, bundle_name: str) -> None:
+    bundle = root / rel_root / bundle_name
+    bundle.mkdir(parents=True, exist_ok=True)
+    (bundle / "SKILL.md").write_bytes(
+        b"---\nname: broken\ndescription: broken\n---\n\n\xff\xfe\xfa\n"
+    )
+
+
+def test_skill_list_cli_lists_discovered_skills_with_source_metadata(tmp_path: Path) -> None:
+    _write_skill(
+        tmp_path,
+        ".sylliptor_skills",
+        "python",
+        name="python",
+        description="Work on Python code",
+        body="Python instructions.",
+    )
+
+    result = CliRunner().invoke(cli_mod.app, ["skill", "list", "--path", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "python" in result.output
+    assert "project" in result.output
+    assert "native" in result.output
+    assert ".sylliptor_skills" in result.output
+
+
+def test_skill_info_cli_shows_skill_details(tmp_path: Path) -> None:
+    _write_skill(
+        tmp_path,
+        ".agents/skills",
+        "docker",
+        name="docker",
+        description="Inspect docker services",
+        body="Use docker-compose commands carefully.",
+    )
+
+    result = CliRunner().invoke(
+        cli_mod.app,
+        ["skill", "info", "docker", "--path", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    assert "name: docker" in result.output
+    assert "description: Inspect docker services" in result.output
+    assert "Use docker-compose commands carefully." in result.output
+
+
+def test_chat_skill_command_lists_discovered_skills_and_info(tmp_path: Path) -> None:
+    _write_skill(
+        tmp_path,
+        ".sylliptor_skills",
+        "python",
+        name="python",
+        description="Work on Python code",
+        body="Python instructions.",
+    )
+    discovered = discover_skills(focus_path=tmp_path, workspace_root=tmp_path)
+
+    session = type("Session", (), {})()
+    session.cfg = AppConfig(model="test-model", skills_enabled=True)
+    session.skill_registry = discovered.skills
+    session.skills_ordered = discovered.ordered
+    session.skill_discovery_issues = discovered.issues
+    session.root = tmp_path
+    session.mode = "review"
+
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False)
+    forge_state = cli_mod._ForgeChatState()
+
+    result = cli_mod._handle_chat_command(
+        input_text="/skill",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=console,
+        forge_state=forge_state,
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert "Skills (1)" in stream.getvalue()
+    assert "python" in stream.getvalue()
+
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False)
+    result = cli_mod._handle_chat_command(
+        input_text="/skills",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=console,
+        forge_state=forge_state,
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert "Unknown command: /skills." in stream.getvalue()
+    assert "Did you mean /skill? Try /help." in stream.getvalue()
+
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False)
+    result = cli_mod._handle_chat_command(
+        input_text="/skill python",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=console,
+        forge_state=forge_state,
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert "name: python" in stream.getvalue()
+    assert "Python instructions." in stream.getvalue()
+
+
+def test_chat_skill_command_returns_one_turn_execution_request(tmp_path: Path) -> None:
+    _write_skill(
+        tmp_path,
+        ".sylliptor_skills",
+        "python",
+        name="python",
+        description="Work on Python code",
+        body='Python instructions for "$ARGUMENTS" with $1 and $2.',
+    )
+    discovered = discover_skills(focus_path=tmp_path, workspace_root=tmp_path)
+
+    session = type("Session", (), {})()
+    session.cfg = AppConfig(model="test-model", skills_enabled=True)
+    session.skill_registry = discovered.skills
+    session.skills_ordered = discovered.ordered
+    session.skill_discovery_issues = discovered.issues
+    session.root = tmp_path
+    session.mode = "review"
+
+    console = Console(file=io.StringIO(), force_terminal=False)
+    result = cli_mod._handle_chat_command(
+        input_text="/skill python add retries to the parser",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=console,
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert isinstance(result, cli_mod._ChatExecutionRequest)
+    assert result.instruction == "add retries to the parser"
+    assert result.routing_mode_override is None
+    assert result.ephemeral_user_messages
+    assert "<explicit_skill_context>" in result.ephemeral_user_messages[0]
+    assert (
+        "turn_requirement: Apply this selected skill before taking other actions on the next user task."
+        in result.ephemeral_user_messages[0]
+    )
+    assert (
+        "task_binding: Treat this wrapper and the next user message as one bound instruction set."
+        in result.ephemeral_user_messages[0]
+    )
+    assert "name: python" in result.ephemeral_user_messages[0]
+    assert '- $ARGUMENTS = "add retries to the parser"' in result.ephemeral_user_messages[0]
+    assert '- $1 = "add"' in result.ephemeral_user_messages[0]
+    assert '- $2 = "retries"' in result.ephemeral_user_messages[0]
+    assert (
+        'Python instructions for "add retries to the parser" with add and retries.'
+        in result.ephemeral_user_messages[0]
+    )
+
+
+def test_chat_skill_command_rejects_when_skills_are_disabled(tmp_path: Path) -> None:
+    _write_skill(
+        tmp_path,
+        ".sylliptor_skills",
+        "python",
+        name="python",
+        description="Work on Python code",
+        body="Python instructions.",
+    )
+    discovered = discover_skills(focus_path=tmp_path, workspace_root=tmp_path)
+
+    session = type("Session", (), {})()
+    session.cfg = AppConfig(model="test-model", skills_enabled=False)
+    session.skill_registry = discovered.skills
+    session.skills_ordered = discovered.ordered
+    session.skill_discovery_issues = discovered.issues
+    session.root = tmp_path
+    session.mode = "review"
+
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False)
+    result = cli_mod._handle_chat_command(
+        input_text="/skill python add retries to the parser",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=console,
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert "Skills are disabled for this session config." in stream.getvalue()
+
+
+def test_cli_skill_list_and_info_skip_invalid_utf8_skill_without_crashing(
+    tmp_path: Path,
+) -> None:
+    _write_skill(
+        tmp_path,
+        ".sylliptor_skills",
+        "python",
+        name="python",
+        description="Work on Python code",
+        body="Python instructions.",
+    )
+    _write_invalid_utf8_skill(tmp_path, ".sylliptor_skills", "broken")
+
+    list_result = CliRunner().invoke(cli_mod.app, ["skill", "list", "--path", str(tmp_path)])
+    info_result = CliRunner().invoke(
+        cli_mod.app,
+        ["skill", "info", "python", "--path", str(tmp_path)],
+    )
+
+    assert list_result.exit_code == 0
+    assert "python" in list_result.output
+    assert "Skipped skill:" in list_result.output
+    assert "UTF-8" in list_result.output
+
+    assert info_result.exit_code == 0
+    assert "name: python" in info_result.output

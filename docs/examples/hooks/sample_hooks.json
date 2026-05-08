@@ -1,0 +1,86 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "shell_run",
+        "hooks": [
+          {
+            "type": "command",
+            "id": "policy.block-dangerous-shell",
+            "description": "Reject obviously destructive shell commands.",
+            "command": "python docs/examples/hooks/block_dangerous.py",
+            "failurePolicy": "warn",
+            "runtimeKinds": ["interactive_chat", "one_shot"]
+          }
+        ]
+      },
+      {
+        "matcher": "fs_write|fs_patch|fs_edit",
+        "hooks": [
+          {
+            "type": "command",
+            "id": "security.secret-scanner",
+            "description": "Block writes containing common API keys, tokens, or private key blocks.",
+            "command": "python docs/examples/hooks/secret_scanner.py",
+            "failurePolicy": "warn"
+          }
+        ]
+      },
+      {
+        "matcher": "fs_read|fs_write|fs_patch|fs_edit",
+        "hooks": [
+          {
+            "type": "command",
+            "id": "security.block-env-files",
+            "description": "Block access to .env files, private keys, and secrets directories.",
+            "command": "python docs/examples/hooks/block_env_files.py",
+            "failurePolicy": "warn"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "id": "context.resume-note",
+            "description": "Inject extra context only for resumed sessions.",
+            "command": "python -c \"import json,sys; payload=json.load(sys.stdin); meta=payload.get('session_source_metadata') or {}; print(json.dumps({'additionalSystemMessages': [f\\\"Resumed from {meta.get('from_session_id') or 'unknown'} with {meta.get('loaded_message_count') or 0} restored messages.\\\"]}))\"",
+            "sessionSource": ["resume"]
+          }
+        ]
+      }
+    ],
+    "TurnComplete": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "id": "notify.turn-complete",
+            "description": "Trigger a desktop notification when a turn completes.",
+            "command": "python docs/examples/hooks/notify_done.py"
+          },
+          {
+            "type": "command",
+            "id": "notify.windows-turn-complete",
+            "description": "Play a Windows-native sound when a turn completes.",
+            "command": "python -m sylliptor_agent_cli.builtin_hooks.notify_done_windows"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "id": "notify.windows-notification",
+            "description": "Play a Windows-native sound for notification events.",
+            "command": "python -m sylliptor_agent_cli.builtin_hooks.notify_done_windows"
+          }
+        ]
+      }
+    ]
+  }
+}

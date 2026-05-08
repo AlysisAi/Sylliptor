@@ -1,0 +1,1399 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import sylliptor_agent_cli.compaction.conversation_compactor as compactor_mod
+from sylliptor_agent_cli.agent_loop import (
+    AgentSession,
+    create_session,
+    refresh_session_task_brief_message,
+)
+from sylliptor_agent_cli.compaction.conversation_compactor import MEMORY_MARKER, PINS_MARKER
+from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.llm.openai_compat import LLMResponse
+
+
+def _summary(*, decisions: list[str]) -> dict[str, Any]:
+    return {
+        "goal": "keep repository healthy",
+        "constraints": [],
+        "decisions": decisions,
+        "work_done": [],
+        "open_threads": [],
+        "next_steps": [],
+    }
+
+
+class _FakeMainClient:
+    def __init__(self) -> None:
+        self.model = "gpt-5-nano"
+        self.temperature = 1.0
+        self.calls = 0
+
+    def chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+        on_text_delta=None,  # type: ignore[no-untyped-def]
+    ) -> LLMResponse:
+        _ = messages, tools, stream, on_text_delta
+        self.calls += 1
+        return LLMResponse(
+            content="done",
+            tool_calls=[],
+            raw={},
+            response_model=self.model,
+        )
+
+
+class _FakeCompactorClient:
+    def __init__(self, summaries: list[dict[str, Any]]) -> None:
+        self.model = "gpt-5-nano"
+        self.temperature = 0.2
+        self._summaries = summaries
+        self.calls = 0
+        self.captured_payloads: list[dict[str, Any]] = []
+
+    def chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+        on_text_delta=None,  # type: ignore[no-untyped-def]
+    ) -> LLMResponse:
+        _ = tools, stream, on_text_delta
+        self.calls += 1
+        if messages:
+            payload_raw = str(messages[-1].get("content") or "")
+            try:
+                payload = json.loads(payload_raw)
+            except json.JSONDecodeError:
+                payload = {}
+            if isinstance(payload, dict):
+                self.captured_payloads.append(payload)
+            else:
+                self.captured_payloads.append({})
+        idx = min(self.calls - 1, len(self._summaries) - 1)
+        return LLMResponse(
+            content=json.dumps(self._summaries[idx]),
+            tool_calls=[],
+            raw={},
+            response_model=self.model,
+        )
+
+
+class _FailingCompactorClient:
+    def __init__(self, *, max_chars: int) -> None:
+        self.model = "gpt-5-nano"
+        self.temperature = 0.2
+        self.max_chars = max_chars
+        self.calls = 0
+
+    def chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+        on_text_delta=None,  # type: ignore[no-untyped-def]
+    ) -> LLMResponse:
+        _ = tools, stream, on_text_delta
+        self.calls += 1
+        payload = json.dumps(messages, ensure_ascii=False)
+        if len(payload) > self.max_chars:
+            from sylliptor_agent_cli.llm.openai_compat import LLMError
+
+            raise LLMError("context length exceeded")
+        return LLMResponse(
+            content=json.dumps(_summary(decisions=["ok"])),
+            tool_calls=[],
+            raw={},
+            response_model=self.model,
+        )
+
+
+def _append_turns(session: AgentSession, *, count: int, prefix: str) -> None:
+    for idx in range(count):
+        session.messages.append(
+            {
+                "role": "user",
+                "content": f"{prefix}-u{idx} " + ("x" * 1600),
+            }
+        )
+        session.messages.append(
+            {
+                "role": "assistant",
+                "content": f"{prefix}-a{idx} " + ("y" * 1600),
+            }
+        )
+
+
+def _assert_valid_tool_transcript(messages: list[dict[str, Any]]) -> None:
+    open_tool_call_ids: set[str] = set()
+    for msg in messages:
+        role = str(msg.get("role") or "")
+        content = str(msg.get("content") or "")
+        if role == "user" and (
+            content.startswith(MEMORY_MARKER) or content.startswith(PINS_MARKER)
+        ):
+            continue
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                assert not open_tool_call_ids
+                ids: set[str] = set()
+                for item in tool_calls:
+                    assert isinstance(item, dict)
+                    call_id = str(item.get("id") or "").strip()
+                    assert call_id
+                    assert call_id not in ids
+                    ids.add(call_id)
+                open_tool_call_ids = ids
+                continue
+            assert not open_tool_call_ids
+            continue
+        if role == "tool":
+            tool_call_id = str(msg.get("tool_call_id") or "").strip()
+            assert tool_call_id
+            assert tool_call_id in open_tool_call_ids
+            open_tool_call_ids.remove(tool_call_id)
+            continue
+        assert not open_tool_call_ids
+    assert not open_tool_call_ids
+
+
+def _make_cfg() -> AppConfig:
+    cfg = AppConfig(model="gpt-5-nano", routing_mode="code_only")
+    cfg.extra_fields = {
+        "compaction": {
+            "enabled": True,
+            "offload_tool_outputs": False,
+            "summarize_conversation": True,
+            "recent_user_turns_to_keep": 3,
+            "trigger_ratio": 0.25,
+            "target_ratio": 0.15,
+            "max_chunk_messages": 40,
+            "safety_margin_tokens": 512,
+        }
+    }
+    return cfg
+
+
+def _init_git_repo_with_commit(repo: Path) -> None:
+    repo.mkdir()
+    subprocess.run(
+        ["git", "-C", os.fspath(repo), "init"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", os.fspath(repo), "config", "user.name", "Test User"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", os.fspath(repo), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo / "README.md").write_text("repo\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", os.fspath(repo), "add", "README.md"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", os.fspath(repo), "commit", "-m", "init"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _compaction_session_dir(session: AgentSession) -> Path:
+    return session.store.session_artifact_root
+
+
+def test_compaction_writes_history_and_inserts_memory_message(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "logs",
+        session_id_override="compaction-test",
+    )
+    session.client = _FakeMainClient()  # type: ignore[assignment]
+    assert session.conversation_compactor is not None
+    session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+        [_summary(decisions=["d1"])]
+    )
+
+    try:
+        _append_turns(session, count=7, prefix="old")
+        old_count = len(session.messages)
+        preserved_last_two_turns = list(session.messages[-4:])
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="compaction-test",
+        )
+        session.messages = compacted
+    finally:
+        session.close()
+
+    assert changed is True
+    assert len(session.messages) < old_count + 2
+    for message in preserved_last_two_turns:
+        assert message in session.messages
+    assert any(
+        str(msg.get("role")) == "user" and str(msg.get("content", "")).startswith(MEMORY_MARKER)
+        for msg in session.messages
+    )
+
+    history_dir = _compaction_session_dir(session) / "history"
+    assert history_dir.exists()
+    assert list(history_dir.glob("chunk_*.jsonl"))
+
+    summary_path = _compaction_session_dir(session) / "memory" / "summary.json"
+    assert summary_path.exists()
+    summary_data = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary_data["decisions"] == ["d1"]
+
+
+def test_repo_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo_with_commit(repo)
+
+    cfg = _make_cfg()
+    session = create_session(
+        cfg=cfg,
+        root=repo,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "logs",
+        session_id_override="compaction-task-brief",
+    )
+    session.client = _FakeMainClient()  # type: ignore[assignment]
+    assert session.conversation_compactor is not None
+    session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+        [_summary(decisions=["d1"])]
+    )
+
+    try:
+        original_pinned_prefix_len = session.pinned_prefix_len
+        refreshed = refresh_session_task_brief_message(
+            session,
+            pending_instruction="Fix src/app.py without changing the output shape.",
+        )
+        session.messages.append(
+            {
+                "role": "user",
+                "content": "Fix src/app.py without changing the output shape.",
+            }
+        )
+        refreshed = refresh_session_task_brief_message(
+            session,
+            pending_instruction="Also preserve unknown values like pending.",
+        )
+        session.messages.append(
+            {
+                "role": "user",
+                "content": "Also preserve unknown values like pending.",
+            }
+        )
+        refreshed = refresh_session_task_brief_message(
+            session,
+            pending_instruction="Can you explain more about src/app.py?",
+        )
+        _append_turns(session, count=7, prefix="old")
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="task-brief",
+        )
+        session.messages = compacted
+    finally:
+        session.close()
+
+    pinned_messages = session.messages[: session.pinned_prefix_len]
+    task_brief_messages = [
+        str(message.get("content") or "")
+        for message in pinned_messages
+        if str(message.get("content") or "").startswith("<task_brief>")
+    ]
+
+    assert refreshed is True
+    assert changed is True
+    assert session.pinned_prefix_len == original_pinned_prefix_len
+    assert len(task_brief_messages) == 1
+    assert "current_focus:" in task_brief_messages[0]
+    assert "- Fix src/app.py without changing the output shape." in task_brief_messages[0]
+    assert "- Also preserve unknown values like pending." in task_brief_messages[0]
+    assert "- Can you explain more about src/app.py?" in task_brief_messages[0]
+
+
+def test_plain_dir_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "logs",
+        session_id_override="compaction-plain-dir-task-brief",
+    )
+    session.client = _FakeMainClient()  # type: ignore[assignment]
+    assert session.conversation_compactor is not None
+    session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+        [_summary(decisions=["d1"])]
+    )
+
+    try:
+        original_pinned_prefix_len = session.pinned_prefix_len
+        refreshed = refresh_session_task_brief_message(
+            session,
+            pending_instruction="Create timer.py here without changing the JSON output shape.",
+        )
+        session.messages.append(
+            {
+                "role": "user",
+                "content": "Create timer.py here without changing the JSON output shape.",
+            }
+        )
+        refreshed = refresh_session_task_brief_message(
+            session,
+            pending_instruction="Also preserve unknown values like pending.",
+        )
+        session.messages.append(
+            {
+                "role": "user",
+                "content": "Also preserve unknown values like pending.",
+            }
+        )
+        refreshed = refresh_session_task_brief_message(
+            session,
+            pending_instruction="Can you explain `timer.py` more?",
+        )
+        _append_turns(session, count=7, prefix="old")
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="task-brief-plain-dir",
+        )
+        session.messages = compacted
+    finally:
+        session.close()
+
+    pinned_messages = session.messages[: session.pinned_prefix_len]
+    task_brief_messages = [
+        str(message.get("content") or "")
+        for message in pinned_messages
+        if str(message.get("content") or "").startswith("<task_brief>")
+    ]
+
+    assert refreshed is True
+    assert changed is True
+    assert session.pinned_prefix_len == original_pinned_prefix_len
+    assert len(task_brief_messages) == 1
+    assert "current_focus:" in task_brief_messages[0]
+    assert (
+        "- Create timer.py here without changing the JSON output shape." in task_brief_messages[0]
+    )
+    assert "- Also preserve unknown values like pending." in task_brief_messages[0]
+    assert "- Can you explain `timer.py` more?" in task_brief_messages[0]
+
+
+def test_maybe_compact_does_not_compact_below_trigger_threshold(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-below-threshold",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [_summary(decisions=["unused"])]
+        )
+        session.messages.extend(
+            [
+                {"role": "user", "content": "small request"},
+                {"role": "assistant", "content": "small reply"},
+            ]
+        )
+
+        compacted, changed = session.conversation_compactor.maybe_compact(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="below-threshold",
+        )
+
+        assert changed is False
+        assert compacted == session.messages
+        assert not list((_compaction_session_dir(session) / "history").glob("chunk_*.jsonl"))
+    finally:
+        session.close()
+
+
+def test_compaction_is_incremental_merges_existing_summary(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["recent_user_turns_to_keep"] = 1  # type: ignore[index]
+
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-incremental",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        fake_compactor = _FakeCompactorClient(
+            [
+                _summary(decisions=["d1"]),
+                _summary(decisions=["d1", "d2"]),
+            ]
+        )
+        session.conversation_compactor.compactor_client = fake_compactor  # type: ignore[assignment]
+
+        _append_turns(session, count=5, prefix="phase1")
+        compacted_messages, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="phase1",
+        )
+        assert changed is True
+        session.messages = compacted_messages
+
+        _append_turns(session, count=4, prefix="phase2")
+        compacted_messages_2, changed_2 = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="phase2",
+        )
+        assert changed_2 is True
+        session.messages = compacted_messages_2
+
+        assert len(fake_compactor.captured_payloads) >= 2
+        second_payload = fake_compactor.captured_payloads[1]
+        existing_summary = second_payload.get("existing_summary")
+        assert isinstance(existing_summary, dict)
+        assert "d1" in existing_summary.get("decisions", [])
+        assert session.conversation_compactor.state.summary.get("decisions") == ["d1", "d2"]
+    finally:
+        session.close()
+
+
+def test_execution_profile_compacts_single_instruction_run_and_preserves_instruction(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["importance_enabled"] = False  # type: ignore[index]
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-execution",
+        compaction_profile="execution",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        assert session.conversation_compactor.profile_name == "execution"
+        session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [_summary(decisions=["keep execution brief pinned"])]
+        )
+
+        execution_instruction = (
+            "Implement the task. Keep write scope under src/. Run pytest -q before finishing. "
+            + ("I" * 4000)
+        )
+        session.messages.append({"role": "user", "content": execution_instruction})
+        for idx in range(8):
+            session.messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"id": f"tc-{idx}", "name": "fs_read", "arguments": {}}],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": f"tc-{idx}",
+                        "content": "tool output " + ("x" * 1200),
+                    },
+                    {"role": "assistant", "content": f"step {idx} complete " + ("y" * 1200)},
+                ]
+            )
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="execution-run",
+        )
+
+        assert changed is True
+        assert any(msg.get("content") == execution_instruction for msg in compacted)
+        history_files = sorted((_compaction_session_dir(session) / "history").glob("chunk_*.jsonl"))
+        assert history_files
+        archived = "\n".join(path.read_text(encoding="utf-8") for path in history_files)
+        assert "step 0 complete" in archived
+        assert execution_instruction not in archived
+    finally:
+        session.close()
+
+
+def test_execution_compaction_skips_partial_multi_tool_exchange(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["importance_enabled"] = False  # type: ignore[index]
+    cfg.extra_fields["compaction"]["max_chunk_messages"] = 8  # type: ignore[index]
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-execution-multi-tool-skip",
+        compaction_profile="execution",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [_summary(decisions=["keep tool exchange atomic"])]
+        )
+
+        session.messages.append({"role": "user", "content": "Implement the task safely."})
+        session.messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "running reads",
+                    "tool_calls": [
+                        {"id": "tc-a", "name": "fs_read", "arguments": {}},
+                        {"id": "tc-b", "name": "search_rg", "arguments": {}},
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "tc-a", "content": "read result"},
+                {"role": "tool", "tool_call_id": "tc-b", "content": "search result"},
+                {"role": "assistant", "content": "combined the tool results"},
+            ]
+        )
+        for idx in range(6):
+            session.messages.append({"role": "assistant", "content": f"recent step {idx}"})
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="execution-tail-skip",
+        )
+
+        assert changed is False
+        assert compacted == session.messages
+        _assert_valid_tool_transcript(compacted)
+        history_dir = _compaction_session_dir(session) / "history"
+        assert not list(history_dir.glob("chunk_*.jsonl"))
+    finally:
+        session.close()
+
+
+def test_execution_compaction_tail_boundary_keeps_multi_tool_bundle_intact(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["importance_enabled"] = False  # type: ignore[index]
+    cfg.extra_fields["compaction"]["max_chunk_messages"] = 8  # type: ignore[index]
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-execution-tail-boundary",
+        compaction_profile="execution",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [_summary(decisions=["keep tool exchange intact"])]
+        )
+
+        session.messages.append({"role": "user", "content": "Implement the task safely."})
+        older_note_a = "older removable note a " + ("o" * 2600)
+        older_note_b = "older removable note b " + ("p" * 2600)
+        session.messages.append({"role": "assistant", "content": older_note_a})
+        session.messages.append({"role": "assistant", "content": older_note_b})
+        session.messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "running reads",
+                    "tool_calls": [
+                        {"id": "tc-a", "name": "fs_read", "arguments": {}},
+                        {"id": "tc-b", "name": "search_rg", "arguments": {}},
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "tc-a", "content": "read result"},
+                {"role": "tool", "tool_call_id": "tc-b", "content": "search result"},
+                {"role": "assistant", "content": "combined the tool results"},
+            ]
+        )
+        for idx in range(6):
+            session.messages.append({"role": "assistant", "content": f"recent step {idx}"})
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="execution-tail-boundary",
+        )
+
+        assert changed is True
+        _assert_valid_tool_transcript(compacted)
+        serialized = json.dumps(compacted, ensure_ascii=False)
+        assert older_note_a not in serialized
+        assert older_note_b not in serialized
+        assert "combined the tool results" in serialized
+        assert '"tool_call_id": "tc-a"' in serialized
+        assert '"tool_call_id": "tc-b"' in serialized
+
+        history_dir = _compaction_session_dir(session) / "history"
+        history_files = sorted(history_dir.glob("chunk_*.jsonl"))
+        assert history_files
+        archived = "\n".join(path.read_text(encoding="utf-8") for path in history_files)
+        assert older_note_a in archived
+        assert older_note_b in archived
+        assert "combined the tool results" not in archived
+        assert '"tool_call_id": "tc-a"' not in archived
+        assert '"tool_call_id": "tc-b"' not in archived
+    finally:
+        session.close()
+
+
+def test_execution_compaction_leaves_active_tool_messages_valid(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["importance_enabled"] = False  # type: ignore[index]
+    cfg.extra_fields["compaction"]["max_chunk_messages"] = 8  # type: ignore[index]
+    cfg.extra_fields["compaction"]["execution_min_removable_tokens"] = 1  # type: ignore[index]
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-execution-validity",
+        compaction_profile="execution",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [_summary(decisions=["preserve transcript validity"])]
+        )
+
+        session.messages.append({"role": "user", "content": "Implement the task safely."})
+        session.messages.append({"role": "assistant", "content": "older removable note"})
+        session.messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "run first tools",
+                    "tool_calls": [
+                        {"id": "tc-a1", "name": "fs_read", "arguments": {}},
+                        {"id": "tc-a2", "name": "search_rg", "arguments": {}},
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "tc-a1", "content": "read result"},
+                {"role": "tool", "tool_call_id": "tc-a2", "content": "search result"},
+                {"role": "assistant", "content": "handled first tool bundle"},
+                {
+                    "role": "assistant",
+                    "content": "run second tools",
+                    "tool_calls": [{"id": "tc-b1", "name": "fs_read", "arguments": {}}],
+                },
+                {"role": "tool", "tool_call_id": "tc-b1", "content": "second read result"},
+                {"role": "assistant", "content": "handled second tool bundle"},
+            ]
+        )
+        for idx in range(6):
+            session.messages.append({"role": "assistant", "content": f"recent step {idx}"})
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="execution-validity",
+        )
+
+        assert changed is True
+        _assert_valid_tool_transcript(compacted)
+        serialized = json.dumps(compacted, ensure_ascii=False)
+        assert "handled second tool bundle" in serialized
+        assert '"tool_call_id": "tc-b1"' in serialized
+
+        history_dir = _compaction_session_dir(session) / "history"
+        history_files = sorted(history_dir.glob("chunk_*.jsonl"))
+        assert history_files
+        archived = "\n".join(path.read_text(encoding="utf-8") for path in history_files)
+        assert "handled first tool bundle" in archived
+        assert '"tool_call_id": "tc-a1"' in archived
+        assert '"tool_call_id": "tc-a2"' in archived
+    finally:
+        session.close()
+
+
+def test_execution_compaction_tiny_candidate_no_progress_is_skipped(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["importance_enabled"] = True  # type: ignore[index]
+    cfg.extra_fields["compaction"]["importance_strategy"] = "lowest_density"  # type: ignore[index]
+    cfg.extra_fields["compaction"]["max_chunk_messages"] = 8  # type: ignore[index]
+    cfg.extra_fields["compaction"]["execution_min_removable_messages"] = 1  # type: ignore[index]
+    cfg.extra_fields["compaction"]["execution_min_removable_tokens"] = 1  # type: ignore[index]
+    huge_summary = _summary(decisions=["S" * 12000])
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-execution-no-progress",
+        compaction_profile="execution",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [huge_summary]
+        )
+
+        session.messages.append({"role": "user", "content": "Implement the task safely."})
+        session.messages.append({"role": "assistant", "content": "tiny old note"})
+        for idx in range(8):
+            session.messages.append({"role": "assistant", "content": f"recent step {idx}"})
+        before_messages = json.loads(json.dumps(session.messages))
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="execution-no-progress",
+        )
+
+        assert changed is False
+        assert compacted == before_messages
+        history_dir = _compaction_session_dir(session) / "history"
+        assert not list(history_dir.glob("chunk_*.jsonl"))
+    finally:
+        session.close()
+
+
+def test_execution_compaction_retries_larger_safe_window_after_no_progress_preview(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["importance_enabled"] = True  # type: ignore[index]
+    cfg.extra_fields["compaction"]["importance_strategy"] = "lowest_density"  # type: ignore[index]
+    cfg.extra_fields["compaction"]["max_chunk_messages"] = 8  # type: ignore[index]
+    cfg.extra_fields["compaction"]["execution_min_removable_messages"] = 1  # type: ignore[index]
+    cfg.extra_fields["compaction"]["execution_min_removable_tokens"] = 1  # type: ignore[index]
+    retry_summary = _summary(decisions=["R" * 3200])
+    fake_compactor = _FakeCompactorClient([retry_summary, retry_summary])
+
+    def _deterministic_request_tokens(
+        messages: list[dict[str, Any]],
+        tool_list: list[dict[str, Any]] | None,
+    ) -> int:
+        _ = tool_list
+        total = 0
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                text = json.dumps(content, ensure_ascii=False, sort_keys=True)
+            elif content is None:
+                text = ""
+            else:
+                text = str(content)
+            total += len(text)
+            if isinstance(content, str) and content.startswith(MEMORY_MARKER):
+                total += 2500
+            elif isinstance(content, str) and content.startswith(PINS_MARKER):
+                total += 250
+        return total
+
+    monkeypatch.setattr(compactor_mod, "estimate_request_tokens", _deterministic_request_tokens)
+
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-execution-retry-larger-window",
+        compaction_profile="execution",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor.compactor_client = fake_compactor  # type: ignore[assignment]
+
+        session.messages.append({"role": "user", "content": "Implement the task safely."})
+        older_note_a = "older removable note a " + ("a" * 5000)
+        older_note_b = "older removable note b " + ("b" * 5000)
+        session.messages.append({"role": "assistant", "content": older_note_a})
+        session.messages.append({"role": "assistant", "content": older_note_b})
+        for idx in range(8):
+            session.messages.append({"role": "assistant", "content": f"recent step {idx}"})
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="execution-retry-larger-window",
+        )
+
+        assert changed is True
+        assert fake_compactor.calls == 2
+        serialized = json.dumps(compacted, ensure_ascii=False)
+        assert older_note_a not in serialized
+        assert older_note_b not in serialized
+
+        history_dir = _compaction_session_dir(session) / "history"
+        history_files = sorted(history_dir.glob("chunk_*.jsonl"))
+        assert history_files
+        archived = "\n".join(path.read_text(encoding="utf-8") for path in history_files)
+        assert older_note_a in archived
+        assert older_note_b in archived
+
+        events = [
+            json.loads(line)
+            for line in session.store.path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        no_progress_events = [
+            event
+            for event in events
+            if event.get("type") == "compaction_warning"
+            and event.get("payload", {}).get("warning") == "compaction_no_progress"
+        ]
+        assert no_progress_events
+        assert any(
+            event.get("payload", {}).get("chunk_strategy") == "execution_lowest_density"
+            for event in no_progress_events
+        )
+    finally:
+        session.close()
+
+
+def test_execution_compaction_no_progress_rolls_back_state_and_artifacts(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["importance_enabled"] = True  # type: ignore[index]
+    cfg.extra_fields["compaction"]["importance_strategy"] = "lowest_density"  # type: ignore[index]
+    cfg.extra_fields["compaction"]["max_chunk_messages"] = 8  # type: ignore[index]
+    cfg.extra_fields["compaction"]["execution_min_removable_messages"] = 1  # type: ignore[index]
+    cfg.extra_fields["compaction"]["execution_min_removable_tokens"] = 1  # type: ignore[index]
+    huge_summary = _summary(decisions=["R" * 12000])
+    existing_summary = _summary(decisions=["keep-existing-summary"])
+    existing_pin = {
+        "kind": "context",
+        "text": "keep existing pin",
+        "reasons": ["seed"],
+        "source": {},
+    }
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-execution-rollback",
+        compaction_profile="execution",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [huge_summary]
+        )
+        session.conversation_compactor.state.summary = existing_summary
+        session.conversation_compactor.state.pins = [existing_pin]
+
+        session.messages.append({"role": "user", "content": "Implement the task safely."})
+        session.messages.append({"role": "assistant", "content": "tiny old note"})
+        for idx in range(8):
+            session.messages.append({"role": "assistant", "content": f"recent step {idx}"})
+        before_messages = json.loads(json.dumps(session.messages))
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="execution-rollback",
+        )
+
+        assert changed is False
+        assert compacted == before_messages
+        assert session.conversation_compactor.state.summary == existing_summary
+        assert session.conversation_compactor.state.pins == [existing_pin]
+        assert session.conversation_compactor.state.history_chunk_index == 0
+        assert session.conversation_compactor.state.memory_message_index is None
+        assert session.conversation_compactor.state.pins_message_index is None
+        history_dir = _compaction_session_dir(session) / "history"
+        assert not list(history_dir.glob("chunk_*.jsonl"))
+        summary_path = _compaction_session_dir(session) / "memory" / "summary.json"
+        pins_path = _compaction_session_dir(session) / "memory" / "pins.json"
+        assert not summary_path.exists()
+        assert not pins_path.exists()
+    finally:
+        session.close()
+
+
+def test_execution_compaction_artifact_publish_failure_rolls_back(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["importance_enabled"] = False  # type: ignore[index]
+    cfg.extra_fields["compaction"]["max_chunk_messages"] = 8  # type: ignore[index]
+    existing_summary = _summary(decisions=["keep-existing-summary"])
+    existing_pin = {
+        "kind": "context",
+        "text": "keep existing pin",
+        "reasons": ["seed"],
+        "source": {},
+    }
+    old_summary_text = json.dumps(existing_summary, ensure_ascii=False, indent=2) + "\n"
+    old_pins_text = (
+        json.dumps(
+            {
+                "pins": [
+                    {
+                        "kind": existing_pin["kind"],
+                        "text": existing_pin["text"],
+                        "reasons": existing_pin["reasons"],
+                        "source": existing_pin["source"],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n"
+    )
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-execution-artifact-rollback",
+        compaction_profile="execution",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [_summary(decisions=["updated-summary"])]
+        )
+        session.conversation_compactor.state.summary = existing_summary
+        session.conversation_compactor.state.pins = [existing_pin]
+
+        summary_path = _compaction_session_dir(session) / "memory" / "summary.json"
+        pins_path = _compaction_session_dir(session) / "memory" / "pins.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(old_summary_text, encoding="utf-8")
+        pins_path.write_text(old_pins_text, encoding="utf-8")
+
+        original_publish = session.conversation_compactor._publish_staged_artifact
+
+        def fail_summary_publish(*, staged_path: Path, artifact_path: Path, warning: str) -> bool:
+            if artifact_path == summary_path:
+                return False
+            return original_publish(
+                staged_path=staged_path,
+                artifact_path=artifact_path,
+                warning=warning,
+            )
+
+        monkeypatch.setattr(
+            session.conversation_compactor,
+            "_publish_staged_artifact",
+            fail_summary_publish,
+        )
+
+        session.messages.append({"role": "user", "content": "Implement the task safely."})
+        session.messages.append({"role": "assistant", "content": "old note a " + ("a" * 2600)})
+        session.messages.append({"role": "assistant", "content": "old note b " + ("b" * 2600)})
+        for idx in range(8):
+            session.messages.append({"role": "assistant", "content": f"recent step {idx}"})
+        before_messages = json.loads(json.dumps(session.messages))
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="execution-artifact-rollback",
+        )
+
+        assert changed is False
+        assert compacted == before_messages
+        assert session.conversation_compactor.state.history_chunk_index == 0
+        assert session.conversation_compactor.state.summary == existing_summary
+        assert session.conversation_compactor.state.pins == [existing_pin]
+        history_dir = _compaction_session_dir(session) / "history"
+        assert not list(history_dir.glob("chunk_*.jsonl"))
+        assert summary_path.read_text(encoding="utf-8") == old_summary_text
+        assert pins_path.read_text(encoding="utf-8") == old_pins_text
+    finally:
+        session.close()
+
+
+def test_execution_compaction_enforces_minimum_removal_thresholds(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["importance_enabled"] = True  # type: ignore[index]
+    cfg.extra_fields["compaction"]["importance_strategy"] = "lowest_density"  # type: ignore[index]
+    cfg.extra_fields["compaction"]["max_chunk_messages"] = 8  # type: ignore[index]
+    cfg.extra_fields["compaction"]["execution_min_removable_messages"] = 3  # type: ignore[index]
+    cfg.extra_fields["compaction"]["execution_min_removable_tokens"] = 1500  # type: ignore[index]
+    fake_compactor = _FakeCompactorClient([_summary(decisions=["unused"])])
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-execution-thresholds",
+        compaction_profile="execution",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor.compactor_client = fake_compactor  # type: ignore[assignment]
+
+        session.messages.append({"role": "user", "content": "Implement the task safely."})
+        session.messages.append({"role": "assistant", "content": "old tiny note a"})
+        session.messages.append({"role": "assistant", "content": "old tiny note b"})
+        for idx in range(8):
+            session.messages.append({"role": "assistant", "content": f"recent step {idx}"})
+        before_messages = json.loads(json.dumps(session.messages))
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="execution-thresholds",
+        )
+
+        assert changed is False
+        assert compacted == before_messages
+        assert fake_compactor.calls == 0
+        history_dir = _compaction_session_dir(session) / "history"
+        assert not list(history_dir.glob("chunk_*.jsonl"))
+    finally:
+        session.close()
+
+
+def test_compaction_prefers_low_importance_turn_first(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["recent_user_turns_to_keep"] = 1  # type: ignore[index]
+    cfg.extra_fields["compaction"]["max_chunk_messages"] = 2  # type: ignore[index]
+    cfg.extra_fields["compaction"]["importance_enabled"] = True  # type: ignore[index]
+    cfg.extra_fields["compaction"]["importance_strategy"] = "lowest_density"  # type: ignore[index]
+
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-importance",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [_summary(decisions=["d1"])]
+        )
+
+        high_signal = "MUST keep API stable. Acceptance criteria: pytest -q passes. " + ("H" * 1400)
+        low_signal = "ok thanks " + ("L" * 1400)
+        recent_signal = "recent turn " + ("R" * 1400)
+        session.messages.extend(
+            [
+                {"role": "user", "content": high_signal},
+                {"role": "assistant", "content": "Will do"},
+                {"role": "user", "content": low_signal},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": recent_signal},
+                {"role": "assistant", "content": "recent response"},
+            ]
+        )
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="importance-test",
+        )
+        assert changed is True
+        first_chunk = _compaction_session_dir(session) / "history" / "chunk_0001.jsonl"
+        assert first_chunk.exists()
+        chunk_payload = first_chunk.read_text(encoding="utf-8")
+        assert low_signal in chunk_payload
+        assert high_signal not in chunk_payload
+
+        serialized = json.dumps(compacted, ensure_ascii=False)
+        assert recent_signal in serialized
+    finally:
+        session.close()
+
+
+def test_pins_preserved_when_high_signal_turn_compacted(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["recent_user_turns_to_keep"] = 1  # type: ignore[index]
+    cfg.extra_fields["compaction"]["importance_enabled"] = False  # type: ignore[index]
+    cfg.extra_fields["compaction"]["importance_strategy"] = "oldest"  # type: ignore[index]
+    cfg.extra_fields["compaction"]["pin_score_threshold"] = 5.0  # type: ignore[index]
+
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "logs",
+        session_id_override="compaction-pins",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [_summary(decisions=["d1"])]
+        )
+
+        high_signal = (
+            "MUST and DO NOT break public API. Acceptance criteria: pytest -q passes. "
+            "Constraint: keep existing command names."
+        ) + ("Z" * 1800)
+        recent_signal = "recent turn " + ("Q" * 1400)
+        session.messages.extend(
+            [
+                {"role": "user", "content": high_signal},
+                {"role": "assistant", "content": "ack"},
+                {"role": "user", "content": recent_signal},
+                {"role": "assistant", "content": "recent ack"},
+            ]
+        )
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="pins-test",
+        )
+        assert changed is True
+
+        pins_messages = [
+            msg
+            for msg in compacted
+            if str(msg.get("role") or "") == "user"
+            and str(msg.get("content") or "").startswith(PINS_MARKER)
+        ]
+        assert pins_messages
+        pins_payload = str(pins_messages[0]["content"]).split("\n", 1)[1]
+        pins_json = json.loads(pins_payload)
+        assert any(
+            "MUST and DO NOT break public API" in pin.get("text", "") for pin in pins_json["pins"]
+        )
+
+        history_dir = _compaction_session_dir(session) / "history"
+        assert list(history_dir.glob("chunk_*.jsonl"))
+        pins_file = _compaction_session_dir(session) / "memory" / "pins.json"
+        assert pins_file.exists()
+        summary_path = _compaction_session_dir(session) / "memory" / "summary.json"
+        assert summary_path.exists()
+    finally:
+        session.close()
+
+
+def test_summary_normalization_unions_previous_items(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["recent_user_turns_to_keep"] = 1  # type: ignore[index]
+
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-summary-union",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        fake_compactor = _FakeCompactorClient(
+            [
+                _summary(decisions=["d1", "d2"]),
+                _summary(decisions=["d1"]),
+            ]
+        )
+        session.conversation_compactor.compactor_client = fake_compactor  # type: ignore[assignment]
+        _append_turns(session, count=4, prefix="union-a")
+        compacted_a, changed_a = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="union-1",
+        )
+        assert changed_a is True
+        session.messages = compacted_a
+
+        _append_turns(session, count=4, prefix="union-b")
+        compacted_b, changed_b = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="union-2",
+        )
+        assert changed_b is True
+        session.messages = compacted_b
+
+        decisions = session.conversation_compactor.state.summary.get("decisions", [])
+        assert "d1" in decisions
+        assert "d2" in decisions
+    finally:
+        session.close()
+
+
+def test_compactor_failure_can_drop_chunk_after_history_write(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["recent_user_turns_to_keep"] = 1  # type: ignore[index]
+    cfg.extra_fields["compaction"]["importance_enabled"] = False  # type: ignore[index]
+    cfg.extra_fields["compaction"]["importance_strategy"] = "oldest"  # type: ignore[index]
+    cfg.extra_fields["compaction"]["pin_score_threshold"] = 1.0  # type: ignore[index]
+    cfg.extra_fields["compaction"]["trigger_ratio"] = 0.2  # type: ignore[index]
+    cfg.extra_fields["compaction"]["target_ratio"] = 0.1  # type: ignore[index]
+
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "logs",
+        session_id_override="compaction-faildrop",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        failing = _FailingCompactorClient(max_chars=200)
+        session.conversation_compactor.compactor_client = failing  # type: ignore[assignment]
+
+        high_signal = (
+            "MUST preserve this requirement while handling failures. "
+            "Acceptance criteria: no stalls."
+        ) + ("X" * 2200)
+        recent_signal = "recent turn " + ("R" * 1200)
+        session.messages.extend(
+            [
+                {"role": "user", "content": high_signal},
+                {"role": "assistant", "content": "ack"},
+                {"role": "user", "content": recent_signal},
+                {"role": "assistant", "content": "recent"},
+            ]
+        )
+
+        compacted, changed = session.conversation_compactor.compact_now(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="faildrop",
+        )
+        assert changed is True
+        assert failing.calls >= 2
+
+        history_dir = _compaction_session_dir(session) / "history"
+        history_files = list(history_dir.glob("chunk_*.jsonl"))
+        assert history_files
+        first_chunk = history_files[0].read_text(encoding="utf-8")
+        assert high_signal in first_chunk
+
+        serialized = json.dumps(compacted, ensure_ascii=False)
+        assert high_signal not in serialized
+        assert any(
+            str(msg.get("content") or "").startswith(MEMORY_MARKER)
+            for msg in compacted
+            if str(msg.get("role") or "") == "user"
+        )
+        assert any(
+            str(msg.get("content") or "").startswith(PINS_MARKER)
+            for msg in compacted
+            if str(msg.get("role") or "") == "user"
+        )
+    finally:
+        session.close()

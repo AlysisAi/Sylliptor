@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling>=1.24.2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sylliptor-agent-cli"
+version = "0.1.4"
+description = "Local CLI coding agent powered by an OpenAI-compatible API."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+keywords = [
+  "agent",
+  "cli",
+  "coding-agent",
+  "developer-tools",
+  "llm",
+  "openai-compatible",
+]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development",
+  "Topic :: Utilities",
+]
+dependencies = [
+  "click>=8.0.0",
+  "cryptography>=42.0.0",
+  "httpcore>=1.0.0,<2.0.0",
+  "httpx>=0.27.0",
+  "keyring>=25.0.0",
+  "packaging>=23.0",
+  "pillow>=10.0.0",
+  "platformdirs>=4.2.0",
+  "pydantic>=2.6.0",
+  "prompt-toolkit>=3.0.43",
+  "rich>=13.7.1",
+  "tiktoken>=0.7.0",
+  "typer>=0.12.0",
+]
+
+[project.urls]
+Changelog = "https://github.com/AlysisAi/Sylliptor/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/AlysisAi/Sylliptor/tree/main/docs"
+Funding = "https://github.com/sponsors/AlysisAi"
+Issues = "https://github.com/AlysisAi/Sylliptor/issues"
+Security = "https://github.com/AlysisAi/Sylliptor/blob/main/SECURITY.md"
+Source = "https://github.com/AlysisAi/Sylliptor"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "ruff>=0.6.0",
+]
+server = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+sylliptor = "sylliptor_agent_cli.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sylliptor_agent_cli"]
+exclude = [
+  "**/__pycache__/**",
+  "**/*.py[cod]",
+]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "**/__pycache__/**",
+  "**/*.py[cod]",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--capture=sys"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["B008", "E501", "UP017", "UP042"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

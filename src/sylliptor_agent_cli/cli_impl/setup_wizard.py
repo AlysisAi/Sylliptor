@@ -1,0 +1,1379 @@
+from __future__ import annotations
+
+import os
+import re
+import traceback
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlparse
+
+import httpx
+import typer
+from click import Abort
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+from ..config import (
+    AppConfig,
+    ConfigError,
+    config_path,
+    credentials_path,
+    default_sessions_dir,
+    load_config,
+    save_config,
+    save_persisted_profile_key,
+    set_config_value,
+)
+from ..llm.factory import make_llm_client
+from ..llm.openai_compat import LLMError
+from ..profile_presets import (
+    PROFILE_PRESETS,
+    ProfilePreset,
+    make_profile_from_preset,
+    model_options_for_preset,
+)
+from ..profiles import ProfileSpec, add_profile, set_active_profile, update_profile
+from ..sandbox_doctor import (
+    SandboxDiagnostic,
+    SandboxPullResult,
+    diagnose_sandbox,
+    format_sandbox_problem_message,
+    pull_sandbox_images,
+)
+from ..surface.console import make_console
+from ..workspace_binding import WorkspaceBindingError, resolve_workspace_binding
+
+_DEFAULT_WORKSPACE_KEY = "default_workspace_path"
+_CUSTOM_MODEL_VALUE = "__custom_model__"
+_CUSTOM_PROVIDER_KEY = "custom"
+_MAX_API_KEY_VALIDATION_ATTEMPTS = 3
+_FALLBACK_VALIDATION_MODEL = "gpt-5.4-mini"
+_VALIDATION_TIMEOUT_S = 8.0
+
+_ValidationStatus = Literal[
+    "validated",
+    "failed",
+    "inconclusive",
+    "skipped",
+    "model_not_found",
+]
+
+
+class _SetupCancelled(Exception):
+    pass
+
+
+class _GoBack(Exception):
+    """Raised by a wizard step when the user pressed Esc to go back."""
+
+
+@dataclass(frozen=True)
+class _ProfileStepResult:
+    profile: ProfileSpec
+    label: str
+    preset: ProfilePreset | None
+
+
+@dataclass(frozen=True)
+class _ApiKeyStepResult:
+    api_key: str
+    validation_status: _ValidationStatus
+    validation_message: str = ""
+
+
+@dataclass(frozen=True)
+class _ModelStepResult:
+    model: str
+    custom: bool = False
+
+
+@dataclass(frozen=True)
+class _WorkspaceStepResult:
+    workspace: str
+
+
+@dataclass(frozen=True)
+class _SandboxStepResult:
+    ready: bool
+    status: str
+
+
+@dataclass(frozen=True)
+class _ApiKeyValidationResult:
+    status: _ValidationStatus
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class _ResolvedValidationModel:
+    model: str
+    used_fallback: bool
+
+
+@dataclass(frozen=True)
+class _FileSnapshot:
+    path: Path
+    existed: bool
+    data: bytes | None
+
+
+def run_setup_wizard() -> bool:
+    """Run the first-time setup wizard."""
+    console = _resolve_console()
+    escape_unavailable_reason = _escape_capture_unavailable_reason()
+    if escape_unavailable_reason is not None:
+        console.print(
+            f"[dim]Note: this terminal does not support Esc/back navigation ({escape_unavailable_reason}). "
+            "Use Ctrl+C to cancel.[/dim]"
+        )
+
+    profile_result: _ProfileStepResult | None = None
+    api_key_result: _ApiKeyStepResult | None = None
+    model_result: _ModelStepResult | None = None
+    workspace_result: _WorkspaceStepResult | None = None
+    steps = ("welcome", "profile", "api_key", "model", "workspace")
+    step_idx = 0
+
+    try:
+        while step_idx < len(steps):
+            step_name = steps[step_idx]
+            try:
+                if step_name == "welcome":
+                    _print_welcome(console)
+                    _wait_to_begin()
+                elif step_name == "profile":
+                    previous_profile = profile_result
+                    new_profile = _prompt_profile(console, previous=previous_profile)
+                    if previous_profile is not None and new_profile != previous_profile:
+                        api_key_result = None
+                        model_result = None
+                    profile_result = new_profile
+                elif step_name == "api_key":
+                    if profile_result is None:
+                        raise ConfigError("Provider profile step was skipped.")
+                    api_key_result = _prompt_api_key(
+                        console,
+                        profile_result,
+                        previous=api_key_result,
+                    )
+                elif step_name == "model":
+                    if profile_result is None or api_key_result is None:
+                        raise ConfigError("Provider profile or API key step was skipped.")
+                    model_result, api_key_result = _prompt_model(
+                        console,
+                        profile_result,
+                        api_key_result=api_key_result,
+                        previous=model_result,
+                    )
+                elif step_name == "workspace":
+                    workspace_result = _prompt_workspace(console, previous=workspace_result)
+                step_idx += 1
+            except _GoBack:
+                if step_idx == 0:
+                    if _confirm_cancel(console, prompt="Cancel setup? [y/N]"):
+                        raise _SetupCancelled() from None
+                    continue
+                step_idx -= 1
+                continue
+            except (KeyboardInterrupt, Abort, EOFError):
+                if _confirm_cancel(console):
+                    raise _SetupCancelled() from None
+                continue
+
+        if (
+            profile_result is None
+            or api_key_result is None
+            or model_result is None
+            or workspace_result is None
+        ):
+            raise ConfigError("Setup did not collect all required inputs.")
+
+        cfg = _commit_setup(
+            profile_result=profile_result,
+            api_key_result=api_key_result,
+            model_result=model_result,
+            workspace_result=workspace_result,
+            console=console,
+        )
+        sandbox_result = _prompt_and_check_sandbox(console, cfg)
+        _print_setup_complete(
+            console=console,
+            profile_result=profile_result,
+            api_key_result=api_key_result,
+            model_result=model_result,
+            workspace_result=workspace_result,
+            sandbox_result=sandbox_result,
+        )
+        return True
+    except _SetupCancelled:
+        console.print()
+        console.print("[yellow]Setup cancelled. No changes saved.[/yellow]")
+        return False
+    except (ConfigError, OSError) as exc:
+        console.print(f"[red]Setup failed:[/red] {exc}")
+        return False
+    except Exception as exc:  # noqa: BLE001 - boundary translates unknown failures
+        log_path = _write_exception_log("setup_wizard", exc)
+        console.print(f"[red]Setup failed:[/red] {exc}")
+        if log_path is not None:
+            console.print(f"[dim]Details saved to: {log_path}[/dim]")
+        return False
+
+
+def _resolve_console() -> Console:
+    return make_console()
+
+
+def _print_welcome(console: Console) -> None:
+    body = Group(
+        Text("Sylliptor is a coding agent that runs in your terminal."),
+        Text("To get started we need four things:"),
+        Text(""),
+        Text(" 1. A provider profile  (OpenAI, DeepSeek, Anthropic, local, or custom)"),
+        Text(" 2. An API key          (from your provider's dashboard)"),
+        Text(" 3. A default model     (picked from the provider's supported presets)"),
+        Text(" 4. A workspace folder  (the project you want to work on)"),
+        Text(""),
+        Text("[Enter] begin  [Esc] cancel", style="dim"),
+    )
+    console.print()
+    console.print(Panel(body, title="Welcome to Sylliptor", border_style="cyan"))
+
+
+def _wait_to_begin() -> None:
+    value = _esc_aware_text_input("Press Enter to begin", default="", show_default=False)
+    if _is_cancel_token(value):
+        raise _GoBack()
+
+
+def _prompt_profile(
+    console: Console,
+    *,
+    previous: _ProfileStepResult | None = None,
+) -> _ProfileStepResult:
+    rows = [(preset.key, preset.label, _preset_description(preset)) for preset in _setup_presets()]
+    current_value = rows[0][0]
+    if previous is not None:
+        current_value = previous.preset.key if previous.preset is not None else _CUSTOM_PROVIDER_KEY
+    selected = _run_wizard_picker(
+        console=console,
+        title="Provider Profile",
+        subtitle="Pick the provider you want Sylliptor to use.",
+        rows=rows,
+        current_value=current_value,
+        cancel_hint="back",
+        invalid_hint="Pick a provider first; you'll enter the key in the next step.",
+    )
+    if selected is None:
+        raise _GoBack()
+
+    preset = _preset_by_key(selected)
+    if preset is None:
+        raise ConfigError(f"Unknown provider preset: {selected}")
+    if preset.key == _CUSTOM_PROVIDER_KEY:
+        profile = _prompt_custom_profile(
+            previous.profile if previous is not None and previous.preset is None else None
+        )
+        return _ProfileStepResult(profile=profile, label=profile.name, preset=None)
+
+    profile = make_profile_from_preset(preset)
+    console.print(f"[green]Provider selected:[/green] {preset.label}")
+    _print_preset_warning(console, preset)
+    return _ProfileStepResult(profile=profile, label=preset.label, preset=preset)
+
+
+def _prompt_custom_profile(previous: ProfileSpec | None = None) -> ProfileSpec:
+    while True:
+        name = (
+            _esc_aware_text_input(
+                "Profile name",
+                default=(previous.name if previous is not None else "custom"),
+                show_default=True,
+            )
+            .strip()
+            .lower()
+        )
+        if _is_cancel_token(name):
+            raise _GoBack()
+        if name:
+            break
+        _resolve_console().print("[red]Profile name is required.[/red]")
+    while True:
+        base_url = _esc_aware_text_input(
+            "Base URL",
+            default=(previous.base_url if previous is not None else ""),
+            show_default=previous is not None,
+        ).strip()
+        if _is_cancel_token(base_url):
+            raise _GoBack()
+        if base_url:
+            break
+        _resolve_console().print("[red]Base URL is required.[/red]")
+    headers = _prompt_extra_headers(previous.extra_headers if previous is not None else None)
+    return ProfileSpec(
+        name=name,
+        protocol="openai_compat",
+        base_url=base_url,
+        extra_headers=headers,
+        notes=previous.notes if previous is not None else "Custom OpenAI-compatible endpoint.",
+    )
+
+
+def _prompt_extra_headers(previous: dict[str, str] | None = None) -> dict[str, str]:
+    previous_text = ", ".join(f"{key}={value}" for key, value in (previous or {}).items())
+    while True:
+        headers_raw = _esc_aware_text_input(
+            "Extra headers (k=v, comma-separated)",
+            default=previous_text,
+            show_default=bool(previous_text),
+        ).strip()
+        if _is_cancel_token(headers_raw):
+            raise _GoBack()
+        headers: dict[str, str] = {}
+        valid = True
+        for item in headers_raw.split(","):
+            text = item.strip()
+            if not text:
+                continue
+            if "=" not in text:
+                _resolve_console().print("[red]Extra headers must use k=v syntax.[/red]")
+                valid = False
+                break
+            key, value = text.split("=", 1)
+            if key.strip() and value.strip():
+                headers[key.strip()] = value.strip()
+        if valid:
+            return headers
+
+
+def _prompt_api_key(
+    console: Console,
+    profile_result: _ProfileStepResult,
+    *,
+    previous: _ApiKeyStepResult | None = None,
+) -> _ApiKeyStepResult:
+    profile = profile_result.profile
+    console.print()
+    console.print(Panel(_api_key_panel_text(profile_result), title="API Key", border_style="cyan"))
+    required = bool(profile.api_key_env)
+    attempts = 0
+    last_key = previous.api_key if previous is not None else ""
+    while attempts < _MAX_API_KEY_VALIDATION_ATTEMPTS:
+        prompt_label = "Paste your API key" if required else "API key (optional)"
+        if previous is not None:
+            prompt_label += " (Enter to keep current)"
+        value = _esc_aware_text_input(
+            prompt_label,
+            default="",
+            hide_input=True,
+            show_default=False,
+        ).strip()
+        if _is_cancel_token(value):
+            raise _GoBack()
+        if not value and previous is not None:
+            return previous
+        if not value:
+            if required:
+                console.print("[red]API key is required to continue.[/red]")
+                attempts += 1
+                continue
+            console.print("[yellow]No API key stored for this profile.[/yellow]")
+            return _ApiKeyStepResult(
+                api_key="",
+                validation_status="skipped",
+                validation_message="No API key provided.",
+            )
+
+        last_key = value
+        console.print("[dim]Validating...[/dim]")
+        validation = _validate_api_key(
+            profile=profile,
+            api_key=value,
+            suggested_models=_suggested_models(profile_result),
+        )
+        if validation.status == "validated":
+            console.print("[green]Key validated.[/green]")
+            if validation.message:
+                console.print(f"[yellow]{validation.message}[/yellow]")
+            return _ApiKeyStepResult(
+                api_key=value,
+                validation_status="validated",
+                validation_message=validation.message,
+            )
+        if validation.status == "inconclusive":
+            console.print(f"[yellow]{validation.message} Continuing without validation.[/yellow]")
+            return _ApiKeyStepResult(
+                api_key=value,
+                validation_status="inconclusive",
+                validation_message=validation.message,
+            )
+        if validation.status == "model_not_found":
+            console.print(
+                f"[yellow]{validation.message} We'll verify your chosen model next.[/yellow]"
+            )
+            return _ApiKeyStepResult(
+                api_key=value,
+                validation_status="model_not_found",
+                validation_message=validation.message,
+            )
+
+        attempts += 1
+        console.print(
+            f"[yellow]Key validation failed:[/yellow] {validation.message or 'provider rejected the key'}"
+        )
+        if attempts >= _MAX_API_KEY_VALIDATION_ATTEMPTS:
+            console.print(
+                "[yellow]Continuing with the last key. You can fix it later in /config.[/yellow]"
+            )
+            return _ApiKeyStepResult(
+                api_key=last_key,
+                validation_status="failed",
+                validation_message=validation.message,
+            )
+        if not _prompt_yes_no("Re-enter API key now? [Y/n]", default=True):
+            console.print(
+                "[yellow]Continuing without validation. You can fix it later in /config.[/yellow]"
+            )
+            return _ApiKeyStepResult(
+                api_key=value,
+                validation_status="failed",
+                validation_message=validation.message,
+            )
+
+    return _ApiKeyStepResult(
+        api_key=last_key,
+        validation_status="failed",
+        validation_message="Provider rejected the API key.",
+    )
+
+
+def _api_key_panel_text(profile_result: _ProfileStepResult) -> str:
+    profile = profile_result.profile
+    lines = [f"Sylliptor will use {profile_result.label}."]
+    if profile.base_url:
+        lines.append(f"Provider URL: {profile.base_url}")
+    if profile.api_key_env:
+        lines.append(f"The key can also be set via env: {profile.api_key_env}")
+    else:
+        lines.append("This profile does not declare a required API key env variable.")
+    lines.append("")
+    lines.append("Enter to confirm. Esc to go back. Ctrl+C to cancel.")
+    return "\n".join(lines)
+
+
+def _suggested_models(profile_result: _ProfileStepResult) -> tuple[str, ...]:
+    if profile_result.preset is None:
+        return ()
+    return tuple(
+        str(model).strip() for model in profile_result.preset.suggested_models if str(model).strip()
+    )
+
+
+def _validate_api_key(
+    *,
+    profile: ProfileSpec,
+    api_key: str,
+    model: str | None = None,
+    suggested_models: tuple[str, ...] = (),
+    transport: httpx.BaseTransport | None = None,
+) -> _ApiKeyValidationResult:
+    if not api_key.strip():
+        return _ApiKeyValidationResult(status="skipped", message="No API key provided.")
+    base_url = str(profile.base_url or "").strip().rstrip("/")
+    if not base_url:
+        return _ApiKeyValidationResult(
+            status="inconclusive", message="Could not reach provider: Base URL is missing."
+        )
+
+    validation_model = _resolve_validation_model(
+        profile=profile,
+        model=model,
+        suggested_models=suggested_models,
+    )
+    validation_profile = ProfileSpec(
+        name=profile.name,
+        protocol=profile.protocol,
+        base_url=base_url,
+        api_key_env=profile.api_key_env,
+        extra_headers=dict(profile.extra_headers),
+        default_model=validation_model.model,
+        web_search_adapter=profile.web_search_adapter,
+        web_search_model=profile.web_search_model,
+        notes=profile.notes,
+    )
+    cfg = AppConfig(
+        model=validation_model.model,
+        provider_retry_max_retries=0,
+    )
+    client = make_llm_client(
+        cfg=cfg,
+        api_key=api_key,
+        model=validation_model.model,
+        timeout_s=_VALIDATION_TIMEOUT_S,
+        temperature=0.0,
+        transport=transport,
+        profile=validation_profile,
+    )
+    try:
+        client.chat(
+            messages=[{"role": "user", "content": "ping"}],
+            temperature=0.0,
+            max_tokens=1,
+        )
+    except LLMError as exc:
+        return _validation_result_from_error(
+            exc,
+            base_url=base_url,
+            model=validation_model.model,
+        )
+
+    message = ""
+    if validation_model.used_fallback:
+        message = (
+            f"Validated using fallback model '{validation_model.model}'. "
+            "The selected model will be verified next."
+        )
+    return _ApiKeyValidationResult(status="validated", message=message)
+
+
+def _resolve_validation_model(
+    *,
+    profile: ProfileSpec,
+    model: str | None,
+    suggested_models: tuple[str, ...],
+) -> _ResolvedValidationModel:
+    for candidate in (model, profile.default_model, *suggested_models):
+        normalized = str(candidate or "").strip()
+        if normalized:
+            return _ResolvedValidationModel(model=normalized, used_fallback=False)
+    return _ResolvedValidationModel(model=_FALLBACK_VALIDATION_MODEL, used_fallback=True)
+
+
+def _validation_result_from_error(
+    exc: LLMError,
+    *,
+    base_url: str,
+    model: str,
+) -> _ApiKeyValidationResult:
+    status_code = _http_status_from_llm_error(exc)
+    error_text = str(exc)
+    error_text_lower = error_text.casefold()
+
+    if status_code == 200:
+        return _ApiKeyValidationResult(status="validated")
+    if status_code in {401, 403}:
+        return _ApiKeyValidationResult(
+            status="failed",
+            message=f"Provider rejected the API key (HTTP {status_code}).",
+        )
+    if status_code == 400 and ("model" in error_text_lower or "not_found" in error_text_lower):
+        return _ApiKeyValidationResult(
+            status="model_not_found",
+            message=f"Model '{model}' not found at this provider. Pick a different model in the next step.",
+        )
+    if status_code == 404:
+        return _ApiKeyValidationResult(
+            status="inconclusive",
+            message=f"Provider endpoint not found at {base_url}. Check the base URL.",
+        )
+    if status_code == 429:
+        return _ApiKeyValidationResult(
+            status="inconclusive",
+            message="Provider rate-limited the validation request. Continuing without validation.",
+        )
+    if status_code is not None and status_code >= 500:
+        return _ApiKeyValidationResult(
+            status="inconclusive",
+            message=f"Provider returned HTTP {status_code} during validation.",
+        )
+
+    cause = _root_cause(exc)
+    if isinstance(cause, httpx.TimeoutException):
+        return _ApiKeyValidationResult(
+            status="inconclusive",
+            message=f"Could not reach {base_url}: validation request timed out.",
+        )
+    if isinstance(cause, httpx.HTTPError):
+        return _ApiKeyValidationResult(
+            status="inconclusive",
+            message=f"Could not reach {base_url}: {cause}",
+        )
+    return _ApiKeyValidationResult(
+        status="inconclusive",
+        message=f"Could not verify {base_url}: {exc}",
+    )
+
+
+def _http_status_from_llm_error(exc: LLMError) -> int | None:
+    match = re.search(r"\bLLM error\s+(\d{3})\b", str(exc))
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _root_cause(exc: BaseException) -> BaseException:
+    cause = exc
+    seen: set[int] = set()
+    while cause.__cause__ is not None and id(cause.__cause__) not in seen:
+        seen.add(id(cause))
+        cause = cause.__cause__
+    return cause
+
+
+def _prompt_model(
+    console: Console,
+    profile_result: _ProfileStepResult,
+    *,
+    api_key_result: _ApiKeyStepResult,
+    previous: _ModelStepResult | None = None,
+) -> tuple[_ModelStepResult, _ApiKeyStepResult]:
+    current_previous = previous
+    while True:
+        model_result = _prompt_model_choice(
+            console,
+            profile_result,
+            previous=current_previous,
+        )
+        updated_api_key_result = _validate_selected_model(
+            console=console,
+            profile_result=profile_result,
+            api_key_result=api_key_result,
+            model_result=model_result,
+        )
+        if updated_api_key_result.validation_status == "model_not_found":
+            current_previous = model_result
+            if model_result.custom and _prompt_yes_no(
+                f"Use custom model '{model_result.model}' anyway? [y/N]",
+                default=False,
+            ):
+                warning = (
+                    f"Model '{model_result.model}' was not confirmed; "
+                    "provider reported it was missing and you chose to use it anyway."
+                )
+                return model_result, replace(
+                    updated_api_key_result,
+                    validation_status="inconclusive",
+                    validation_message=warning,
+                )
+            continue
+        return model_result, updated_api_key_result
+
+
+def _prompt_model_choice(
+    console: Console,
+    profile_result: _ProfileStepResult,
+    *,
+    previous: _ModelStepResult | None = None,
+) -> _ModelStepResult:
+    rows = _model_picker_rows(profile_result)
+    row_values = {value for value, _label, _description in rows}
+    current_value = rows[0][0]
+    if previous is not None:
+        current_value = previous.model if previous.model in row_values else _CUSTOM_MODEL_VALUE
+    selected = _run_wizard_picker(
+        console=console,
+        title="Default Model",
+        subtitle=f"Pick the model Sylliptor will use by default for {profile_result.label}.",
+        rows=rows,
+        current_value=current_value,
+        cancel_hint="back",
+    )
+    if selected is None:
+        raise _GoBack()
+    if selected == _CUSTOM_MODEL_VALUE:
+        default_model = (
+            previous.model if previous is not None and previous.model not in row_values else ""
+        )
+        model = _prompt_custom_model_name(previous=default_model or None)
+        is_custom = True
+    else:
+        model = selected
+        is_custom = False
+    if not model.strip():
+        raise ConfigError("Default model is required.")
+    console.print(f"[green]Default model:[/green] {model}")
+    return _ModelStepResult(model=model.strip(), custom=is_custom)
+
+
+def _validate_selected_model(
+    *,
+    console: Console,
+    profile_result: _ProfileStepResult,
+    api_key_result: _ApiKeyStepResult,
+    model_result: _ModelStepResult,
+) -> _ApiKeyStepResult:
+    if not api_key_result.api_key:
+        return api_key_result
+    if api_key_result.validation_status == "failed":
+        console.print(
+            "[yellow]Skipping model validation because the provider already rejected the API key.[/yellow]"
+        )
+        return api_key_result
+
+    console.print("[dim]Validating selected model...[/dim]")
+    validation = _validate_api_key(
+        profile=profile_result.profile,
+        api_key=api_key_result.api_key,
+        model=model_result.model,
+        suggested_models=_suggested_models(profile_result),
+    )
+    if validation.status == "validated":
+        console.print("[green]Model validated.[/green]")
+    elif validation.status == "model_not_found":
+        console.print(f"[red]{validation.message}[/red]")
+    elif validation.status == "failed":
+        console.print(f"[red]{validation.message}[/red]")
+    elif validation.status == "inconclusive":
+        console.print(f"[yellow]{validation.message}[/yellow]")
+    return replace(
+        api_key_result,
+        validation_status=validation.status,
+        validation_message=validation.message,
+    )
+
+
+def _model_picker_rows(profile_result: _ProfileStepResult) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    preset = profile_result.preset
+    if preset is not None:
+        for value, label, description in model_options_for_preset(preset):
+            if value in seen:
+                continue
+            seen.add(value)
+            rows.append((value, label, description))
+    if profile_result.profile.default_model:
+        normalized = str(profile_result.profile.default_model).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            rows.append((normalized, normalized, "current profile default"))
+    rows.append(
+        (
+            _CUSTOM_MODEL_VALUE,
+            "Type a custom model name",
+            "Use any model supported by this provider",
+        )
+    )
+    return rows
+
+
+def _prompt_custom_model_name(*, previous: str | None = None) -> str:
+    while True:
+        value = _esc_aware_text_input(
+            "Model",
+            default=previous or "",
+            show_default=previous is not None,
+        ).strip()
+        if _is_cancel_token(value):
+            raise _GoBack()
+        if value:
+            return value
+        _resolve_console().print("[red]Model is required.[/red]")
+
+
+def _prompt_workspace(
+    console: Console,
+    *,
+    previous: _WorkspaceStepResult | None = None,
+) -> _WorkspaceStepResult:
+    default_workspace = (
+        Path(previous.workspace).expanduser()
+        if previous is not None
+        else _suggest_workspace_default()
+    )
+    console.print()
+    console.print(
+        Panel(
+            Group(
+                Text("Sylliptor reads and edits files inside one folder."),
+                Text(f"Suggestion: {_display_path(default_workspace)}", style="dim"),
+                Text(""),
+                Text("Enter to confirm. Esc to go back. Ctrl+C to cancel.", style="dim"),
+            ),
+            title="Workspace",
+            border_style="cyan",
+        )
+    )
+    while True:
+        raw = _esc_aware_text_input(
+            "Workspace folder",
+            default=os.fspath(default_workspace),
+            show_default=True,
+        )
+        if _is_cancel_token(raw):
+            raise _GoBack()
+        selected = Path(str(raw or default_workspace)).expanduser().resolve()
+        try:
+            binding = resolve_workspace_binding(
+                selected,
+                allow_broad_workspace=True,
+                source="setup_wizard",
+            )
+        except WorkspaceBindingError as exc:
+            console.print(f"[red]{exc}[/red]")
+            continue
+
+        workspace = os.fspath(binding.requested_path)
+        console.print(f"[green]Workspace:[/green] {workspace}")
+        return _WorkspaceStepResult(workspace=workspace)
+
+
+def _commit_setup(
+    *,
+    profile_result: _ProfileStepResult,
+    api_key_result: _ApiKeyStepResult,
+    model_result: _ModelStepResult,
+    workspace_result: _WorkspaceStepResult,
+    console: Console,
+) -> AppConfig:
+    snapshots = [_snapshot_file(config_path()), _snapshot_file(credentials_path())]
+    try:
+        cfg = load_config()
+        add_profile(cfg, profile_result.profile)
+        set_active_profile(cfg, profile_result.profile.name)
+        set_config_value(cfg, "model", model_result.model)
+        update_profile(cfg, profile_result.profile.name, default_model=model_result.model)
+        extra_fields = dict(cfg.extra_fields or {})
+        extra_fields[_DEFAULT_WORKSPACE_KEY] = workspace_result.workspace
+        cfg.extra_fields = extra_fields
+        save_config(cfg)
+        if api_key_result.api_key:
+            save_persisted_profile_key(profile_result.profile.name, api_key_result.api_key)
+        console.print("[green]Setup saved.[/green]")
+        return cfg
+    except (ConfigError, OSError) as exc:
+        rollback_errors = _rollback_partial_persistence(snapshots)
+        console.print(f"[red]Failed to save setup:[/red] {exc}")
+        if rollback_errors:
+            for error in rollback_errors:
+                console.print(f"[red]Rollback failed:[/red] {error}")
+            raise ConfigError(
+                f"Failed to save setup: {exc}. Rollback also failed; inspect config and credentials files manually."
+            ) from exc
+        raise ConfigError(f"Failed to save setup: {exc}") from exc
+
+
+def _snapshot_file(path: Path) -> _FileSnapshot:
+    try:
+        if path.exists():
+            return _FileSnapshot(path=path, existed=True, data=path.read_bytes())
+        return _FileSnapshot(path=path, existed=False, data=None)
+    except OSError as exc:
+        raise ConfigError(f"Failed to snapshot {path}: {exc}") from exc
+
+
+def _rollback_partial_persistence(snapshots: list[_FileSnapshot]) -> list[str]:
+    errors: list[str] = []
+    for snapshot in snapshots:
+        try:
+            if snapshot.existed:
+                snapshot.path.parent.mkdir(parents=True, exist_ok=True)
+                snapshot.path.write_bytes(snapshot.data or b"")
+            elif snapshot.path.exists():
+                snapshot.path.unlink()
+        except OSError as exc:
+            errors.append(f"{snapshot.path}: {exc}")
+    return errors
+
+
+def _prompt_and_check_sandbox(console: Console, cfg: AppConfig) -> _SandboxStepResult:
+    console.print()
+    console.print(
+        Panel(
+            "Sylliptor runs shell commands in a sandbox to keep your system safe.\n"
+            "Checking sandbox readiness...",
+            title="Sandbox",
+            border_style="cyan",
+        )
+    )
+    try:
+        result = diagnose_sandbox(cfg, include_smoke=False)
+    except (_GoBack, KeyboardInterrupt, Abort, EOFError):
+        console.print(
+            "[yellow]Sandbox skipped. You can finish this later with `sylliptor sandbox setup`.[/yellow]"
+        )
+        return _SandboxStepResult(ready=False, status="skipped")
+    except Exception as exc:  # noqa: BLE001 - sandbox backends fail in environment-specific ways
+        console.print(
+            f"[yellow]Sandbox check failed:[/yellow] {exc}. Re-run with `sylliptor sandbox doctor`."
+        )
+        return _SandboxStepResult(ready=False, status="check failed")
+
+    _print_sandbox_status(console, result)
+    if result.ready:
+        return _SandboxStepResult(ready=True, status=result.selected_backend or result.status)
+
+    console.print(Panel(_sandbox_problem_text(result), title="Sandbox", border_style="yellow"))
+    if result.can_pull:
+        try:
+            should_pull = _prompt_yes_no(
+                "Sandbox image not found. Pull it now? (~50MB) [Y/n]", default=True
+            )
+        except (_GoBack, KeyboardInterrupt, Abort, EOFError):
+            console.print(
+                "[yellow]Sandbox skipped. You can finish this later with `sylliptor sandbox setup`.[/yellow]"
+            )
+            return _SandboxStepResult(ready=False, status="skipped")
+        if should_pull:
+            try:
+                return _pull_sandbox(console, cfg, result)
+            except (_GoBack, KeyboardInterrupt, Abort, EOFError):
+                console.print(
+                    "[yellow]Sandbox skipped. You can finish this later with `sylliptor sandbox setup`.[/yellow]"
+                )
+                return _SandboxStepResult(ready=False, status="skipped")
+
+    console.print("[yellow]You can finish this later with `sylliptor sandbox setup`.[/yellow]")
+    return _SandboxStepResult(ready=False, status="not ready")
+
+
+def _pull_sandbox(
+    console: Console,
+    cfg: AppConfig,
+    initial_result: SandboxDiagnostic,
+) -> _SandboxStepResult:
+    console.print("[dim]Pulling Sylliptor sandbox image...[/dim]")
+    try:
+        pull_result = pull_sandbox_images(timeout_s=900)
+    except (KeyboardInterrupt, Abort, EOFError):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log_path = _write_exception_log("sandbox_pull", exc)
+        console.print(f"[yellow]Sandbox image pull failed:[/yellow] {exc}")
+        if log_path is not None:
+            console.print(f"[dim]Details saved to: {log_path}[/dim]")
+        console.print("[yellow]You can finish this later with `sylliptor sandbox setup`.[/yellow]")
+        return _SandboxStepResult(ready=False, status="pull failed")
+
+    if not pull_result.ok:
+        log_path = _write_sandbox_pull_log(pull_result)
+        console.print(
+            Panel(_sandbox_problem_text(initial_result), title="Sandbox", border_style="yellow")
+        )
+        console.print(
+            f"[yellow]Sandbox image pull failed:[/yellow] {pull_result.error or 'image pull failed'}"
+        )
+        if log_path is not None:
+            console.print(f"[dim]Raw pull output saved to: {log_path}[/dim]")
+        console.print("[yellow]You can finish this later with `sylliptor sandbox setup`.[/yellow]")
+        return _SandboxStepResult(ready=False, status="pull failed")
+
+    console.print("[green]Sandbox image pulled.[/green]")
+    try:
+        final_result = diagnose_sandbox(cfg, include_smoke=True)
+    except Exception as exc:  # noqa: BLE001
+        console.print(
+            f"[yellow]Sandbox check failed after pull:[/yellow] {exc}. "
+            "Re-run with `sylliptor sandbox doctor`."
+        )
+        return _SandboxStepResult(ready=False, status="check failed")
+    _print_sandbox_status(console, final_result)
+    if final_result.ready:
+        return _SandboxStepResult(
+            ready=True, status=final_result.selected_backend or final_result.status
+        )
+    console.print(
+        Panel(_sandbox_problem_text(final_result), title="Sandbox", border_style="yellow")
+    )
+    console.print("[yellow]You can finish this later with `sylliptor sandbox setup`.[/yellow]")
+    return _SandboxStepResult(ready=False, status="not ready")
+
+
+def _print_sandbox_status(console: Console, result: SandboxDiagnostic) -> None:
+    backend = result.selected_backend or result.status
+    console.print(f"Backend detected: {backend}")
+    console.print(f"Image present: {result.docker_image}")
+    if result.ready:
+        console.print("[green]Sandbox ready[/green]")
+
+
+def _sandbox_problem_text(result: SandboxDiagnostic) -> str:
+    return format_sandbox_problem_message(result)
+
+
+def _print_setup_complete(
+    *,
+    console: Console,
+    profile_result: _ProfileStepResult,
+    api_key_result: _ApiKeyStepResult,
+    model_result: _ModelStepResult,
+    workspace_result: _WorkspaceStepResult,
+    sandbox_result: _SandboxStepResult,
+) -> None:
+    api_key_label = _api_key_summary_label(api_key_result)
+    sandbox_label = _sandbox_summary_label(sandbox_result)
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("label", no_wrap=True, style="bold")
+    table.add_column("value")
+    table.add_row("Profile:", f"{profile_result.label} (active)")
+    table.add_row("API key:", api_key_label)
+    table.add_row("Model:", model_result.model)
+    table.add_row("Workspace:", workspace_result.workspace)
+    table.add_row("Sandbox:", sandbox_label)
+    console.print()
+    console.print(
+        Panel(
+            Group(table, Text(""), Text("Type your first message to start chatting.", style="dim")),
+            title="Setup complete",
+            border_style="green",
+        )
+    )
+
+
+def _api_key_summary_label(api_key_result: _ApiKeyStepResult) -> Text:
+    if not api_key_result.api_key:
+        return Text("not stored", style="yellow")
+
+    reason = str(api_key_result.validation_message or "").strip()
+    if api_key_result.validation_status == "validated":
+        return Text("stored, validated", style="green")
+    if api_key_result.validation_status == "inconclusive":
+        suffix = f" ({reason})" if reason else ""
+        return Text(f"stored, validation inconclusive{suffix}", style="yellow")
+    if api_key_result.validation_status == "failed":
+        suffix = f" ({reason})" if reason else ""
+        return Text(
+            f"stored, but provider rejected it{suffix}. Re-enter via /config.",
+            style="red",
+        )
+    if api_key_result.validation_status == "skipped":
+        return Text("stored, validation skipped", style="yellow")
+    if api_key_result.validation_status == "model_not_found":
+        suffix = f" ({reason})" if reason else ""
+        return Text(f"stored, model validation failed{suffix}", style="red")
+    return Text(
+        f"stored, unknown validation status: {api_key_result.validation_status}", style="red"
+    )
+
+
+def _sandbox_summary_label(sandbox_result: _SandboxStepResult) -> Text:
+    if sandbox_result.ready:
+        return Text(f"ready ({sandbox_result.status})", style="green")
+    if sandbox_result.status == "skipped":
+        return Text("skipped - run `sylliptor sandbox setup` to finish", style="yellow")
+    return Text(
+        f"{sandbox_result.status} - run `sylliptor sandbox setup` to finish",
+        style="yellow",
+    )
+
+
+def _run_wizard_picker(
+    *,
+    console: Console,
+    title: str,
+    subtitle: str,
+    rows: list[tuple[str, str, str]],
+    current_value: str,
+    cancel_hint: str,
+    invalid_hint: str = "Choose one of the numbered options.",
+) -> str | None:
+    if not rows:
+        return None
+    footer_hint = (
+        f"↑/↓ navigate  Enter select  1-{min(len(rows), 9)} jump  Esc {cancel_hint}  Ctrl+C cancel"
+    )
+    try:
+        from .config_menu import _run_config_picker
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[dim]Interactive picker unavailable: {exc}. Using numeric input.[/dim]")
+        return _run_wizard_picker_fallback(
+            console=console,
+            title=title,
+            subtitle=subtitle,
+            rows=rows,
+            current_value=current_value,
+            footer_hint=footer_hint,
+            invalid_hint=invalid_hint,
+        )
+    try:
+        return _run_config_picker(
+            console=console,
+            title=title,
+            subtitle=subtitle,
+            rows=rows,
+            current_value=current_value,
+            footer_hint=footer_hint,
+        )
+    except (KeyboardInterrupt, Abort, EOFError):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[dim]Interactive picker unavailable: {exc}. Using numeric input.[/dim]")
+        return _run_wizard_picker_fallback(
+            console=console,
+            title=title,
+            subtitle=subtitle,
+            rows=rows,
+            current_value=current_value,
+            footer_hint=footer_hint,
+            invalid_hint=invalid_hint,
+        )
+
+
+def _run_wizard_picker_fallback(
+    *,
+    console: Console,
+    title: str,
+    subtitle: str,
+    rows: list[tuple[str, str, str]],
+    current_value: str,
+    footer_hint: str,
+    invalid_hint: str,
+) -> str | None:
+    current = str(current_value or "")
+    while True:
+        console.print()
+        console.rule(f"[bold]{title}[/bold]")
+        console.print(f"[dim]{subtitle}[/dim]")
+        console.print()
+        for index, (value, label, description) in enumerate(rows, start=1):
+            suffix = " [dim](current)[/dim]" if value == current else ""
+            detail = f"  [dim]{description}[/dim]" if description else ""
+            console.print(f"  {index}) {label}{suffix}{detail}")
+        console.print()
+        console.print(f"[dim]{footer_hint}[/dim]")
+        raw = _prompt_text("Choice", default="", show_default=False).strip()
+        if not raw or _is_cancel_token(raw):
+            return None
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(rows):
+                return rows[idx][0]
+        matched = _match_row_by_key_or_label(rows, raw)
+        if matched is not None:
+            return matched
+        console.print(f"[yellow]{invalid_hint}[/yellow]")
+
+
+def _match_row_by_key_or_label(rows: list[tuple[str, str, str]], raw_value: str) -> str | None:
+    value = str(raw_value or "").strip().casefold()
+    if not value:
+        return None
+    for row_value, label, _description in rows:
+        if value in {row_value.casefold(), label.casefold()}:
+            return row_value
+    return None
+
+
+def _setup_presets() -> list[ProfilePreset]:
+    local_keys = {"ollama", "lm-studio", "vllm"}
+    regular = [
+        preset
+        for preset in PROFILE_PRESETS
+        if preset.key not in local_keys | {_CUSTOM_PROVIDER_KEY}
+    ]
+    local = [preset for preset in PROFILE_PRESETS if preset.key in local_keys]
+    custom = [preset for preset in PROFILE_PRESETS if preset.key == _CUSTOM_PROVIDER_KEY]
+    return [*regular, *local, *custom]
+
+
+def _preset_by_key(key: str) -> ProfilePreset | None:
+    normalized = str(key or "").strip().lower()
+    for preset in PROFILE_PRESETS:
+        if preset.key == normalized:
+            return preset
+    return None
+
+
+def _preset_description(preset: ProfilePreset) -> str:
+    if preset.notes:
+        return preset.notes
+    parsed = urlparse(preset.base_url)
+    if parsed.netloc:
+        return parsed.netloc
+    return "Use any OpenAI-compatible base URL"
+
+
+def _print_preset_warning(console: Console, preset: ProfilePreset) -> None:
+    warning = str(preset.setup_warning or "").strip()
+    if warning:
+        console.print(f"[yellow]{warning}[/yellow]")
+
+
+def _suggest_workspace_default() -> Path:
+    home = Path.home()
+    for candidate in (home / "projects", home / "code"):
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return home
+
+
+def _display_path(path: Path) -> str:
+    home = Path.home()
+    if path == home:
+        return "~"
+    if path.is_relative_to(home):
+        return "~" + os.fspath(path).removeprefix(os.fspath(home))
+    return os.fspath(path)
+
+
+def _escape_capture_unavailable_reason() -> str | None:
+    try:
+        from ..cli import _is_non_interactive_terminal
+    except Exception as exc:  # noqa: BLE001 - capability checks should degrade clearly
+        return f"terminal capability check failed: {exc}"
+    if _is_non_interactive_terminal():
+        return "non-interactive terminal"
+    try:
+        from prompt_toolkit import PromptSession  # noqa: F401
+        from prompt_toolkit.key_binding import KeyBindings  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        return f"prompt_toolkit unavailable: {exc}"
+    return None
+
+
+def _can_capture_escape() -> bool:
+    return _escape_capture_unavailable_reason() is None
+
+
+def _esc_aware_text_input(
+    prompt: str,
+    *,
+    default: str = "",
+    show_default: bool = True,
+    hide_input: bool = False,
+) -> str:
+    if not _can_capture_escape():
+        return _prompt_text(
+            prompt,
+            default=default,
+            show_default=show_default,
+            hide_input=hide_input,
+        )
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.key_binding import KeyBindings
+    except Exception as exc:  # noqa: BLE001
+        _resolve_console().print(
+            f"[dim]Esc/back navigation unavailable: {exc}. Using line input.[/dim]"
+        )
+        return _prompt_text(
+            prompt,
+            default=default,
+            show_default=show_default,
+            hide_input=hide_input,
+        )
+
+    bindings = KeyBindings()
+
+    @bindings.add("escape", eager=True)
+    def _go_back(event: Any) -> None:
+        event.app.exit(exception=_GoBack())
+
+    session: PromptSession[str] = PromptSession(
+        key_bindings=bindings,
+        is_password=hide_input,
+    )
+    try:
+        return str(
+            session.prompt(
+                f"{prompt}: ",
+                default=default,
+                is_password=hide_input,
+            )
+        )
+    except _GoBack:
+        raise
+    except (KeyboardInterrupt, EOFError):
+        raise
+
+
+def _confirm_cancel(
+    console: Console, *, prompt: str = "Cancel setup and discard inputs? [y/N]"
+) -> bool:
+    while True:
+        try:
+            value = _esc_aware_text_input(prompt, default="n", show_default=False).strip().lower()
+        except _GoBack:
+            return False
+        except (Abort, EOFError, KeyboardInterrupt):
+            return True
+        if not value:
+            return False
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        console.print("[red]Enter y or n.[/red]")
+
+
+def _prompt_text(
+    prompt: str,
+    *,
+    default: str,
+    show_default: bool,
+    hide_input: bool = False,
+) -> str:
+    return str(
+        typer.prompt(
+            prompt,
+            default=default,
+            show_default=show_default,
+            hide_input=hide_input,
+        )
+    )
+
+
+def _prompt_yes_no(prompt: str, *, default: bool) -> bool:
+    default_text = "y" if default else "n"
+    while True:
+        value = (
+            _esc_aware_text_input(prompt, default=default_text, show_default=False).strip().lower()
+        )
+        if _is_cancel_token(value):
+            raise _GoBack()
+        if not value:
+            return default
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        _resolve_console().print("[red]Enter y or n.[/red]")
+
+
+def _is_cancel_token(value: str) -> bool:
+    normalized = str(value or "").strip().casefold()
+    return normalized in {"\x1b", "esc", "escape", "cancel", "q", "quit"}
+
+
+def _write_sandbox_pull_log(result: SandboxPullResult) -> Path | None:
+    lines = [
+        f"ok={result.ok}",
+        f"error={result.error or ''}",
+        "",
+    ]
+    for item in result.results:
+        lines.extend(
+            [
+                f"image={item.image}",
+                f"ok={item.ok}",
+                "output:",
+                item.output,
+                "",
+            ]
+        )
+    return _write_log("sandbox_pull", "\n".join(lines))
+
+
+def _write_exception_log(prefix: str, exc: BaseException) -> Path | None:
+    content = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    return _write_log(prefix, content)
+
+
+def _write_log(prefix: str, content: str) -> Path | None:
+    try:
+        logs_dir = default_sessions_dir().parent / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        path = logs_dir / f"{prefix}_{timestamp}.log"
+        path.write_text(content, encoding="utf-8")
+        return path
+    except OSError as exc:
+        _resolve_console().print(f"[yellow]Could not write diagnostic log:[/yellow] {exc}")
+        return None

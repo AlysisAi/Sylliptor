@@ -2,20 +2,8 @@ name: sandbox-image
 
 on:
   push:
-    branches:
-      - main
-      - v0.5
     tags:
       - "v*"
-    paths:
-      - .github/workflows/sandbox-image.yml
-      - sandbox/**
-      - .dockerignore
-      - .trivyignore
-      - src/sylliptor_agent_cli/sandbox_doctor.py
-      - src/sylliptor_agent_cli/sandbox_runner.py
-      - src/sylliptor_agent_cli/sandbox_settings.py
-      - src/sylliptor_agent_cli/cli_impl/commands/sandbox.py
   pull_request:
     paths:
       - .github/workflows/sandbox-image.yml
@@ -333,7 +321,7 @@ jobs:
 
   runtime-smoke:
     name: runtime-smoke (dev image)
-    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: github.event_name != 'pull_request'
     needs: build-scan-publish
     runs-on: ubuntu-latest
     timeout-minutes: 20

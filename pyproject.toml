@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sylliptor-agent-cli"
-version = "0.1.4"
+version = "0.9.0b1"
 description = "Local CLI coding agent powered by an OpenAI-compatible API."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,7 +21,8 @@ classifiers = [
   "Environment :: Console",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: Apache Software License",
-  "Operating System :: OS Independent",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.11",

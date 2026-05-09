@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/sylliptor-demo.gif" alt="Sylliptor mascot" width="192">
+  <img src="https://raw.githubusercontent.com/AlysisAi/Sylliptor/main/docs/assets/sylliptor-demo.gif" alt="Sylliptor mascot" width="192">
 </p>
 
 <h1 align="center">SYLLIPTOR</h1>
@@ -14,8 +14,8 @@
 
 <p align="center">
   <a href="https://sylliptor.alysisai.com/">Website</a> ·
-  <a href="docs/README.md">Docs</a> ·
-  <a href="CHANGELOG.md">Changelog</a>
+  <a href="https://github.com/AlysisAi/Sylliptor/tree/main/docs">Docs</a> ·
+  <a href="https://github.com/AlysisAi/Sylliptor/blob/main/CHANGELOG.md">Changelog</a>
 </p>
 
 <p align="center">
@@ -127,6 +127,9 @@ sylliptor chat --mode auto
 ## Sandbox & Safety
 
 Shell and verification execution run inside a hardened Docker or Bubblewrap sandbox by default.
+Shell commands and verification commands default to strict sandboxing. To deliberately disable
+verification sandboxing for a trusted local setup, set `verify_sandbox.mode="off"` or
+`SYLLIPTOR_VERIFY_SANDBOX_MODE=off`.
 
 ```bash
 docker pull ghcr.io/alysisai/sylliptor-sandbox:dev
@@ -199,4 +202,4 @@ Missing paths require `--create-path`. Broad directories such as `~` require an 
 
 Use Python 3.11 or newer for local development. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and PR expectations. Report vulnerabilities through [SECURITY.md](SECURITY.md), not public GitHub issues.
 
-Sylliptor is distributed under the license in [LICENSE](LICENSE).
+Sylliptor is distributed under the [Apache License 2.0](LICENSE).

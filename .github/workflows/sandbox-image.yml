@@ -1,0 +1,414 @@
+name: sandbox-image
+
+on:
+  push:
+    branches:
+      - main
+      - v0.5
+    tags:
+      - "v*"
+    paths:
+      - .github/workflows/sandbox-image.yml
+      - sandbox/**
+      - .dockerignore
+      - .trivyignore
+      - src/sylliptor_agent_cli/sandbox_doctor.py
+      - src/sylliptor_agent_cli/sandbox_runner.py
+      - src/sylliptor_agent_cli/sandbox_settings.py
+      - src/sylliptor_agent_cli/cli_impl/commands/sandbox.py
+  pull_request:
+    paths:
+      - .github/workflows/sandbox-image.yml
+      - sandbox/**
+      - .dockerignore
+      - .trivyignore
+  workflow_dispatch:
+    inputs:
+      default_variant:
+        description: Variant that also receives the latest and release tags.
+        required: false
+        default: dev
+        type: choice
+        options:
+          - dev
+          - base
+          - server
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: sylliptor-sandbox
+  DEFAULT_VARIANT: ${{ github.event_name == 'workflow_dispatch' && inputs.default_variant || 'dev' }}
+  DOCKER_METADATA_SHORT_SHA_LENGTH: "12"
+
+concurrency:
+  group: sandbox-image-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-scan-pr:
+    name: build dev (pr)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve image coordinates
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "image=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve build version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_SHA::12}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.image }}
+          tags: |
+            type=raw,value=dev
+            type=sha,format=short,prefix=dev-
+            type=raw,value=latest
+
+      - name: Build sandbox image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./sandbox
+          file: ./sandbox/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=sandbox-dev
+          cache-to: type=gha,mode=max,scope=sandbox-dev
+          build-args: |
+            VARIANT=dev
+            SOURCE_URL=https://github.com/${{ github.repository }}
+            GIT_SHA=${{ github.sha }}
+            VERSION=${{ steps.version.outputs.version }}
+
+      - name: Run Trivy vulnerability scan
+        id: trivy
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: ${{ steps.image.outputs.image }}:dev-${{ steps.version.outputs.version }}
+          format: sarif
+          output: trivy-dev.sarif
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          trivyignores: .trivyignore
+          limit-severities-for-sarif: true
+          cache: true
+          skip-dirs: node_modules,tests/fixtures
+
+      - name: Upload Trivy SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-dev-sarif
+          path: trivy-dev.sarif
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Write job summary
+        if: always()
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TRIVY: ${{ steps.trivy.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags="${TAGS:-n/a}"
+          tags="${tags//$'\n'/<br>}"
+          digest="${DIGEST:-n/a}"
+          trivy="${TRIVY:-not-run}"
+          {
+            echo "## Sandbox Image"
+            echo
+            echo "| variant | platforms | tags | digest | trivy |"
+            echo "| --- | --- | --- | --- | --- |"
+            echo "| dev | linux/amd64 | ${tags} | ${digest} | ${trivy} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-scan-publish:
+    name: build ${{ matrix.variant }}
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    outputs:
+      default_digest: ${{ steps.expose.outputs.default_digest }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ["base", "dev", "server"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve image coordinates
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "image=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve build version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="${GITHUB_SHA::12}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.image }}
+          tags: |
+            type=raw,value=${{ matrix.variant }}
+            type=sha,format=short,prefix=${{ matrix.variant }}-
+            type=ref,event=tag,prefix=${{ matrix.variant }}-
+            type=raw,value=latest,enable=${{ matrix.variant == env.DEFAULT_VARIANT }}
+            type=ref,event=tag,enable=${{ matrix.variant == env.DEFAULT_VARIANT }}
+
+      - name: Build sandbox image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.variant == 'server' && '.' || './sandbox' }}
+          file: ./sandbox/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=sandbox-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=sandbox-${{ matrix.variant }}
+          build-args: |
+            VARIANT=${{ matrix.variant }}
+            SOURCE_URL=https://github.com/${{ github.repository }}
+            GIT_SHA=${{ github.sha }}
+            VERSION=${{ steps.version.outputs.version }}
+
+      - name: Expose default variant digest
+        id: expose
+        if: matrix.variant == env.DEFAULT_VARIANT
+        shell: bash
+        run: echo "default_digest=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+      - name: Run Trivy vulnerability scan
+        id: trivy
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: ${{ steps.image.outputs.image }}:${{ matrix.variant }}-${{ steps.version.outputs.version }}
+          format: sarif
+          output: trivy-${{ matrix.variant }}.sarif
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          trivyignores: .trivyignore
+          limit-severities-for-sarif: true
+          cache: true
+          skip-dirs: node_modules,tests/fixtures
+
+      - name: Upload Trivy SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ matrix.variant }}-sarif
+          path: trivy-${{ matrix.variant }}.sarif
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Trivy SARIF to code scanning
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.variant }}.sarif
+          category: trivy-sandbox-${{ matrix.variant }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.1
+
+      - name: Attest build provenance
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Keyless sign pushed image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [[ -z "${tag}" ]] && continue
+            cosign sign --yes "${tag}@${DIGEST}"
+          done <<< "${TAGS}"
+
+      - name: Write job summary
+        if: always()
+        env:
+          VARIANT: ${{ matrix.variant }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TRIVY: ${{ steps.trivy.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags="${TAGS:-n/a}"
+          tags="${tags//$'\n'/<br>}"
+          digest="${DIGEST:-n/a}"
+          trivy="${TRIVY:-not-run}"
+          {
+            echo "## Sandbox Image"
+            echo
+            echo "| variant | platforms | tags | digest | trivy |"
+            echo "| --- | --- | --- | --- | --- |"
+            echo "| ${VARIANT} | linux/amd64,linux/arm64 | ${tags} | ${digest} | ${trivy} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  runtime-smoke:
+    name: runtime-smoke (dev image)
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: build-scan-publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve image coordinates
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "image=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull freshly published dev image by digest
+        id: dev-image
+        shell: bash
+        run: |
+          set -euo pipefail
+          dev_tag="${{ steps.image.outputs.image }}:dev"
+          sha_tag="${{ steps.image.outputs.image }}:dev-${GITHUB_SHA::12}"
+          dev_digest="$(docker buildx imagetools inspect "${dev_tag}" --format '{{json .Manifest.Digest}}')"
+          sha_digest="$(docker buildx imagetools inspect "${sha_tag}" --format '{{json .Manifest.Digest}}')"
+          dev_digest="${dev_digest%\"}"
+          dev_digest="${dev_digest#\"}"
+          sha_digest="${sha_digest%\"}"
+          sha_digest="${sha_digest#\"}"
+          if [[ -z "${dev_digest}" || "${dev_digest}" == "null" ]]; then
+            echo "Could not resolve digest for ${dev_tag}" >&2
+            exit 1
+          fi
+          if [[ "${dev_digest}" != "${sha_digest}" ]]; then
+            echo "${dev_tag} does not match ${sha_tag}" >&2
+            exit 1
+          fi
+          image="${{ steps.image.outputs.image }}@${dev_digest}"
+          docker pull "${image}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.10"
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+
+      - name: Install sylliptor
+        run: uv pip install --system -e .
+
+      - name: Run sandbox runtime smoke
+        env:
+          SYLLIPTOR_SHELL_SANDBOX_BACKEND: docker
+          SYLLIPTOR_SHELL_SANDBOX_CLEAR_ENV: "1"
+          SYLLIPTOR_SHELL_SANDBOX_DOCKER_IMAGE: ${{ steps.dev-image.outputs.image }}
+          SYLLIPTOR_SHELL_SANDBOX_MODE: strict
+          SYLLIPTOR_SHELL_SANDBOX_NETWORK: off
+          SYLLIPTOR_SERVER_DOCKER_IMAGE: ${{ steps.dev-image.outputs.image }}
+          SYLLIPTOR_SERVER_WORKER_BACKEND: docker
+        run: sylliptor sandbox doctor --smoke

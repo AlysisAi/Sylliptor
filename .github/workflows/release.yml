@@ -57,10 +57,13 @@ jobs:
           python -m twine check dist/*
 
       - name: Smoke install wheel
+        env:
+          PIPX_HOME: ${{ runner.temp }}/pipx-home
+          PIPX_BIN_DIR: ${{ runner.temp }}/pipx-bin
         run: |
           python -m pipx install dist/*.whl
-          ~/.local/bin/sylliptor --help
-          ~/.local/bin/sylliptor --version
+          "$PIPX_BIN_DIR/sylliptor" --help
+          "$PIPX_BIN_DIR/sylliptor" --version
 
       - name: Upload distributions
         uses: actions/upload-artifact@v7

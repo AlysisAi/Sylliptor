@@ -50,7 +50,6 @@ RUN groupadd --gid 1000 sylliptor; \
     install -d -m 0755 -o 1000 -g 1000 /workspace
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD git --version && rg --version
-ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["sh", "-lc", "echo sylliptor-sandbox ready"]
 WORKDIR /workspace
 USER sylliptor
@@ -135,7 +134,6 @@ RUN node -v; \
     pkg-config --version
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD git --version && rg --version
-ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["sh", "-lc", "echo sylliptor-sandbox ready"]
 WORKDIR /workspace
 USER sylliptor
@@ -150,7 +148,6 @@ COPY src /opt/sylliptor/src
 RUN python -m pip install --no-cache-dir /opt/sylliptor
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD git --version && rg --version
-ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["sh", "-lc", "echo sylliptor-sandbox ready"]
 WORKDIR /workspace
 USER sylliptor

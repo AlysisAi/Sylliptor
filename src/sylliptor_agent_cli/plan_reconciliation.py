@@ -368,10 +368,15 @@ def reconcile_plan_with_workspace(
             )
 
         if not task_anchor_paths:
-            symbol_paths = _resolve_symbol_grounded_paths(task=task, workspace_root=root)
+            symbol_paths = _resolve_symbol_grounded_paths(
+                task=task,
+                workspace_root=root,
+                latest_user_text=str(user_text or ""),
+            )
             grounded_paths = symbol_paths or _resolve_named_code_file_paths(
                 task=task,
                 workspace_root=root,
+                latest_user_text=str(user_text or ""),
             )
             if grounded_paths:
                 estimated_files, estimated_symbol_warning = _apply_symbol_grounded_paths(
@@ -761,14 +766,31 @@ def _infer_estimated_files(
     return _dedupe_keep_order(inferred), _dedupe_keep_order(ignored)
 
 
-def _task_symbol_candidates(task: dict[str, Any]) -> list[str]:
-    text = "\n".join(
+def _task_grounding_text(task: dict[str, Any], *, latest_user_text: str = "") -> str:
+    user_text = str(latest_user_text or "").strip()
+    title = str(task.get("title") or "").strip()
+    description = str(task.get("description") or "").strip()
+    if (
+        user_text
+        and title == "Implement requested repository change"
+        and "Use local search/read tools to locate" in description
+    ):
+        return user_text
+    return "\n".join(
         [
-            str(task.get("title") or ""),
-            str(task.get("description") or ""),
+            title,
+            description,
             *[str(item) for item in _string_list(task.get("acceptance_criteria"))],
         ]
     )
+
+
+def _task_symbol_candidates(
+    task: dict[str, Any],
+    *,
+    latest_user_text: str = "",
+) -> list[str]:
+    text = _task_grounding_text(task, latest_user_text=latest_user_text)
     candidates: list[str] = []
     for raw in _SYMBOL_CANDIDATE_RE.findall(text):
         symbol = raw.strip()
@@ -785,14 +807,12 @@ def _task_symbol_candidates(task: dict[str, Any]) -> list[str]:
     return _dedupe_keep_order(candidates)[:6]
 
 
-def _task_filename_candidates(task: dict[str, Any]) -> list[str]:
-    text = "\n".join(
-        [
-            str(task.get("title") or ""),
-            str(task.get("description") or ""),
-            *[str(item) for item in _string_list(task.get("acceptance_criteria"))],
-        ]
-    )
+def _task_filename_candidates(
+    task: dict[str, Any],
+    *,
+    latest_user_text: str = "",
+) -> list[str]:
+    text = _task_grounding_text(task, latest_user_text=latest_user_text)
     candidates: list[str] = []
     for raw in _FILENAME_TOKEN_RE.findall(text):
         token = raw.strip().casefold()
@@ -853,8 +873,13 @@ def _file_text(path: Path) -> str:
         return ""
 
 
-def _resolve_symbol_grounded_paths(*, task: dict[str, Any], workspace_root: Path) -> list[str]:
-    symbols = _task_symbol_candidates(task)
+def _resolve_symbol_grounded_paths(
+    *,
+    task: dict[str, Any],
+    workspace_root: Path,
+    latest_user_text: str = "",
+) -> list[str]:
+    symbols = _task_symbol_candidates(task, latest_user_text=latest_user_text)
     if not symbols:
         return []
 
@@ -881,8 +906,13 @@ def _resolve_symbol_grounded_paths(*, task: dict[str, Any], workspace_root: Path
     return _dedupe_keep_order(grounded)[:3]
 
 
-def _resolve_named_code_file_paths(*, task: dict[str, Any], workspace_root: Path) -> list[str]:
-    candidates = _task_filename_candidates(task)
+def _resolve_named_code_file_paths(
+    *,
+    task: dict[str, Any],
+    workspace_root: Path,
+    latest_user_text: str = "",
+) -> list[str]:
+    candidates = _task_filename_candidates(task, latest_user_text=latest_user_text)
     if not candidates:
         return []
 
@@ -926,6 +956,10 @@ def is_code_implementation_path(path: str) -> bool:
     return pure.suffix.casefold() in _SYMBOL_SCAN_EXTENSIONS and not _is_probable_test_path(path)
 
 
+def _is_concrete_code_implementation_path(path: str) -> bool:
+    return not _has_glob(path) and is_code_implementation_path(path)
+
+
 def _is_code_implementation_path(path: str) -> bool:
     return is_code_implementation_path(path)
 
@@ -962,7 +996,7 @@ def _apply_symbol_grounded_paths(
         return normalized_current, None
 
     implementation_paths = [
-        path for path in normalized_current if is_code_implementation_path(path)
+        path for path in normalized_current if _is_concrete_code_implementation_path(path)
     ]
     if implementation_paths and any(
         _path_contains_any_task_symbol(
@@ -978,7 +1012,7 @@ def _apply_symbol_grounded_paths(
         replacement: list[str] = []
         inserted_symbols = False
         for path in normalized_current:
-            if is_code_implementation_path(path):
+            if _is_concrete_code_implementation_path(path):
                 if not inserted_symbols:
                     replacement.extend(normalized_symbol_paths)
                     inserted_symbols = True

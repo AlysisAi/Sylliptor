@@ -1042,10 +1042,15 @@ def test_rich_surface_progress_update_deduplicates_repeated_lines() -> None:
 @pytest.mark.parametrize(
     "message",
     [
+        "Applied planner update to the Forge plan.",
         "Plan draft ready for review.",
         "Planner response ready.",
+        "Planner update was a no-op.",
         "Planner returned an error; using fallback handling.",
         "Planner request recovered after 1 transient retry.",
+        "Swarm completed with exit code 1. Summary: summary.md.",
+        "[None] Swarm completed with exit code 1. Summary: summary.md.",
+        "[T01] Swarm aborted: worker failed before completion.",
     ],
 )
 def test_rich_surface_terminal_progress_does_not_restart_spinner(
@@ -1055,19 +1060,27 @@ def test_rich_surface_terminal_progress_does_not_restart_spinner(
     buffer = io.StringIO()
     surface = RichSurface(console=Console(file=buffer, force_terminal=False))
     started: list[str] = []
+    stopped: list[None] = []
     monkeypatch.setattr(
         surface,
         "_start_thinking_spinner",
         lambda *, label: started.append(label),
+    )
+    monkeypatch.setattr(
+        surface,
+        "_stop_thinking_spinner",
+        lambda: stopped.append(None),
     )
 
     surface.on_progress_update("Receiving planner output...")
     assert started == ["Thinking..."]
 
     started.clear()
+    stopped.clear()
     surface.on_progress_update(message)
 
     assert started == []
+    assert stopped
     assert message in buffer.getvalue()
 
 

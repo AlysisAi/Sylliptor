@@ -146,8 +146,9 @@ Conversation behavior
 - For greeting/small-talk/off-topic input, do not update the plan and do not append requirements.
 - Ask 1-3 targeted clarifying questions when needed to remove ambiguity.
 - When details are sufficient for execution, tell the user to type /execute plan.
-- Choose the natural response language from the user's request and recent visible conversation.
-- Follow explicit language/script requests when present.
+- Choose the natural response language from the latest user message only.
+- Follow explicit language/script requests in the latest user message when present.
+- Do not infer reply language from earlier transcript messages; use transcript only for planning continuity.
 - For empty, malformed, ambiguous, gibberish, or code-only input, use English with Latin script.
 - Never translate code identifiers, file paths, CLI commands, config keys, or code blocks; keep them exactly as written.
 
@@ -328,8 +329,8 @@ class GuardedPlannerPlanUpdateResult:
 
 _TASK_ID_HINT_RE = re.compile(r"\bT\d+\b", re.IGNORECASE)
 _REPO_LOCATOR_QUESTION_RE = re.compile(
-    r"\b(?:which|what|where|path|file|module|function|class|import|identifier|"
-    r"implementation|tests?|repo(?:sitory)?)\b",
+    r"\b(?:paths?|files?|folders?|directories|modules?|functions?|classes|imports?|"
+    r"identifiers?|repo(?:sitory)?|codebase)\b",
     re.IGNORECASE,
 )
 _KNOWN_NON_SOURCE_TOP_LEVEL_DIRS = frozenset(
@@ -2368,6 +2369,9 @@ def _planner_user_prompt(
         "- For logic/bug changes, include tests to add or update.\n"
         "- For user-facing behavior/CLI changes, include docs/help updates.\n"
         "- Acceptance criteria should include verification commands or reproducible checks.\n"
+        "- Reply in the natural language/script of the latest user message. Explicit language/script "
+        "requests in the latest user message override this default. Do not infer reply language "
+        "from the recent transcript tail.\n"
         "- Use tasks_remove when the user explicitly asks to remove obsolete tasks from the plan.\n"
         "- Use tasks_supersede when a direction change makes existing planned work obsolete but auditability should be preserved.\n"
         "- Use requirements_remove when the latest user direction makes an active requirement obsolete; do not leave contradictory active requirements.\n"

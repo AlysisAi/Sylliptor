@@ -575,3 +575,56 @@ def test_reconciliation_adds_unique_named_code_file_for_behavior_task_with_tests
     joined = " | ".join(result.warnings)
     assert "added repository symbol definition path(s) to estimated_files: parser.py" in joined
     assert "added repository symbol definition path(s) to write_scope: parser.py" in joined
+
+
+def test_reconciliation_does_not_replace_broad_globs_from_planner_boilerplate(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    for dirname in ("qa_reports", "sandbox", "scripts"):
+        (root / dirname).mkdir(parents=True)
+    (root / "src" / "sylliptor_agent_cli" / "tools").mkdir(parents=True)
+    (root / "src" / "sylliptor_agent_cli" / "tools" / "search.py").write_text(
+        "def search(query):\n    return []\n",
+        encoding="utf-8",
+    )
+    (root / "src" / "sylliptor_agent_cli" / "cli_impl" / "commands").mkdir(parents=True)
+    (root / "src" / "sylliptor_agent_cli" / "cli_impl" / "commands" / "tools.py").write_text(
+        "def tools():\n    return None\n",
+        encoding="utf-8",
+    )
+    workspace_context = _workspace_context_payload(root)
+    broad_scope = ["qa_reports/**/*.py", "sandbox/**/*.py", "scripts/**/*.py"]
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Implement requested repository change",
+                "description": (
+                    "Use local search/read tools to locate the existing implementation and tests, "
+                    "then make the smallest repository change needed for: "
+                    "Can you help me build a new website?"
+                ),
+                "acceptance_criteria": [
+                    "Locate the relevant implementation and tests before editing.",
+                    "Add or update regression coverage for the requested behavior.",
+                ],
+                "estimated_files": list(broad_scope),
+                "write_scope": list(broad_scope),
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+        user_text="Can you help me build a new website?",
+    )
+
+    assert result.changed is False
+    assert plan["tasks"][0]["estimated_files"] == broad_scope
+    assert plan["tasks"][0]["write_scope"] == broad_scope
+    assert not any(
+        "search.py" in warning or "commands/tools.py" in warning for warning in result.warnings
+    )

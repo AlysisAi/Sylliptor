@@ -88,14 +88,28 @@ _STYLE_FAILURE = STYLE_ERROR
 _STYLE_WARNING = STYLE_WARN
 _THINKING_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _TERMINAL_PROGRESS_MESSAGES = {
+    "Applied planner update to the Forge plan.",
     "Plan draft ready for review.",
     "Planner response ready.",
+    "Planner update was a no-op.",
 }
 _TERMINAL_PROGRESS_PREFIXES = (
     "Plan generation failed:",
     "Planner request recovered after",
     "Planner returned an error",
+    "Swarm aborted:",
+    "Swarm completed with exit code",
 )
+
+
+def _strip_progress_scope_prefix(message: str) -> str:
+    clean = str(message or "").strip()
+    if not clean.startswith("["):
+        return clean
+    closing = clean.find("]")
+    if closing <= 1:
+        return clean
+    return clean[closing + 1 :].strip()
 
 
 def _redact(text: str) -> str:
@@ -231,7 +245,7 @@ def _format_turn_elapsed(elapsed_s: float) -> str | None:
 
 
 def _progress_message_completes_activity(message: str) -> bool:
-    clean = str(message or "").strip()
+    clean = _strip_progress_scope_prefix(message)
     if clean in _TERMINAL_PROGRESS_MESSAGES:
         return True
     return any(clean.startswith(prefix) for prefix in _TERMINAL_PROGRESS_PREFIXES)
@@ -575,6 +589,7 @@ class RichSurface:
             return
         self._emit_thinking(message, style="dim")
         if _progress_message_completes_activity(message):
+            self._stop_thinking_spinner()
             return
         if not self._assistant_stream_open and not self._tool_start_info:
             self._start_thinking_spinner(label="Thinking...")

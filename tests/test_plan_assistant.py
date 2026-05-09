@@ -3119,6 +3119,25 @@ def test_planner_user_prompt_preserves_greek_text_without_ascii_escaping() -> No
     assert "\\u03" not in prompt
 
 
+def test_planner_prompt_language_policy_uses_latest_user_message_not_transcript() -> None:
+    assert "Choose the natural response language from the latest user message only." in (
+        PLANNER_SYSTEM_PROMPT
+    )
+    assert "Do not infer reply language from earlier transcript messages" in PLANNER_SYSTEM_PROMPT
+
+
+def test_planner_user_prompt_reinforces_latest_message_language_policy() -> None:
+    prompt = _planner_user_prompt(
+        plan=_base_plan(),
+        transcript_tail=[{"role": "user", "content": "Μίλα μου στα ελληνικά."}],
+        user_text="Can you help me build a new website?",
+    )
+
+    assert "Latest user message:\nCan you help me build a new website?" in prompt
+    assert "Reply in the natural language/script of the latest user message" in prompt
+    assert "Do not infer reply language from the recent transcript tail" in prompt
+
+
 def test_planner_user_prompt_surfaces_explicit_grounding_anchors() -> None:
     prompt = _planner_user_prompt(
         plan=_base_plan(),
@@ -3941,6 +3960,51 @@ def test_run_planner_turn_falls_back_for_thin_repo_locator_question(
     task = result.plan_update["tasks_add"][0]
     assert "src/**" in task["write_scope"]
     assert "cargo test" in " ".join(task["acceptance_criteria"])
+
+
+def test_run_planner_turn_preserves_greenfield_clarifying_questions(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
+
+    planner_payload = {
+        "assistant_message": "I need a few details before planning the website.",
+        "questions": [
+            "What type of website is this, which sections should it include, and are there style or technical constraints?"
+        ],
+        "plan_update": None,
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(planner_payload)}}]},
+        )
+
+    result = run_planner_turn(
+        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
+        api_key_override=None,
+        plan={**_base_plan(), "requirements": [], "tasks": []},
+        transcript_tail=[],
+        user_text="Can you help me build a new website?",
+        workspace_context={
+            "workspace_kind": "git_repo",
+            "top_level_entries": [
+                {"path": "src", "kind": "dir"},
+                {"path": "tests", "kind": "dir"},
+                {"path": "README.md", "kind": "file"},
+            ],
+            "language_hints": ["python"],
+            "likely_test_commands": ["pytest -q"],
+            "readme_paths": ["README.md"],
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.error is None
+    assert result.plan_update is None
+    assert result.questions == planner_payload["questions"]
+    assert "repository-grounded execution task" not in result.assistant_message
 
 
 def test_run_planner_turn_repairs_common_schema_mismatches(monkeypatch) -> None:

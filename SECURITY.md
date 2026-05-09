@@ -2,13 +2,13 @@
 
 ## Supported Versions
 
-Sylliptor tracks security support by release line and repository branch, not only by the
-current Python package version string. Until the first public beta is cut, package metadata may
-still report `0.1.4`; security fixes are handled on the `v0.5` branch / `v0.5.x` line.
+Sylliptor tracks security support by release line and repository branch. During the
+0.9 beta series, security fixes are handled on the `main` branch and shipped in the
+next beta patch release.
 
 | Release line / branch | Supported |
 | --------------------- | --------- |
-| v0.5.x / `v0.5`       | Yes       |
+| 0.9.x beta / `main`   | Yes       |
 | Earlier lines         | No        |
 
 ## Reporting a Vulnerability

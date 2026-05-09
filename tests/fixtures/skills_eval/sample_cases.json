@@ -6,7 +6,7 @@
     "invocation_mode": "normal",
     "expected_skills": [],
     "verification_command": "python -c \"from pathlib import Path; import sys; sys.exit(0 if Path('AGENTS.md').exists() else 1)\"",
-    "tags": ["conventions", "dogfood"],
+    "tags": ["conventions", "evaluation"],
     "notes": "Conventions-helpful control case."
   },
   {
@@ -16,7 +16,7 @@
     "invocation_mode": "normal",
     "expected_skills": ["pytest"],
     "verification_command": "python -c \"from pathlib import Path; import sys; sys.exit(0 if Path('tests/parser_checks.py').exists() else 1)\"",
-    "tags": ["skills", "dogfood"]
+    "tags": ["skills", "evaluation"]
   },
   {
     "id": "skills_parser_pytest_explicit",
@@ -26,7 +26,7 @@
     "explicit_skill_name": "pytest",
     "expected_skills": ["pytest"],
     "verification_command": "python -c \"from pathlib import Path; import sys; sys.exit(0 if Path('tests/parser_checks.py').exists() else 1)\"",
-    "tags": ["skills", "explicit", "dogfood"]
+    "tags": ["skills", "explicit", "evaluation"]
   },
   {
     "id": "negative_readme_summary",
@@ -35,7 +35,7 @@
     "invocation_mode": "normal",
     "expected_skills": [],
     "verification_command": "python -c \"from pathlib import Path; import sys; sys.exit(0 if Path('README.md').exists() else 1)\"",
-    "tags": ["negative-control", "dogfood"]
+    "tags": ["negative-control", "evaluation"]
   },
   {
     "id": "empty_workspace_first_skill_authoring",
@@ -44,7 +44,7 @@
     "invocation_mode": "normal",
     "expected_skills": [],
     "verification_command": "python -c \"from pathlib import Path; import sys; sys.exit(0 if Path('README.md').exists() else 1)\"",
-    "tags": ["lifecycle", "authoring", "dogfood"],
-    "notes": "Future dogfooding hook for empty-workspace first-skill authoring behavior."
+    "tags": ["lifecycle", "authoring", "evaluation"],
+    "notes": "Future validation hook for empty-workspace first-skill authoring behavior."
   }
 ]

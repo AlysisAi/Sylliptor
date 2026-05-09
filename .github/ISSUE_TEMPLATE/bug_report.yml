@@ -45,7 +45,7 @@ body:
     attributes:
       label: Sylliptor version
       description: Output of `sylliptor --version` (or commit SHA if running from source).
-      placeholder: 0.1.4
+      placeholder: 0.9.0b2
     validations:
       required: true
   - type: input

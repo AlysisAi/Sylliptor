@@ -314,7 +314,7 @@ def test_installed_cli_entrypoint_smoke_from_outside_source_tree(
     assert config_payload["model"] == SMOKE_MODEL
 
 
-def test_installed_wheel_cli_dogfood_forge_journey_writes_expected_artifacts(
+def test_installed_wheel_cli_release_smoke_forge_journey_writes_expected_artifacts(
     installed_wheel_cli: _InstalledCli,
     tmp_path: Path,
 ) -> None:
@@ -328,10 +328,10 @@ def test_installed_wheel_cli_dogfood_forge_journey_writes_expected_artifacts(
         cwd=workspace,
         env=runtime_env,
     )
-    _assert_completed_ok(config_set_proc, label="pre-dogfood config set")
+    _assert_completed_ok(config_set_proc, label="pre-smoke config set")
 
-    result_json = tmp_path / "dogfood_result.json"
-    harness_script = tmp_path / "dogfood_smoke.py"
+    result_json = tmp_path / "release_smoke_result.json"
+    harness_script = tmp_path / "release_smoke.py"
     harness_script.write_text(
         textwrap.dedent(
             """
@@ -451,7 +451,7 @@ def test_installed_wheel_cli_dogfood_forge_journey_writes_expected_artifacts(
             "SYLLIPTOR_SMOKE_RESULT_JSON": os.fspath(result_json),
         },
     )
-    _assert_completed_ok(proc, label="installed wheel dogfood smoke harness")
+    _assert_completed_ok(proc, label="installed wheel release smoke harness")
 
     payload = json.loads(result_json.read_text(encoding="utf-8"))
     assert payload["exit_code"] == 0

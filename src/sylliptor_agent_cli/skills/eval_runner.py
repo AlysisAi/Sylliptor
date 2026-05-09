@@ -279,7 +279,7 @@ def run_skills_eval_auth_preflight(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Internal skills eval harness for Sylliptor dogfooding.",
+        description="Skills evaluation harness for Sylliptor.",
     )
     parser.add_argument(
         "--manifest", required=True, help="Path to the skills eval cases JSON manifest."

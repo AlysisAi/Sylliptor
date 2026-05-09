@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.0b2] - 2026-05-09
+
+### Fixed
+
+- Restored the sandbox image workflow for GHCR publishing and runtime smoke validation.
+- Fixed sandbox image smoke checks by avoiding nested container init handling.
+- Updated release metadata so the next beta can publish as a new PyPI version.
+
+### Changed
+
+- Cleaned stale beta support wording and public issue template version examples.
+
+## [0.9.0b1] - 2026-05-09
+
+### Added
+
+- First beta package published to PyPI as `sylliptor-agent-cli`.
+- GitHub Actions release workflow with build, test, package smoke, and PyPI Trusted Publisher publishing.
+- Public governance files, contribution templates, funding metadata, and polished docs navigation.
+
 ### Changed
 
 - Public-facing repository documentation was trimmed and polished for beta launch.

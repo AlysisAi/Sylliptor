@@ -10,9 +10,6 @@ on:
 permissions:
   contents: read
 
-env:
-  PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
-
 jobs:
   test:
     name: test (ubuntu-latest, py${{ matrix.python-version }})
@@ -51,6 +48,8 @@ jobs:
   macos-smoke:
     name: macOS smoke
     runs-on: macos-latest
+    env:
+      PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
 
     steps:
       - name: Check out repository

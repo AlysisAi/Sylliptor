@@ -535,6 +535,23 @@ def _build_profile_model_lookup_index(preset: Any) -> dict[str, str]:
             continue
         for alias in _iter_model_lookup_aliases(canonical):
             index.setdefault(alias.casefold(), canonical)
+    model_aliases = getattr(preset, "model_aliases", {}) or {}
+    if isinstance(model_aliases, dict):
+        for raw_alias, raw_target in model_aliases.items():
+            alias_text = str(raw_alias or "").strip()
+            target_text = str(raw_target or "").strip()
+            if not alias_text or not target_text:
+                continue
+            canonical = next(
+                (
+                    index[target_alias.casefold()]
+                    for target_alias in _iter_model_lookup_aliases(target_text)
+                    if target_alias.casefold() in index
+                ),
+                target_text,
+            )
+            for alias in _iter_model_lookup_aliases(alias_text):
+                index.setdefault(alias.casefold(), canonical)
     return index
 
 

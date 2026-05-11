@@ -764,7 +764,7 @@ def test_gemini_tool_call_extra_content_round_trips_for_tool_calls() -> None:
     client = OpenAICompatClient(
         base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         api_key="test",
-        model="gemini-3-pro",
+        model="gemini-3.1-pro-preview",
         transport=httpx.MockTransport(handler),
     )
 
@@ -855,7 +855,7 @@ def test_gemini_tool_call_extra_content_is_stripped_for_other_transports() -> No
     [
         ("https://api.openai.com/v1", "gpt-5"),
         ("https://example-resource.openai.azure.com/openai/deployments/main", "gpt-5"),
-        ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3-pro"),
+        ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.1-pro-preview"),
         ("https://api.mistral.ai/v1", "mistral-large-latest"),
     ],
 )
@@ -886,14 +886,16 @@ def test_reasoning_effort_is_sent_for_supported_openai_style_providers(
 @pytest.mark.parametrize(
     ("model", "effort", "expected"),
     [
-        ("gemini-3-pro", "minimal", "minimal"),
-        ("gemini-3-pro", "medium", "medium"),
-        ("gemini-3-pro", "high", "high"),
-        ("gemini-3-pro", "none", None),
+        ("gemini-3.1-pro-preview", "minimal", "minimal"),
+        ("gemini-3.1-pro-preview", "medium", "medium"),
+        ("gemini-3.1-pro-preview", "high", "high"),
+        ("gemini-3.1-pro-preview", "none", None),
+        ("gemini-3-flash-preview", "minimal", "minimal"),
+        ("gemini-3-flash-preview", "medium", "medium"),
         ("gemini-2.5-flash", "none", "none"),
         ("gemini-2.5-flash-lite", "none", "none"),
         ("gemini-2.5-pro", "none", None),
-        ("gemini-3-pro", "xhigh", None),
+        ("gemini-3.1-pro-preview", "xhigh", None),
     ],
 )
 def test_gemini_reasoning_effort_is_model_safe(
@@ -1306,7 +1308,7 @@ def test_stream_gemini_tool_call_extra_content_round_trips() -> None:
     client = OpenAICompatClient(
         base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         api_key="test",
-        model="gemini-3-pro",
+        model="gemini-3.1-pro-preview",
         transport=httpx.MockTransport(handler),
     )
 

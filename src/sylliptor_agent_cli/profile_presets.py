@@ -30,6 +30,8 @@ class ProfilePreset:
     extra_headers: dict[str, str] = field(default_factory=dict)
     suggested_models: tuple[str, ...] = ()
     suggested_model_descriptions: dict[str, str] = field(default_factory=dict)
+    model_aliases: dict[str, str] = field(default_factory=dict)
+    validation_model: str = ""
     web_search_adapter: str = AUTO_WEB_SEARCH_ADAPTER
     web_search_model: str = ""
     setup_warning: str = ""
@@ -89,13 +91,19 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         suggested_models=(
             "gemini-3.1-pro-preview",
             "gemini-3-flash-preview",
-            "gemini-3.1-flash-lite-preview",
+            "gemini-3.1-flash-lite",
         ),
         suggested_model_descriptions={
             "gemini-3.1-pro-preview": "default - software engineering and agentic workflows",
             "gemini-3-flash-preview": "coding - fast Gemini 3 model with 1M context",
-            "gemini-3.1-flash-lite-preview": "fast - low-cost high-volume agentic tasks",
+            "gemini-3.1-flash-lite": "fast - low-cost high-volume agentic tasks",
         },
+        model_aliases={
+            "gemini-3.1-preview": "gemini-3.1-pro-preview",
+            "gemini-3-pro-preview": "gemini-3.1-pro-preview",
+            "gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
+        },
+        validation_model="gemini-3-flash-preview",
         web_search_adapter=GEMINI_GROUNDING_ADAPTER,
         setup_warning=(
             "Gemini OpenAI compatibility is served from v1beta and these Gemini 3.x "
@@ -403,6 +411,18 @@ def model_options_for_preset(preset: ProfilePreset) -> tuple[tuple[str, str, str
         description = str(preset.suggested_model_descriptions.get(model_id) or "").strip()
         rows.append((model_id, model_id, description or "suggested by provider preset"))
     return tuple(rows)
+
+
+def canonical_model_alias_for_preset(preset: ProfilePreset, model: str) -> str:
+    """Map explicit stale provider aliases to the preset's current model ID."""
+    raw = str(model or "").strip()
+    if not raw:
+        return raw
+    for alias, canonical in preset.model_aliases.items():
+        if str(alias or "").strip().casefold() == raw.casefold():
+            normalized = str(canonical or "").strip()
+            return normalized or raw
+    return raw
 
 
 def find_preset_for_profile(profile: ProfileSpec) -> ProfilePreset | None:

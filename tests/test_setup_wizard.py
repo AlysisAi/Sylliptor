@@ -331,6 +331,51 @@ def test_deepseek_model_picker_uses_v4_models(monkeypatch, tmp_path: Path) -> No
     assert "deepseek-coder" not in model_values
 
 
+def test_gemini_model_picker_uses_current_preview_models(monkeypatch, tmp_path: Path) -> None:
+    _config_env(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    picker = PickerScript(["gemini", "gemini-3.1-pro-preview"])
+    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
+    monkeypatch.setattr(
+        setup_wizard_mod.typer, "prompt", PromptScript(["", "sk-test-1234", os.fspath(tmp_path)])
+    )
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+    model_values = [value for value, _label, _description in picker.calls[1]["rows"]]
+    assert model_values[0] == "gemini-3.1-pro-preview"
+    assert "gemini-3.1-flash-lite" in model_values
+    assert "gemini-3.1-preview" not in model_values
+    assert "gemini-3-pro-preview" not in model_values
+    assert "gemini-3.1-flash-lite-preview" not in model_values
+
+
+def test_gemini_custom_stale_preview_alias_canonicalizes_before_validation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    picker = PickerScript(["gemini", setup_wizard_mod._CUSTOM_MODEL_VALUE])
+    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
+    monkeypatch.setattr(
+        setup_wizard_mod.typer,
+        "prompt",
+        PromptScript(["", "sk-test-1234", "gemini-3.1-preview", os.fspath(tmp_path)]),
+    )
+    validated_models: list[str | None] = []
+
+    def validate(*, profile, api_key, model=None, **_kwargs):
+        del profile, api_key
+        validated_models.append(model)
+        return setup_wizard_mod._ApiKeyValidationResult(status="validated")
+
+    monkeypatch.setattr(setup_wizard_mod, "_validate_api_key", validate)
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+    assert validated_models == [None, "gemini-3.1-pro-preview"]
+    assert load_config().model == "gemini-3.1-pro-preview"
+
+
 def test_model_picker_without_suggestions_only_offers_custom() -> None:
     preset = ProfilePreset(
         key="empty",
@@ -397,7 +442,6 @@ def test_api_key_validation_posts_chat_completion_ping() -> None:
         "model": "example-model",
         "messages": [{"role": "user", "content": "ping"}],
         "temperature": 0.0,
-        "max_tokens": 1,
     }
 
 
@@ -425,6 +469,142 @@ def test_api_key_validation_400_model_not_found_is_distinct() -> None:
 
     assert result.status == "model_not_found"
     assert "Model 'example-model' not found" in result.message
+
+
+def test_api_key_validation_400_max_tokens_unsupported_is_not_model_not_found() -> None:
+    result, _captured = _validate_with_transport_response(
+        httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": (
+                        "Unsupported parameter: 'max_tokens' is not supported with this model. "
+                        "Use 'max_completion_tokens' instead."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "max_tokens",
+                    "code": "unsupported_parameter",
+                }
+            },
+        )
+    )
+
+    assert result.status == "inconclusive"
+    assert "max_tokens" in result.message
+    assert "not found" not in result.message
+
+
+def test_api_key_validation_retries_when_gemini_rejects_temperature() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.append(body)
+        if "temperature" in body:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "temperature cannot be set for this model.",
+                        "type": "invalid_request_error",
+                        "param": "temperature",
+                        "code": "unsupported_parameter",
+                    }
+                },
+            )
+        return httpx.Response(200, json={"choices": [{"message": {"content": "p"}}]})
+
+    result = _ORIGINAL_VALIDATE_API_KEY(
+        profile=ProfileSpec(
+            name="gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            default_model="gemini-3.1-pro-preview",
+        ),
+        api_key="sk-test",
+        model="gemini-3.1-pro-preview",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.status == "validated"
+    assert len(captured) == 3
+    assert captured[0]["temperature"] == 0.0
+    assert captured[1]["temperature"] == 1.0
+    assert "temperature" not in captured[2]
+
+
+def test_gemini_api_key_validation_uses_fast_validation_model_before_model_choice() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "p"}}]})
+
+    result = _ORIGINAL_VALIDATE_API_KEY(
+        profile=ProfileSpec(
+            name="gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            default_model="gemini-3.1-pro-preview",
+        ),
+        api_key="sk-test",
+        suggested_models=(
+            "gemini-3.1-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite",
+        ),
+        validation_model="gemini-3-flash-preview",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.status == "validated"
+    assert result.message == (
+        "Validated API key using 'gemini-3-flash-preview'. "
+        "The selected model will be verified next."
+    )
+    assert "gemini-3-flash-preview" in result.message
+    assert "fallback" not in result.message.casefold()
+    assert captured["body"]["model"] == "gemini-3-flash-preview"
+    assert captured["body"]["reasoning_effort"] == "low"
+
+
+def test_gemini_selected_model_validation_uses_low_reasoning_effort() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "p"}}]})
+
+    result = _ORIGINAL_VALIDATE_API_KEY(
+        profile=ProfileSpec(
+            name="gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            default_model="gemini-3.1-pro-preview",
+        ),
+        api_key="sk-test",
+        model="gemini-3.1-pro-preview",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.status == "validated"
+    assert result.message == ""
+    assert captured["body"]["model"] == "gemini-3.1-pro-preview"
+    assert captured["body"]["reasoning_effort"] == "low"
+
+
+def test_gemini_validation_uses_extended_timeout() -> None:
+    gemini_profile = ProfileSpec(
+        name="gemini",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    )
+    custom_profile = ProfileSpec(name="custom", base_url="https://api.example.test/v1")
+
+    assert (
+        setup_wizard_mod._validation_timeout_s(gemini_profile)
+        > setup_wizard_mod._VALIDATION_TIMEOUT_S
+    )
+    assert (
+        setup_wizard_mod._validation_timeout_s(custom_profile)
+        == setup_wizard_mod._VALIDATION_TIMEOUT_S
+    )
 
 
 def test_api_key_validation_404_is_endpoint_inconclusive_not_failed() -> None:

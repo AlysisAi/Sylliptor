@@ -75,7 +75,11 @@ def test_qwen_aliases_fold_to_single_canonical_key() -> None:
         ("https://openrouter.ai/api/v1", "openai/gpt-5", "openrouter"),
         ("https://api.openai.com/v1", "gpt-5", "openai"),
         ("https://api.deepseek.com/v1", "deepseek-chat", "deepseek"),
-        ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3-pro", "gemini"),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "gemini-3.1-pro-preview",
+            "gemini",
+        ),
         ("https://api.mistral.ai/v1", "mistral-large-latest", "mistral"),
         ("https://api.x.ai/v1", "grok-4", "xai"),
     ],

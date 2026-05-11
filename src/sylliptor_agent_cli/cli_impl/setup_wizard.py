@@ -33,6 +33,7 @@ from ..llm.openai_compat import LLMError
 from ..profile_presets import (
     PROFILE_PRESETS,
     ProfilePreset,
+    canonical_model_alias_for_preset,
     make_profile_from_preset,
     model_options_for_preset,
 )
@@ -53,6 +54,8 @@ _CUSTOM_PROVIDER_KEY = "custom"
 _MAX_API_KEY_VALIDATION_ATTEMPTS = 3
 _FALLBACK_VALIDATION_MODEL = "gpt-5.4-mini"
 _VALIDATION_TIMEOUT_S = 8.0
+_GEMINI_VALIDATION_TIMEOUT_S = 20.0
+_GEMINI_VALIDATION_REASONING_EFFORT = "low"
 
 _ValidationStatus = Literal[
     "validated",
@@ -394,6 +397,7 @@ def _prompt_api_key(
             profile=profile,
             api_key=value,
             suggested_models=_suggested_models(profile_result),
+            validation_model=_validation_model_hint(profile_result),
         )
         if validation.status == "validated":
             console.print("[green]Key validated.[/green]")
@@ -473,12 +477,23 @@ def _suggested_models(profile_result: _ProfileStepResult) -> tuple[str, ...]:
     )
 
 
+def _validation_model_hint(profile_result: _ProfileStepResult) -> str:
+    preset = profile_result.preset
+    if preset is None:
+        return ""
+    model = str(preset.validation_model or "").strip()
+    if not model:
+        return ""
+    return canonical_model_alias_for_preset(preset, model)
+
+
 def _validate_api_key(
     *,
     profile: ProfileSpec,
     api_key: str,
     model: str | None = None,
     suggested_models: tuple[str, ...] = (),
+    validation_model: str | None = None,
     transport: httpx.BaseTransport | None = None,
 ) -> _ApiKeyValidationResult:
     if not api_key.strip():
@@ -489,10 +504,11 @@ def _validate_api_key(
             status="inconclusive", message="Could not reach provider: Base URL is missing."
         )
 
-    validation_model = _resolve_validation_model(
+    resolved_validation_model = _resolve_validation_model(
         profile=profile,
         model=model,
         suggested_models=suggested_models,
+        validation_model=validation_model,
     )
     validation_profile = ProfileSpec(
         name=profile.name,
@@ -500,21 +516,22 @@ def _validate_api_key(
         base_url=base_url,
         api_key_env=profile.api_key_env,
         extra_headers=dict(profile.extra_headers),
-        default_model=validation_model.model,
+        default_model=resolved_validation_model.model,
         web_search_adapter=profile.web_search_adapter,
         web_search_model=profile.web_search_model,
         notes=profile.notes,
     )
     cfg = AppConfig(
-        model=validation_model.model,
+        model=resolved_validation_model.model,
         provider_retry_max_retries=0,
     )
     client = make_llm_client(
         cfg=cfg,
         api_key=api_key,
-        model=validation_model.model,
-        timeout_s=_VALIDATION_TIMEOUT_S,
+        model=resolved_validation_model.model,
+        timeout_s=_validation_timeout_s(validation_profile),
         temperature=0.0,
+        reasoning_effort=_validation_reasoning_effort(validation_profile),
         transport=transport,
         profile=validation_profile,
     )
@@ -522,19 +539,18 @@ def _validate_api_key(
         client.chat(
             messages=[{"role": "user", "content": "ping"}],
             temperature=0.0,
-            max_tokens=1,
         )
     except LLMError as exc:
         return _validation_result_from_error(
             exc,
             base_url=base_url,
-            model=validation_model.model,
+            model=resolved_validation_model.model,
         )
 
     message = ""
-    if validation_model.used_fallback:
+    if resolved_validation_model.used_fallback:
         message = (
-            f"Validated using fallback model '{validation_model.model}'. "
+            f"Validated API key using '{resolved_validation_model.model}'. "
             "The selected model will be verified next."
         )
     return _ApiKeyValidationResult(status="validated", message=message)
@@ -545,12 +561,37 @@ def _resolve_validation_model(
     profile: ProfileSpec,
     model: str | None,
     suggested_models: tuple[str, ...],
+    validation_model: str | None = None,
 ) -> _ResolvedValidationModel:
-    for candidate in (model, profile.default_model, *suggested_models):
+    explicit_model = str(model or "").strip()
+    if explicit_model:
+        return _ResolvedValidationModel(model=explicit_model, used_fallback=False)
+    validation_candidate = str(validation_model or "").strip()
+    if validation_candidate:
+        return _ResolvedValidationModel(model=validation_candidate, used_fallback=True)
+    for candidate in (profile.default_model, *suggested_models):
         normalized = str(candidate or "").strip()
         if normalized:
             return _ResolvedValidationModel(model=normalized, used_fallback=False)
     return _ResolvedValidationModel(model=_FALLBACK_VALIDATION_MODEL, used_fallback=True)
+
+
+def _validation_timeout_s(profile: ProfileSpec) -> float:
+    if _is_gemini_profile(profile):
+        return _GEMINI_VALIDATION_TIMEOUT_S
+    return _VALIDATION_TIMEOUT_S
+
+
+def _validation_reasoning_effort(profile: ProfileSpec) -> str | None:
+    if _is_gemini_profile(profile):
+        return _GEMINI_VALIDATION_REASONING_EFFORT
+    return None
+
+
+def _is_gemini_profile(profile: ProfileSpec) -> bool:
+    name = str(profile.name or "").strip().casefold()
+    base_url = str(profile.base_url or "").strip().casefold()
+    return name == "gemini" or "generativelanguage.googleapis.com" in base_url
 
 
 def _validation_result_from_error(
@@ -570,7 +611,7 @@ def _validation_result_from_error(
             status="failed",
             message=f"Provider rejected the API key (HTTP {status_code}).",
         )
-    if status_code == 400 and ("model" in error_text_lower or "not_found" in error_text_lower):
+    if status_code == 400 and _is_model_not_found_error(error_text_lower):
         return _ApiKeyValidationResult(
             status="model_not_found",
             message=f"Model '{model}' not found at this provider. Pick a different model in the next step.",
@@ -605,6 +646,25 @@ def _validation_result_from_error(
     return _ApiKeyValidationResult(
         status="inconclusive",
         message=f"Could not verify {base_url}: {exc}",
+    )
+
+
+def _is_model_not_found_error(error_text_lower: str) -> bool:
+    if "not_found" in error_text_lower and "model" in error_text_lower:
+        return True
+    if "model_not_found" in error_text_lower:
+        return True
+    if "model not found" in error_text_lower:
+        return True
+    if re.search(
+        r"\bmodel\b.{0,80}\b(?:does not exist|not exist|not found|unknown)", error_text_lower
+    ):
+        return True
+    return (
+        re.search(
+            r"\b(?:does not exist|not exist|not found|unknown)\b.{0,80}\bmodel\b", error_text_lower
+        )
+        is not None
     )
 
 
@@ -696,6 +756,8 @@ def _prompt_model_choice(
     else:
         model = selected
         is_custom = False
+    if profile_result.preset is not None:
+        model = canonical_model_alias_for_preset(profile_result.preset, model)
     if not model.strip():
         raise ConfigError("Default model is required.")
     console.print(f"[green]Default model:[/green] {model}")
@@ -751,6 +813,8 @@ def _model_picker_rows(profile_result: _ProfileStepResult) -> list[tuple[str, st
             rows.append((value, label, description))
     if profile_result.profile.default_model:
         normalized = str(profile_result.profile.default_model).strip()
+        if preset is not None:
+            normalized = canonical_model_alias_for_preset(preset, normalized)
         if normalized and normalized not in seen:
             seen.add(normalized)
             rows.append((normalized, normalized, "current profile default"))

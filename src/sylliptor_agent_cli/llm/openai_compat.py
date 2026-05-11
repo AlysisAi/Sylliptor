@@ -84,6 +84,8 @@ _TEMPERATURE_UNSUPPORTED_TOKENS = (
     "range",
     "deprecated",
     "only the default",
+    "cannot be set",
+    "must be omitted",
 )
 
 

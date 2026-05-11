@@ -356,6 +356,29 @@ def test_set_model_canonicalizes_legacy_numeric_separator_alias(
     assert profile.default_model == "mistral-medium-3-5"
 
 
+@pytest.mark.parametrize(
+    ("alias", "expected"),
+    [
+        ("gemini-3.1-preview", "gemini-3.1-pro-preview"),
+        ("gemini-3-pro-preview", "gemini-3.1-pro-preview"),
+        ("gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite"),
+    ],
+)
+def test_set_model_canonicalizes_gemini_stale_preview_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alias: str, expected: str
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    cfg = load_config()
+    set_config_value(cfg, "base_url", "https://generativelanguage.googleapis.com/v1beta/openai/")
+
+    set_config_value(cfg, "model", alias)
+
+    profile = get_active_profile(cfg)
+    assert profile.name == "gemini"
+    assert cfg.model == expected
+    assert profile.default_model == expected
+
+
 def test_set_known_base_url_switches_provider_profile_and_default_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

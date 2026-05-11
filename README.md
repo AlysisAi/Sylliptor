@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/AlysisAi/Sylliptor/main/docs/assets/sylliptor-demo.gif" alt="Sylliptor mascot" width="192">
+  <img src="https://raw.githubusercontent.com/AlysisAi/Sylliptor/main/docs/assets/sylliptor-logo.gif" alt="Sylliptor owl logo" width="192" height="192">
 </p>
 
 <h1 align="center">SYLLIPTOR</h1>

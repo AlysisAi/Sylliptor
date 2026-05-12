@@ -1165,7 +1165,7 @@ def _run_provider_section(state: ConfigMenuState, console: Console) -> None:
             rows=[
                 ("switch", "Switch active profile", "Choose another configured profile."),
                 ("add_preset", "Add from preset", "Pick a known provider (OpenAI, Anthropic, ...)"),
-                ("add_custom", "Add custom", "Use any OpenAI-compatible base URL"),
+                ("add_custom", "Add custom", "Use any API base URL"),
                 ("edit", "Edit current", "Change URL, key env, default model, headers, notes"),
                 ("remove", "Remove", "Delete a profile (applied on save)"),
                 ("back", "Back", "Return to the menu"),
@@ -1246,7 +1246,7 @@ def _preset_description(preset: ProfilePreset) -> str:
     parsed = urlparse(preset.base_url)
     if parsed.netloc:
         return parsed.netloc
-    return "Use any OpenAI-compatible base URL"
+    return "Use any API base URL"
 
 
 def _print_preset_warning(console: Console, preset: ProfilePreset) -> None:
@@ -1266,7 +1266,7 @@ def _run_profile_add_custom(state: ConfigMenuState, console: Console) -> None:
         extra_headers=headers,
         web_search_adapter="auto",
         web_search_model="",
-        notes="Custom OpenAI-compatible endpoint.",
+        notes="Custom model API endpoint.",
     )
     state.add_profile_spec(profile)
     console.print(f"[green]Profile {profile.name} added.[/green]")

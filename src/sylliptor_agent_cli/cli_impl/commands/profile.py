@@ -107,7 +107,7 @@ def profile_show(name: str = typer.Argument(..., help="Profile name.")) -> None:
 @profile_app.command("add")
 def profile_add(
     name: str = typer.Argument(..., help="Profile name."),
-    base_url: str = typer.Option(..., "--base-url", help="OpenAI-compatible base URL."),
+    base_url: str = typer.Option(..., "--base-url", help="Model provider API base URL."),
     api_key_env: str | None = typer.Option(None, "--api-key-env", help="API key env var."),
     header: list[str] | None = typer.Option(None, "--header", help="Extra request header k=v."),
     default_model: str = typer.Option("", "--default-model", help="Default model."),

@@ -322,7 +322,7 @@ def _prompt_custom_profile(previous: ProfileSpec | None = None) -> ProfileSpec:
         protocol="openai_compat",
         base_url=base_url,
         extra_headers=headers,
-        notes=previous.notes if previous is not None else "Custom OpenAI-compatible endpoint.",
+        notes=previous.notes if previous is not None else "Custom model API endpoint.",
     )
 
 
@@ -1251,7 +1251,7 @@ def _preset_description(preset: ProfilePreset) -> str:
     parsed = urlparse(preset.base_url)
     if parsed.netloc:
         return parsed.netloc
-    return "Use any OpenAI-compatible base URL"
+    return "Use any API base URL"
 
 
 def _print_preset_warning(console: Console, preset: ProfilePreset) -> None:

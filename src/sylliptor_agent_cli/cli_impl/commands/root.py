@@ -52,7 +52,7 @@ def _cli_module() -> Any:
     return cli
 
 
-app = typer.Typer(add_completion=False, help="Local CLI coding agent (OpenAI-compatible).")
+app = typer.Typer(add_completion=False, help="Local CLI coding agent powered by any API.")
 app.add_typer(config_app, name="config")
 app.add_typer(profile_app, name="profile")
 app.add_typer(update_app, name="update")

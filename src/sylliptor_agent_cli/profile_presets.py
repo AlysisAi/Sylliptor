@@ -239,7 +239,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         web_search_adapter=GROQ_COMPOUND_ADAPTER,
         web_search_model="groq/compound-mini",
         setup_warning=(
-            "Groq is mostly OpenAI-compatible; avoid preview-only models as production defaults."
+            "Groq uses the standard chat-completions API shape; avoid preview-only models as production defaults."
         ),
     ),
     ProfilePreset(

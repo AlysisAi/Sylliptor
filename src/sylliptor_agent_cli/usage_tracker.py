@@ -167,7 +167,7 @@ def _looks_like_character_count(
     if character_count <= 0:
         return api_count >= max(estimated_tokens * 3, estimated_tokens + 256)
 
-    # Some OpenAI-compatible providers put character counts in token fields.
+    # Some providers put character counts in token fields.
     # Trust plausible API token counts, but replace counts that are much closer
     # to raw text size than to the local tokenizer estimate.
     minimum_delta = 64 if character_count < 2048 else 256

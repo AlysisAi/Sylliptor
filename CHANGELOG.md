@@ -75,7 +75,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Core local agent CLI with chat and run modes, OpenAI-compatible model access, tool execution, streaming responses, image inputs, clipboard support, and slash commands.
+- Core local agent CLI with chat and run modes, model provider API access, tool execution, streaming responses, image inputs, clipboard support, and slash commands.
 - Setup, configuration, usage tracking, conversation compaction, history search, and workspace binding flows.
 - Forge planning and execution workflows with swarm orchestration, worktrees, verification gates, review gates, conflict review, and feedback bundle export.
 - Sandboxed shell execution, isolated server worker jobs, web fetch/search tools, subagents, and the first extensions foundation.
@@ -93,5 +93,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Initial Python package scaffold for a local OpenAI-compatible coding agent CLI.
+- Initial Python package scaffold for a local coding agent CLI.
 - Baseline README, architecture notes, Apache-2.0 license, packaging metadata, and development configuration.

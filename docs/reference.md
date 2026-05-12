@@ -184,7 +184,7 @@ sylliptor profile list
 ```
 
 Presets are convenience templates, not hard constraints. Custom profiles can
-point at OpenAI-compatible endpoints.
+point at model provider endpoints.
 
 ## Built-In Tools
 

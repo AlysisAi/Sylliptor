@@ -69,8 +69,8 @@ work, interactive chat or Forge is usually a better fit.
 ### Model Provider Layer
 
 Sylliptor talks to model providers through configured API profiles. The default
-transport is OpenAI-compatible chat completions, with provider-specific request
-normalization where needed.
+transport is chat completions, with provider-specific request normalization
+where needed.
 
 Model choice, base URL, API key source, timeout, reasoning options, and role
 overrides are resolved before a session starts. Provider credentials are never

@@ -29,7 +29,7 @@ def make_llm_client(
     transport: httpx.BaseTransport | None = None,
     profile: ProfileSpec | None = None,
 ) -> OpenAICompatClient:
-    """Build an OpenAI-compatible client using the resolved provider profile."""
+    """Build a chat-completions client using the resolved provider profile."""
     resolved_profile = profile or get_active_profile(cfg)
     base_url = _resolve_base_url(cfg=cfg, profile=resolved_profile)
     resolved_enable_thinking = (

@@ -4,10 +4,12 @@ import pytest
 
 from sylliptor_agent_cli.config import AppConfig, ConfigError
 from sylliptor_agent_cli.model_router import (
+    PREFER_CONTEXT_FORGE,
     ROLE_CODING,
     ROLE_COMPACTOR,
     ROLE_COMPREHENSION,
     ROLE_REVIEW,
+    ROLE_ROUTER,
     resolve_model_for_role,
 )
 
@@ -39,6 +41,24 @@ def test_resolve_model_for_role_plan_overrides_config(monkeypatch) -> None:
 
     resolved = resolve_model_for_role(cfg=cfg, role=ROLE_CODING, plan=plan)
     assert resolved == "plan-coding-model"
+
+
+def test_resolve_router_model_prefers_forge_override(monkeypatch) -> None:
+    cfg = AppConfig(model="default-model")
+    cfg.extra_fields = {
+        "role_models": {ROLE_ROUTER: "config-router-model"},
+        "forge_role_models": {ROLE_ROUTER: "forge-router-model"},
+    }
+    monkeypatch.delenv("SYLLIPTOR_MODEL_ROUTER", raising=False)
+
+    resolved = resolve_model_for_role(
+        cfg=cfg,
+        role=ROLE_ROUTER,
+        plan={},
+        prefer_context=PREFER_CONTEXT_FORGE,
+    )
+
+    assert resolved == "forge-router-model"
 
 
 def test_resolve_model_for_role_falls_back_to_cfg_model(monkeypatch) -> None:

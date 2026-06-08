@@ -33,12 +33,12 @@ def _github_owner_from_url(url: str) -> str | None:
 
 
 def _packaging_source_urls() -> tuple[str, ...]:
+    urls: list[str] = [PROJECT_SOURCE_URL]
     try:
         package_metadata = importlib_metadata.metadata(PYTHON_PACKAGE_NAME)
     except importlib_metadata.PackageNotFoundError:
-        return (PROJECT_SOURCE_URL,)
+        return tuple(urls)
 
-    urls: list[str] = []
     homepage = package_metadata.get("Home-page")
     if homepage:
         urls.append(homepage)
@@ -46,7 +46,6 @@ def _packaging_source_urls() -> tuple[str, ...]:
         label, _, value = project_url.partition(",")
         if label.strip().lower() in {"source", "repository", "homepage"} and value.strip():
             urls.append(value.strip())
-    urls.append(PROJECT_SOURCE_URL)
     return tuple(dict.fromkeys(urls))
 
 
@@ -62,7 +61,7 @@ def default_sandbox_docker_image(variant: str = "dev") -> str:
     tag = variant.strip() or "dev"
     owner = resolve_ghcr_owner()
     if owner:
-        return f"ghcr.io/{owner}/{SANDBOX_IMAGE_REPOSITORY}:{tag}"
+        return f"ghcr.io/{owner.lower()}/{SANDBOX_IMAGE_REPOSITORY}:{tag}"
     return f"{SANDBOX_IMAGE_REPOSITORY}:{tag}"
 
 

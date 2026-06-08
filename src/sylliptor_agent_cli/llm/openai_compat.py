@@ -6,60 +6,50 @@ import logging
 import re
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
+from ..provider_telemetry import ProviderCallTelemetryRecorder
+from .metadata import (
+    DEEPSEEK_REASONING_CONTENT_KEY as _DEEPSEEK_REASONING_CONTENT_KEY,
+)
+from .metadata import (
+    OPENROUTER_REASONING_DETAILS_KEY as _OPENROUTER_REASONING_DETAILS_KEY,
+)
+from .metadata import (
+    OPENROUTER_REASONING_KEY as _OPENROUTER_REASONING_KEY,
+)
+from .metadata import (
+    PROVIDER_METADATA_KEY,
+    strip_provider_metadata_from_message,
+)
+from .metadata import (
+    TOOL_CALL_PROVIDER_METADATA_KEY as _TOOL_CALL_PROVIDER_METADATA_KEY,
+)
+from .metadata import (
+    assistant_message_from_response as assistant_message_from_response,
+)
+from .metadata import (
+    attach_provider_metadata_to_assistant_message as attach_provider_metadata_to_assistant_message,
+)
+from .metadata import (
+    merge_provider_metadata as _merge_provider_metadata,
+)
 from .provider_limits import (
     DEFAULT_PROVIDER_CONCURRENCY_CAPS,
     ProviderRetrySettings,
     best_effort_provider_key,
     run_provider_limited_call,
 )
-
-
-class LLMError(RuntimeError):
-    pass
-
-
-@dataclass(frozen=True)
-class ToolCall:
-    id: str
-    name: str
-    arguments: dict[str, Any]
-    provider_metadata: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class LLMUsage:
-    prompt_tokens: int | None
-    completion_tokens: int | None
-    total_tokens: int | None
-    cached_prompt_tokens: int | None = None
-
-
-@dataclass(frozen=True)
-class LLMResponse:
-    content: str
-    tool_calls: list[ToolCall]
-    raw: dict[str, Any]
-    response_model: str | None = None
-    usage: LLMUsage | None = None
-    provider_metadata: dict[str, Any] | None = None
-
+from .types import LLMError, LLMResponse, LLMUsage, ToolCall
 
 _TEXT_LIKE_CONTENT_PART_TYPES = {"text", "output_text"}
-PROVIDER_METADATA_KEY = "_sylliptor_provider_metadata"
 _DEEPSEEK_PROVIDER_KEY = "deepseek"
-_DEEPSEEK_REASONING_CONTENT_KEY = "reasoning_content"
 _OPENROUTER_PROVIDER_KEY = "openrouter"
-_OPENROUTER_REASONING_KEY = "reasoning"
-_OPENROUTER_REASONING_DETAILS_KEY = "reasoning_details"
 _GEMINI_PROVIDER_KEY = "gemini"
 _GEMINI_EXTRA_CONTENT_KEY = "extra_content"
-_TOOL_CALL_PROVIDER_METADATA_KEY = "_tool_calls"
 _OPENAI_STYLE_REASONING_EFFORT_PROVIDERS = frozenset({"openai", "azure", "mistral"})
 _GEMINI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 _DEFAULT_ACCEPT_ENCODING = "identity"
@@ -387,17 +377,6 @@ def _provider_metadata_for_reasoning(
     return None
 
 
-def _merge_provider_metadata(*items: dict[str, Any] | None) -> dict[str, Any] | None:
-    merged: dict[str, Any] = {}
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for key, value in item.items():
-            if isinstance(value, dict) and value:
-                merged[str(key)] = dict(value)
-    return merged or None
-
-
 def _deepseek_reasoning_from_provider_metadata(metadata: Any) -> str:
     if not isinstance(metadata, dict):
         return ""
@@ -431,27 +410,6 @@ def _gemini_tool_call_provider_metadata(tool_call: dict[str, Any]) -> dict[str, 
             _GEMINI_EXTRA_CONTENT_KEY: copy.deepcopy(extra_content),
         }
     }
-
-
-def _tool_call_metadata_entries(response: Any) -> list[dict[str, Any]]:
-    tool_calls = getattr(response, "tool_calls", None)
-    if not isinstance(tool_calls, list):
-        return []
-    entries: list[dict[str, Any]] = []
-    for index, tool_call in enumerate(tool_calls):
-        metadata = getattr(tool_call, "provider_metadata", None)
-        merged = _merge_provider_metadata(metadata)
-        if not merged:
-            continue
-        entry: dict[str, Any] = {
-            "index": index,
-            "metadata": merged,
-        }
-        tool_call_id = str(getattr(tool_call, "id", "") or "")
-        if tool_call_id:
-            entry["id"] = tool_call_id
-        entries.append(entry)
-    return entries
 
 
 def _copy_transport_tool_calls(
@@ -526,35 +484,6 @@ def _reattach_gemini_tool_call_extra_content(
             copied_tool_call[_GEMINI_EXTRA_CONTENT_KEY] = copy.deepcopy(extra_content)
         reattached.append(copied_tool_call)
     message["tool_calls"] = reattached
-
-
-def strip_provider_metadata_from_message(message: dict[str, Any]) -> dict[str, Any]:
-    copied = dict(message)
-    copied.pop(PROVIDER_METADATA_KEY, None)
-    copied.pop(_DEEPSEEK_REASONING_CONTENT_KEY, None)
-    copied.pop(_OPENROUTER_REASONING_KEY, None)
-    copied.pop(_OPENROUTER_REASONING_DETAILS_KEY, None)
-    return copied
-
-
-def attach_provider_metadata_to_assistant_message(
-    message: dict[str, Any],
-    response: Any,
-) -> dict[str, Any]:
-    if str(message.get("role") or "") != "assistant":
-        return message
-    if not message.get("tool_calls"):
-        return message
-    message_metadata = _merge_provider_metadata(getattr(response, "provider_metadata", None))
-    tool_call_metadata = _tool_call_metadata_entries(response)
-    if not message_metadata and not tool_call_metadata:
-        return message
-    copied = dict(message)
-    merged = dict(message_metadata or {})
-    if tool_call_metadata:
-        merged[_TOOL_CALL_PROVIDER_METADATA_KEY] = tool_call_metadata
-    copied[PROVIDER_METADATA_KEY] = merged
-    return copied
 
 
 def _message_for_transport(
@@ -998,6 +927,16 @@ class OpenAICompatClient:
                 model=self.model,
             )
         )
+        telemetry = ProviderCallTelemetryRecorder(
+            provider_key=provider_key,
+            protocol="openai_compat",
+            model=self.model,
+            base_url=self.base_url,
+            stream=stream,
+            tools=tools,
+            operation="chat_completions",
+        )
+        telemetry_on_text_delta = telemetry.wrap_text_delta(on_text_delta)
 
         def _send_request() -> LLMResponse:
             temperature_retry_count = 0
@@ -1012,7 +951,7 @@ class OpenAICompatClient:
                                 ) as resp:
                                     response = self._parse_stream_response(
                                         resp,
-                                        on_text_delta=on_text_delta,
+                                        on_text_delta=telemetry_on_text_delta,
                                         provider_key=transport_provider_key,
                                     )
                             else:
@@ -1077,14 +1016,17 @@ class OpenAICompatClient:
             except Exception as e:  # noqa: BLE001 - network errors vary
                 raise LLMError(f"LLM request failed: {e}") from e
 
-        return run_provider_limited_call(
-            call=_send_request,
-            provider_key=provider_key,
-            provider_concurrency_caps=self.provider_concurrency_caps,
-            retry_settings=self.provider_retry_settings,
-            operation="chat_completions",
-            sleep_fn=self._provider_sleep_fn,
-            random_fn=self._provider_random_fn,
+        return telemetry.run(
+            lambda: run_provider_limited_call(
+                call=_send_request,
+                provider_key=provider_key,
+                provider_concurrency_caps=self.provider_concurrency_caps,
+                retry_settings=self.provider_retry_settings,
+                operation="chat_completions",
+                sleep_fn=self._provider_sleep_fn,
+                random_fn=self._provider_random_fn,
+                on_retry=telemetry.on_retry,
+            )
         )
 
     @staticmethod

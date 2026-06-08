@@ -3,9 +3,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
-import time
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -1379,7 +1380,7 @@ def test_subagent_tool_result_fires_subagent_stop_event(
 
 def _env_probe_command() -> str:
     return (
-        f'{sys.executable} -c "import os,json,sys; '
+        f'{shlex.quote(sys.executable)} -c "import os,json,sys; '
         "print(json.dumps({'has_openai': 'OPENAI_API_KEY' in os.environ, "
         "'my_flag': os.environ.get('MY_FLAG'), "
         "'has_path': 'PATH' in os.environ, "
@@ -1643,7 +1644,7 @@ def test_env_sandbox_all_mode_unchanged(
 
 def _payload_inspect_command() -> str:
     return (
-        f'{sys.executable} -c "import json,sys; '
+        f'{shlex.quote(sys.executable)} -c "import json,sys; '
         "d=json.load(sys.stdin); "
         "ti=d.get('tool_input',{}); "
         "c=ti.get('content'); "
@@ -1878,19 +1879,6 @@ def test_payload_truncation_audit_flag(
     assert audit_events[0].get("payload_bytes", 0) > 2 * 1024 * 1024
 
 
-def _sleep_command(seconds: float) -> str:
-    return f'{sys.executable} -c "import time; time.sleep({seconds:.3f})"'
-
-
-def _sleep_emit_command(seconds: float, message: str) -> str:
-    # Use single-quoted outer shell string + double-quoted JSON inside.
-    inner = (
-        f"import time,json; time.sleep({seconds:.3f}); "
-        f'print(json.dumps({{\\"additionalSystemMessages\\": [\\"{message}\\"]}}))'
-    )
-    return f'{sys.executable} -c "{inner}"'
-
-
 def _build_parallel_hook_dispatcher(
     *,
     workspace_root: Path,
@@ -1924,18 +1912,18 @@ def test_parallel_execution_non_blocking_speedup(
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": _sleep_command(0.4),
-                                "id": "sleep-a",
+                                "command": "fake-hook-a",
+                                "id": "fake-a",
                             },
                             {
                                 "type": "command",
-                                "command": _sleep_command(0.4),
-                                "id": "sleep-b",
+                                "command": "fake-hook-b",
+                                "id": "fake-b",
                             },
                             {
                                 "type": "command",
-                                "command": _sleep_command(0.4),
-                                "id": "sleep-c",
+                                "command": "fake-hook-c",
+                                "id": "fake-c",
                             },
                         ],
                     }
@@ -1945,24 +1933,60 @@ def test_parallel_execution_non_blocking_speedup(
     )
     _trust_project_hooks(tmp_path)
 
+    expected_commands = {"fake-hook-a", "fake-hook-b", "fake-hook-c"}
+    barrier = threading.Barrier(len(expected_commands), timeout=5.0)
+    lock = threading.Lock()
+    active_count = 0
+    max_active_count = 0
+    started_commands: list[str] = []
+
+    def fake_run(
+        command: str,
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal active_count, max_active_count
+        assert command in expected_commands
+        assert kwargs["shell"] is True
+        assert kwargs["cwd"] == os.fspath(tmp_path)
+        assert kwargs["capture_output"] is True
+        assert isinstance(kwargs["input"], str)
+
+        with lock:
+            started_commands.append(command)
+            active_count += 1
+            max_active_count = max(max_active_count, active_count)
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError as exc:
+            raise AssertionError(
+                "parallel hook dispatch did not start all hooks concurrently"
+            ) from exc
+        finally:
+            with lock:
+                active_count -= 1
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(hooks_dispatcher_mod.subprocess, "run", fake_run)
+
     dispatcher = _build_parallel_hook_dispatcher(
         workspace_root=tmp_path,
         parallel_enabled=True,
         max_parallel_workers=4,
     )
-    started = time.monotonic()
     result = dispatcher.fire_turn_complete(
         cwd=tmp_path,
         active_workdir_relpath=".",
         payload={"reason": "completed"},
     )
-    elapsed = time.monotonic() - started
 
     assert result.blocked is False
-    # Serial execution would take ~1.2s+ for three 0.4s hooks; parallel (4 workers)
-    # should finish near one 0.4s slot plus startup overhead. Use a generous upper
-    # bound (<1.0s) to tolerate slow CI while still proving parallelism.
-    assert elapsed < 1.0, f"expected parallel dispatch <1.0s, got {elapsed:.3f}s"
+    assert set(started_commands) == expected_commands
+    assert max_active_count == len(expected_commands)
 
 
 def test_parallel_execution_disabled_is_serial(
@@ -1980,18 +2004,18 @@ def test_parallel_execution_disabled_is_serial(
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": _sleep_command(0.4),
-                                "id": "sleep-a",
+                                "command": "fake-hook-a",
+                                "id": "fake-a",
                             },
                             {
                                 "type": "command",
-                                "command": _sleep_command(0.4),
-                                "id": "sleep-b",
+                                "command": "fake-hook-b",
+                                "id": "fake-b",
                             },
                             {
                                 "type": "command",
-                                "command": _sleep_command(0.4),
-                                "id": "sleep-c",
+                                "command": "fake-hook-c",
+                                "id": "fake-c",
                             },
                         ],
                     }
@@ -2001,22 +2025,43 @@ def test_parallel_execution_disabled_is_serial(
     )
     _trust_project_hooks(tmp_path)
 
+    expected_commands = ["fake-hook-a", "fake-hook-b", "fake-hook-c"]
+    caller_thread_id = threading.get_ident()
+    observed: list[tuple[str, int]] = []
+
+    def fake_run(
+        command: str,
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        assert command in expected_commands
+        assert kwargs["shell"] is True
+        assert kwargs["cwd"] == os.fspath(tmp_path)
+        assert kwargs["capture_output"] is True
+        assert isinstance(kwargs["input"], str)
+        observed.append((command, threading.get_ident()))
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(hooks_dispatcher_mod.subprocess, "run", fake_run)
+
     dispatcher = _build_parallel_hook_dispatcher(
         workspace_root=tmp_path,
         parallel_enabled=False,
         max_parallel_workers=4,
     )
-    started = time.monotonic()
     result = dispatcher.fire_turn_complete(
         cwd=tmp_path,
         active_workdir_relpath=".",
         payload={"reason": "completed"},
     )
-    elapsed = time.monotonic() - started
 
     assert result.blocked is False
-    # Serial execution of three 0.4s hooks should clearly exceed 1.0s wall time.
-    assert elapsed > 1.0, f"expected serial dispatch >1.0s, got {elapsed:.3f}s"
+    assert [command for command, _thread_id in observed] == expected_commands
+    assert {thread_id for _command, thread_id in observed} == {caller_thread_id}
 
 
 def test_parallel_execution_preserves_merge_order(
@@ -2026,8 +2071,6 @@ def test_parallel_execution_preserves_merge_order(
     cfg_dir = tmp_path / "cfg"
     monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(cfg_dir))
     # Hook priorities 30/20/10 force deterministic config order: msg-0, msg-1, msg-2.
-    # Sleep times 0.3s/0.1s/0.2s ensure parallel completion order (msg-1 first,
-    # msg-2 second, msg-0 last) differs from configured merge order.
     _write_json(
         project_hooks_config_path(tmp_path),
         {
@@ -2037,19 +2080,19 @@ def test_parallel_execution_preserves_merge_order(
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": _sleep_emit_command(0.3, "msg-0"),
+                                "command": "emit-0",
                                 "id": "emit-0",
                                 "priority": 30,
                             },
                             {
                                 "type": "command",
-                                "command": _sleep_emit_command(0.1, "msg-1"),
+                                "command": "emit-1",
                                 "id": "emit-1",
                                 "priority": 20,
                             },
                             {
                                 "type": "command",
-                                "command": _sleep_emit_command(0.2, "msg-2"),
+                                "command": "emit-2",
                                 "id": "emit-2",
                                 "priority": 10,
                             },
@@ -2060,6 +2103,54 @@ def test_parallel_execution_preserves_merge_order(
         },
     )
     _trust_project_hooks(tmp_path)
+
+    expected_commands = {"emit-0", "emit-1", "emit-2"}
+    barrier = threading.Barrier(len(expected_commands), timeout=5.0)
+    emit_1_done = threading.Event()
+    emit_2_done = threading.Event()
+    completion_order: list[str] = []
+    lock = threading.Lock()
+
+    def fake_run(
+        command: str,
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        assert command in expected_commands
+        assert kwargs["shell"] is True
+        assert kwargs["cwd"] == os.fspath(tmp_path)
+        assert kwargs["capture_output"] is True
+        assert isinstance(kwargs["input"], str)
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError as exc:
+            raise AssertionError(
+                "parallel hook dispatch did not start all hooks concurrently"
+            ) from exc
+
+        if command == "emit-2":
+            assert emit_1_done.wait(timeout=5.0)
+        elif command == "emit-0":
+            assert emit_2_done.wait(timeout=5.0)
+
+        messages = {
+            "emit-0": "msg-0",
+            "emit-1": "msg-1",
+            "emit-2": "msg-2",
+        }
+        with lock:
+            completion_order.append(command)
+        if command == "emit-1":
+            emit_1_done.set()
+        elif command == "emit-2":
+            emit_2_done.set()
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps({"additionalSystemMessages": [messages[command]]}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(hooks_dispatcher_mod.subprocess, "run", fake_run)
 
     dispatcher = _build_parallel_hook_dispatcher(
         workspace_root=tmp_path,
@@ -2072,6 +2163,7 @@ def test_parallel_execution_preserves_merge_order(
         payload={"reason": "completed"},
     )
 
+    assert completion_order == ["emit-1", "emit-2", "emit-0"]
     assert result.additional_system_messages == ("msg-0", "msg-1", "msg-2")
 
 

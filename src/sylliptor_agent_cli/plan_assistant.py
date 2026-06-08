@@ -42,9 +42,11 @@ from .failure_category import (
     is_provider_throttling_error,
     is_provider_unavailable_error,
 )
+from .llm.base import ChatClient
 from .llm.factory import _resolve_base_url, make_llm_client
-from .llm.openai_compat import LLMError, attach_provider_metadata_to_assistant_message
+from .llm.metadata import assistant_message_from_response
 from .llm.openai_compat import OpenAICompatClient as _OpenAICompatClient
+from .llm.types import LLMError
 from .mcp.forge_scope import normalize_task_mcp_scope, serialize_task_mcp_scope
 from .model_metadata_policy import (
     ActiveModelRef,
@@ -53,10 +55,30 @@ from .model_metadata_policy import (
 )
 from .model_registry import ModelRegistry
 from .model_router import PREFER_CONTEXT_FORGE, ROLE_PLANNER, ROLE_ROUTER, resolve_model_for_role
+from .planning_constraints import (
+    PLANNING_CONSTRAINTS_KEY,
+    merge_latest_planning_scope_constraints,
+    path_matches_planning_root,
+    planning_constraints_from_plan,
+    planning_constraints_prompt_payload,
+    task_has_target_root_scope,
+    task_scope_constraint_violations,
+    update_plan_planning_constraints,
+)
 from .profiles import get_active_profile
 from .swarm_scheduler import canonical_task_status
+from .task_dependencies import apply_ordered_dependency_inference
+from .task_readiness import (
+    TASK_KIND_ANALYSIS_ONLY,
+)
+from .task_readiness import (
+    classify_task_lifecycle as _classify_task_lifecycle,
+)
 from .task_readiness import (
     contains_mutating_task_signal as _contains_mutating_task_signal,
+)
+from .task_readiness import (
+    has_mutating_task_action_clause as _has_mutating_task_action_clause,
 )
 from .task_readiness import (
     has_runnable_local_file_scope as _has_runnable_local_file_scope,
@@ -103,6 +125,10 @@ How to structure tasks (high quality)
   discovery into the implementation task unless the requested output is explicitly report-only.
 - Paths described as forbidden, preserved, excluded, ignored, or untouched must not appear in
   estimated_files or write_scope.
+- In monorepos, user-named package/service roots narrow the plan. If the user says only, stay
+  inside, ignore, unrelated, decoy, or do not touch an area, treat that as a scope constraint.
+- Decoys and negative examples are not implementation targets. Do not create tasks from them.
+- Do not supersede valid target-root tasks just because an out-of-scope or decoy area is mentioned.
 - Use `mcp_scope` only when the task truly needs remote MCP access during `forge_exec`.
 - `mcp_scope.allow_resources` controls the generic host-owned `mcp_resources_list` /
   `mcp_resource_read` tools.
@@ -270,6 +296,7 @@ class PlannerTurnResult:
     model: str = ""
     planner_invoked: bool = True
     planner_router_event: dict[str, Any] | None = None
+    schema_failures: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -332,6 +359,11 @@ _REPO_LOCATOR_QUESTION_RE = re.compile(
     r"\b(?:paths?|files?|folders?|directories|modules?|functions?|classes|imports?|"
     r"identifiers?|repo(?:sitory)?|codebase)\b",
     re.IGNORECASE,
+)
+_REPO_LOCATOR_REQUEST_RE = re.compile(
+    r"\b(?:find|locate|map|where|which)\b.{0,100}\b(?:behavior|code|file|files|"
+    r"function|implementation|lives?|module|path|repo(?:sitory)?|scope)\b",
+    re.IGNORECASE | re.DOTALL,
 )
 _KNOWN_NON_SOURCE_TOP_LEVEL_DIRS = frozenset(
     {
@@ -1452,6 +1484,7 @@ def apply_guarded_planner_plan_update(
     plan_update: dict[str, Any],
     *,
     latest_user_text: str = "",
+    workspace_context: dict[str, Any] | None = None,
 ) -> PlanApplyResult:
     guarded_update = sanitize_guarded_planner_plan_update(plan=plan, plan_update=plan_update)
     apply_result = apply_plan_update(
@@ -1459,6 +1492,7 @@ def apply_guarded_planner_plan_update(
         guarded_update.plan_update,
         skip_dependency_cleanup_task_ids=set(protected_task_ids(plan)),
         latest_user_text=latest_user_text,
+        workspace_context=workspace_context,
     )
     should_synthesize_follow_up = bool(guarded_update.rejected_protected_updates) and not (
         _has_runnable_planned_tasks(plan)
@@ -1572,6 +1606,20 @@ def _planner_questions_ask_for_repo_locator(questions: list[str]) -> bool:
     return bool(_REPO_LOCATOR_QUESTION_RE.search(joined))
 
 
+def _user_text_requests_repo_locator(user_text: str) -> bool:
+    return bool(_REPO_LOCATOR_REQUEST_RE.search(str(user_text or "")))
+
+
+def _user_text_requests_mutating_repo_work(
+    *,
+    user_text: str,
+    planner_asked_locator: bool,
+) -> bool:
+    if planner_asked_locator:
+        return _contains_mutating_task_signal(user_text)
+    return _has_mutating_task_action_clause(user_text)
+
+
 def _workspace_manifest_paths(workspace_context: dict[str, Any] | None) -> set[str]:
     if not isinstance(workspace_context, dict):
         return set()
@@ -1660,19 +1708,50 @@ def _apply_repo_grounding_fallback(
     user_text: str,
     workspace_context: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    if validated.get("plan_update") is not None:
+    plan_update = validated.get("plan_update")
+    if isinstance(plan_update, dict) and any(
+        plan_update.get(key) for key in ("tasks_add", "tasks_update", "tasks_remove")
+    ):
         return validated
     questions = [
         str(item).strip() for item in validated.get("questions") or [] if str(item).strip()
     ]
-    if not questions or not _planner_questions_ask_for_repo_locator(questions):
+    planner_asked_locator = bool(questions and _planner_questions_ask_for_repo_locator(questions))
+    user_asked_locator = _user_text_requests_repo_locator(user_text)
+    if not planner_asked_locator and not user_asked_locator:
         return validated
     if not _workspace_has_existing_repo_context(workspace_context):
         return validated
-    if not _contains_mutating_task_signal(user_text):
-        return validated
+    if not _user_text_requests_mutating_repo_work(
+        user_text=user_text,
+        planner_asked_locator=planner_asked_locator,
+    ):
+        return _repo_locator_report_fallback(validated=validated, user_text=user_text)
 
-    scope = _workspace_scope_globs(workspace_context)
+    constraints = merge_latest_planning_scope_constraints(
+        planning_constraints_from_plan(plan),
+        text=user_text,
+        workspace_context=workspace_context,
+        direction_change=detect_direction_change(user_text),
+    )
+    if constraints.target_roots:
+        scope = [
+            item.path
+            if item.path.endswith("/**") or "." in PurePosixPath(item.path).name
+            else f"{item.path}/**"
+            for item in constraints.target_roots
+        ]
+    else:
+        scope = _workspace_scope_globs(workspace_context)
+    if constraints.blocked_roots:
+        scope = [
+            path
+            for path in scope
+            if not any(
+                path_matches_planning_root(path, blocked.path)
+                for blocked in constraints.blocked_roots
+            )
+        ]
     if not scope:
         return validated
     verify_commands = _workspace_string_list(workspace_context, "likely_test_commands")
@@ -1703,6 +1782,41 @@ def _apply_repo_grounding_fallback(
                 "dependencies": [],
                 "estimated_files": scope,
                 "write_scope": scope,
+                "parallel_group": "",
+            }
+        ]
+    }
+    return fallback
+
+
+def _repo_locator_report_fallback(
+    *,
+    validated: dict[str, Any],
+    user_text: str,
+) -> dict[str, Any]:
+    fallback = dict(validated)
+    fallback["assistant_message"] = (
+        "I added a read-only repository locator task so execution can discover and report the "
+        "relevant files instead of leaving the plan empty."
+    )
+    fallback["questions"] = []
+    fallback["plan_update"] = {
+        "tasks_add": [
+            {
+                "title": "Locate requested repository implementation",
+                "description": (
+                    "Use local search/read tools to find the repo-relative implementation, test, "
+                    "and documentation files relevant to this request, then report exact paths and "
+                    f"the safest follow-up update scope for: {user_text.strip()}"
+                ),
+                "acceptance_criteria": [
+                    "Identify relevant repo-relative files and explain why each matters.",
+                    "Report the smallest follow-up write scope if a later mutating change is requested.",
+                    "Do not change files; report findings only.",
+                ],
+                "dependencies": [],
+                "estimated_files": [],
+                "write_scope": [],
                 "parallel_group": "",
             }
         ]
@@ -2117,7 +2231,7 @@ def compact_plan_for_planner(plan: dict[str, Any]) -> dict[str, Any]:
                 }
             )
 
-    return {
+    compact: dict[str, Any] = {
         "project_goal": str(plan.get("project_goal") or "").strip(),
         "summary": str(plan.get("summary") or "").strip(),
         "requirements_total": len(requirements),
@@ -2129,6 +2243,10 @@ def compact_plan_for_planner(plan: dict[str, Any]) -> dict[str, Any]:
         "assets_total": len(assets_raw) if isinstance(assets_raw, list) else 0,
         "assets": assets_compact,
     }
+    planning_constraints = planning_constraints_prompt_payload(planning_constraints_from_plan(plan))
+    if planning_constraints:
+        compact[PLANNING_CONSTRAINTS_KEY] = planning_constraints
+    return compact
 
 
 def compact_workspace_context_for_planner(workspace_context: dict[str, Any]) -> dict[str, Any]:
@@ -2340,6 +2458,13 @@ def _planner_user_prompt(
         user_text=user_text,
     ):
         grounding_anchors["preserve_user_structure"] = True
+    planning_constraints = merge_latest_planning_scope_constraints(
+        planning_constraints_from_plan(plan),
+        text=user_text,
+        workspace_context=workspace_context,
+        direction_change=detect_direction_change(user_text),
+    )
+    planning_constraints_payload = planning_constraints_prompt_payload(planning_constraints)
     workspace_s = None
     if workspace_context is not None:
         digest = compact_workspace_context_for_planner(workspace_context)
@@ -2352,6 +2477,11 @@ def _planner_user_prompt(
         prompt += (
             "Latest user grounding anchors:\n"
             f"{json.dumps(grounding_anchors, ensure_ascii=False, sort_keys=True)}\n\n"
+        )
+    if planning_constraints_payload:
+        prompt += (
+            "Planning scope constraints JSON:\n"
+            f"{json.dumps(planning_constraints_payload, ensure_ascii=False, sort_keys=True)}\n\n"
         )
     if relevant_knowledge_section:
         prompt += f"{relevant_knowledge_section.strip()}\n\n"
@@ -2386,6 +2516,9 @@ def _planner_user_prompt(
         "- write_scope controls only local repo file mutation scope.\n"
         "- Do not include read-only context files in write_scope unless they may be edited.\n"
         "- Runnable mutating tasks must include non-empty file scope, either explicitly or via clear repo-relative path hints in task text.\n"
+        "- Target roots in Planning scope constraints narrow implementation scope; tasks outside target roots require explicit evidence.\n"
+        "- Decoy, unrelated, ignored, or forbidden paths in Planning scope constraints are constraints, not implementation targets.\n"
+        "- Do not create tasks from negative examples or decoy areas.\n"
         "- When the user says to drop, abandon, replace, or switch away from an approach, obsolete planned tasks must be removed or superseded and replacement tasks must include runnable file scope.\n"
         "- Do not rewrite completed task history; preserve completed work as audit history and add replacement planned work instead.\n"
         "- Clearly analysis-only or report-only tasks may leave estimated_files/write_scope empty.\n"
@@ -2448,6 +2581,7 @@ def _planner_error(
     model: str = "",
     planner_invoked: bool = True,
     planner_router_event: dict[str, Any] | None = None,
+    schema_failures: list[dict[str, Any]] | None = None,
 ) -> PlannerTurnResult:
     result_route = route or intent_route
     return PlannerTurnResult(
@@ -2468,6 +2602,7 @@ def _planner_error(
         model=model,
         planner_invoked=planner_invoked,
         planner_router_event=planner_router_event,
+        schema_failures=list(schema_failures or []),
     )
 
 
@@ -2478,7 +2613,7 @@ def _make_planner_llm_client(
     model: str,
     timeout_s: float | None,
     transport: httpx.BaseTransport | None,
-) -> _OpenAICompatClient:
+) -> ChatClient:
     if OpenAICompatClient is _OpenAICompatClient:
         return make_llm_client(
             cfg=cfg,
@@ -2806,7 +2941,8 @@ def _retry_schema_prompt(*, validation_error: str, previous_response: str) -> st
         "Previous response:\n"
         f"{previous_response}\n\n"
         "Return ONLY one JSON object that matches the schema. "
-        "No markdown. No extra keys."
+        "No markdown. No extra keys. Preserve the latest user intent, target roots, and "
+        "decoy/forbidden constraints from the prompt."
     )
 
 
@@ -2893,30 +3029,7 @@ def _run_planner_asset_tool_rounds(
 
 
 def _assistant_tool_call_message(response: Any) -> dict[str, Any]:
-    tool_calls = []
-    for tool_call in list(getattr(response, "tool_calls", []) or []):
-        tool_calls.append(
-            {
-                "id": str(getattr(tool_call, "id", "") or ""),
-                "type": "function",
-                "function": {
-                    "name": str(getattr(tool_call, "name", "") or ""),
-                    "arguments": json.dumps(
-                        getattr(tool_call, "arguments", {}) or {},
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                },
-            }
-        )
-    return attach_provider_metadata_to_assistant_message(
-        {
-            "role": "assistant",
-            "content": str(getattr(response, "content", "") or ""),
-            "tool_calls": tool_calls,
-        },
-        response,
-    )
+    return assistant_message_from_response(response)
 
 
 def _planner_plan_update_asset_reference_error(
@@ -3255,6 +3368,7 @@ def run_planner_turn(
         error: str,
         request_retry_count: int = 0,
         failure_category: FailureCategory | str | None = FailureCategory.PLANNER_FAILED,
+        schema_failures: list[dict[str, Any]] | None = None,
     ) -> PlannerTurnResult:
         return _planner_error(
             message,
@@ -3272,6 +3386,7 @@ def run_planner_turn(
             model=router_model if router_enabled else "",
             planner_invoked=True,
             planner_router_event=planner_router_event,
+            schema_failures=schema_failures,
         )
 
     client = _make_planner_llm_client(
@@ -3416,8 +3531,16 @@ def run_planner_turn(
             request_retry_count=total_request_retries,
         )
 
+    schema_failures: list[dict[str, Any]] = []
     validated, validation_error = _parse_repair_validate(content)
     if validated is None:
+        schema_failures.append(
+            {
+                "attempt": 1,
+                "reason_code": "planner_schema_validation_failed",
+                "error": validation_error or "schema_mismatch",
+            }
+        )
         retry_messages = _planner_request_messages(
             user_content=_planner_retry_user_prompt(
                 base_prompt=base_user_prompt,
@@ -3439,20 +3562,37 @@ def run_planner_turn(
                 error=str(e),
                 request_retry_count=total_request_retries,
                 failure_category=_planner_failure_category_for_llm_error(e),
+                schema_failures=schema_failures,
             )
         retry_content = (retry_resp.content or "").strip()
         if not retry_content:
+            schema_failures.append(
+                {
+                    "attempt": 2,
+                    "reason_code": "planner_schema_empty_retry_response",
+                    "error": validation_error or "empty_retry_response",
+                }
+            )
             return _planner_error_after_router(
                 "Planner assistant JSON did not match schema; no plan updates were applied.",
                 error=validation_error or "empty_retry_response",
                 request_retry_count=total_request_retries,
+                schema_failures=schema_failures,
             )
         validated, validation_error = _parse_repair_validate(retry_content)
         if validated is None:
+            schema_failures.append(
+                {
+                    "attempt": 2,
+                    "reason_code": "planner_schema_validation_failed",
+                    "error": validation_error or "schema_mismatch",
+                }
+            )
             return _planner_error_after_router(
                 "Planner assistant JSON did not match schema; no plan updates were applied.",
                 error=validation_error or "schema_mismatch",
                 request_retry_count=total_request_retries,
+                schema_failures=schema_failures,
             )
 
     validated_questions = [
@@ -3535,6 +3675,7 @@ def run_planner_turn(
         model=router_model if router_enabled else "",
         planner_invoked=True,
         planner_router_event=planner_router_event,
+        schema_failures=schema_failures,
     )
 
 
@@ -3582,6 +3723,26 @@ def _dedupe_keep_order(values: list[str]) -> list[str]:
         seen.add(key)
         out.append(value)
     return out
+
+
+def _scope_constraint_warning(
+    *,
+    prefix: str,
+    violations: list[Any],
+) -> str:
+    details = []
+    for violation in violations[:6]:
+        constraint = (
+            f" constraint={violation.constraint_path}"
+            if getattr(violation, "constraint_path", None)
+            else ""
+        )
+        details.append(
+            f"{violation.path} ({violation.classification}; {violation.reason_code}{constraint})"
+        )
+    if len(violations) > 6:
+        details.append(f"+{len(violations) - 6} more")
+    return prefix + ": " + ", ".join(details)
 
 
 def _normalize_task_file_fields(
@@ -3668,6 +3829,7 @@ def _mark_task_superseded(
     *,
     task: dict[str, Any],
     reason: str,
+    reason_code: str,
     old_terms: tuple[str, ...],
     new_terms: tuple[str, ...],
 ) -> bool:
@@ -3679,6 +3841,7 @@ def _mark_task_superseded(
         changed = True
     metadata = {
         "reason": reason,
+        "reason_code": reason_code,
         "old_terms": list(old_terms),
         "new_terms": list(new_terms),
     }
@@ -3879,6 +4042,17 @@ def _apply_conservative_inferred_dependencies(
                 changed = True
         if _task_is_implementation_task(task):
             previous_impl_id = task_id
+    ordered_changed, ordered_dependencies = apply_ordered_dependency_inference(
+        tasks=tasks,
+        touched_task_ids=touched_task_ids,
+    )
+    if ordered_changed:
+        changed = True
+    for dependency in ordered_dependencies:
+        warnings.append(
+            f"Added dependency {dependency.task_id} -> {dependency.depends_on} because the task "
+            "references ordered predecessor work."
+        )
     return changed, warnings
 
 
@@ -3888,6 +4062,7 @@ def apply_plan_update(
     *,
     skip_dependency_cleanup_task_ids: set[str] | None = None,
     latest_user_text: str = "",
+    workspace_context: dict[str, Any] | None = None,
 ) -> PlanApplyResult:
     tasks_raw = plan.get("tasks")
     reqs_raw = plan.get("requirements")
@@ -3938,6 +4113,19 @@ def apply_plan_update(
         req_key = _requirement_text(req).casefold()
         if req_key:
             known_requirement_keys.add(req_key)
+
+    direction_change = detect_direction_change(latest_user_text)
+    planning_constraints = planning_constraints_from_plan(plan)
+    if str(latest_user_text or "").strip():
+        planning_constraints, constraints_changed = update_plan_planning_constraints(
+            plan,
+            text=latest_user_text,
+            workspace_context=workspace_context,
+            direction_change=direction_change,
+        )
+        if constraints_changed:
+            changed = True
+            warnings.append("Recorded planning scope constraints from latest user direction.")
 
     if "project_goal" in plan_update:
         goal = str(plan_update["project_goal"]).strip()
@@ -4010,9 +4198,43 @@ def apply_plan_update(
         if status != "planned":
             warnings.append(f"Ignored supersede for protected non-planned task history: {task_id}")
             continue
+        if (
+            planning_constraints.target_roots
+            and task_has_target_root_scope(existing_task, planning_constraints)
+            and (
+                direction_change is None
+                or not text_matches_obsolete_direction(
+                    _task_direction_text(existing_task),
+                    direction_change,
+                )
+            )
+        ):
+            warnings.append(
+                f"Ignored supersede for target-root task '{task_id}' without an explicit "
+                "user-requested direction change."
+            )
+            continue
+        supersede_reason_code = "obsolete_after_replan"
+        if direction_change is not None and text_matches_obsolete_direction(
+            _task_direction_text(existing_task),
+            direction_change,
+        ):
+            supersede_reason_code = "user_changed_goal"
+        elif planning_constraints.has_constraints:
+            constraint_violations = task_scope_constraint_violations(
+                existing_task,
+                planning_constraints,
+            )
+            if constraint_violations:
+                supersede_reason_code = "invalid_out_of_scope"
+            elif planning_constraints.target_roots and not task_has_target_root_scope(
+                existing_task, planning_constraints
+            ):
+                supersede_reason_code = "scope_narrowed"
         if _mark_task_superseded(
             task=existing_task,
             reason="planner requested task supersession",
+            reason_code=supersede_reason_code,
             old_terms=(str(existing_task.get("title") or task_id).strip() or task_id,),
             new_terms=(),
         ):
@@ -4101,6 +4323,32 @@ def apply_plan_update(
                 f"Skipped task_add '{title_text}' because the task needs runnable file scope but still lacks it."
             )
             continue
+        lifecycle = _classify_task_lifecycle(
+            title=title_text,
+            description=str(spec.get("description") or "").strip(),
+            acceptance_criteria=list(spec.get("acceptance_criteria") or []),
+            estimated_files=normalized_estimated,
+            write_scope=normalized_write_scope,
+        )
+        analysis_only = lifecycle.kind == TASK_KIND_ANALYSIS_ONLY
+        scope_violations = task_scope_constraint_violations(
+            {
+                "title": title_text,
+                "description": str(spec.get("description") or "").strip(),
+                "acceptance_criteria": list(spec.get("acceptance_criteria") or []),
+                "estimated_files": normalized_estimated,
+                "write_scope": normalized_write_scope,
+            },
+            planning_constraints,
+        )
+        if scope_violations:
+            warnings.append(
+                _scope_constraint_warning(
+                    prefix=f"Skipped task_add '{title_text}' because it violates planning scope constraints",
+                    violations=scope_violations,
+                )
+            )
+            continue
         normalized_mcp_scope, mcp_scope_warnings = normalize_task_mcp_scope(
             spec.get("mcp_scope"),
             warning_prefix=f"New task '{title_text}'",
@@ -4120,7 +4368,11 @@ def apply_plan_update(
             "branch": "",
             "status": "planned",
             "attempts": 0,
+            "task_kind": lifecycle.kind,
+            "task_kind_reason": lifecycle.reason_code,
         }
+        if analysis_only:
+            new_task["analysis_only"] = True
         serialized_mcp_scope = serialize_task_mcp_scope(normalized_mcp_scope)
         if serialized_mcp_scope is not None:
             new_task["mcp_scope"] = serialized_mcp_scope
@@ -4157,13 +4409,14 @@ def apply_plan_update(
         )
         normalized_estimated = list(existing_task.get("estimated_files") or [])
         normalized_write_scope = list(existing_task.get("write_scope") or [])
-        if (
+        lifecycle_relevant_update = (
             "estimated_files" in patch
             or "write_scope" in patch
             or "title" in patch
             or "description" in patch
             or "acceptance_criteria" in patch
-        ):
+        )
+        if lifecycle_relevant_update:
             (
                 normalized_estimated,
                 normalized_write_scope,
@@ -4182,6 +4435,27 @@ def apply_plan_update(
             if requires_runnable_scope and not (normalized_estimated or normalized_write_scope):
                 warnings.append(
                     f"Ignored update for task '{task_id}' because the resulting task needs runnable file scope but still lacks it."
+                )
+                continue
+            scope_violations = task_scope_constraint_violations(
+                {
+                    "title": next_title,
+                    "description": next_description,
+                    "acceptance_criteria": next_acceptance_criteria,
+                    "estimated_files": normalized_estimated,
+                    "write_scope": normalized_write_scope,
+                },
+                planning_constraints,
+            )
+            if scope_violations:
+                warnings.append(
+                    _scope_constraint_warning(
+                        prefix=(
+                            f"Ignored update for task '{task_id}' because it violates "
+                            "planning scope constraints"
+                        ),
+                        violations=scope_violations,
+                    )
                 )
                 continue
 
@@ -4216,6 +4490,33 @@ def apply_plan_update(
                 )
             if dep_ids != list(existing_task.get("dependencies") or []):
                 existing_task["dependencies"] = dep_ids
+                local_changed = True
+        should_refresh_lifecycle = (
+            lifecycle_relevant_update
+            or "task_kind" in existing_task
+            or "task_kind_reason" in existing_task
+        )
+        if should_refresh_lifecycle:
+            next_lifecycle = _classify_task_lifecycle(
+                title=next_title,
+                description=next_description,
+                acceptance_criteria=next_acceptance_criteria,
+                estimated_files=normalized_estimated,
+                write_scope=normalized_write_scope,
+            )
+            next_analysis_only = next_lifecycle.kind == TASK_KIND_ANALYSIS_ONLY
+            if next_analysis_only:
+                if existing_task.get("analysis_only") is not True:
+                    existing_task["analysis_only"] = True
+                    local_changed = True
+            elif "analysis_only" in existing_task:
+                existing_task.pop("analysis_only", None)
+                local_changed = True
+            if existing_task.get("task_kind") != next_lifecycle.kind:
+                existing_task["task_kind"] = next_lifecycle.kind
+                local_changed = True
+            if existing_task.get("task_kind_reason") != next_lifecycle.reason_code:
+                existing_task["task_kind_reason"] = next_lifecycle.reason_code
                 local_changed = True
         if "mcp_scope" in patch:
             normalized_mcp_scope, mcp_scope_warnings = normalize_task_mcp_scope(
@@ -4263,7 +4564,6 @@ def apply_plan_update(
             updated_task_ids.append(task_id)
             changed = True
 
-    direction_change = detect_direction_change(latest_user_text)
     if direction_change is not None:
         direction_record = direction_change_to_record(direction_change)
         existing_direction_changes = plan.setdefault("direction_changes", [])
@@ -4286,6 +4586,7 @@ def apply_plan_update(
             if _mark_task_superseded(
                 task=task,
                 reason="latest user direction changed",
+                reason_code="user_changed_goal",
                 old_terms=direction_change.old_terms,
                 new_terms=direction_change.new_terms,
             ):

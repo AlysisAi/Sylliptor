@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .llm.openai_compat import strip_provider_metadata_from_message
+from .llm.metadata import strip_provider_metadata_from_message
 from .model_registry import ModelMeta, ModelRegistry
 from .request_estimation import RequestTokenBreakdown, estimate_request_token_breakdown
 from .session_store import read_session_events
@@ -167,7 +167,7 @@ def _looks_like_character_count(
     if character_count <= 0:
         return api_count >= max(estimated_tokens * 3, estimated_tokens + 256)
 
-    # Some providers put character counts in token fields.
+    # Some OpenAI-compatible providers put character counts in token fields.
     # Trust plausible API token counts, but replace counts that are much closer
     # to raw text size than to the local tokenizer estimate.
     minimum_delta = 64 if character_count < 2048 else 256

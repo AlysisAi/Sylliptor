@@ -13,17 +13,20 @@ venv/
 .tmp_ci*/
 
 # Tooling
+.dev/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .coverage
 htmlcov/
+uv.lock
 .sylliptor/
 .sylliptor_data_demo/
 .sylliptor_data_demo_verify/
 .sylliptor_images/
 sylliptor-feedback/
 reports/
+qa_reports/
 
 # Claude Code local config
 .claude/

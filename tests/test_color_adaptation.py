@@ -103,6 +103,7 @@ def test_detect_terminal_theme_fallback_is_neutral(monkeypatch) -> None:
         monkeypatch.delenv(env_name, raising=False)
 
     monkeypatch.setattr(theme_mod, "_theme_from_osc11", lambda _stream: None)
+    monkeypatch.setattr(theme_mod, "_windows_terminal_settings_paths", lambda: [])
 
     assert detect_terminal_theme(stream=_Pipe()) == "neutral"
 
@@ -120,6 +121,7 @@ def test_detect_terminal_theme_if_available_does_not_guess(monkeypatch) -> None:
     ):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setattr(theme_mod, "_theme_from_osc11", lambda _stream: None)
+    monkeypatch.setattr(theme_mod, "_windows_terminal_settings_paths", lambda: [])
 
     assert detect_terminal_theme_if_available(stream=_Pipe()) is None
 
@@ -163,6 +165,7 @@ def test_osc11_disabled_by_default(monkeypatch) -> None:
         "_theme_from_osc11",
         lambda _stream: (_ for _ in ()).throw(AssertionError("unexpected OSC 11 query")),
     )
+    monkeypatch.setattr(theme_mod, "_windows_terminal_settings_paths", lambda: [])
 
     assert detect_terminal_theme(stream=_Pipe()) == "neutral"
 
@@ -346,6 +349,7 @@ def test_no_color_theme_detection_skips_terminal_query(monkeypatch) -> None:
         "_theme_from_osc11",
         lambda _stream: (_ for _ in ()).throw(AssertionError("unexpected OSC 11 query")),
     )
+    monkeypatch.setattr(theme_mod, "_windows_terminal_settings_paths", lambda: [])
 
     assert detect_terminal_theme(stream=_Pipe()) == "light"
 

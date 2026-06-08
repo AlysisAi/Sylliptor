@@ -703,6 +703,7 @@ def validate_replanning_plan_update(
     initial_errors: tuple[str, ...] = (),
     initial_warnings: tuple[str, ...] = (),
     latest_user_text: str = "",
+    workspace_context: dict[str, Any] | None = None,
 ) -> tuple[ReplanValidationResult, PlanApplyResult]:
     task_by_id = _task_by_id(plan)
     known_ids = set(task_by_id)
@@ -783,6 +784,7 @@ def validate_replanning_plan_update(
         simulated_plan,
         copy.deepcopy(plan_update),
         latest_user_text=latest_user_text,
+        workspace_context=workspace_context,
     )
 
     for task_id in sorted(protected_ids):
@@ -832,6 +834,7 @@ def _planner_result_payload(result: PlannerTurnResult) -> dict[str, Any]:
         "plan_update": result.plan_update,
         "error": result.error,
         "request_retry_count": int(result.request_retry_count or 0),
+        "schema_failures": list(result.schema_failures),
     }
 
 
@@ -1007,13 +1010,14 @@ def run_replanning_attempt(
         replanner_assets_bundle=replanner_assets_bundle,
         questioning_mode=cfg.assets.comprehension.questioning_mode,
     )
+    workspace_context = _read_workspace_context(paths)
     planner_result = planner_runner(
         cfg=cfg,
         api_key_override=api_key_override,
         plan=plan,
         transcript_tail=[],
         user_text=replan_user_text,
-        workspace_context=_read_workspace_context(paths),
+        workspace_context=workspace_context,
         relevant_knowledge_section=relevant_knowledge_prompt,
         run_paths=paths,
         prebuilt_assets_bundle=(
@@ -1071,12 +1075,14 @@ def run_replanning_attempt(
             initial_errors=grounding_result.errors if grounding_result else (),
             initial_warnings=grounding_result.warnings if grounding_result else (),
             latest_user_text=replan_user_text,
+            workspace_context=workspace_context,
         )
         if validation.valid and effective_mode == "apply":
             apply_preview = apply_plan_update(
                 plan,
                 copy.deepcopy(effective_plan_update),
                 latest_user_text=replan_user_text,
+                workspace_context=workspace_context,
             )
             applied = True
             plan_changed = apply_preview.changed

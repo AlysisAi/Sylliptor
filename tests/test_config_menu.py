@@ -229,7 +229,7 @@ def test_default_model_rows_fallback_to_base_url_provider() -> None:
             name="anthropic",
             base_url="https://api.anthropic.com/v1",
             api_key_env="ANTHROPIC_API_KEY",
-            default_model="claude-opus-4-7",
+            default_model="claude-sonnet-4-6",
         ),
     )
     set_active_profile(cfg, "deepseek")
@@ -240,7 +240,7 @@ def test_default_model_rows_fallback_to_base_url_provider() -> None:
         value for value, _label, _description in config_menu_mod._default_model_rows(state)
     ]
 
-    assert "claude-opus-4-7" in model_values
+    assert "claude-sonnet-4-6" in model_values
     assert "deepseek-v4-flash" not in model_values
 
 

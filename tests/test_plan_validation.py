@@ -270,7 +270,7 @@ def test_missing_write_scope_raises_planner_failed_before_execution() -> None:
     assert "write_scope" in str(exc_info.value)
 
 
-def test_execution_readiness_rejects_no_mutating_tasks_as_planner_failed() -> None:
+def test_execution_readiness_allows_report_only_execution_candidates() -> None:
     plan = {
         "tasks": [
             {
@@ -286,12 +286,145 @@ def test_execution_readiness_rejects_no_mutating_tasks_as_planner_failed() -> No
         ]
     }
 
+    raise_for_execution_ready_plan(plan)
+
+
+def test_execution_readiness_allows_support_task_dependent_on_implementation() -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Implement habit persistence",
+                "description": "Update habit.py to save and load habit data.",
+                "dependencies": [],
+                "acceptance_criteria": ["Habits are persisted."],
+                "estimated_files": ["habit.py", "habits.json"],
+                "write_scope": ["habit.py", "habits.json"],
+                "status": "planned",
+            },
+            {
+                "id": "T02",
+                "title": "Add persistence regression tests",
+                "description": "Add tests covering save/load behavior and the habits.json fixture.",
+                "dependencies": ["T01"],
+                "acceptance_criteria": ["Regression tests cover persistence."],
+                "estimated_files": ["test_habit.py", "habits.json"],
+                "write_scope": ["test_habit.py", "habits.json"],
+                "status": "planned",
+            },
+        ]
+    }
+
+    issues = find_plan_acceptance_issues(plan)
+
+    assert not issues
+    raise_for_execution_ready_plan(plan)
+
+
+def test_execution_readiness_rejects_support_task_with_production_fixture_path() -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Implement settings loader",
+                "description": "Update app/settings.py to load settings data.",
+                "dependencies": [],
+                "acceptance_criteria": ["Settings load correctly."],
+                "estimated_files": ["app/settings.py"],
+                "write_scope": ["app/settings.py"],
+                "status": "planned",
+            },
+            {
+                "id": "T02",
+                "title": "Add settings regression tests",
+                "description": "Add tests and update the app/settings.json fixture.",
+                "dependencies": ["T01"],
+                "acceptance_criteria": ["Regression tests cover settings loading."],
+                "estimated_files": ["test_settings.py", "app/settings.json"],
+                "write_scope": ["test_settings.py", "app/settings.json"],
+                "status": "planned",
+            },
+        ]
+    }
+
+    issues = find_plan_acceptance_issues(plan)
+
+    assert [issue.rule_id for issue in issues] == ["R3"]
+    assert issues[0].task_id == "T02"
+
+
+@pytest.mark.parametrize(
+    ("title", "description", "path"),
+    [
+        (
+            "Create TODO.md with first tasks",
+            "Write a simple markdown todo checklist.",
+            "TODO.md",
+        ),
+        (
+            "Update notes/ideas.md with two headings",
+            "Organize the note content into simple sections.",
+            "notes/ideas.md",
+        ),
+        (
+            "Build landing page HTML in index.html",
+            "Create the frontend page structure.",
+            "index.html",
+        ),
+        (
+            "Add responsive styles in styles.css",
+            "Style the frontend page layout.",
+            "styles.css",
+        ),
+    ],
+)
+def test_execution_readiness_allows_explicit_content_and_frontend_scopes(
+    title: str,
+    description: str,
+    path: str,
+) -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": title,
+                "description": description,
+                "dependencies": [],
+                "acceptance_criteria": ["Requested content is updated."],
+                "estimated_files": [path],
+                "write_scope": [path],
+                "status": "planned",
+            }
+        ]
+    }
+
+    raise_for_execution_ready_plan(plan)
+
+
+def test_execution_readiness_rejects_mixed_content_and_unknown_scopes_without_primary_impl() -> (
+    None
+):
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Update generated metadata",
+                "description": "Update documentation and helper script metadata.",
+                "dependencies": [],
+                "acceptance_criteria": ["Documentation and metadata are updated."],
+                "estimated_files": ["README.md", "scripts/build.sh"],
+                "write_scope": ["README.md", "scripts/build.sh"],
+                "status": "planned",
+            }
+        ]
+    }
+
     with pytest.raises(PlannerFailedError) as exc_info:
         raise_for_execution_ready_plan(plan)
 
     assert exc_info.value.failure_category == FailureCategory.PLANNER_FAILED
-    assert "R1" in str(exc_info.value)
-    assert "no mutating execution candidates" in str(exc_info.value)
+    assert "R3" in str(exc_info.value)
+    assert "no code implementation paths" in str(exc_info.value)
 
 
 def test_execution_readiness_rejects_internal_only_write_scope_fixture() -> None:
@@ -478,6 +611,139 @@ def test_execution_readiness_rejects_behavior_task_with_tests_only_scope() -> No
     assert "write_scope has no code implementation paths" in str(exc_info.value)
 
 
+def test_execution_readiness_accepts_java_implementation_scope() -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix Java config loader",
+                "description": "Implement ConfigLoader behavior.",
+                "dependencies": [],
+                "acceptance_criteria": ["ConfigLoader handles defaults."],
+                "estimated_files": ["src/main/java/com/example/ConfigLoader.java"],
+                "write_scope": ["src/main/java/com/example/ConfigLoader.java"],
+                "status": "planned",
+            }
+        ]
+    }
+
+    raise_for_execution_ready_plan(plan)
+
+
+def test_execution_readiness_rejects_java_tests_only_scope_with_kind_diagnostic() -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix Java config loader",
+                "description": "Implement ConfigLoader behavior.",
+                "dependencies": [],
+                "acceptance_criteria": ["ConfigLoader handles defaults."],
+                "estimated_files": ["src/test/java/com/example/ConfigLoaderTest.java"],
+                "write_scope": ["src/test/java/com/example/ConfigLoaderTest.java"],
+                "status": "planned",
+            }
+        ]
+    }
+
+    with pytest.raises(PlannerFailedError) as exc_info:
+        raise_for_execution_ready_plan(plan)
+
+    message = str(exc_info.value)
+    assert "R3" in message
+    assert "write_scope has no code implementation paths" in message
+    assert "Java test files only" in message
+
+
+def test_execution_readiness_accepts_mixed_java_implementation_and_test_scope() -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix Java config loader",
+                "description": "Implement ConfigLoader behavior and cover it.",
+                "dependencies": [],
+                "acceptance_criteria": ["ConfigLoader handles defaults."],
+                "estimated_files": [
+                    "src/main/java/com/example/ConfigLoader.java",
+                    "src/test/java/com/example/ConfigLoaderTest.java",
+                ],
+                "write_scope": [
+                    "src/main/java/com/example/ConfigLoader.java",
+                    "src/test/java/com/example/ConfigLoaderTest.java",
+                ],
+                "status": "planned",
+            }
+        ]
+    }
+
+    raise_for_execution_ready_plan(plan)
+
+
+def test_execution_readiness_reports_unknown_extensions_without_silent_invalid() -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix generated metadata",
+                "description": "Implement behavior in generated metadata.",
+                "dependencies": [],
+                "acceptance_criteria": ["Behavior is implemented."],
+                "estimated_files": ["scripts/build.weird"],
+                "write_scope": ["scripts/build.weird"],
+                "status": "planned",
+            }
+        ]
+    }
+
+    with pytest.raises(PlannerFailedError) as exc_info:
+        raise_for_execution_ready_plan(plan)
+
+    assert "unknown .weird files only" in str(exc_info.value)
+
+
+def test_execution_readiness_accepts_broad_domain_package_scope_for_implementation() -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix billing tax rounding",
+                "description": "Implement calculate_tax rounding behavior in the billing package.",
+                "dependencies": [],
+                "acceptance_criteria": ["calculate_tax returns the rounded total."],
+                "estimated_files": ["billing/**"],
+                "write_scope": ["billing/**"],
+                "status": "planned",
+            }
+        ]
+    }
+
+    raise_for_execution_ready_plan(plan)
+
+
+def test_execution_readiness_still_rejects_broad_support_scope_for_behavior_fix() -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix billing tax rounding",
+                "description": "Implement calculate_tax rounding behavior.",
+                "dependencies": [],
+                "acceptance_criteria": ["Tax rounding is covered."],
+                "estimated_files": ["docs/**"],
+                "write_scope": ["docs/**"],
+                "status": "planned",
+            }
+        ]
+    }
+
+    with pytest.raises(PlannerFailedError) as exc_info:
+        raise_for_execution_ready_plan(plan)
+
+    assert "R3" in str(exc_info.value)
+    assert "write_scope is README/docs only" in str(exc_info.value)
+
+
 def test_execution_readiness_treats_packaging_manifest_as_primary_scope() -> None:
     plan = {
         "tasks": [
@@ -626,6 +892,122 @@ def test_plan_validation_accepts_superseded_and_invalidated_task_statuses() -> N
 
     assert warnings == []
     assert find_execution_unready_mutating_tasks(plan) == []
+
+
+def test_plan_validation_rejects_monorepo_task_outside_target_root() -> None:
+    plan = {
+        "planning_constraints": {
+            "schema_version": 1,
+            "target_roots": [
+                {
+                    "path": "services/api",
+                    "kind": "target_root",
+                    "reason_code": "user_target_root",
+                    "evidence": "only services/api",
+                }
+            ],
+            "forbidden_roots": [],
+            "decoy_roots": [
+                {
+                    "path": "services/worker",
+                    "kind": "decoy_root",
+                    "reason_code": "decoy_path_constraint",
+                    "evidence": "worker is a decoy",
+                }
+            ],
+            "unrelated_roots": [],
+        },
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix API config",
+                "description": "Update APP_REGION precedence in services/api.",
+                "dependencies": [],
+                "acceptance_criteria": ["API config precedence is correct."],
+                "estimated_files": ["services/api/src/config.ts"],
+                "write_scope": ["services/api/src/config.ts"],
+                "status": "planned",
+            },
+            {
+                "id": "T02",
+                "title": "Fix worker config",
+                "description": "Update worker config.",
+                "dependencies": [],
+                "acceptance_criteria": ["Worker config changes."],
+                "estimated_files": ["services/worker/src/config.ts"],
+                "write_scope": ["services/worker/src/config.ts"],
+                "status": "planned",
+            },
+        ],
+    }
+
+    issues = find_plan_acceptance_issues(plan)
+
+    assert any(
+        issue.rule_id == "R5" and issue.task_id == "T02" and "decoy_root" in issue.observed
+        for issue in issues
+    )
+    with pytest.raises(PlannerFailedError):
+        raise_for_execution_ready_plan(plan)
+
+
+def test_plan_validation_rejects_decoy_write_scope_even_when_estimated_files_target_api() -> None:
+    plan = {
+        "planning_constraints": {
+            "schema_version": 1,
+            "target_roots": [{"path": "services/api", "reason_code": "user_target_root"}],
+            "forbidden_roots": [],
+            "decoy_roots": [{"path": "services/worker", "reason_code": "decoy_path_constraint"}],
+            "unrelated_roots": [],
+        },
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix API config",
+                "description": "Update API behavior.",
+                "dependencies": [],
+                "acceptance_criteria": ["API behavior is correct."],
+                "estimated_files": ["services/api/src/config.ts"],
+                "write_scope": ["services/worker/src/config.ts"],
+                "status": "planned",
+            }
+        ],
+    }
+
+    issues = find_plan_acceptance_issues(plan)
+
+    assert any(
+        issue.rule_id == "R5"
+        and issue.task_id == "T01"
+        and "services/worker/src/config.ts" in issue.observed
+        for issue in issues
+    )
+
+
+def test_plan_validation_allows_explicit_shared_dependency_for_target_root() -> None:
+    plan = {
+        "planning_constraints": {
+            "schema_version": 1,
+            "target_roots": [{"path": "packages/web", "reason_code": "user_target_root"}],
+            "forbidden_roots": [],
+            "decoy_roots": [],
+            "unrelated_roots": [],
+        },
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix shared formatter for web",
+                "description": "Update the shared dependency used by packages/web.",
+                "dependencies": [],
+                "acceptance_criteria": ["packages/web uses the corrected formatter."],
+                "estimated_files": ["packages/shared/src/format.ts"],
+                "write_scope": ["packages/shared/src/format.ts"],
+                "status": "planned",
+            }
+        ],
+    }
+
+    assert [issue for issue in find_plan_acceptance_issues(plan) if issue.rule_id == "R5"] == []
 
 
 def test_validate_plan_detects_cycle_with_path() -> None:

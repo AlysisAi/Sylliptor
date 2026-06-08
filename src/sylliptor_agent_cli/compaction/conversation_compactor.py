@@ -8,11 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from sylliptor_agent_cli.llm.openai_compat import (
-    LLMError,
-    OpenAICompatClient,
+from sylliptor_agent_cli.llm.base import ChatClient
+from sylliptor_agent_cli.llm.metadata import (
+    PROVIDER_METADATA_KEY,
     strip_provider_metadata_from_message,
 )
+from sylliptor_agent_cli.llm.types import LLMError
 from sylliptor_agent_cli.model_registry import ModelRegistry
 from sylliptor_agent_cli.request_estimation import (
     estimate_request_tokens,
@@ -288,7 +289,7 @@ class ConversationCompactor:
         artifact_layout: SessionArtifactLayout,
         store: SessionStore,
         settings: CompactionSettings,
-        compactor_client: OpenAICompatClient,
+        compactor_client: ChatClient,
         model_registry: ModelRegistry,
         usage_summary: UsageSummary,
         usage_role: str,
@@ -364,6 +365,16 @@ class ConversationCompactor:
             workspace_root=self._root,
         )
 
+    @staticmethod
+    def _history_chunk_payload(*, idx: int, message: dict[str, Any]) -> dict[str, Any]:
+        payload = {
+            "idx": idx,
+            "message": strip_provider_metadata_from_message(message),
+        }
+        if PROVIDER_METADATA_KEY in message:
+            payload["internal_message"] = deepcopy(message)
+        return payload
+
     def _write_history_chunk(
         self,
         *,
@@ -376,10 +387,7 @@ class ConversationCompactor:
             history_path.parent.mkdir(parents=True, exist_ok=True)
             with history_path.open("w", encoding="utf-8") as fh:
                 for offset, msg in enumerate(chunk_messages):
-                    payload = {
-                        "idx": first_idx + offset,
-                        "message": strip_provider_metadata_from_message(msg),
-                    }
+                    payload = self._history_chunk_payload(idx=first_idx + offset, message=msg)
                     fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except OSError as exc:
             self._store.append(
@@ -414,10 +422,7 @@ class ConversationCompactor:
     ) -> str:
         rows: list[str] = []
         for offset, msg in enumerate(chunk_messages):
-            payload = {
-                "idx": first_idx + offset,
-                "message": strip_provider_metadata_from_message(msg),
-            }
+            payload = self._history_chunk_payload(idx=first_idx + offset, message=msg)
             rows.append(json.dumps(payload, ensure_ascii=False))
         return "\n".join(rows) + ("\n" if rows else "")
 

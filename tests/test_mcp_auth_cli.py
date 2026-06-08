@@ -172,7 +172,7 @@ def test_mcp_auth_login_cli_requires_protected_resource_metadata_for_scope_fallb
     )
 
     assert result.exit_code == 1
-    assert "protected resource metadata discovery failed" in result.output
+    assert "protected resource metadata discovery failed" in " ".join(result.output.split())
     assert not oauth_fixture_server.authorize_requests
     assert not oauth_fixture_server.token_requests
     assert load_oauth_token_record("alpha") is None

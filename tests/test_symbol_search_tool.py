@@ -614,6 +614,56 @@ def test_symbol_search_reports_mixed_static_backend(tmp_path: Path) -> None:
     assert result["parsed_files"] == 2
 
 
+def test_symbol_search_finds_java_symbols(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "src" / "main" / "java" / "com" / "example" / "CSVParser.java",
+        (
+            "package com.example;\n"
+            "\n"
+            "import java.io.IOException;\n"
+            "\n"
+            "@Deprecated\n"
+            "public final class CSVParser<T> {\n"
+            "  public CSVParser() {}\n"
+            "  public static <R> R parseLine(String input) throws IOException { return null; }\n"
+            "  private final void reset() {}\n"
+            "}\n"
+            "\n"
+            "interface Loader<T> {\n"
+            "  T load(String name) throws IOException;\n"
+            "}\n"
+            "\n"
+            "enum Mode {\n"
+            "  FAST, SLOW;\n"
+            "  public boolean enabled() { return true; }\n"
+            "}\n"
+            "\n"
+            "record UserRecord(String id) {\n"
+            "  public String label() { return id; }\n"
+            "}\n"
+        ),
+    )
+
+    class_result = symbol_search(root=tmp_path, query="CSVParser", kind="class", exact=True)
+    constructor_result = symbol_search(root=tmp_path, query="CSVParser", kind="method", exact=True)
+    method_result = symbol_search(root=tmp_path, query="parseLine", kind="method", exact=True)
+    interface_result = symbol_search(root=tmp_path, query="Loader", kind="class", exact=True)
+    enum_result = symbol_search(root=tmp_path, query="Mode", kind="class", exact=True)
+    record_result = symbol_search(root=tmp_path, query="UserRecord", kind="class", exact=True)
+
+    assert class_result["backend"] == "java_heuristic"
+    assert class_result["parsed_files"] == 1
+    assert [match["name"] for match in class_result["matches"]] == ["CSVParser"]
+    assert [match["name"] for match in constructor_result["matches"]] == ["CSVParser.CSVParser"]
+    assert [match["name"] for match in method_result["matches"]] == ["CSVParser.parseLine"]
+    assert [match["name"] for match in interface_result["matches"]] == ["Loader"]
+    assert [match["name"] for match in enum_result["matches"]] == ["Mode"]
+    assert [match["name"] for match in record_result["matches"]] == ["UserRecord"]
+    assert method_result["matches"][0]["signature"] == (
+        "public static <R> R parseLine(String input) throws IOException { return null; }"
+    )
+
+
 def test_symbol_search_respects_scope_globs_exact_and_max_results(tmp_path: Path) -> None:
     _write(
         tmp_path / "pkg" / "alpha.py",

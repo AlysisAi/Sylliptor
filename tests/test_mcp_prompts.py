@@ -657,7 +657,7 @@ def test_targeted_mcp_prompt_cli_operations_skip_unrelated_broken_servers(tmp_pa
     assert targeted_get_payload["messages"][0]["text"] == expected_text
     assert targeted_get_payload["messages"][0]["content"][0]["text"] == expected_text
     assert global_list.exit_code == 1
-    assert broken_command in global_list.output
+    assert broken_command in "".join(global_list.output.split())
 
 
 def test_mcp_prompts_list_cli_rejects_blank_server_filter_without_bootstrap(

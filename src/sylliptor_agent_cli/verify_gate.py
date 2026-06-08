@@ -26,25 +26,17 @@ from .failure_category import (
     failure_category_value,
     is_infra_unavailable_error,
 )
+from .file_classification import SOURCE_EXTENSIONS_BY_LANGUAGE
 from .repo_scan import RepoScanResult, scan_workspace
 from .sandbox_runner import HostShellRunner, build_shell_runner_from_settings
 from .sandbox_settings import resolve_shell_sandbox_settings
-from .workspace_context import WorkspaceContextError, resolve_workspace_context
+from .workspace_context import WorkspaceContext, WorkspaceContextError, resolve_workspace_context
 
 VERIFY_MODES = {"off", "warn", "strict"}
 VERIFY_SANDBOX_MODES = {"off", "warn", "strict"}
 VERIFY_OUTPUT_PREVIEW_CHARS = 400
 VERIFICATION_FAILURE_SNIPPET_MAX_CHARS = 240
-_NODE_JS_EXTENSIONS = {
-    ".cjs",
-    ".cts",
-    ".js",
-    ".jsx",
-    ".mjs",
-    ".mts",
-    ".ts",
-    ".tsx",
-}
+_NODE_JS_EXTENSIONS = set(SOURCE_EXTENSIONS_BY_LANGUAGE["node"])
 _NODE_BOOTSTRAP_FILENAMES = {
     "package-lock.json",
     "package.json",
@@ -2127,14 +2119,85 @@ def _resolve_repo_inferred_verify_commands(
     repo_scan: RepoScanResult | None,
 ) -> tuple[str, ...]:
     scan = repo_scan
-    if scan is None and root is not None:
+    if root is not None:
         try:
-            scan = scan_workspace(context=resolve_workspace_context(root))
+            scan = scan_workspace(context=_resolve_verify_workspace_context(root, repo_scan))
         except (WorkspaceContextError, OSError):
-            scan = None
+            if scan is None:
+                scan = None
     if scan is None:
         return ()
     return normalize_verify_command_list(scan.likely_test_commands)
+
+
+def _resolve_verify_workspace_context(
+    root: Path, repo_scan: RepoScanResult | None
+) -> WorkspaceContext:
+    root = root.resolve()
+    focus_relpath = str(getattr(repo_scan, "focus_relpath", "") or ".").strip()
+    if focus_relpath and focus_relpath not in {".", ""}:
+        focus_path = (root / focus_relpath).resolve()
+        try:
+            focus_path.relative_to(root)
+        except ValueError:
+            focus_path = root
+        if focus_path.exists():
+            return _workspace_context_for_root_focus(root=root, focus_path=focus_path)
+    inferred_plain_focus = _plain_scan_focus_path_from_candidate_root(root, repo_scan)
+    if inferred_plain_focus is not None:
+        return _workspace_context_for_root_focus(root=root, focus_path=inferred_plain_focus)
+    return resolve_workspace_context(root)
+
+
+def _workspace_context_for_root_focus(*, root: Path, focus_path: Path) -> WorkspaceContext:
+    root_context = resolve_workspace_context(root)
+    focus_path = focus_path.resolve()
+    if focus_path == root_context.workspace_root:
+        return root_context
+    if root_context.git_root is not None:
+        return resolve_workspace_context(focus_path)
+    focus_relpath = focus_path.relative_to(root_context.workspace_root).as_posix()
+    return WorkspaceContext(
+        input_path=focus_path,
+        focus_path=focus_path,
+        workspace_root=root_context.workspace_root,
+        git_root=root_context.git_root,
+        focus_relpath=focus_relpath,
+        workspace_kind=root_context.workspace_kind,
+        has_head_commit=root_context.has_head_commit,
+        current_branch=root_context.current_branch,
+    )
+
+
+def _plain_scan_focus_path_from_candidate_root(
+    root: Path,
+    repo_scan: RepoScanResult | None,
+) -> Path | None:
+    if repo_scan is None:
+        return None
+    if str(repo_scan.focus_relpath or ".").strip() not in {"", "."}:
+        return None
+    previous_root = Path(str(repo_scan.workspace_root or "")).expanduser()
+    focus_name = previous_root.name
+    if not focus_name or focus_name == root.name:
+        return None
+    candidate = (root / focus_name).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    if not candidate.is_dir():
+        return None
+    signal_paths = [
+        item.get("path", "")
+        for item in [*repo_scan.manifests, *({"path": path} for path in repo_scan.readme_paths)]
+    ]
+    signal_paths.extend(repo_scan.observed_paths)
+    for raw_path in signal_paths:
+        rel_path = str(raw_path or "").strip()
+        if rel_path and (candidate / rel_path).exists():
+            return candidate
+    return None
 
 
 def _parse_verify_sandbox_mode(

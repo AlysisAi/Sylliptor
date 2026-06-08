@@ -155,7 +155,9 @@ def test_router_section_persists_changes(monkeypatch, tmp_path: Path) -> None:
     _seed_config(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
     prompt = PromptScript(["4", "", "144", "12", "s"])
-    inline = InlineChoiceScript(["code_only", "fixed"])
+    inline = InlineChoiceScript(
+        [config_menu_mod._INHERIT_DEFAULT_MODEL_VALUE, "code_only", "fixed"]
+    )
     monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
     monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
 
@@ -168,6 +170,49 @@ def test_router_section_persists_changes(monkeypatch, tmp_path: Path) -> None:
     assert cfg.max_steps == AppConfig().max_steps
     assert cfg.task_max_steps == 144
     assert cfg.subagent_max_steps == 12
+    assert "router" not in cfg.extra_fields.get("role_models", {})
+
+
+def test_router_section_persists_router_model(monkeypatch, tmp_path: Path) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(["4", "cheap-router-model", "", "100", "10", "s"])
+    inline = InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE, "auto", "fixed"])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
+
+    result = config_menu_mod.run_config_menu()
+
+    assert result.saved is True
+    assert load_config().extra_fields["role_models"]["router"] == "cheap-router-model"
+
+
+def test_router_section_preserves_unexposed_role_model_keys(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _seed_config(tmp_path, monkeypatch)
+    cfg = load_config()
+    cfg.extra_fields["role_models"] = {"comprehension": "vision-reader-model"}
+    cfg.extra_fields["forge_role_models"] = {"comprehension": "forge-vision-reader-model"}
+    save_config(cfg)
+    _patch_console(monkeypatch)
+    prompt = PromptScript(["4", "cheap-router-model", "", "100", "10", "s"])
+    inline = InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE, "auto", "fixed"])
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
+
+    result = config_menu_mod.run_config_menu()
+    saved_cfg = load_config()
+
+    assert result.saved is True
+    assert saved_cfg.extra_fields["role_models"] == {
+        "comprehension": "vision-reader-model",
+        "router": "cheap-router-model",
+    }
+    assert saved_cfg.extra_fields["forge_role_models"] == {
+        "comprehension": "forge-vision-reader-model"
+    }
 
 
 def test_subagent_role_override(monkeypatch, tmp_path: Path) -> None:
@@ -194,7 +239,10 @@ def test_forge_role_override(monkeypatch, tmp_path: Path) -> None:
     _seed_config(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
     answers = ["6"]
-    answers.extend("anthropic/claude-opus-4-7" if role == "planner" else "" for role in ROLE_ORDER)
+    answers.extend(
+        "anthropic/claude-opus-4-7" if role == "planner" else ""
+        for role in config_menu_mod.FORGE_ROLE_ORDER
+    )
     answers.append("s")
     prompt = PromptScript(answers)
     monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
@@ -205,6 +253,26 @@ def test_forge_role_override(monkeypatch, tmp_path: Path) -> None:
     assert result.saved is True
     assert forge_role_models["planner"] == "anthropic/claude-opus-4-7"
     assert set(forge_role_models) == {"planner"}
+
+
+def test_router_override_stays_out_of_subagent_summary() -> None:
+    base_state = config_menu_mod.ConfigMenuState.from_cfg(AppConfig(model="default"))
+    cfg = AppConfig(model="default")
+    cfg.extra_fields = {"role_models": {"router": "cheap-router-model"}}
+    state = config_menu_mod.ConfigMenuState.from_cfg(cfg)
+
+    base_rows = {
+        value: (label, summary)
+        for value, label, summary in config_menu_mod._top_level_menu_rows(base_state)
+    }
+    rows = {
+        value: (label, summary)
+        for value, label, summary in config_menu_mod._top_level_menu_rows(state)
+    }
+
+    assert rows["router"][0] == "Routing & Limits"
+    assert "router cheap-router-model" in rows["router"][1]
+    assert rows["subagents"][1] == base_rows["subagents"][1]
 
 
 def test_cancel_with_dirty_prompts_confirm(monkeypatch, tmp_path: Path) -> None:
@@ -265,6 +333,105 @@ def test_config_menu_provider_section_lists_profiles(monkeypatch, tmp_path: Path
 
     assert result.saved is False
     assert "anthropic" in output.getvalue()
+
+
+def test_config_menu_preset_rows_explain_compatibility_and_native_modes() -> None:
+    presets = config_menu_mod._ordered_profile_presets_for_setup()
+    keys = [preset.key for preset in presets]
+    advanced = config_menu_mod._advanced_profile_presets_for_setup()
+    advanced_keys = [preset.key for preset in advanced]
+
+    assert keys == ["openai-responses", "anthropic", "gemini"]
+    assert "anthropic-compat" not in keys
+    assert "gemini-compat" not in keys
+    assert "anthropic-compat" in advanced_keys
+    assert "gemini-compat" in advanced_keys
+    assert "Compatibility protocol" in config_menu_mod._preset_description(
+        next(preset for preset in advanced if preset.key == "anthropic-compat")
+    )
+    assert "Native first-party protocol" in config_menu_mod._preset_description(
+        next(preset for preset in presets if preset.key == "anthropic")
+    )
+
+
+def test_config_menu_advanced_preset_flow_can_choose_gemini_compat(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    state = config_menu_mod.ConfigMenuState.from_cfg(AppConfig(model="old"))
+    picker = InlineChoiceScript([config_menu_mod._ADVANCED_PROVIDER_PRESETS_VALUE, "gemini-compat"])
+    prompt = PromptScript(["gemini-compat"])
+    monkeypatch.setattr(config_menu_mod, "_run_config_picker", picker)
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    config_menu_mod._run_profile_add_preset(state, console)
+
+    profile = state.profiles["gemini-compat"]
+    assert profile["protocol"] == "openai_compat"
+    assert profile["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
+def test_config_menu_add_preset_surfaces_provider_diagnostic_warnings(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    state = config_menu_mod.ConfigMenuState.from_cfg(
+        AppConfig(model="old", web_search_mode="external")
+    )
+    picker = InlineChoiceScript(["openai-responses"])
+    prompt = PromptScript(["openai-responses"])
+    monkeypatch.setattr(config_menu_mod, "_run_config_picker", picker)
+    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
+
+    config_menu_mod._run_profile_add_preset(state, console)
+
+    assert picker.calls[0]["current_value"] == "openai-responses"
+    rendered = output.getvalue()
+    assert "Provider diagnostic:" in rendered
+    assert "web_search_mode=external is incompatible" in rendered
+    assert "web_search_adapter=openai_responses" in rendered
+
+
+def test_config_menu_active_preset_prefers_active_profile_protocol_over_base_url() -> None:
+    cfg = AppConfig(model="gpt-5.5")
+    add_profile(
+        cfg,
+        ProfileSpec(
+            name="openai-responses",
+            protocol="openai_responses",
+            base_url="https://api.openai.com/v1",
+            default_model="gpt-5.5",
+            web_search_adapter="openai_responses",
+        ),
+    )
+    add_profile(
+        cfg,
+        ProfileSpec(
+            name="anthropic",
+            protocol="anthropic_messages",
+            base_url="https://api.anthropic.com/v1",
+            default_model="claude-sonnet-4-6",
+            web_search_adapter="anthropic_messages",
+        ),
+    )
+    add_profile(
+        cfg,
+        ProfileSpec(
+            name="gemini",
+            protocol="gemini_generate_content",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            default_model="gemini-3.5-flash",
+            web_search_adapter="gemini_grounding",
+        ),
+    )
+
+    set_active_profile(cfg, "openai-responses")
+    state = config_menu_mod.ConfigMenuState.from_cfg(cfg)
+    assert config_menu_mod._active_preset(state).key == "openai-responses"
+
+    state.set_active_profile_name("anthropic")
+    assert config_menu_mod._active_preset(state).key == "anthropic"
+
+    state.set_active_profile_name("gemini")
+    assert config_menu_mod._active_preset(state).key == "gemini"
 
 
 def test_config_menu_switch_active_profile_persists(monkeypatch, tmp_path: Path) -> None:

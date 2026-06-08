@@ -47,12 +47,15 @@ from ..hooks import (
     ResolvedHookConfig,
     load_resolved_hooks_config,
 )
+from ..llm.base import ChatClient
 from ..llm.factory import _resolve_base_url, make_llm_client
+from ..llm.metadata import PROVIDER_METADATA_KEY, assistant_message_from_response
 from ..llm.openai_compat import OpenAICompatClient as _OpenAICompatClient
+from ..llm.protocols import OPENAI_COMPAT_PROTOCOL, get_provider_protocol_capabilities
 from ..mcp.config import load_resolved_mcp_config
 from ..mcp.manager import ForgeTaskScopedMcpManager, McpManager, create_mcp_manager
 from ..model_metadata_policy import ActiveModelRef, evaluate_active_model_metadata_policy
-from ..model_registry import ModelRegistry
+from ..model_registry import ModelRegistry, resolve_model_provider_key
 from ..model_router import ROLE_CODING, ROLE_COMPACTOR, ROLE_ROUTER, resolve_model_for_role
 from ..profiles import get_active_profile
 from ..repo_scan import scan_workspace as scan_workspace
@@ -203,7 +206,7 @@ def _make_session_llm_client(
     prompt_cache_retention: str | None,
     enable_thinking: bool | None,
     reasoning_effort: str | None,
-):
+) -> ChatClient:
     openai_client_cls = _patchable("OpenAICompatClient", OpenAICompatClient)
     if openai_client_cls is _OpenAICompatClient:
         return make_llm_client(
@@ -301,6 +304,41 @@ def _repo_summary(root: Path) -> str:
     return _repo_summary_data(root).text
 
 
+def _disable_unsupported_native_streaming(
+    *,
+    cfg: AppConfig,
+) -> tuple[AppConfig, str | None]:
+    if not bool(getattr(cfg, "stream", False)):
+        return cfg, None
+    profile = get_active_profile(cfg)
+    protocol = str(profile.protocol or OPENAI_COMPAT_PROTOCOL).strip()
+    if protocol == OPENAI_COMPAT_PROTOCOL:
+        return cfg, None
+    base_url = _resolve_base_url(cfg=cfg, profile=profile)
+    provider_key = resolve_model_provider_key(
+        cfg=cfg,
+        model_name=cfg.model,
+        base_url=base_url,
+        profile_name=profile.name,
+    )
+    capabilities = get_provider_protocol_capabilities(
+        provider_key=provider_key,
+        protocol=protocol,
+    )
+    streaming_supported = (
+        capabilities.supports_streaming
+        if capabilities is not None
+        else protocol == OPENAI_COMPAT_PROTOCOL
+    )
+    if streaming_supported:
+        return cfg, None
+    warning = (
+        f"Streaming requested but profile {profile.name!r} uses protocol={protocol!r}, "
+        "which does not support streaming yet in Sylliptor; streaming is disabled for this run."
+    )
+    return cfg.model_copy(update={"stream": False}, deep=True), warning
+
+
 @dataclass
 class AgentSession:
     cfg: AppConfig
@@ -313,7 +351,7 @@ class AgentSession:
     console: Any | None
     surface: Surface
     store: SessionStore
-    client: OpenAICompatClient
+    client: ChatClient
     model_registry: ModelRegistry
     usage_summary: UsageSummary
     usage_role: str
@@ -356,6 +394,7 @@ class AgentSession:
     skill_catalog_entries: tuple[SkillCatalogEntry, ...] = ()
     repo_conventions: tuple[ConventionDocument, ...] = ()
     subagents_enabled: bool = False
+    enforce_explicit_subagent_requests: bool = True
     subagent_depth: int = 0
     subagent_registry: dict[str, SubagentDefinition] | None = None
     step_budget_runtime: StepBudgetRuntime | None = None
@@ -522,8 +561,16 @@ class AgentSession:
     ) -> str:
         normalized_text = self._normalize_visible_assistant_text(text)
         if not normalized_text:
+            if extra_payload:
+                payload = {"content": text}
+                payload.update(extra_payload)
+                self.store.append("assistant_message", payload)
             return self._normalize_visible_assistant_text(prior_visible_text)
         if normalized_text == self._normalize_visible_assistant_text(prior_visible_text):
+            if extra_payload:
+                payload = {"content": text}
+                payload.update(extra_payload)
+                self.store.append("assistant_message", payload)
             return normalized_text
         payload = {"content": text}
         if extra_payload:
@@ -541,6 +588,7 @@ class AgentSession:
         self,
         *,
         final_text: str,
+        assistant_response: Any | None = None,
         language: str = "",
         script: str = "",
         explicit_language_override: bool = False,
@@ -557,11 +605,23 @@ class AgentSession:
         )
         if rewrite_payload is not None:
             self.store.append("final_summary_rewrite", rewrite_payload)
+        assistant_message = None
+        if assistant_response is not None:
+            candidate_message = assistant_message_from_response(
+                assistant_response,
+                content=emitted_text,
+            )
+            if PROVIDER_METADATA_KEY in candidate_message:
+                assistant_message = candidate_message
+        extra_payload = {"message": assistant_message} if assistant_message is not None else None
         self._emit_assistant_message_if_changed(
             text=emitted_text,
             prior_visible_text=prior_visible_text,
+            extra_payload=extra_payload,
             streamed_text_emitted=streamed_text_emitted,
         )
+        if assistant_message is not None:
+            self.messages.append(assistant_message)
         self.store.append("final", {"content": emitted_text})
         return emitted_text
 
@@ -837,6 +897,7 @@ class AgentSession:
 
         emitted_text = self._emit_final_assistant_text(
             final_text=final_text,
+            assistant_response=resp if fallback_reason is None else None,
             language=language,
             script=script,
             explicit_language_override=explicit_language_override,
@@ -903,6 +964,7 @@ def create_session(
     authoritative_verification_commands: list[str] | None = None,
     verify_cmd: list[str] | None = None,
     subagents_enabled: bool | None = None,
+    enforce_explicit_subagent_requests: bool = True,
     subagent_depth: int = 0,
     subagent_registry: dict[str, SubagentDefinition] | None = None,
     workspace_binding: WorkspaceBinding | None = None,
@@ -951,6 +1013,9 @@ def create_session(
     binding_created_path = prompt_context.binding_created_path
     authoritative_verify_commands = prompt_context.authoritative_verify_commands
     session_cfg = prompt_context.session_cfg
+    session_cfg, native_streaming_warning_message = _disable_unsupported_native_streaming(
+        cfg=session_cfg
+    )
     normalized_session_source = str(session_source or "startup").strip().lower() or "startup"
     if normalized_session_source not in {"startup", "resume", "fork"}:
         raise ConfigError("session_source must be one of: startup, resume, fork.")
@@ -1194,6 +1259,19 @@ def create_session(
             surface_on_warning(warning_message)
         else:
             warnings.warn(warning_message, stacklevel=2)
+
+    if native_streaming_warning_message:
+        store.append(
+            "warning",
+            {
+                "warning": "native_streaming_disabled",
+                "message": native_streaming_warning_message,
+            },
+        )
+        if callable(surface_on_warning):
+            surface_on_warning(native_streaming_warning_message)
+        else:
+            warnings.warn(native_streaming_warning_message, stacklevel=2)
 
     store.append(
         "session_start",
@@ -1738,6 +1816,7 @@ def create_session(
             mcp_manager=mcp_manager,
             terminal_manager=terminal_manager,
             subagents_enabled=resolved_subagents_enabled,
+            enforce_explicit_subagent_requests=bool(enforce_explicit_subagent_requests),
             subagent_depth=subagent_depth,
             subagent_registry=resolved_subagent_registry,
             shell_runner=runner,

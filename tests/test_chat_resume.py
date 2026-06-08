@@ -34,6 +34,64 @@ def test_load_chat_resume_messages_reads_user_and_assistant_events(tmp_path: Pat
     ]
 
 
+def test_load_chat_resume_messages_uses_shaped_tool_result_content(tmp_path: Path) -> None:
+    log_path = tmp_path / "resume-shaped-tool-result.jsonl"
+    shaped_content = json.dumps(
+        {
+            "transcript_shaped": True,
+            "tool": "fs_read",
+            "tool_call_id": "tc-read",
+            "summary": 'Loaded "large.txt" (5000 chars).',
+            "preview": "A" * 80,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    events = [
+        {"type": "session_start", "payload": {"mode": "auto"}},
+        {"type": "user_message", "payload": {"content": "Read the large file."}},
+        {
+            "type": "assistant_message",
+            "payload": {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "tc-read",
+                            "type": "function",
+                            "function": {
+                                "name": "fs_read",
+                                "arguments": json.dumps({"path": "large.txt"}),
+                            },
+                        }
+                    ],
+                }
+            },
+        },
+        {
+            "type": "tool_result",
+            "payload": {
+                "name": "fs_read",
+                "tool_call_id": "tc-read",
+                "result": {"path": "large.txt", "content": "A" * 5000},
+                "content": shaped_content,
+                "step": 1,
+            },
+        },
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    loaded = cli_mod._load_chat_resume_messages(log_path)
+
+    assert loaded[-1] == {
+        "role": "tool",
+        "tool_call_id": "tc-read",
+        "content": shaped_content,
+    }
+    assert "A" * 1000 not in loaded[-1]["content"]
+
+
 def test_load_chat_resume_messages_prefers_user_display_content(tmp_path: Path) -> None:
     log_path = tmp_path / "resume-display.jsonl"
     events = [

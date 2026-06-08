@@ -56,12 +56,23 @@ class PromptScript:
 
 
 class PickerScript:
-    def __init__(self, answers: list[str | None]) -> None:
+    def __init__(self, answers: list[str | None], *, auto_router_inherit: bool = True) -> None:
         self.answers = list(answers)
+        self.auto_router_inherit = auto_router_inherit
         self.calls: list[dict[str, Any]] = []
 
     def __call__(self, **kwargs: Any) -> str | None:
         self.calls.append(kwargs)
+        if kwargs.get("title") == "Router Model" and self.auto_router_inherit:
+            if not self.answers:
+                return setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE
+            next_answer = self.answers[0]
+            if next_answer not in {
+                None,
+                setup_wizard_mod._CUSTOM_MODEL_VALUE,
+                setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
+            }:
+                return setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE
         if not self.answers:
             raise AssertionError(f"Unexpected picker: {kwargs}")
         return self.answers.pop(0)
@@ -94,15 +105,15 @@ def _sandbox_diagnostic(
         configured_mode="strict",
         configured_backend="auto",
         selected_backend="docker",
-        docker_image="ghcr.io/AlysisAi/Sylliptor-sandbox:dev",
-        server_image="ghcr.io/AlysisAi/Sylliptor-sandbox:server",
+        docker_image="ghcr.io/alysisai/sylliptor-sandbox:dev",
+        server_image="ghcr.io/alysisai/sylliptor-sandbox:server",
         checks=(
             SandboxCheck("Docker CLI", "ok", "/usr/bin/docker"),
             SandboxCheck("Docker daemon", "ok", "running"),
             SandboxCheck(
                 "sandbox image",
                 "ok" if ready else "missing",
-                "ghcr.io/AlysisAi/Sylliptor-sandbox:dev",
+                "ghcr.io/alysisai/sylliptor-sandbox:dev",
             ),
         ),
         next_steps=next_steps,
@@ -158,6 +169,57 @@ def test_setup_wizard_full_flow_persists_everything(monkeypatch, tmp_path: Path)
     assert cfg.model == "gpt-5"
     assert cfg.extra_fields["active_profile"] == "openai"
     assert cfg.extra_fields["default_workspace_path"] == os.fspath(tmp_path.resolve())
+    assert "router" not in cfg.extra_fields.get("role_models", {})
+
+
+def test_setup_wizard_router_model_inherits_and_clears_existing_override(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    cfg = AppConfig()
+    cfg.extra_fields = {"role_models": {"coding": "coding-model", "router": "old-router-model"}}
+    save_config(cfg)
+
+    result, output, picker, _prompt = _run_basic_wizard(monkeypatch, tmp_path)
+
+    assert result is True
+    saved_cfg = load_config()
+    assert saved_cfg.extra_fields["role_models"] == {"coding": "coding-model"}
+    assert "Router model:" in output
+    assert "inherits default" in output
+    router_rows = picker.calls[2]["rows"]
+    assert router_rows[0][0] == setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE
+
+
+def test_setup_wizard_persists_explicit_router_model_and_validates_it(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    picker = PickerScript(
+        ["openai", "gpt-5", "gpt-5.4-mini"],
+        auto_router_inherit=False,
+    )
+    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
+    monkeypatch.setattr(
+        setup_wizard_mod.typer,
+        "prompt",
+        PromptScript(["", "sk-test-1234", os.fspath(tmp_path)]),
+    )
+    validated_models: list[str | None] = []
+
+    def validate(*, profile, api_key, model=None, **_kwargs):
+        del profile, api_key
+        validated_models.append(model)
+        return setup_wizard_mod._ApiKeyValidationResult(status="validated")
+
+    monkeypatch.setattr(setup_wizard_mod, "_validate_api_key", validate)
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+    assert load_config().extra_fields["role_models"]["router"] == "gpt-5.4-mini"
+    assert validated_models == [None, "gpt-5", "gpt-5.4-mini"]
 
 
 def test_setup_wizard_abort_on_api_key_writes_nothing(monkeypatch, tmp_path: Path) -> None:
@@ -259,6 +321,8 @@ def test_setup_wizard_creates_anthropic_profile_with_chosen_model(
     profile = cfg.extra_fields["profiles"]["anthropic"]
     assert cfg.extra_fields["active_profile"] == "anthropic"
     assert cfg.model == "claude-sonnet-4-6"
+    assert profile["protocol"] == "anthropic_messages"
+    assert profile["base_url"] == "https://api.anthropic.com/v1"
     assert profile["default_model"] == "claude-sonnet-4-6"
     assert profile["web_search_adapter"] == "anthropic_messages"
     assert profile["extra_headers"] == {}
@@ -296,6 +360,78 @@ def test_provider_fallback_does_not_treat_api_key_like_input_as_openai(
     assert "Pick a provider first; you'll enter the key in the next step." in output.getvalue()
 
 
+def test_setup_profile_picker_separates_compatibility_and_native_presets() -> None:
+    presets = setup_wizard_mod._setup_presets()
+    keys = [preset.key for preset in presets]
+    advanced = setup_wizard_mod._advanced_setup_presets()
+    advanced_keys = [preset.key for preset in advanced]
+
+    assert keys == ["openai-responses", "anthropic", "gemini"]
+    assert all(preset.protocol != "gemini_interactions" for preset in presets)
+    assert all(preset.protocol != "gemini_interactions" for preset in advanced)
+    assert "anthropic-compat" not in keys
+    assert "gemini-compat" not in keys
+    assert "anthropic-compat" in advanced_keys
+    assert "gemini-compat" in advanced_keys
+    assert all(
+        "Compatibility protocol" in setup_wizard_mod._preset_description(preset)
+        for preset in advanced
+        if preset.key in {"anthropic-compat", "gemini-compat"}
+    )
+    assert all(
+        "Native first-party protocol" in setup_wizard_mod._preset_description(preset)
+        for preset in presets
+        if preset.key in {"openai-responses", "anthropic", "gemini"}
+    )
+
+
+def test_setup_wizard_advanced_flow_can_choose_anthropic_compat(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    picker = PickerScript(
+        [
+            setup_wizard_mod._ADVANCED_PROVIDER_PRESETS_VALUE,
+            "anthropic-compat",
+            "claude-sonnet-4-6",
+        ]
+    )
+    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
+    monkeypatch.setattr(
+        setup_wizard_mod.typer,
+        "prompt",
+        PromptScript(["", "sk-ant-test", os.fspath(tmp_path)]),
+    )
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+    profile = load_config().extra_fields["profiles"]["anthropic-compat"]
+    assert profile["protocol"] == "openai_compat"
+    assert profile["base_url"] == "https://api.anthropic.com/v1/"
+
+
+def test_setup_wizard_surfaces_provider_diagnostic_warnings(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    cfg = AppConfig(web_search_mode="external")
+    save_config(cfg)
+    output = _patch_console(monkeypatch)
+    picker = PickerScript(["openai-responses", "gpt-5.5"])
+    prompt = PromptScript(["", "sk-test-1234", os.fspath(tmp_path)])
+    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
+    monkeypatch.setattr(setup_wizard_mod.typer, "prompt", prompt)
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+
+    rendered = output.getvalue()
+    assert "Provider diagnostic:" in rendered
+    assert "web_search_mode=external is incompatible" in rendered
+    assert "web_search_adapter=openai_responses" in rendered
+
+
 def test_model_picker_rows_include_preset_suggestions(monkeypatch, tmp_path: Path) -> None:
     _config_env(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
@@ -331,10 +467,10 @@ def test_deepseek_model_picker_uses_v4_models(monkeypatch, tmp_path: Path) -> No
     assert "deepseek-coder" not in model_values
 
 
-def test_gemini_model_picker_uses_current_preview_models(monkeypatch, tmp_path: Path) -> None:
+def test_gemini_model_picker_uses_stable_models(monkeypatch, tmp_path: Path) -> None:
     _config_env(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
-    picker = PickerScript(["gemini", "gemini-3.1-pro-preview"])
+    picker = PickerScript(["gemini", "gemini-3.5-flash"])
     monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
     monkeypatch.setattr(
         setup_wizard_mod.typer, "prompt", PromptScript(["", "sk-test-1234", os.fspath(tmp_path)])
@@ -342,8 +478,10 @@ def test_gemini_model_picker_uses_current_preview_models(monkeypatch, tmp_path: 
 
     assert setup_wizard_mod.run_setup_wizard() is True
     model_values = [value for value, _label, _description in picker.calls[1]["rows"]]
-    assert model_values[0] == "gemini-3.1-pro-preview"
+    assert model_values[0] == "gemini-3.5-flash"
     assert "gemini-3.1-flash-lite" in model_values
+    assert "gemini-2.5-pro" in model_values
+    assert "gemini-2.5-flash" in model_values
     assert "gemini-3.1-preview" not in model_values
     assert "gemini-3-pro-preview" not in model_values
     assert "gemini-3.1-flash-lite-preview" not in model_values
@@ -518,10 +656,10 @@ def test_api_key_validation_retries_when_gemini_rejects_temperature() -> None:
         profile=ProfileSpec(
             name="gemini",
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-            default_model="gemini-3.1-pro-preview",
+            default_model="gemini-2.5-flash",
         ),
         api_key="sk-test",
-        model="gemini-3.1-pro-preview",
+        model="gemini-2.5-flash",
         transport=httpx.MockTransport(handler),
     )
 
@@ -543,26 +681,26 @@ def test_gemini_api_key_validation_uses_fast_validation_model_before_model_choic
         profile=ProfileSpec(
             name="gemini",
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-            default_model="gemini-3.1-pro-preview",
+            default_model="gemini-2.5-flash",
         ),
         api_key="sk-test",
         suggested_models=(
-            "gemini-3.1-pro-preview",
-            "gemini-3-flash-preview",
+            "gemini-3.5-flash",
             "gemini-3.1-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
         ),
-        validation_model="gemini-3-flash-preview",
+        validation_model="gemini-2.5-flash",
         transport=httpx.MockTransport(handler),
     )
 
     assert result.status == "validated"
     assert result.message == (
-        "Validated API key using 'gemini-3-flash-preview'. "
-        "The selected model will be verified next."
+        "Validated API key using 'gemini-2.5-flash'. The selected model will be verified next."
     )
-    assert "gemini-3-flash-preview" in result.message
+    assert "gemini-2.5-flash" in result.message
     assert "fallback" not in result.message.casefold()
-    assert captured["body"]["model"] == "gemini-3-flash-preview"
+    assert captured["body"]["model"] == "gemini-2.5-flash"
     assert captured["body"]["reasoning_effort"] == "low"
 
 
@@ -577,16 +715,16 @@ def test_gemini_selected_model_validation_uses_low_reasoning_effort() -> None:
         profile=ProfileSpec(
             name="gemini",
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-            default_model="gemini-3.1-pro-preview",
+            default_model="gemini-2.5-flash",
         ),
         api_key="sk-test",
-        model="gemini-3.1-pro-preview",
+        model="gemini-2.5-flash",
         transport=httpx.MockTransport(handler),
     )
 
     assert result.status == "validated"
     assert result.message == ""
-    assert captured["body"]["model"] == "gemini-3.1-pro-preview"
+    assert captured["body"]["model"] == "gemini-2.5-flash"
     assert captured["body"]["reasoning_effort"] == "low"
 
 
@@ -675,6 +813,7 @@ def test_setup_summary_renders_api_key_validation_status(
             validation_message=validation_message,
         ),
         model_result=setup_wizard_mod._ModelStepResult(model="example-model"),
+        router_model_result=setup_wizard_mod._RouterModelStepResult(),
         workspace_result=setup_wizard_mod._WorkspaceStepResult(workspace="C:\\repo"),
         sandbox_result=setup_wizard_mod._SandboxStepResult(ready=True, status="docker"),
     )
@@ -897,7 +1036,7 @@ def test_setup_wizard_pull_failure_logs_raw_output_without_printing_it(
                 error="docker pull failed",
                 results=(
                     SandboxImagePullResult(
-                        image="ghcr.io/AlysisAi/Sylliptor-sandbox:dev",
+                        image="ghcr.io/alysisai/sylliptor-sandbox:dev",
                         ok=False,
                         output="RAW SUBPROCESS OUTPUT",
                     ),
@@ -1001,7 +1140,12 @@ def test_setup_wizard_escape_at_profile_returns_to_welcome(monkeypatch, tmp_path
 
     assert setup_wizard_mod.run_setup_wizard() is True
     assert output.getvalue().count("Welcome to Sylliptor") == 2
-    assert len(picker.calls) == 3
+    assert [call["title"] for call in picker.calls] == [
+        "Provider Profile",
+        "Provider Profile",
+        "Default Model",
+        "Router Model",
+    ]
 
 
 def test_setup_wizard_escape_at_api_key_returns_to_profile_with_preselection(
@@ -1050,14 +1194,26 @@ def test_setup_wizard_escape_at_workspace_returns_to_model_with_preselection(
 ) -> None:
     _config_env(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
-    picker = PickerScript(["openai", "gpt-5.5", "gpt-5.5"])
+    picker = PickerScript(
+        [
+            "openai",
+            "gpt-5.5",
+            setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
+            None,
+            "gpt-5.5",
+            setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
+        ],
+        auto_router_inherit=False,
+    )
     text_input = PromptScript(["", "sk-test-1234", setup_wizard_mod._GoBack(), os.fspath(tmp_path)])
     monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
     monkeypatch.setattr(setup_wizard_mod, "_esc_aware_text_input", text_input)
 
     assert setup_wizard_mod.run_setup_wizard() is True
-    assert picker.calls[2]["title"] == "Default Model"
-    assert picker.calls[2]["current_value"] == "gpt-5.5"
+    assert picker.calls[3]["title"] == "Router Model"
+    assert picker.calls[3]["current_value"] == setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE
+    assert picker.calls[4]["title"] == "Default Model"
+    assert picker.calls[4]["current_value"] == "gpt-5.5"
 
 
 def test_setup_wizard_profile_change_invalidates_api_key_and_model_results(
@@ -1070,10 +1226,14 @@ def test_setup_wizard_profile_change_invalidates_api_key_and_model_results(
         [
             "openai",
             "gpt-5",
+            setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
+            None,
             None,
             "anthropic",
             "claude-sonnet-4-6",
-        ]
+            setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
+        ],
+        auto_router_inherit=False,
     )
     text_input = PromptScript(
         [
@@ -1094,7 +1254,8 @@ def test_setup_wizard_profile_change_invalidates_api_key_and_model_results(
     assert load_persisted_profile_keys()["anthropic"] == "sk-ant"
     api_prompts = [call[0] for call in text_input.calls if call[0].startswith("Paste your API key")]
     assert api_prompts[-1] == "Paste your API key"
-    assert any(row[0] == "claude-sonnet-4-6" for row in picker.calls[-1]["rows"])
+    assert picker.calls[-2]["title"] == "Default Model"
+    assert any(row[0] == "claude-sonnet-4-6" for row in picker.calls[-2]["rows"])
 
 
 def test_setup_wizard_ctrl_c_confirmation_decline_stays_on_same_step(

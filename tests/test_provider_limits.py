@@ -37,6 +37,10 @@ def _chat_ok() -> dict[str, object]:
     return {"choices": [{"message": {"content": "ok"}}]}
 
 
+def _public_resolver(_host: str, _port: int) -> list[str]:
+    return ["93.184.216.34"]
+
+
 def test_qwen35_plus_resolves_to_canonical_qwen_cap() -> None:
     cfg = AppConfig(base_url="https://api.deepseek.com", model="deepseek-v4-pro")
 
@@ -370,6 +374,7 @@ def test_dashscope_web_search_shares_qwen_semaphore_with_planner_call() -> None:
             api_key="k",
             model="qwen3.5-plus",
             transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
             provider_concurrency_caps=caps,
             provider_retry_settings=ProviderRetrySettings(max_retries=0),
         )

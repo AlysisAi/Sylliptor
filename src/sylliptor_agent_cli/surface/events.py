@@ -38,7 +38,7 @@ Engine event inventory (migration targets; current call sites are intentionally 
 from __future__ import annotations
 
 import math
-from dataclasses import MISSING, dataclass, fields
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Any, ClassVar, Literal, TypeAlias, get_args
 
 JsonPrimitive: TypeAlias = str | int | float | bool | None
@@ -75,8 +75,8 @@ def _json_safe(value: Any) -> JsonValue:
 
 def _to_dict(event: Any) -> dict[str, Any]:
     data: dict[str, Any] = {"type": event.type}
-    for field in fields(event):
-        data[field.name] = _json_safe(getattr(event, field.name))
+    for event_field in fields(event):
+        data[event_field.name] = _json_safe(getattr(event, event_field.name))
     return data
 
 
@@ -257,6 +257,17 @@ class PromptForInput:
     prompt_id: str
     prompt_text: str
     kind: str
+    approval_kind: str | None = None
+    approval_id: str | None = None
+    reason: str | None = None
+    preview: str | None = None
+    files: list[str] = field(default_factory=list)
+    command: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    expires_at: str | None = None
+    allow_for_session_supported: bool | None = None
+    allow_for_session_scope: dict[str, Any] | None = None
+    allow_for_session_warning: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _to_dict(self)

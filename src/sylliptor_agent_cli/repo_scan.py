@@ -9,6 +9,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .file_classification import (
+    BROAD_SOURCE_EXTENSIONS,
+    CODE_SCAN_SKIP_DIR_NAMES,
+    SOURCE_EXTENSIONS_BY_LANGUAGE,
+    source_extensions_for_languages,
+)
 from .runtime_artifacts import RUNTIME_ARTIFACT_DIR_NAMES
 from .workspace_context import WorkspaceContext
 
@@ -37,17 +43,21 @@ _SKIP_TOP_LEVEL_NAMES = {
     "target",
     "venv",
 } | set(RUNTIME_ARTIFACT_DIR_NAMES)
-_SKIP_RECURSIVE_NAMES = _SKIP_TOP_LEVEL_NAMES | {
-    ".idea",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".tox",
-    ".venv",
-    "__pycache__",
-    "coverage",
-    "vendor",
-}
+_SKIP_RECURSIVE_NAMES = (
+    _SKIP_TOP_LEVEL_NAMES
+    | set(CODE_SCAN_SKIP_DIR_NAMES)
+    | {
+        ".idea",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "coverage",
+        "vendor",
+    }
+)
 _MANIFEST_SPECS: tuple[tuple[str, str], ...] = (
     ("pyproject.toml", "python"),
     ("requirements.txt", "python"),
@@ -83,36 +93,8 @@ _RECURSIVE_MANIFEST_FILENAMES = {
 }
 _README_NAMES = ("README.md", "README.rst", "README.txt", "README")
 _MAKE_TARGET_RE = re.compile(r"^([A-Za-z0-9_.-]+)\s*::?\s*$")
-_SOURCE_EXTENSIONS_BY_LANGUAGE: dict[str, set[str]] = {
-    "python": {".py"},
-    "rust": {".rs"},
-    "go": {".go"},
-    "javascript": {".js", ".jsx", ".mjs", ".cjs"},
-    "typescript": {".ts", ".tsx"},
-    "java": {".java", ".kt"},
-    "node": {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"},
-}
-_BROAD_SOURCE_EXTENSIONS = {
-    ".bash",
-    ".c",
-    ".cpp",
-    ".go",
-    ".h",
-    ".hpp",
-    ".java",
-    ".js",
-    ".jsx",
-    ".kt",
-    ".mjs",
-    ".php",
-    ".py",
-    ".rb",
-    ".rs",
-    ".sh",
-    ".swift",
-    ".ts",
-    ".tsx",
-}
+_SOURCE_EXTENSIONS_BY_LANGUAGE = SOURCE_EXTENSIONS_BY_LANGUAGE
+_BROAD_SOURCE_EXTENSIONS = BROAD_SOURCE_EXTENSIONS
 
 
 @dataclass(frozen=True)
@@ -358,10 +340,7 @@ def _collect_top_level_entries(root: Path) -> list[dict[str, str]]:
 
 
 def _source_extensions_for_languages(language_hints: list[str]) -> set[str]:
-    extensions: set[str] = set()
-    for hint in language_hints:
-        extensions.update(_SOURCE_EXTENSIONS_BY_LANGUAGE.get(hint.casefold(), set()))
-    return extensions or set(_BROAD_SOURCE_EXTENSIONS)
+    return source_extensions_for_languages(language_hints)
 
 
 def _collect_representative_source_paths(
@@ -644,8 +623,13 @@ def _infer_test_commands(
     if _find_manifest_path(manifests, "Cargo.toml") is not None:
         commands.append("cargo test")
 
-    if _likely_has_python_tests(root=root, search_dirs=search_dirs, manifests=manifests):
-        commands.append("pytest -q")
+    python_test_command = _python_test_command(
+        root=root,
+        search_dirs=search_dirs,
+        manifests=manifests,
+    )
+    if python_test_command is not None:
+        commands.append(python_test_command)
 
     commands.extend(_readme_doctest_commands(root=root, readme_paths=readme_paths))
 
@@ -698,10 +682,36 @@ def _likely_has_python_tests(
     search_dirs: list[Path],
     manifests: list[dict[str, str]],
 ) -> bool:
-    for directory in search_dirs:
+    return _python_test_command(root=root, search_dirs=search_dirs, manifests=manifests) is not None
+
+
+def _python_test_command(
+    *,
+    root: Path,
+    search_dirs: list[Path],
+    manifests: list[dict[str, str]],
+) -> str | None:
+    _ = manifests
+    for directory in _python_test_search_dirs(root=root, search_dirs=search_dirs):
         if _directory_has_python_test_layout_signal(directory, allow_tests_dir_hint=False):
-            return True
-    return False
+            rel_path = _relpath(root, directory)
+            if rel_path in {"", "."}:
+                return "pytest -q"
+            quoted = shlex.quote(rel_path)
+            return f"PYTHONPATH={quoted} pytest -q {quoted}"
+    return None
+
+
+def _python_test_search_dirs(*, root: Path, search_dirs: list[Path]) -> list[Path]:
+    focused: list[Path] = []
+    workspace_roots: list[Path] = []
+    for directory in search_dirs:
+        rel_path = _relpath(root, directory)
+        if rel_path in {"", "."}:
+            workspace_roots.append(directory)
+        else:
+            focused.append(directory)
+    return [*focused, *workspace_roots]
 
 
 def _directory_has_python_test_layout_signal(

@@ -236,7 +236,7 @@ def tool_info(
     for entry in matches:
         table = _Table(title=f"Custom Tool: {entry.name}")
         table.add_column("field")
-        table.add_column("value")
+        table.add_column("value", overflow="fold")
         table.add_row("scope", entry.source_scope)
         table.add_row("trust", entry.trust)
         table.add_row("status", entry.status)
@@ -279,6 +279,7 @@ def tool_info(
                 ),
             )
         console.print(table)
+        console.print(f"[dim]source_path:[/dim] {entry.source_path.as_posix()}")
 
 
 def _select_project_tool_entry_or_exit(

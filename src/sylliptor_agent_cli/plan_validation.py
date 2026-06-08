@@ -11,11 +11,23 @@ from .assets.models import AssetError
 from .assets.plan_binding import task_asset_briefing
 from .direction_change import filter_obsolete_direction_paths
 from .failure_category import FailureCategory
+from .file_classification import (
+    CONTENT_SURFACE_EXTENSIONS,
+    FRONTEND_SURFACE_EXTENSIONS,
+    describe_path_kinds,
+    is_code_implementation_path,
+    is_test_path,
+)
 from .mcp.forge_scope import normalize_task_mcp_scope
-from .plan_reconciliation import is_code_implementation_path
+from .planning_constraints import (
+    planning_constraints_from_plan,
+    task_scope_constraint_violations,
+)
 from .swarm_scheduler import canonical_task_status
 from .task_readiness import (
     EXECUTION_UNREADY_SCOPE_WARNING,
+    TASK_KIND_ANALYSIS_ONLY,
+    classify_task_lifecycle,
     normalize_existing_task_scope_fields,
     normalized_text_list,
     status_is_execution_candidate,
@@ -31,7 +43,7 @@ from .task_scope import (
 )
 
 _NON_EXECUTABLE_OBSOLETE_STATUSES = frozenset({"superseded", "invalidated"})
-PlanAcceptanceRuleId = Literal["R1", "R2", "R3", "R4"]
+PlanAcceptanceRuleId = Literal["R1", "R2", "R3", "R4", "R5"]
 
 
 class PlannerFailedError(RuntimeError):
@@ -191,7 +203,7 @@ def _metadata_only_observed(write_scope: list[str]) -> str:
         for path in lowered
     ):
         return "write_scope is README/docs only"
-    return "write_scope has no code implementation paths"
+    return f"write_scope has no code implementation paths (detected: {describe_path_kinds(write_scope)})"
 
 
 _PRIMARY_IMPLEMENTATION_FILENAMES = frozenset(
@@ -224,6 +236,76 @@ _PRIMARY_IMPLEMENTATION_EXTENSIONS = frozenset(
         ".yml",
     }
 )
+_FRONTEND_SURFACE_EXTENSIONS = FRONTEND_SURFACE_EXTENSIONS
+_CONTENT_SURFACE_EXTENSIONS = CONTENT_SURFACE_EXTENSIONS
+_PRIMARY_IMPLEMENTATION_SCOPE_DIRS = frozenset(
+    {
+        "app",
+        "apps",
+        "bin",
+        "cmd",
+        "lib",
+        "libs",
+        "package",
+        "packages",
+        "server",
+        "src",
+    }
+)
+_BROAD_SUPPORT_SCOPE_DIRS = frozenset(
+    {
+        ".github",
+        ".sylliptor",
+        "__tests__",
+        "build",
+        "coverage",
+        "dist",
+        "doc",
+        "docs",
+        "example",
+        "examples",
+        "fixture",
+        "fixtures",
+        "note",
+        "notes",
+        "spec",
+        "specs",
+        "test",
+        "tests",
+    }
+)
+_SUPPORT_FIXTURE_SCOPE_DIRS = frozenset(
+    {
+        "__snapshots__",
+        "fixture",
+        "fixtures",
+        "golden",
+        "goldens",
+        "sample",
+        "samples",
+        "snapshot",
+        "snapshots",
+        "test_data",
+        "test-data",
+        "testdata",
+    }
+)
+_SUPPORT_FIXTURE_EXTENSIONS = frozenset(
+    {
+        ".csv",
+        ".golden",
+        ".ini",
+        ".json",
+        ".jsonl",
+        ".out",
+        ".snap",
+        ".toml",
+        ".txt",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
+)
 _SUPPORT_SCOPE_TEXT_RE = re.compile(
     r"(?<![A-Za-z0-9_])"
     r"(?:changelog|coverage|docs?|doctest|documentation|examples?|jest|markdown|"
@@ -241,14 +323,32 @@ _PRIMARY_SUPPORT_SCOPE_TEXT_RE = re.compile(
     r"|^\s*document\b",
     re.IGNORECASE,
 )
+_CONTENT_SCOPE_TEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?:adoc|article|checklist|chores?|content|copy|css|docs?|documentation|"
+    r"frontend|front-end|headings?|html|landing|markdown|mdx|notes?|page|readme|"
+    r"rst|sections?|style|styles|styling|todo|todos|ui|web(?:site)?|write[- ]?up)"
+    r"(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 _IMPLEMENTATION_INTENT_TEXT_RE = re.compile(
     r"\b(?:build|change|configure|edit|enable|fix|implement|improve|modify|patch|"
     r"refactor|rename|repair|support|wire)\b",
     re.IGNORECASE,
 )
+_SUPPORT_FIXTURE_TEXT_RE = re.compile(
+    r"\b(?:fixtures?|test\s+data|sample(?:\s+data)?|golden(?:\s+files?)?|"
+    r"snapshots?|expected\s+(?:output|data|results?))\b",
+    re.IGNORECASE,
+)
 
 
 def _is_primary_implementation_path(path: str) -> bool:
+    cleaned = str(path or "").strip().replace("\\", "/").strip("/")
+    if cleaned.endswith("/**"):
+        first_part = cleaned.split("/", 1)[0].casefold()
+        if first_part in _PRIMARY_IMPLEMENTATION_SCOPE_DIRS:
+            return True
     if is_code_implementation_path(path):
         return True
     pure = PurePosixPath(path)
@@ -258,6 +358,114 @@ def _is_primary_implementation_path(path: str) -> bool:
     if pure.suffix.casefold() in _PRIMARY_IMPLEMENTATION_EXTENSIONS:
         return True
     return False
+
+
+def _is_task_broad_primary_implementation_scope(task: dict[str, Any], path: str) -> bool:
+    cleaned = str(path or "").strip().replace("\\", "/").strip("/")
+    if not cleaned.endswith("/**"):
+        return False
+    base = cleaned[:-3].strip("/")
+    if not base:
+        return False
+    parts = [part.casefold() for part in base.split("/") if part]
+    if not parts:
+        return False
+    if any(part.startswith(".") or part in _BROAD_SUPPORT_SCOPE_DIRS for part in parts):
+        return False
+    text = _task_text(task)
+    if not _IMPLEMENTATION_INTENT_TEXT_RE.search(text):
+        return False
+    if _task_is_explicit_support_scope(task):
+        return False
+    return True
+
+
+def _path_suffix(path: str) -> str:
+    return PurePosixPath(str(path or "").strip().replace("\\", "/")).suffix.casefold()
+
+
+def _is_content_surface_path(path: str) -> bool:
+    lowered = str(path or "").strip().replace("\\", "/").casefold()
+    if lowered in {"readme", "readme.md", "todo", "todo.md"}:
+        return True
+    if lowered.startswith(("docs/", "notes/")):
+        return True
+    return _path_suffix(path) in _CONTENT_SURFACE_EXTENSIONS
+
+
+def _is_frontend_surface_path(path: str) -> bool:
+    return _path_suffix(path) in _FRONTEND_SURFACE_EXTENSIONS
+
+
+def _is_test_surface_path(path: str) -> bool:
+    return is_test_path(path)
+
+
+def _is_support_surface_path(path: str) -> bool:
+    lowered = str(path or "").strip().replace("\\", "/").casefold()
+    name = PurePosixPath(lowered).name
+    if _is_content_surface_path(path) or _is_frontend_surface_path(path):
+        return True
+    if _is_test_surface_path(path):
+        return True
+    if lowered.startswith(("example/", "examples/")):
+        return True
+    return name in {
+        "changelog",
+        "changelog.md",
+        "license",
+        "license.md",
+        "licence",
+        "licence.md",
+    }
+
+
+def _is_support_fixture_path(task: dict[str, Any], path: str) -> bool:
+    normalized = str(path or "").strip().replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+    pure = PurePosixPath(normalized)
+    lowered_parts = tuple(part.casefold() for part in pure.parts)
+    if set(lowered_parts) & _SUPPORT_FIXTURE_SCOPE_DIRS:
+        return True
+    if len(lowered_parts) != 1:
+        if any(part in _PRIMARY_IMPLEMENTATION_SCOPE_DIRS for part in lowered_parts[:-1]):
+            return False
+        return False
+    if pure.suffix.casefold() not in _SUPPORT_FIXTURE_EXTENSIONS:
+        return False
+    return _SUPPORT_FIXTURE_TEXT_RE.search(_task_text(task)) is not None
+
+
+def _task_has_explicit_support_surface_scope(
+    *,
+    estimated_files: list[str],
+    write_scope: list[str],
+) -> bool:
+    scoped_paths = [*estimated_files, *write_scope]
+    return bool(scoped_paths) and all(_is_support_surface_path(path) for path in scoped_paths)
+
+
+def _task_has_explicit_content_surface_scope(
+    task: dict[str, Any],
+    *,
+    estimated_files: list[str],
+    write_scope: list[str],
+) -> bool:
+    scoped_paths = [*estimated_files, *write_scope]
+    if not scoped_paths:
+        return False
+    if not all(
+        _is_content_surface_path(path) or _is_frontend_surface_path(path) for path in scoped_paths
+    ):
+        return False
+    text = _task_text(task)
+    if _CONTENT_SCOPE_TEXT_RE.search(text):
+        return True
+    path_hints = _explicit_task_path_hints(task)
+    return bool(path_hints) and all(
+        _is_content_surface_path(path) or _is_frontend_surface_path(path) for path in path_hints
+    )
 
 
 def _task_text(task: dict[str, Any]) -> str:
@@ -357,10 +565,117 @@ def _missing_explicit_scope_hints(
 
 def _task_needs_primary_implementation_scope(
     task: dict[str, Any],
+    *,
+    estimated_files: list[str],
+    write_scope: list[str],
 ) -> bool:
-    if _task_is_explicit_support_scope(task):
+    if _task_is_explicit_support_scope(task) and _task_has_explicit_support_surface_scope(
+        estimated_files=estimated_files,
+        write_scope=write_scope,
+    ):
+        return False
+    if _task_has_explicit_content_surface_scope(
+        task,
+        estimated_files=estimated_files,
+        write_scope=write_scope,
+    ):
         return False
     return True
+
+
+def _task_has_primary_implementation_scope(
+    task: dict[str, Any],
+) -> bool:
+    estimated_files, write_scope = normalize_existing_task_scope_fields(
+        estimated_files=task.get("estimated_files"),
+        write_scope=task.get("write_scope"),
+    )
+    return any(
+        _is_primary_implementation_path(path)
+        or _is_task_broad_primary_implementation_scope(task, path)
+        for path in [*estimated_files, *write_scope]
+    )
+
+
+def _task_has_implementation_intent(task: dict[str, Any]) -> bool:
+    if _task_is_explicit_support_scope(task):
+        return False
+    return _IMPLEMENTATION_INTENT_TEXT_RE.search(_task_text(task)) is not None
+
+
+def _task_has_primary_implementation_dependency(
+    task: dict[str, Any],
+    *,
+    task_by_id: dict[str, dict[str, Any]],
+    seen: set[str] | None = None,
+) -> bool:
+    raw_deps = task.get("dependencies") or []
+    if not isinstance(raw_deps, list):
+        return False
+    seen = set(seen or ())
+    for raw_dep in raw_deps:
+        dep_id = str(raw_dep or "").strip()
+        if not dep_id or dep_id in seen:
+            continue
+        seen.add(dep_id)
+        dep_task = task_by_id.get(dep_id)
+        if dep_task is None:
+            continue
+        dep_status = canonical_task_status(str(dep_task.get("status") or ""))
+        if dep_status in _NON_EXECUTABLE_OBSOLETE_STATUSES:
+            continue
+        if _task_has_primary_implementation_scope(dep_task) or _task_has_implementation_intent(
+            dep_task
+        ):
+            return True
+        if _task_has_primary_implementation_dependency(
+            dep_task,
+            task_by_id=task_by_id,
+            seen=seen,
+        ):
+            return True
+    return False
+
+
+def _support_surface_scope_is_covered_by_implementation_dependency(
+    task: dict[str, Any],
+    *,
+    estimated_files: list[str],
+    write_scope: list[str],
+    task_by_id: dict[str, dict[str, Any]],
+) -> bool:
+    scoped_paths = [*estimated_files, *write_scope]
+    if not scoped_paths:
+        return False
+    if not _task_is_explicit_support_scope(task):
+        return False
+    if not any(_is_support_surface_path(path) for path in scoped_paths):
+        return False
+    if any(
+        _is_primary_implementation_path(path)
+        or _is_task_broad_primary_implementation_scope(task, path)
+        for path in scoped_paths
+    ):
+        return False
+    if not all(
+        _is_support_surface_path(path) or _is_support_fixture_path(task, path)
+        for path in scoped_paths
+    ):
+        return False
+    return _task_has_primary_implementation_dependency(task, task_by_id=task_by_id)
+
+
+def _task_is_report_only_execution_candidate(task: dict[str, Any]) -> bool:
+    if task.get("analysis_only") is True:
+        return True
+    lifecycle = classify_task_lifecycle(
+        title=str(task.get("title") or "").strip(),
+        description=str(task.get("description") or "").strip(),
+        acceptance_criteria=normalized_text_list(task.get("acceptance_criteria")),
+        estimated_files=_raw_text_list(task.get("estimated_files")),
+        write_scope=_raw_text_list(task.get("write_scope")),
+    )
+    return lifecycle.kind == TASK_KIND_ANALYSIS_ONLY
 
 
 def find_plan_acceptance_issues(
@@ -388,11 +703,24 @@ def find_plan_acceptance_issues(
         retry_merge_conflicts=retry_merge_conflicts,
         only=only,
     )
+    task_by_id = {
+        str(task.get("id") or "").strip(): task
+        for task in tasks_raw
+        if isinstance(task, dict) and str(task.get("id") or "").strip()
+    }
+    planning_constraints = planning_constraints_from_plan(plan)
     mutating_seen = False
+    report_only_seen = False
     issues: list[PlanAcceptanceIssue] = []
     for _index, task, task_id, _status in candidates:
         requires_runnable_scope, estimated_files, write_scope = _mutating_task_scope(task)
         if not requires_runnable_scope:
+            if _task_is_report_only_execution_candidate(task):
+                report_only_seen = True
+                if not str(task.get("id") or "").strip():
+                    issues.append(_missing_field_issue(task_id=task_id, field_name="id"))
+                if not str(task.get("title") or "").strip():
+                    issues.append(_missing_field_issue(task_id=task_id, field_name="title"))
             continue
         mutating_seen = True
         issues.extend(_required_task_field_errors(task, task_id=task_id))
@@ -429,9 +757,21 @@ def find_plan_acceptance_issues(
         if (
             write_scope
             and not any(
-                _is_primary_implementation_path(path) for path in [*estimated_files, *write_scope]
+                _is_primary_implementation_path(path)
+                or _is_task_broad_primary_implementation_scope(task, path)
+                for path in [*estimated_files, *write_scope]
             )
-            and _task_needs_primary_implementation_scope(task)
+            and not _support_surface_scope_is_covered_by_implementation_dependency(
+                task,
+                estimated_files=estimated_files,
+                write_scope=write_scope,
+                task_by_id=task_by_id,
+            )
+            and _task_needs_primary_implementation_scope(
+                task,
+                estimated_files=estimated_files,
+                write_scope=write_scope,
+            )
         ):
             issues.append(
                 PlanAcceptanceIssue(
@@ -442,7 +782,26 @@ def find_plan_acceptance_issues(
                 )
             )
 
-    if not mutating_seen and candidates:
+        constraint_violations = task_scope_constraint_violations(task, planning_constraints)
+        for violation in constraint_violations:
+            detail = (
+                f"constraint={violation.constraint_path}; evidence={violation.evidence}"
+                if violation.constraint_path
+                else f"evidence={violation.evidence}"
+            )
+            issues.append(
+                PlanAcceptanceIssue(
+                    rule_id="R5",
+                    task_id=task_id,
+                    observed=(
+                        f"scope violates planning constraints: {violation.path} "
+                        f"({violation.classification}; {violation.reason_code})"
+                    ),
+                    detail=detail,
+                )
+            )
+
+    if not mutating_seen and candidates and not report_only_seen:
         issues.insert(
             0,
             PlanAcceptanceIssue(
@@ -518,6 +877,7 @@ def validate_plan(plan: dict[str, Any]) -> list[str]:
     known_ids = _task_ids(tasks)
     known_set = set(known_ids)
     warnings: list[str] = []
+    planning_constraints = planning_constraints_from_plan(plan)
 
     deps_map: dict[str, list[str]] = {}
     for task in tasks:
@@ -573,6 +933,11 @@ def validate_plan(plan: dict[str, Any]) -> list[str]:
         )
         warnings.extend(mcp_scope_warnings)
         warnings.extend(_validate_task_asset_briefing_shape(task, task_id=task_id))
+        for violation in task_scope_constraint_violations(task, planning_constraints):
+            warnings.append(
+                f"Task {task_id} violates planning scope constraints: {violation.path} "
+                f"({violation.classification}; {violation.reason_code})"
+            )
 
     cycle = _find_cycle(known_ids, deps_map)
     if cycle is not None:

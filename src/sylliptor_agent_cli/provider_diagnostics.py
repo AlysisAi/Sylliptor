@@ -1,0 +1,771 @@
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any, Protocol
+from urllib.parse import urlsplit
+
+from .config import (
+    ApiKeyResolution,
+    AppConfig,
+    resolve_api_key,
+    resolve_profile_api_key,
+    resolve_web_search_adapter,
+    resolve_web_search_mode,
+)
+from .llm.gemini_interactions import (
+    gemini_interactions_disabled_message,
+    gemini_interactions_enabled,
+)
+from .llm.protocols import (
+    ANTHROPIC_MESSAGES_PROTOCOL,
+    GEMINI_GENERATE_CONTENT_PROTOCOL,
+    GEMINI_INTERACTIONS_PROTOCOL,
+    OPENAI_COMPAT_PROTOCOL,
+    OPENAI_RESPONSES_PROTOCOL,
+    get_provider_protocol_capabilities,
+)
+from .model_registry import resolve_model_provider_key
+from .profile_presets import (
+    NATIVE_PROFILE_PROTOCOLS,
+    canonical_model_alias_for_preset,
+    find_preset_for_profile,
+    known_model_family,
+    model_known_incompatible_with_family,
+    profile_provider_family,
+)
+from .profiles import ProfileSpec, get_active_profile, resolve_effective_base_url
+from .tools.web_search import resolve_web_search_runtime_status
+from .web_search_adapters import (
+    AUTO_WEB_SEARCH_ADAPTER,
+    EXTERNAL_WEB_SEARCH_ADAPTERS,
+    NATIVE_WEB_SEARCH_ADAPTERS,
+    web_search_adapter_is_external,
+    web_search_adapter_is_native,
+)
+
+
+class _ChatClientFactory(Protocol):
+    def __call__(self, **kwargs: Any) -> Any: ...
+
+
+@dataclass(frozen=True)
+class ProviderDiagnostics:
+    profile_name: str
+    provider_key: str
+    protocol: str
+    protocol_kind: str
+    base_url_host: str
+    model: str
+    api_key_source: str
+    api_key_present: bool
+    web_search_mode: str
+    web_search_configured_adapter: str
+    web_search_runtime_adapter: str
+    web_search_registration_ready: bool
+    web_search_backend_kind: str
+    streaming_supported: bool
+    stream_enabled: bool
+    unsupported_parameters: tuple[str, ...]
+    quirks: tuple[str, ...]
+    notes: tuple[str, ...]
+    issues: tuple[str, ...]
+
+    def rows(self) -> tuple[tuple[str, str], ...]:
+        return (
+            ("profile", self.profile_name),
+            ("provider_key", self.provider_key),
+            ("protocol", self.protocol),
+            ("protocol_kind", self.protocol_kind),
+            ("base_url_host", self.base_url_host or "(missing)"),
+            ("model", self.model or "(missing)"),
+            ("api_key_source", self.api_key_source),
+            ("api_key_present", "yes" if self.api_key_present else "no"),
+            ("web_search_mode", self.web_search_mode),
+            ("web_search_configured_adapter", self.web_search_configured_adapter),
+            ("web_search_runtime_adapter", self.web_search_runtime_adapter or "(none)"),
+            (
+                "web_search_ready",
+                "yes" if self.web_search_registration_ready else "no",
+            ),
+            ("web_search_backend_kind", self.web_search_backend_kind),
+            ("stream_enabled", "yes" if self.stream_enabled else "no"),
+            ("streaming_supported", "yes" if self.streaming_supported else "no"),
+            (
+                "unsupported_parameters",
+                ", ".join(self.unsupported_parameters) if self.unsupported_parameters else "none",
+            ),
+            ("known_quirks", "; ".join(self.quirks) if self.quirks else "none"),
+            ("notes", "; ".join(self.notes) if self.notes else "none"),
+            ("issues", "; ".join(self.issues) if self.issues else "none"),
+        )
+
+
+@dataclass(frozen=True)
+class ProviderLiveValidation:
+    profile_name: str
+    provider_key: str
+    protocol: str
+    model: str
+    status: str
+    message: str
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "passed"
+
+    def rows(self) -> tuple[tuple[str, str], ...]:
+        return (
+            ("profile", self.profile_name),
+            ("provider_key", self.provider_key),
+            ("protocol", self.protocol),
+            ("model", self.model or "(missing)"),
+            ("status", self.status),
+            ("message", self.message),
+        )
+
+
+def build_provider_diagnostics(cfg: AppConfig) -> ProviderDiagnostics:
+    profile = get_active_profile(cfg)
+    base_url = resolve_effective_base_url(cfg=cfg, profile=profile)
+    model = str(profile.default_model or getattr(cfg, "model", "") or "").strip()
+    provider_key = (
+        resolve_model_provider_key(
+            cfg=cfg,
+            model_name=model,
+            base_url=base_url,
+            profile_name=profile.name,
+        )
+        or profile.name
+    )
+    api_key = _resolve_active_profile_api_key(cfg, profile.name)
+    protocol = str(profile.protocol or OPENAI_COMPAT_PROTOCOL).strip()
+    capabilities = get_provider_protocol_capabilities(
+        provider_key=provider_key,
+        protocol=protocol,
+    )
+    streaming_supported = (
+        capabilities.supports_streaming
+        if capabilities is not None
+        else protocol == OPENAI_COMPAT_PROTOCOL
+    )
+    protocol_kind = "native" if protocol in NATIVE_PROFILE_PROTOCOLS else "compatibility"
+
+    mode = resolve_web_search_mode(cfg)
+    configured_adapter = resolve_web_search_adapter(cfg)
+    search_status = resolve_web_search_runtime_status(cfg=cfg, api_key=api_key.key)
+    runtime_adapter = search_status.provider or ""
+    backend_kind = _web_search_backend_kind(runtime_adapter, configured_adapter)
+
+    notes = [_redact_url_text(note) for note in search_status.notes]
+    if capabilities is None:
+        notes.append(
+            "No bundled capability record for this provider/protocol; treating it as a custom profile."
+        )
+    notes.extend(capabilities.quirks if capabilities is not None else ())
+
+    issues = _provider_diagnostic_issues(
+        cfg=cfg,
+        profile=profile,
+        provider_key=provider_key,
+        protocol=protocol,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        streaming_supported=streaming_supported,
+        web_search_mode=mode,
+        configured_adapter=configured_adapter,
+        runtime_adapter=runtime_adapter,
+        search_ready=search_status.registration_ready,
+        search_notes=search_status.notes,
+    )
+
+    unsupported = capabilities.unsupported_parameters if capabilities is not None else ()
+    quirks = (
+        capabilities.quirks
+        if capabilities is not None
+        else ("Custom provider profile; validate gateway-specific behavior with a smoke run.",)
+    )
+    return ProviderDiagnostics(
+        profile_name=profile.name,
+        provider_key=str(provider_key or ""),
+        protocol=protocol,
+        protocol_kind=protocol_kind,
+        base_url_host=_base_url_host(base_url),
+        model=model,
+        api_key_source=_redacted_api_key_source(api_key),
+        api_key_present=bool(api_key.key),
+        web_search_mode=mode,
+        web_search_configured_adapter=configured_adapter,
+        web_search_runtime_adapter=runtime_adapter,
+        web_search_registration_ready=search_status.registration_ready,
+        web_search_backend_kind=backend_kind,
+        streaming_supported=streaming_supported,
+        stream_enabled=bool(getattr(cfg, "stream", False)),
+        unsupported_parameters=unsupported,
+        quirks=quirks,
+        notes=tuple(_dedupe(notes)),
+        issues=tuple(_dedupe([_redact_url_text(issue) for issue in issues])),
+    )
+
+
+def provider_diagnostic_warning_lines(cfg: AppConfig) -> tuple[str, ...]:
+    """Return redacted active-provider setup issues suitable for setup/config UX."""
+    return build_provider_diagnostics(cfg).issues
+
+
+def validate_active_provider_live(
+    cfg: AppConfig,
+    *,
+    timeout_s: float = 15.0,
+    client_factory: _ChatClientFactory | None = None,
+) -> ProviderLiveValidation:
+    """Run a minimal active-profile text request after explicit user opt-in.
+
+    The caller is responsible for confirmation. This function keeps output redacted and classifies
+    common provider failures without making any live requests from unit tests unless a real factory
+    is supplied intentionally.
+    """
+    profile = get_active_profile(cfg)
+    base_url = resolve_effective_base_url(cfg=cfg, profile=profile)
+    model = str(profile.default_model or getattr(cfg, "model", "") or "").strip()
+    protocol = str(profile.protocol or OPENAI_COMPAT_PROTOCOL).strip()
+    provider_key = (
+        resolve_model_provider_key(
+            cfg=cfg,
+            model_name=model,
+            base_url=base_url,
+            profile_name=profile.name,
+        )
+        or profile_provider_family(profile)
+        or profile.name
+    )
+    if not model:
+        return ProviderLiveValidation(
+            profile_name=profile.name,
+            provider_key=str(provider_key or ""),
+            protocol=protocol,
+            model=model,
+            status="failed",
+            message="Active profile has no model configured. Set a model before live validation.",
+        )
+    api_key = _resolve_active_profile_api_key(cfg, profile.name)
+    if not api_key.key:
+        return ProviderLiveValidation(
+            profile_name=profile.name,
+            provider_key=str(provider_key or ""),
+            protocol=protocol,
+            model=model,
+            status="failed",
+            message=(
+                "Active profile has no API key. Export the profile API key environment variable "
+                "or store a profile key before live validation."
+            ),
+        )
+    try:
+        if client_factory is None:
+            from .llm.factory import make_llm_client
+
+            client_factory = make_llm_client
+        client = client_factory(
+            cfg=cfg,
+            api_key=api_key.key,
+            model=model,
+            timeout_s=timeout_s,
+            temperature=0.0,
+            profile=profile,
+        )
+        response = client.chat(
+            messages=[{"role": "user", "content": "Reply with only: ok"}],
+            max_tokens=20,
+        )
+    except Exception as exc:  # pragma: no cover - exercised with fake clients in tests.
+        return ProviderLiveValidation(
+            profile_name=profile.name,
+            provider_key=str(provider_key or ""),
+            protocol=protocol,
+            model=model,
+            status="failed",
+            message=_classify_live_validation_error(str(exc), model=model),
+        )
+    if str(getattr(response, "content", "") or "").strip() or getattr(response, "tool_calls", None):
+        return ProviderLiveValidation(
+            profile_name=profile.name,
+            provider_key=str(provider_key or ""),
+            protocol=protocol,
+            model=model,
+            status="passed",
+            message="Minimal text request completed successfully.",
+        )
+    return ProviderLiveValidation(
+        profile_name=profile.name,
+        provider_key=str(provider_key or ""),
+        protocol=protocol,
+        model=model,
+        status="failed",
+        message="Provider returned an empty response to the live validation prompt.",
+    )
+
+
+def _provider_diagnostic_issues(
+    *,
+    cfg: AppConfig,
+    profile: ProfileSpec,
+    provider_key: str,
+    protocol: str,
+    base_url: str,
+    api_key: ApiKeyResolution,
+    model: str,
+    streaming_supported: bool,
+    web_search_mode: str,
+    configured_adapter: str,
+    runtime_adapter: str,
+    search_ready: bool,
+    search_notes: tuple[str, ...],
+) -> list[str]:
+    issues: list[str] = []
+    missing_key_issue = _missing_api_key_issue(
+        profile=profile,
+        provider_key=provider_key,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    if missing_key_issue:
+        issues.append(missing_key_issue)
+    issues.extend(
+        _provider_model_issues(
+            profile=profile,
+            protocol=protocol,
+            model=model,
+            stream_enabled=bool(getattr(cfg, "stream", False)),
+            web_search_mode=web_search_mode,
+        )
+    )
+    if bool(getattr(cfg, "stream", False)) and not streaming_supported:
+        issues.append(
+            f"stream=true is configured but protocol={protocol} does not support streaming yet; "
+            "Sylliptor will disable streaming for native chat runs until that protocol's "
+            "streaming path is implemented. Suggested fix: `sylliptor config set stream false`."
+        )
+    if protocol == GEMINI_INTERACTIONS_PROTOCOL and not gemini_interactions_enabled(cfg):
+        issues.append(gemini_interactions_disabled_message())
+    issues.extend(
+        _provider_protocol_mismatch_issues(
+            profile=profile,
+            protocol=protocol,
+            base_url=base_url,
+        )
+    )
+
+    if web_search_mode == "native" and configured_adapter in EXTERNAL_WEB_SEARCH_ADAPTERS:
+        issues.append(
+            f"web_search_mode=native is incompatible with web_search_adapter={configured_adapter}; "
+            "native mode never uses Tavily or other external search providers. Suggested fix: "
+            "`sylliptor config set web_search_mode external` or choose a provider-hosted "
+            "web_search_adapter."
+        )
+    if web_search_mode == "external" and configured_adapter in NATIVE_WEB_SEARCH_ADAPTERS:
+        issues.append(
+            f"web_search_mode=external is incompatible with web_search_adapter={configured_adapter}; "
+            "external mode does not use provider-hosted search adapters. Suggested fix: "
+            "`sylliptor config set web_search_mode native` or choose an external adapter such as Tavily."
+        )
+    if web_search_mode in {"native", "external"} and not search_ready:
+        detail = search_notes[0] if search_notes else "no ready web_search adapter"
+        issues.append(f"web_search_mode={web_search_mode} is not ready: {detail}")
+
+    if (
+        web_search_mode == "external"
+        and not search_ready
+        and (
+            configured_adapter == AUTO_WEB_SEARCH_ADAPTER
+            or web_search_adapter_is_external(configured_adapter)
+        )
+    ):
+        issues.append(
+            "external web_search requires TAVILY_API_KEY for the Tavily adapter. Suggested fix: "
+            "export TAVILY_API_KEY or run `sylliptor config set web_search_mode auto`."
+        )
+
+    is_custom_openai_compat = protocol == OPENAI_COMPAT_PROTOCOL and provider_key not in {
+        "openai",
+        "anthropic",
+        "gemini",
+        "qwen",
+        "openrouter",
+    }
+    if web_search_mode == "native" and is_custom_openai_compat and not search_ready:
+        issues.append(
+            "custom OpenAI-compatible profiles do not automatically provide native hosted "
+            "search; use a native provider preset, configure a matching native web_search_adapter, "
+            "or switch web_search_mode to auto/external."
+        )
+
+    if (
+        runtime_adapter
+        and web_search_mode == "native"
+        and not web_search_adapter_is_native(runtime_adapter)
+    ):
+        issues.append(f"native web_search selected non-native adapter {runtime_adapter}.")
+    if (
+        runtime_adapter
+        and web_search_mode == "external"
+        and not web_search_adapter_is_external(runtime_adapter)
+    ):
+        issues.append(f"external web_search selected non-external adapter {runtime_adapter}.")
+
+    return issues
+
+
+def _provider_model_issues(
+    *,
+    profile: ProfileSpec,
+    protocol: str,
+    model: str,
+    stream_enabled: bool,
+    web_search_mode: str,
+) -> list[str]:
+    issues: list[str] = []
+    normalized_model = str(model or "").strip()
+    if not normalized_model:
+        issues.append(
+            "Model is empty for the active profile. Suggested fix: `sylliptor config set model "
+            "<provider-model-id>` or choose a model in `/config`."
+        )
+        return issues
+
+    family = profile_provider_family(profile)
+    model_family = known_model_family(normalized_model)
+    if family is not None and model_known_incompatible_with_family(normalized_model, family):
+        issues.append(
+            f"Model {normalized_model!r} looks like a {model_family} model, but the active "
+            f"profile/protocol is for {family}. Suggested fix: choose a {family} model or "
+            "convert the profile to the matching provider."
+        )
+
+    preset = find_preset_for_profile(profile)
+    if preset is not None:
+        canonical = canonical_model_alias_for_preset(preset, normalized_model)
+        if canonical and canonical != normalized_model:
+            issues.append(
+                f"Model {normalized_model!r} is a known renamed/deprecated alias for preset "
+                f"{preset.key!r}; suggested model: {canonical!r}."
+            )
+
+    if _looks_like_unstable_model_alias(normalized_model):
+        issues.append(
+            f"Model {normalized_model!r} looks like a preview/latest alias. Availability can vary "
+            "by account, region, and provider rollout; use a dated/stable model or run "
+            "`sylliptor doctor providers --live --yes` to validate this profile."
+        )
+
+    if web_search_mode == "native" and _likely_non_chat_or_search_model(normalized_model):
+        issues.append(
+            f"Native web_search is enabled, but model {normalized_model!r} looks like a "
+            "non-chat, audio, image, embedding, or realtime model that is unlikely to support "
+            "provider-hosted search. Choose a chat model or set `web_search_mode` to off/auto."
+        )
+
+    if (
+        stream_enabled
+        and protocol != OPENAI_COMPAT_PROTOCOL
+        and _likely_non_chat_stream_model(normalized_model)
+    ):
+        issues.append(
+            f"stream=true is enabled, but model {normalized_model!r} looks like a specialized "
+            "model that may not support this native streaming protocol. Validate with "
+            "`sylliptor doctor providers --live --yes` or choose a standard chat model."
+        )
+
+    return issues
+
+
+def _resolve_active_profile_api_key(cfg: AppConfig, profile_name: str) -> ApiKeyResolution:
+    profile_key = resolve_profile_api_key(cfg, profile_name)
+    if profile_key.key:
+        return profile_key
+    return resolve_api_key(cfg, profile_name=profile_name)
+
+
+def _provider_protocol_mismatch_issues(
+    *,
+    profile: ProfileSpec,
+    protocol: str,
+    base_url: str,
+) -> list[str]:
+    issues: list[str] = []
+    host = _base_url_host(base_url)
+    path = _base_url_path(base_url)
+    profile_name = profile.name
+    plain_anthropic_legacy = profile_name == "anthropic" and protocol == OPENAI_COMPAT_PROTOCOL
+    plain_gemini_legacy = profile_name == "gemini" and protocol == OPENAI_COMPAT_PROTOCOL
+    explicit_first_party_compat = profile_name in {"anthropic-compat", "gemini-compat"}
+
+    if profile_name.endswith("-native") and protocol == OPENAI_COMPAT_PROTOCOL:
+        issues.append(
+            f"Profile {profile_name!r} is named like a native profile but uses "
+            "protocol=openai_compat. Suggested fix: "
+            f"`sylliptor profile convert {profile_name} --to native`."
+        )
+
+    if plain_anthropic_legacy:
+        issues.append(
+            "Profile 'anthropic' uses legacy compatibility semantics. Plain 'anthropic' now "
+            "means native Anthropic Messages for new profiles. Convert explicitly with "
+            "`sylliptor profile convert anthropic --to native`, or keep an explicit legacy "
+            "fallback profile such as `anthropic-compat`."
+        )
+
+    if plain_gemini_legacy:
+        issues.append(
+            "Profile 'gemini' uses legacy compatibility semantics. Plain 'gemini' now means "
+            "native Gemini GenerateContent for new profiles. Convert explicitly with "
+            "`sylliptor profile convert gemini --to native`, or keep an explicit legacy fallback "
+            "profile such as `gemini-compat`."
+        )
+
+    if protocol == OPENAI_RESPONSES_PROTOCOL and host != "api.openai.com":
+        issues.append(
+            "protocol=openai_responses is intended for the OpenAI Responses API at "
+            "api.openai.com. Suggested fix: "
+            f"`sylliptor profile convert {profile_name} --to compatibility` or update the base URL."
+        )
+
+    if protocol == ANTHROPIC_MESSAGES_PROTOCOL and host != "api.anthropic.com":
+        issues.append(
+            "protocol=anthropic_messages is intended for the Anthropic first-party Messages API. "
+            f"Suggested fix: `sylliptor profile convert {profile_name} --to compatibility` "
+            "or update the base URL."
+        )
+
+    if (
+        protocol == OPENAI_COMPAT_PROTOCOL
+        and host == "api.anthropic.com"
+        and not explicit_first_party_compat
+    ):
+        issues.append(
+            "This looks like the Anthropic first-party API using compatibility mode. "
+            "Recommended fix for new first-party Claude profiles: "
+            f"`sylliptor profile convert {profile_name} --to native`."
+        )
+
+    if protocol == GEMINI_GENERATE_CONTENT_PROTOCOL and "/openai" in path:
+        issues.append(
+            "This looks like the Gemini OpenAI-compatible endpoint, but the profile uses "
+            "native Gemini GenerateContent. Suggested fix: "
+            f"`sylliptor profile convert {profile_name} --to compatibility`."
+        )
+
+    if protocol == GEMINI_INTERACTIONS_PROTOCOL and (
+        host != "generativelanguage.googleapis.com" or "/openai" in path
+    ):
+        issues.append(
+            "protocol=gemini_interactions is an experimental Gemini first-party protocol for "
+            "generativelanguage.googleapis.com/v1beta/interactions, not OpenAI-compatible "
+            "gateways. Suggested fix: use the stable `gemini` preset or "
+            f"`sylliptor profile convert {profile_name} --to compatibility`."
+        )
+
+    if (
+        protocol == OPENAI_COMPAT_PROTOCOL
+        and host == "generativelanguage.googleapis.com"
+        and "/openai" not in path
+        and not explicit_first_party_compat
+    ):
+        issues.append(
+            "This looks like the Gemini native API using compatibility mode. Recommended fix "
+            f"for new first-party Gemini profiles: `sylliptor profile convert {profile_name} --to native`."
+        )
+
+    return issues
+
+
+def _looks_like_unstable_model_alias(model: str) -> bool:
+    normalized = model.strip().lower()
+    return (
+        normalized.endswith("-latest")
+        or "-latest-" in normalized
+        or normalized.endswith("-preview")
+        or "-preview-" in normalized
+    )
+
+
+def _likely_non_chat_or_search_model(model: str) -> bool:
+    normalized = model.strip().lower()
+    markers = (
+        "audio",
+        "embedding",
+        "embed",
+        "image",
+        "realtime",
+        "speech",
+        "tts",
+        "transcribe",
+        "whisper",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _likely_non_chat_stream_model(model: str) -> bool:
+    normalized = model.strip().lower()
+    markers = (
+        "audio",
+        "embedding",
+        "embed",
+        "image",
+        "live",
+        "realtime",
+        "speech",
+        "tts",
+        "transcribe",
+        "whisper",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _classify_live_validation_error(error_text: str, *, model: str) -> str:
+    text = _redact_url_text(error_text)
+    lowered = text.lower()
+    if "401" in lowered or "unauthorized" in lowered or "invalid api key" in lowered:
+        return "Provider rejected the API key during live validation. Check the active profile key."
+    if "403" in lowered or "permission" in lowered or "forbidden" in lowered:
+        return (
+            "Provider denied live validation for this key/account. Check account permissions, "
+            "region, billing, and model access."
+        )
+    if (
+        "404" in lowered
+        or "not found" in lowered
+        or "model_not_found" in lowered
+        or "does not exist" in lowered
+        or "not supported" in lowered
+    ):
+        return (
+            f"Provider could not use model {model!r}. Model availability can vary by account, "
+            "region, and rollout; choose another model or set the relevant smoke/model override."
+        )
+    if "429" in lowered or "rate limit" in lowered or "quota" in lowered:
+        return "Provider rate limit or quota blocked live validation. Retry later or use another model."
+    if "timeout" in lowered or "timed out" in lowered:
+        return "Live validation timed out. Retry later, increase timeout, or choose a faster model."
+    return f"Live validation failed: {text}"
+
+
+def _missing_api_key_issue(
+    *,
+    profile: ProfileSpec,
+    provider_key: str,
+    base_url: str,
+    api_key: ApiKeyResolution,
+) -> str | None:
+    if api_key.key:
+        return None
+    if not _profile_requires_api_key(profile=profile, provider_key=provider_key, base_url=base_url):
+        return None
+
+    env_name = str(profile.api_key_env or "").strip()
+    if env_name:
+        return (
+            f"API key is missing for active profile {profile.name!r}. Suggested fix: "
+            f"export {env_name} or run `sylliptor config set-api-key`."
+        )
+    return (
+        f"API key is missing for active profile {profile.name!r}. Suggested fix: "
+        "run `sylliptor config set-api-key` or set a profile-specific api_key_env."
+    )
+
+
+def _profile_requires_api_key(
+    *,
+    profile: ProfileSpec,
+    provider_key: str,
+    base_url: str,
+) -> bool:
+    if str(profile.api_key_env or "").strip():
+        return True
+    host = _base_url_host(base_url)
+    if not host:
+        return False
+    if _is_local_host(host):
+        return False
+    if provider_key in {
+        "openai",
+        "anthropic",
+        "gemini",
+        "qwen",
+        "openrouter",
+        "deepseek",
+        "mistral",
+        "xai",
+    }:
+        return True
+    return "." in host
+
+
+def _is_local_host(host: str) -> bool:
+    normalized = host.strip("[]").lower()
+    return normalized in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or normalized.endswith(
+        ".localhost"
+    )
+
+
+def _web_search_backend_kind(runtime_adapter: str, configured_adapter: str) -> str:
+    adapter = runtime_adapter or (
+        "" if configured_adapter == AUTO_WEB_SEARCH_ADAPTER else configured_adapter
+    )
+    if not adapter:
+        return "unavailable"
+    if web_search_adapter_is_native(adapter):
+        return "native/provider-hosted"
+    if web_search_adapter_is_external(adapter):
+        return "external"
+    return "unknown"
+
+
+def _base_url_host(base_url: str) -> str:
+    try:
+        return (urlsplit(base_url).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return ""
+
+
+def _base_url_path(base_url: str) -> str:
+    try:
+        return (urlsplit(base_url).path or "").rstrip("/").lower()
+    except ValueError:
+        return ""
+
+
+_URL_RE = re.compile(r"https?://[^\s),;]+")
+
+
+def _redact_url_text(value: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        return _base_url_host(match.group(0)) or "(url)"
+
+    return _URL_RE.sub(_replace, str(value or ""))
+
+
+def _redacted_api_key_source(api_key: ApiKeyResolution) -> str:
+    source = str(api_key.source or "").strip()
+    if not api_key.key:
+        return "missing"
+    if source.startswith("env:"):
+        return f"env:{source.removeprefix('env:')} (redacted)"
+    if source.startswith("stored:profile="):
+        return f"stored profile:{source.removeprefix('stored:profile=')} (redacted)"
+    if source in {"stored", "stored:legacy"}:
+        return "stored legacy key (redacted)"
+    return "configured (redacted)"
+
+
+def _dedupe(values: list[str] | tuple[str, ...]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result

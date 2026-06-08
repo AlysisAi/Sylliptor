@@ -21,15 +21,21 @@ from ..config import (
     resolve_web_search_timeout_s,
 )
 from ..llm.openai_responses import OpenAIResponsesClient, ResponsesError
+from ..llm.protocols import OPENAI_COMPAT_PROTOCOL
 from ..llm.provider_limits import resolve_provider_retry_settings
+from ..profiles import get_active_profile
+from ..provider_telemetry import record_web_search_call
+from ..safety.safe_http import Resolver
 from ..web_search_adapters import (
     ANTHROPIC_MESSAGES_ADAPTER,
     AUTO_WEB_SEARCH_ADAPTER,
     DASHSCOPE_CHAT_ADAPTER,
+    EXTERNAL_WEB_SEARCH_ADAPTERS,
     GEMINI_GROUNDING_ADAPTER,
     GROQ_COMPOUND_ADAPTER,
     MISTRAL_CONVERSATIONS_ADAPTER,
     MOONSHOT_KIMI_ADAPTER,
+    NATIVE_WEB_SEARCH_ADAPTERS,
     OPENAI_RESPONSES_ADAPTER,
     OPENROUTER_WEB_ADAPTER,
     PERPLEXITY_SONAR_ADAPTER,
@@ -40,6 +46,8 @@ from ..web_search_adapters import (
     XAI_RESPONSES_ADAPTER,
     ZHIPU_WEB_SEARCH_ADAPTER,
     normalize_web_search_adapter,
+    web_search_adapter_is_external,
+    web_search_adapter_is_native,
 )
 from .web_search_dashscope import DashScopeChatSearchError, dashscope_chat_search
 from .web_search_provider_adapters import (
@@ -77,6 +85,10 @@ _TAVILY_PROVIDER = TAVILY_ADAPTER
 _WEB_SEARCH_PROVIDER_ENV = "SYLLIPTOR_WEB_SEARCH_PROVIDER"
 _WEB_SEARCH_ADAPTER_ENV = "SYLLIPTOR_WEB_SEARCH_ADAPTER"
 _VALID_WEB_SEARCH_PROVIDERS = set(VALID_WEB_SEARCH_ADAPTERS) - {AUTO_WEB_SEARCH_ADAPTER}
+_WEB_SEARCH_MODE_OFF = "off"
+_WEB_SEARCH_MODE_AUTO = "auto"
+_WEB_SEARCH_MODE_NATIVE = "native"
+_WEB_SEARCH_MODE_EXTERNAL = "external"
 
 _DASHSCOPE_SEARCH_MODEL_PREFIXES = (
     "qwen3.5-plus",
@@ -120,9 +132,9 @@ class WebSearchRuntimeStatus:
     def availability_label(self) -> str:
         if self.registration_ready:
             return "available"
-        if self.mode == "off":
+        if self.mode == _WEB_SEARCH_MODE_OFF:
             return "disabled"
-        return "auto-unavailable"
+        return f"{self.mode}-unavailable"
 
     @property
     def summary(self) -> str:
@@ -174,23 +186,45 @@ class WebSearchRuntimeStatus:
                 return "Mistral Conversations web_search is ready."
             return "web_search is ready for chat and top-level Plan/readonly sessions."
 
-        if self.mode == "off":
-            return "Enable with `sylliptor config set web_search_mode auto`."
+        if self.mode == _WEB_SEARCH_MODE_OFF:
+            return (
+                "Enable with `sylliptor config set web_search_mode auto`, `native`, or `external`."
+            )
 
         if self.notes and self.notes[0].startswith("invalid web_search_adapter: "):
             return (
                 f"Fix web_search_adapter, {_WEB_SEARCH_ADAPTER_ENV}, or {_WEB_SEARCH_PROVIDER_ENV}."
             )
 
+        if any(" is incompatible with " in note for note in self.notes):
+            return "Choose a web_search_adapter compatible with the selected web_search_mode."
+
         if len(self.notes) > 1 and self.notes[0].startswith("explicit adapter selected "):
             return f"The selected web_search_adapter is not ready: {self.notes[1]}"
 
         if not self.api_key_available:
+            if self.mode == _WEB_SEARCH_MODE_NATIVE:
+                return (
+                    "Set the active provider key with `sylliptor config set-api-key`, "
+                    "SYLLIPTOR_API_KEY, or SYLLIPTOR_WEB_SEARCH_API_KEY. Native mode "
+                    "does not use Tavily or other external fallback search providers."
+                )
+            if self.mode == _WEB_SEARCH_MODE_EXTERNAL:
+                return "Set TAVILY_API_KEY for external web_search."
             return (
                 "Set an API key with `sylliptor config set-api-key`, "
                 "SYLLIPTOR_API_KEY, SYLLIPTOR_WEB_SEARCH_API_KEY, or set "
                 "TAVILY_API_KEY for provider-agnostic fallback."
             )
+
+        if self.mode == _WEB_SEARCH_MODE_NATIVE:
+            return (
+                "Use a native search-capable provider/profile (OpenAI, xAI, Anthropic, "
+                "Gemini, OpenRouter, DashScope/Qwen, Kimi, Zhipu/GLM, Doubao, "
+                "Perplexity, Groq, or Mistral). Native mode never falls back to Tavily."
+            )
+        if self.mode == _WEB_SEARCH_MODE_EXTERNAL:
+            return "Use an external web_search adapter such as Tavily and set TAVILY_API_KEY."
 
         return (
             "Use a native search-capable provider/profile (OpenAI, xAI, Anthropic, Gemini, "
@@ -795,7 +829,7 @@ def _resolve_tavily_readiness(*, cfg: AppConfig | None) -> _BackendReadiness:
         _append_unique_note(notes, str(e))
 
     if not resolved_api_key:
-        _append_unique_note(notes, "missing TAVILY_API_KEY for Tavily fallback")
+        _append_unique_note(notes, "missing TAVILY_API_KEY for Tavily search")
 
     runtime: WebSearchRuntimeConfig | None = None
     if resolved_api_key and timeout_s is not None:
@@ -833,6 +867,34 @@ def _readiness_order() -> tuple[str, ...]:
         _MISTRAL_CONVERSATIONS_PROVIDER,
         _TAVILY_PROVIDER,
     )
+
+
+def _readiness_order_for_mode(mode: str) -> tuple[str, ...]:
+    if mode == _WEB_SEARCH_MODE_NATIVE:
+        return tuple(
+            provider for provider in _readiness_order() if provider in NATIVE_WEB_SEARCH_ADAPTERS
+        )
+    if mode == _WEB_SEARCH_MODE_EXTERNAL:
+        return tuple(
+            provider for provider in _readiness_order() if provider in EXTERNAL_WEB_SEARCH_ADAPTERS
+        )
+    return _readiness_order()
+
+
+def _adapter_mode_incompatibility(*, mode: str, provider: str) -> str | None:
+    if mode == _WEB_SEARCH_MODE_NATIVE and web_search_adapter_is_external(provider):
+        return (
+            f"web_search_mode=native is incompatible with web_search_adapter={provider}: "
+            "native mode allows only provider-hosted/native web search adapters and never "
+            "uses Tavily or other external search providers."
+        )
+    if mode == _WEB_SEARCH_MODE_EXTERNAL and web_search_adapter_is_native(provider):
+        return (
+            f"web_search_mode=external is incompatible with web_search_adapter={provider}: "
+            "external mode allows only external search providers such as Tavily and does "
+            "not use provider-hosted/native adapters."
+        )
+    return None
 
 
 def _resolve_backend_readiness_map(
@@ -875,16 +937,60 @@ def _resolve_backend_readiness_map(
     }
 
 
-def _combined_api_key_available(readiness: dict[str, _BackendReadiness]) -> bool:
-    return any(item.api_key_available for item in readiness.values())
+def _combined_api_key_available(
+    readiness: dict[str, _BackendReadiness],
+    providers: tuple[str, ...] | None = None,
+) -> bool:
+    order = providers or _readiness_order()
+    return any(readiness[provider].api_key_available for provider in order)
 
 
-def _first_context_backend(readiness: dict[str, _BackendReadiness]) -> _BackendReadiness:
-    for provider in _readiness_order():
+def _first_context_backend(
+    readiness: dict[str, _BackendReadiness],
+    providers: tuple[str, ...] | None = None,
+) -> _BackendReadiness:
+    order = providers or _readiness_order()
+    for provider in order:
         item = readiness[provider]
         if item.base_url or item.model:
             return item
+    if order:
+        return readiness[order[0]]
     return readiness[_OPENAI_RESPONSES_PROVIDER]
+
+
+def _format_runtime_context(item: _BackendReadiness) -> str:
+    base_url = item.base_url or "(missing)"
+    model = item.model or "(missing)"
+    return f"base_url={base_url}, model={model}"
+
+
+def _mode_unavailable_notes(
+    *,
+    mode: str,
+    readiness: dict[str, _BackendReadiness],
+    providers: tuple[str, ...],
+) -> tuple[str, ...]:
+    combined = _combine_notes(*(readiness[provider].notes for provider in providers))
+    if mode == _WEB_SEARCH_MODE_NATIVE:
+        context = _first_context_backend(readiness, providers)
+        return _combine_notes(
+            (
+                "web_search_mode=native found no ready provider-hosted/native adapter for "
+                f"the active provider/profile ({_format_runtime_context(context)}). "
+                "Native mode never falls back to Tavily or other external search providers.",
+            ),
+            combined,
+        )
+    if mode == _WEB_SEARCH_MODE_EXTERNAL:
+        return _combine_notes(
+            (
+                "web_search_mode=external found no ready external web search adapter. "
+                "Configure TAVILY_API_KEY or select another external adapter when available.",
+            ),
+            combined,
+        )
+    return combined
 
 
 def _select_runtime_status(
@@ -894,7 +1000,7 @@ def _select_runtime_status(
     override_error: str | None,
     readiness: dict[str, _BackendReadiness],
 ) -> WebSearchRuntimeStatus:
-    if mode == "off":
+    if mode == _WEB_SEARCH_MODE_OFF:
         return WebSearchRuntimeStatus(
             mode=mode,
             provider=None,
@@ -902,23 +1008,40 @@ def _select_runtime_status(
             model=None,
             api_key_available=False,
             registration_ready=False,
-            notes=("disabled by policy: set web_search_mode=auto",),
+            notes=("disabled by policy: set web_search_mode=auto, native, or external",),
         )
 
+    mode_providers = _readiness_order_for_mode(mode)
+
     if override_error:
-        context = _first_context_backend(readiness)
+        context = _first_context_backend(readiness, mode_providers)
         return WebSearchRuntimeStatus(
             mode=mode,
             provider=None,
             base_url=context.base_url,
             model=context.model,
-            api_key_available=_combined_api_key_available(readiness),
+            api_key_available=_combined_api_key_available(readiness, mode_providers),
             registration_ready=False,
             notes=(f"invalid web_search_adapter: {override_error}",),
         )
 
     if provider_override is not None:
         selected = readiness[provider_override]
+        incompatibility = _adapter_mode_incompatibility(mode=mode, provider=provider_override)
+        if incompatibility is not None:
+            context = _first_context_backend(readiness, mode_providers)
+            return WebSearchRuntimeStatus(
+                mode=mode,
+                provider=None,
+                base_url=selected.base_url or context.base_url,
+                model=selected.model or context.model,
+                api_key_available=selected.api_key_available,
+                registration_ready=False,
+                notes=_combine_notes(
+                    (f"explicit adapter selected {selected.provider}",),
+                    (incompatibility,),
+                ),
+            )
         if selected.runtime is not None:
             return WebSearchRuntimeStatus(
                 mode=mode,
@@ -942,9 +1065,10 @@ def _select_runtime_status(
             ),
         )
 
-    for provider in _readiness_order():
+    for provider in mode_providers:
         item = readiness[provider]
         if item.runtime is not None:
+            selection_prefix = "auto" if mode == _WEB_SEARCH_MODE_AUTO else mode
             return WebSearchRuntimeStatus(
                 mode=mode,
                 provider=item.provider,
@@ -952,18 +1076,22 @@ def _select_runtime_status(
                 model=item.model,
                 api_key_available=item.api_key_available,
                 registration_ready=True,
-                notes=(f"auto selected {item.provider}",),
+                notes=(f"{selection_prefix} selected {item.provider}",),
             )
 
-    context = _first_context_backend(readiness)
+    context = _first_context_backend(readiness, mode_providers)
     return WebSearchRuntimeStatus(
         mode=mode,
         provider=None,
         base_url=context.base_url,
         model=context.model,
-        api_key_available=_combined_api_key_available(readiness),
+        api_key_available=_combined_api_key_available(readiness, mode_providers),
         registration_ready=False,
-        notes=_combine_notes(*(readiness[provider].notes for provider in _readiness_order())),
+        notes=_mode_unavailable_notes(
+            mode=mode,
+            readiness=readiness,
+            providers=mode_providers,
+        ),
     )
 
 
@@ -990,17 +1118,36 @@ def _strict_runtime_error_message(
     override_error: str | None,
     readiness: dict[str, _BackendReadiness],
 ) -> str:
-    if mode == "off":
+    if mode == _WEB_SEARCH_MODE_OFF:
         return "web_search is disabled by policy (web_search_mode=off)."
     if override_error:
         return override_error
+    mode_providers = _readiness_order_for_mode(mode)
     if provider_override is not None:
+        incompatibility = _adapter_mode_incompatibility(mode=mode, provider=provider_override)
+        if incompatibility is not None:
+            return incompatibility
         selected = readiness[provider_override]
         reason = (
             selected.notes[0] if selected.notes else f"{provider_override} runtime is not ready"
         )
-        return f"web_search adapter {provider_override} is not ready: {reason}"
-    combined = _combine_notes(*(readiness[provider].notes for provider in _readiness_order()))
+        mode_suffix = "" if mode == _WEB_SEARCH_MODE_AUTO else f" for web_search_mode={mode}"
+        return f"web_search adapter {provider_override} is not ready{mode_suffix}: {reason}"
+    combined = _combine_notes(*(readiness[provider].notes for provider in mode_providers))
+    if mode == _WEB_SEARCH_MODE_NATIVE:
+        context = _first_context_backend(readiness, mode_providers)
+        details = "; ".join(combined) if combined else "no native/provider-hosted adapter is ready"
+        return (
+            "web_search is not available in native mode for active provider/profile "
+            f"({_format_runtime_context(context)}): {details}. Native mode never falls "
+            "back to Tavily or other external search providers."
+        )
+    if mode == _WEB_SEARCH_MODE_EXTERNAL:
+        details = "; ".join(combined) if combined else "no external adapter is ready"
+        return (
+            f"web_search is not available in external mode: {details}. "
+            "Configure TAVILY_API_KEY for Tavily external search."
+        )
     if combined:
         return "web_search is not available in auto mode: " + "; ".join(combined)
     return "web_search is not enabled or configured."
@@ -1016,7 +1163,7 @@ def resolve_web_search_runtime(
     provider_override, override_error = _resolve_provider_override(cfg=cfg, strict=False)
     readiness = _resolve_backend_readiness_map(cfg=cfg, api_key=api_key)
 
-    if mode == "off":
+    if mode == _WEB_SEARCH_MODE_OFF:
         return None
 
     if override_error:
@@ -1033,9 +1180,10 @@ def resolve_web_search_runtime(
 
     selected_runtime: WebSearchRuntimeConfig | None = None
     if provider_override is not None:
-        selected_runtime = readiness[provider_override].runtime
+        if _adapter_mode_incompatibility(mode=mode, provider=provider_override) is None:
+            selected_runtime = readiness[provider_override].runtime
     else:
-        for provider in _readiness_order():
+        for provider in _readiness_order_for_mode(mode):
             selected_runtime = readiness[provider].runtime
             if selected_runtime is not None:
                 break
@@ -1065,6 +1213,59 @@ def _dedupe_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(url)
         deduped.append(source)
     return deduped
+
+
+def _with_web_search_observability(
+    *,
+    result: dict[str, Any],
+    runtime: WebSearchRuntimeConfig,
+    cfg: AppConfig | None,
+    fallback_occurred: bool = False,
+) -> dict[str, Any]:
+    enriched = dict(result)
+    citations = enriched.get("citations")
+    sources = enriched.get("sources")
+    queries = enriched.get("queries")
+    citation_count = len(citations) if isinstance(citations, list) else 0
+    source_count = len(sources) if isinstance(sources, list) else 0
+    query_count = len(queries) if isinstance(queries, list) else 0
+    provider_hosted = web_search_adapter_is_native(runtime.provider)
+    chat_protocol = _observability_chat_protocol(cfg)
+    enriched["protocol"] = chat_protocol or runtime.provider
+    enriched["chat_protocol"] = chat_protocol
+    enriched["search_protocol"] = runtime.provider
+    enriched["backend_adapter"] = runtime.provider
+    enriched["provider_hosted_search"] = provider_hosted
+    enriched["external_search_provider"] = (
+        runtime.provider if web_search_adapter_is_external(runtime.provider) else None
+    )
+    enriched["citation_count"] = citation_count
+    enriched["source_count"] = source_count
+    record_web_search_call(
+        protocol=chat_protocol or runtime.provider,
+        provider_key=runtime.provider,
+        model=runtime.model,
+        web_search_mode=resolve_web_search_mode(cfg),
+        web_search_adapter=resolve_web_search_adapter(cfg),
+        provider_hosted_search=provider_hosted,
+        external_provider_name=enriched["external_search_provider"],
+        source_count=source_count,
+        citation_count=citation_count,
+        query_count=query_count,
+        fallback_occurred=fallback_occurred,
+    )
+    return enriched
+
+
+def _observability_chat_protocol(cfg: AppConfig | None) -> str:
+    if cfg is None:
+        return ""
+    try:
+        profile = get_active_profile(cfg)
+    except Exception:  # noqa: BLE001
+        return OPENAI_COMPAT_PROTOCOL
+    protocol = str(profile.protocol or OPENAI_COMPAT_PROTOCOL).strip()
+    return protocol or OPENAI_COMPAT_PROTOCOL
 
 
 def _openai_responses_search(
@@ -1152,6 +1353,7 @@ def web_search(
     max_sources: int = 8,
     external_web_access: bool = True,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
     client_factory: Callable[..., OpenAIResponsesClient] = OpenAIResponsesClient,
 ) -> dict[str, Any]:
     validated_query = _validate_query(query)
@@ -1176,6 +1378,7 @@ def web_search(
             include_domains=validated_allowed_domains,
             timeout_s=tavily_runtime.timeout_s,
             transport=transport,
+            resolver=resolver,
         )
 
     def _fallback_to_tavily_or_raise(provider: str, error: Exception) -> dict[str, Any]:
@@ -1187,7 +1390,12 @@ def web_search(
         if tavily_runtime is None:
             raise WebSearchError(str(error)) from error
         try:
-            return _run_tavily(tavily_runtime)
+            return _with_web_search_observability(
+                result=_run_tavily(tavily_runtime),
+                runtime=tavily_runtime,
+                cfg=cfg,
+                fallback_occurred=True,
+            )
         except TavilySearchError as tavily_error:
             raise WebSearchError(
                 "web_search failed across auto backends: "
@@ -1196,23 +1404,32 @@ def web_search(
 
     if runtime.provider == _TAVILY_PROVIDER:
         try:
-            return _run_tavily(runtime)
+            return _with_web_search_observability(
+                result=_run_tavily(runtime),
+                runtime=runtime,
+                cfg=cfg,
+            )
         except TavilySearchError as e:
             raise WebSearchError(str(e)) from e
 
     if runtime.provider == _DASHSCOPE_CHAT_PROVIDER:
         try:
-            return dashscope_chat_search(
-                query=validated_query,
-                base_url=str(runtime.base_url or ""),
-                api_key=runtime.api_key,
-                model=str(runtime.model or ""),
-                max_results=validated_max_sources,
-                include_domains=validated_allowed_domains,
-                timeout_s=runtime.timeout_s,
-                transport=transport,
-                provider_concurrency_caps=getattr(cfg, "provider_concurrency_caps", None),
-                provider_retry_settings=resolve_provider_retry_settings(cfg),
+            return _with_web_search_observability(
+                result=dashscope_chat_search(
+                    query=validated_query,
+                    base_url=str(runtime.base_url or ""),
+                    api_key=runtime.api_key,
+                    model=str(runtime.model or ""),
+                    max_results=validated_max_sources,
+                    include_domains=validated_allowed_domains,
+                    timeout_s=runtime.timeout_s,
+                    transport=transport,
+                    resolver=resolver,
+                    provider_concurrency_caps=getattr(cfg, "provider_concurrency_caps", None),
+                    provider_retry_settings=resolve_provider_retry_settings(cfg),
+                ),
+                runtime=runtime,
+                cfg=cfg,
             )
         except DashScopeChatSearchError as e:
             return _fallback_to_tavily_or_raise(_DASHSCOPE_CHAT_PROVIDER, e)
@@ -1227,74 +1444,115 @@ def web_search(
         "allowed_domains": validated_allowed_domains,
         "timeout_s": runtime.timeout_s,
         "transport": transport,
+        "resolver": resolver,
         "provider_concurrency_caps": getattr(cfg, "provider_concurrency_caps", None),
         "provider_retry_settings": provider_retry_settings,
     }
 
     if runtime.provider == _ANTHROPIC_MESSAGES_PROVIDER:
         try:
-            return anthropic_messages_search(**native_kwargs)
+            return _with_web_search_observability(
+                result=anthropic_messages_search(**native_kwargs),
+                runtime=runtime,
+                cfg=cfg,
+            )
         except ProviderWebSearchError as e:
             return _fallback_to_tavily_or_raise(_ANTHROPIC_MESSAGES_PROVIDER, e)
 
     if runtime.provider == _GEMINI_GROUNDING_PROVIDER:
         try:
-            return gemini_grounding_search(**native_kwargs)
+            return _with_web_search_observability(
+                result=gemini_grounding_search(**native_kwargs),
+                runtime=runtime,
+                cfg=cfg,
+            )
         except ProviderWebSearchError as e:
             return _fallback_to_tavily_or_raise(_GEMINI_GROUNDING_PROVIDER, e)
 
     if runtime.provider == _OPENROUTER_WEB_PROVIDER:
         try:
-            return openrouter_web_search(**native_kwargs)
+            return _with_web_search_observability(
+                result=openrouter_web_search(**native_kwargs),
+                runtime=runtime,
+                cfg=cfg,
+            )
         except ProviderWebSearchError as e:
             return _fallback_to_tavily_or_raise(_OPENROUTER_WEB_PROVIDER, e)
 
     if runtime.provider == _MOONSHOT_KIMI_PROVIDER:
         try:
-            return moonshot_kimi_search(**native_kwargs)
+            return _with_web_search_observability(
+                result=moonshot_kimi_search(**native_kwargs),
+                runtime=runtime,
+                cfg=cfg,
+            )
         except ProviderWebSearchError as e:
             return _fallback_to_tavily_or_raise(_MOONSHOT_KIMI_PROVIDER, e)
 
     if runtime.provider == _ZHIPU_WEB_SEARCH_PROVIDER:
         try:
-            return zhipu_web_search(**native_kwargs)
+            return _with_web_search_observability(
+                result=zhipu_web_search(**native_kwargs),
+                runtime=runtime,
+                cfg=cfg,
+            )
         except ProviderWebSearchError as e:
             return _fallback_to_tavily_or_raise(_ZHIPU_WEB_SEARCH_PROVIDER, e)
 
     if runtime.provider == _VOLCENGINE_WEB_SEARCH_PROVIDER:
         try:
-            return volcengine_web_search(**native_kwargs)
+            return _with_web_search_observability(
+                result=volcengine_web_search(**native_kwargs),
+                runtime=runtime,
+                cfg=cfg,
+            )
         except ProviderWebSearchError as e:
             return _fallback_to_tavily_or_raise(_VOLCENGINE_WEB_SEARCH_PROVIDER, e)
 
     if runtime.provider == _PERPLEXITY_SONAR_PROVIDER:
         try:
-            return perplexity_sonar_search(**native_kwargs)
+            return _with_web_search_observability(
+                result=perplexity_sonar_search(**native_kwargs),
+                runtime=runtime,
+                cfg=cfg,
+            )
         except ProviderWebSearchError as e:
             return _fallback_to_tavily_or_raise(_PERPLEXITY_SONAR_PROVIDER, e)
 
     if runtime.provider == _GROQ_COMPOUND_PROVIDER:
         try:
-            return groq_compound_search(**native_kwargs)
+            return _with_web_search_observability(
+                result=groq_compound_search(**native_kwargs),
+                runtime=runtime,
+                cfg=cfg,
+            )
         except ProviderWebSearchError as e:
             return _fallback_to_tavily_or_raise(_GROQ_COMPOUND_PROVIDER, e)
 
     if runtime.provider == _MISTRAL_CONVERSATIONS_PROVIDER:
         try:
-            return mistral_conversations_search(**native_kwargs)
+            return _with_web_search_observability(
+                result=mistral_conversations_search(**native_kwargs),
+                runtime=runtime,
+                cfg=cfg,
+            )
         except ProviderWebSearchError as e:
             return _fallback_to_tavily_or_raise(_MISTRAL_CONVERSATIONS_PROVIDER, e)
 
     try:
-        return _openai_responses_search(
-            query=validated_query,
+        return _with_web_search_observability(
+            result=_openai_responses_search(
+                query=validated_query,
+                runtime=runtime,
+                cfg=cfg,
+                allowed_domains=validated_allowed_domains,
+                max_sources=validated_max_sources,
+                external_web_access=validated_external_web_access,
+                transport=transport,
+                client_factory=client_factory,
+            ),
             runtime=runtime,
             cfg=cfg,
-            allowed_domains=validated_allowed_domains,
-            max_sources=validated_max_sources,
-            external_web_access=validated_external_web_access,
-            transport=transport,
-            client_factory=client_factory,
         )
     except WebSearchError as openai_error:
         return _fallback_to_tavily_or_raise(runtime.provider, openai_error)

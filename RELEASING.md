@@ -4,7 +4,7 @@ This is the maintainer checklist for publishing Sylliptor packages and sandbox i
 
 ## Version And Tag
 
-1. Bump the package version in `pyproject.toml`.
+1. Bump the package version in `pyproject.toml` and `src/sylliptor_agent_cli/__init__.py`.
 2. Update `CHANGELOG.md` with user-facing changes and known limitations.
 3. Commit the release changes.
 4. Create and push the release tag:

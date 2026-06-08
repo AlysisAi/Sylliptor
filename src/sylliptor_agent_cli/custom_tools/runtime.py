@@ -758,12 +758,14 @@ def _terminate_posix_process_group(proc: subprocess.Popen[bytes]) -> None:
     if not _signal_posix_process_group(pgid, signal.SIGTERM):
         _terminate_immediate_worker(proc)
         return
+    _wait_for_worker_exit(proc, timeout_s=0.5)
     if not _wait_for_posix_process_group_exit(pgid, timeout_s=0.5):
         if not _signal_posix_process_group(pgid, signal.SIGKILL):
             _terminate_immediate_worker(proc)
             return
         _wait_for_posix_process_group_exit(pgid, timeout_s=1.0)
-    _wait_for_worker_exit(proc, timeout_s=1.0)
+    if not _wait_for_worker_exit(proc, timeout_s=1.0):
+        _terminate_immediate_worker(proc)
 
 
 def _signal_posix_process_group(pgid: int, signum: int) -> bool:

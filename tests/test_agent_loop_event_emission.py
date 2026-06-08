@@ -8,6 +8,10 @@ from rich.console import Console
 
 from sylliptor_agent_cli.agent_loop import AgentSession, ToolDef
 from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.llm.metadata import (
+    GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY,
+    PROVIDER_METADATA_KEY,
+)
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse, ToolCall
 from sylliptor_agent_cli.model_registry import ModelMeta
 from sylliptor_agent_cli.session_store import SessionStore
@@ -49,19 +53,26 @@ class _ScriptedClient:
         self._responses = list(responses)
         self._stream_chunks = list(stream_chunks or [])
         self.calls = 0
+        self.requests: list[dict[str, Any]] = []
+        self.call_messages: list[list[dict[str, Any]]] = []
 
     def chat(
         self,
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
+        response_format: dict[str, Any] | None = None,
         stream: bool = False,
         on_text_delta: Any = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
-        _ = messages, tools, temperature
+        _ = messages, tools, tool_choice, response_format, temperature, max_tokens
         call_index = self.calls
         self.calls += 1
+        self.call_messages.append(list(messages))
+        self.requests.append({"stream": stream, "has_delta_callback": callable(on_text_delta)})
         if stream and callable(on_text_delta) and call_index < len(self._stream_chunks):
             for chunk in self._stream_chunks[call_index]:
                 on_text_delta(chunk)
@@ -230,6 +241,123 @@ def test_run_turn_streaming_assistant_text_emits_events_and_legacy(tmp_path: Pat
     assert ends[0].text == "Hello world."
     assert "".join(event.text for event in deltas) == surface.legacy_assistant_done[-1]
     assert surface.legacy_tokens == ["Hello ", "world."]
+
+
+def test_run_turn_streaming_tool_call_executes_after_stream_finishes(tmp_path: Path) -> None:
+    tool = ToolDef(
+        name="echo_tool",
+        description="echo",
+        parameters={"type": "object", "properties": {}, "required": []},
+        run=lambda args: {"ok": args["message"]},
+    )
+    surface = _RecordingEventSurface()
+    client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="I will call the tool.",
+                tool_calls=[
+                    ToolCall(id="call_streamed", name="echo_tool", arguments={"message": "hello"})
+                ],
+                raw={},
+            ),
+            LLMResponse(content="done", tool_calls=[], raw={}),
+        ],
+        stream_chunks=[["I will ", "call the tool."]],
+    )
+    session = _make_session(root=tmp_path, client=client, surface=surface, stream=True, tool=tool)
+
+    try:
+        exit_code = session.run_turn("run the tool")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert client.requests[0] == {"stream": True, "has_delta_callback": True}
+    assert client.requests[1] == {"stream": True, "has_delta_callback": True}
+    event_types = [type(event) for event in surface.events]
+    first_tool_index = event_types.index(ToolCallStarted)
+    assert event_types[:first_tool_index] == [MessageDelta, MessageDelta, MessageEnd]
+    assert [event.text for event in surface.events[:2]] == ["I will ", "call the tool."]
+
+
+def test_run_turn_streaming_provider_metadata_survives_tool_followup_request(
+    tmp_path: Path,
+) -> None:
+    tool = ToolDef(
+        name="echo_tool",
+        description="echo",
+        parameters={"type": "object", "properties": {}, "required": []},
+        run=lambda args: {"ok": args["message"]},
+    )
+    provider_content = {
+        "role": "model",
+        "parts": [
+            {"text": "I will call the tool."},
+            {
+                "functionCall": {
+                    "id": "call_streamed",
+                    "name": "echo_tool",
+                    "args": {"message": "hello"},
+                },
+                "thoughtSignature": "streamed-thought-signature",
+            },
+        ],
+    }
+    surface = _RecordingEventSurface()
+    client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="I will call the tool.",
+                tool_calls=[
+                    ToolCall(
+                        id="call_streamed",
+                        name="echo_tool",
+                        arguments={"message": "hello"},
+                        provider_metadata={
+                            GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY: {
+                                "part_index": 1,
+                                "thoughtSignature": "streamed-thought-signature",
+                            }
+                        },
+                    )
+                ],
+                raw={},
+                provider_metadata={
+                    GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY: {
+                        "content": provider_content,
+                    }
+                },
+            ),
+            LLMResponse(content="done", tool_calls=[], raw={}),
+        ],
+        stream_chunks=[["I will ", "call the tool."]],
+    )
+    session = _make_session(root=tmp_path, client=client, surface=surface, stream=True, tool=tool)
+
+    try:
+        exit_code = session.run_turn("run the tool")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert len(client.call_messages) >= 2
+    followup_assistant = next(
+        message
+        for message in client.call_messages[1]
+        if str(message.get("role")) == "assistant" and message.get("tool_calls")
+    )
+    assert (
+        followup_assistant[PROVIDER_METADATA_KEY][GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY][
+            "content"
+        ]
+        == provider_content
+    )
+    assert (
+        followup_assistant[PROVIDER_METADATA_KEY]["_tool_calls"][0]["metadata"][
+            GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY
+        ]["thoughtSignature"]
+        == "streamed-thought-signature"
+    )
 
 
 def test_run_turn_tool_success_emits_lifecycle_events_and_legacy(tmp_path: Path) -> None:

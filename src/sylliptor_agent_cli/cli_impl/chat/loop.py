@@ -11,6 +11,7 @@ import typer
 
 from ...compaction.conversation_compactor import CompactionState
 from ...runtime_kind import RuntimeKind
+from ...surface.console import safe_plain_error
 from .state import _ChatExecutionRequest, _ChatPlanModeState, _ForgeChatState
 
 _PROTECTED_GLOBAL_NAMES: set[str] = set()
@@ -26,6 +27,14 @@ def _sync_cli_globals(cli_mod: Any) -> None:
         if name.startswith("__") or name in _PROTECTED_GLOBAL_NAMES:
             continue
         module_globals[name] = value
+
+
+def _path_binding_source(path_source: Any, path: Any) -> str:
+    if path_source is not None and path_source is not ParameterSource.DEFAULT:
+        return "explicit_path"
+    if path not in (None, ".", Path(".")):
+        return "explicit_path"
+    return "cwd"
 
 
 _SUBAGENT_DEFAULT_TASKS: dict[str, str] = {
@@ -919,7 +928,7 @@ def _run_plan_mode_approval_loop(
         return None
 
     try:
-        from ...llm.openai_compat import LLMError as _PlanLLMError
+        from ...llm.types import LLMError as _PlanLLMError
     except Exception:  # noqa: BLE001
         _PlanLLMError = RuntimeError
 
@@ -1131,7 +1140,7 @@ def chat(
         help="In auto mode, skip confirmations for sensitive commands.",
     ),
 ) -> None:
-    from ...llm.openai_compat import LLMError
+    from ...llm.types import LLMError
 
     console = _console()
     requested_path = path
@@ -1172,9 +1181,7 @@ def chat(
     )
 
     effective_mode = (mode.value if mode else effective.default_mode) or "review"
-    binding_source = (
-        "cwd" if path_source is None or path_source is ParameterSource.DEFAULT else "explicit_path"
-    )
+    binding_source = _path_binding_source(path_source, requested_path)
 
     try:
         if not effective.model:
@@ -1559,9 +1566,7 @@ def run(
         effective.subagents_enabled = subagents
 
     effective_mode = (mode.value if mode else effective.default_mode) or "review"
-    binding_source = (
-        "cwd" if path_source is None or path_source is ParameterSource.DEFAULT else "explicit_path"
-    )
+    binding_source = _path_binding_source(path_source, path)
 
     try:
         if not effective.model:
@@ -1609,7 +1614,14 @@ def run(
         console.print(f"[red]Workspace error:[/red] {e}")
         raise typer.Exit(code=1) from e
     except Exception as e:  # noqa: BLE001
-        console.print(f"[red]Error:[/red] {e}")
+        try:
+            console.print(f"[red]Error:[/red] {e}")
+        except Exception as render_exc:  # noqa: BLE001 - CLI error rendering must not double-crash.
+            safe_plain_error(
+                stream=getattr(console, "file", None),
+                error_type=type(render_exc).__name__,
+                message=str(e),
+            )
         raise typer.Exit(code=1) from e
 
     raise typer.Exit(code=code)

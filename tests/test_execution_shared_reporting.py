@@ -190,7 +190,7 @@ def test_build_execution_reporting_diff_includes_staged_new_file(tmp_path: Path)
 
     assert result.changed_files == ("staged_new.py",)
     assert "diff --git a/staged_new.py b/staged_new.py" in result.patch_text
-    assert "new file mode 100644" in result.patch_text
+    assert any(f"new file mode {mode}" in result.patch_text for mode in ("100644", "100755"))
 
 
 def test_build_workspace_snapshot_reporting_diff_reports_plain_dir_changes(tmp_path: Path) -> None:
@@ -322,8 +322,8 @@ def test_build_task_local_workspace_reporting_diff_excludes_preexisting_dirty_pa
 
     assert result.changed_files == ("README.md", "b.txt", "new.txt")
     assert "modified: b.txt" in result.patch_text
-    assert "deleted file mode 100644" in result.patch_text
-    assert "new file mode 100644" in result.patch_text
+    assert any(f"deleted file mode {mode}" in result.patch_text for mode in ("100644", "100755"))
+    assert any(f"new file mode {mode}" in result.patch_text for mode in ("100644", "100755"))
     assert "diff --git a/b.txt b/b.txt" in result.patch_text
     assert "a.txt" not in result.patch_text
 

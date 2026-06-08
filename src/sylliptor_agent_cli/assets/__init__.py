@@ -33,10 +33,13 @@ from .ocr import (
 from .plan_binding import (
     AssetBriefingEntry,
     TaskAssetBriefing,
+    bind_asset_to_matching_tasks,
     collect_referenced_asset_ids,
+    infer_implicit_task_asset_briefing,
     parse_task_asset_briefing,
     serialize_task_asset_briefing,
     task_asset_briefing,
+    task_asset_briefing_for_execution,
 )
 from .planner_context import (
     AssetReadinessPolicy,
@@ -104,11 +107,13 @@ __all__ = [
     "MirroredAssetEntry",
     "asset_reference_check",
     "allocate_task_assets",
+    "bind_asset_to_matching_tasks",
     "build_planner_assets_block",
     "build_planner_assets_bundle",
     "build_replanner_assets_bundle",
     "collect_referenced_asset_ids",
     "ensure_planner_asset_readiness",
+    "infer_implicit_task_asset_briefing",
     "ingest_asset",
     "migrate_legacy_assets",
     "mirror_task_assets",
@@ -117,4 +122,5 @@ __all__ = [
     "render_relevant_assets_section",
     "serialize_task_asset_briefing",
     "task_asset_briefing",
+    "task_asset_briefing_for_execution",
 ]

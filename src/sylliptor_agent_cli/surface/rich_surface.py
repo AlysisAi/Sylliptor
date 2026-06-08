@@ -14,6 +14,7 @@ from rich.markdown import Markdown
 from rich.prompt import Prompt
 from rich.text import Text
 
+from ..approval_scope import approval_session_scope_for_request
 from ..interactive_input_guard import interactive_prompt_guard
 from ..llm_error_display import classify_llm_error_display
 from ..plan_mode import extract_approved_plan_user_message
@@ -29,7 +30,14 @@ from ..tools.registry import (
 from ..tools.registry import (
     tool_reasoning_hints as _tool_reasoning_hints,
 )
-from .console import make_console
+from .console import (
+    ascii_sanitize,
+    console_glyph,
+    console_uses_ascii,
+    make_console,
+    safe_plain_error,
+    safe_write,
+)
 from .events import (
     ConfigFormRequest,
     ErrorRaised,
@@ -167,6 +175,32 @@ def _prefixed_text(
     text_style: str,
 ) -> Text:
     return Text.assemble((prefix, prefix_style), (text, text_style))
+
+
+def _bar_prefix(console: Console) -> str:
+    return console_glyph(console, "│ ", "| ")
+
+
+def _subagent_top_prefix(console: Console, *, indent: str) -> str:
+    return indent + console_glyph(console, "╭─ ", "+- ")
+
+
+def _subagent_bottom_prefix(console: Console, *, indent: str) -> str:
+    return indent + console_glyph(console, "╰─ ", "+- ")
+
+
+def _subagent_bar_prefix(console: Console, *, indent: str) -> str:
+    return indent + console_glyph(console, "│ ", "| ")
+
+
+def _separator(console: Console) -> str:
+    return console_glyph(console, " · ", " - ")
+
+
+def _surface_text(console: Console, text: str) -> str:
+    if not console_uses_ascii(console):
+        return str(text)
+    return ascii_sanitize(str(text), stream=getattr(console, "file", None))
 
 
 def _error_renderable(err: str) -> Group:
@@ -308,6 +342,8 @@ class RichSurface:
         clean = _redact(message.strip())
         if not clean:
             return
+        prefix = _surface_text(self.console, prefix)
+        clean = _surface_text(self.console, clean)
         line_key = dedupe_key or f"{prefix}\0{clean}"
         if line_key == self._last_trace_line_key:
             return
@@ -322,7 +358,7 @@ class RichSurface:
         self._emit_trace_line(
             message,
             style=style,
-            prefix="• ",
+            prefix=console_glyph(self.console, "• ", "* "),
             prefix_style=_STYLE_CHROME,
         )
 
@@ -333,6 +369,8 @@ class RichSurface:
         self._stream_buffer.clear()
 
     def _supports_live_thinking_spinner(self) -> bool:
+        if console_uses_ascii(self.console):
+            return False
         return bool(getattr(self.console, "is_terminal", False))
 
     def _make_thinking_renderable(self) -> Text:
@@ -340,6 +378,7 @@ class RichSurface:
             return Text("")
         elapsed = max(int(time.monotonic() - self._thinking_start), 0)
         spinner_char = _THINKING_SPINNER_FRAMES[self._spinner_frame % len(_THINKING_SPINNER_FRAMES)]
+        spinner_char = console_glyph(self.console, spinner_char, "*")
         self._spinner_frame = (self._spinner_frame + 1) % len(_THINKING_SPINNER_FRAMES)
         style = _STYLE_WARNING if elapsed >= 30 else _STYLE_META
         return Text(f"{spinner_char} {self._spinner_label} {elapsed}s", style=style)
@@ -365,7 +404,7 @@ class RichSurface:
                 self._emit_trace_line(
                     label,
                     style=_STYLE_META,
-                    prefix="β€Ά ",
+                    prefix=console_glyph(self.console, "• ", "* "),
                     prefix_style=_STYLE_CHROME,
                     dedupe_key=f"thinking-fallback:{label}",
                 )
@@ -404,11 +443,10 @@ class RichSurface:
         if line_count <= 0:
             return
         stream = self._assistant_stream()
-        stream.write("\r\033[2K")
+        safe_write(stream, "\r\033[2K")
         for _ in range(max(0, line_count - 1)):
-            stream.write("\033[A\033[2K")
-        stream.write("\r")
-        stream.flush()
+            safe_write(stream, "\033[A\033[2K")
+        safe_write(stream, "\r")
 
     def _subagent_indent(self, *, nesting_depth: int = 1) -> str:
         indent = "  " * max(nesting_depth, 1)
@@ -425,7 +463,7 @@ class RichSurface:
         self._emit_trace_line(
             f"{subagent_name} · {subagent_mode}",
             style=f"bold {_STYLE_SUBAGENT}",
-            prefix=f"{indent}╭─ ",
+            prefix=_subagent_top_prefix(self.console, indent=indent),
             prefix_style=_STYLE_SUBAGENT,
             dedupe_key=f"subagent-top:{subagent_name}:{subagent_mode}:{nesting_depth}",
         )
@@ -448,11 +486,11 @@ class RichSurface:
         self._last_trace_line_key = f"subagent-bottom:{subagent_name}:{status_label}:{steps_completed}:{elapsed_ms}:{nesting_depth}"
         self.console.print(
             Text.assemble(
-                (f"{indent}╰─ ", _STYLE_SUBAGENT),
+                (_subagent_bottom_prefix(self.console, indent=indent), _STYLE_SUBAGENT),
                 (status_label, status_style),
-                (" · ", _STYLE_SUBAGENT),
+                (_separator(self.console), _STYLE_SUBAGENT),
                 (step_text, _STYLE_SUBAGENT),
-                (" · ", _STYLE_SUBAGENT),
+                (_separator(self.console), _STYLE_SUBAGENT),
                 (elapsed, _STYLE_SUBAGENT),
             ),
             highlight=False,
@@ -470,7 +508,7 @@ class RichSurface:
         self._emit_trace_line(
             message,
             style=style,
-            prefix=f"{indent}│ ",
+            prefix=_subagent_bar_prefix(self.console, indent=indent),
             prefix_style=_STYLE_SUBAGENT,
             dedupe_key=f"subagent:{subagent_name}:{nesting_depth}:{message}",
         )
@@ -486,9 +524,9 @@ class RichSurface:
         for line in lines:
             self.console.print(
                 _prefixed_text(
-                    prefix="│ ",
+                    prefix=_bar_prefix(self.console),
                     prefix_style=bar_style,
-                    text=line,
+                    text=_surface_text(self.console, line),
                     text_style=text_style,
                 ),
                 highlight=False,
@@ -553,8 +591,7 @@ class RichSurface:
             self._assistant_stream_open = True
         clean_delta = _redact(delta)
         stream = self._assistant_stream()
-        stream.write(clean_delta)
-        stream.flush()
+        safe_write(stream, clean_delta)
         self._stream_buffer.append(clean_delta)
 
     def on_assistant_message_done(self, text: str) -> None:
@@ -756,7 +793,7 @@ class RichSurface:
         self._stop_thinking_spinner()
         self.console.print(
             _prefixed_text(
-                prefix="│ ",
+                prefix=_bar_prefix(self.console),
                 prefix_style=_STYLE_CHROME,
                 text=", ".join(event.files[:5]) or "Patch Preview",
                 text_style=_STYLE_EMPHASIS,
@@ -766,7 +803,7 @@ class RichSurface:
         if event.summary:
             self.console.print(
                 _prefixed_text(
-                    prefix="│ ",
+                    prefix=_bar_prefix(self.console),
                     prefix_style=_STYLE_CHROME,
                     text=event.summary,
                     text_style=_STYLE_META,
@@ -787,7 +824,7 @@ class RichSurface:
                 style = _STYLE_CHROME
             self.console.print(
                 _prefixed_text(
-                    prefix="│ ",
+                    prefix=_bar_prefix(self.console),
                     prefix_style=_STYLE_CHROME,
                     text=line,
                     text_style=style,
@@ -803,14 +840,28 @@ class RichSurface:
         self._turn_started = False
         self._working_banner_shown = False
         self._reset_thinking()
-        self.console.print(_error_renderable(err))
+        try:
+            self.console.print(_error_renderable(err))
+        except Exception as exc:  # noqa: BLE001 - final output fallback must not double-crash.
+            safe_plain_error(
+                stream=getattr(self.console, "file", None),
+                error_type=type(exc).__name__,
+                message=err,
+            )
 
     def on_warning(self, warning: str) -> None:
         self._stop_thinking_spinner()
         if self._assistant_stream_open:
             self.console.print("")
             self._assistant_stream_open = False
-        self.console.print(_warning_renderable(warning))
+        try:
+            self.console.print(_warning_renderable(warning))
+        except Exception:
+            safe_plain_error(
+                stream=getattr(self.console, "file", None),
+                error_type="Warning",
+                message=warning,
+            )
 
     def _emit_event_info(self, message: str) -> None:
         if self._trace_level == "off":
@@ -1155,9 +1206,8 @@ class RichSurface:
     def _erase_approval_selector_menu(self) -> None:
         stream = self.console.file if self.console.file is not None else sys.stdout
         for _ in range(len(self._approval_selector_options())):
-            stream.write("\033[A\033[2K")
-        stream.write("\r")
-        stream.flush()
+            safe_write(stream, "\033[A\033[2K")
+        safe_write(stream, "\r")
 
     def _read_approval_selector_keypress(self) -> str:
         import select
@@ -1262,7 +1312,8 @@ class RichSurface:
 
     def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
         self._stop_thinking_spinner()
-        if request.kind in self._allow_for_session:
+        scope_info = approval_session_scope_for_request(request)
+        if scope_info.key is not None and scope_info.key in self._allow_for_session:
             return ApprovalDecision(allow=True, allow_for_session=True)
 
         files = ", ".join(request.files[:8]) if request.files else "-"
@@ -1286,11 +1337,11 @@ class RichSurface:
             }.get(request.kind, f"Approve {request.kind}")
         headline = action_label
         if request.reason:
-            headline += f" · {request.reason}"
+            headline += f"{_separator(self.console)}{request.reason}"
 
         self.console.print(
             _prefixed_text(
-                prefix="│ ",
+                prefix=_bar_prefix(self.console),
                 prefix_style=bar_style,
                 text=headline,
                 text_style=title_style,
@@ -1299,7 +1350,7 @@ class RichSurface:
         )
         self.console.print(
             _prefixed_text(
-                prefix="│ ",
+                prefix=_bar_prefix(self.console),
                 prefix_style=bar_style,
                 text=target,
                 text_style=_STYLE_CONTENT,
@@ -1342,17 +1393,34 @@ class RichSurface:
                 highlight=False,
             )
         if not self._uses_inline_approval_selector():
-            self.console.print(
-                Text.assemble(
-                    ("  ", _STYLE_CONTENT),
-                    ("[y]", _STYLE_EMPHASIS),
-                    (" allow  ", _STYLE_META),
-                    ("[a]", _STYLE_EMPHASIS),
-                    (" always  ", _STYLE_META),
+            options = [
+                ("  ", _STYLE_CONTENT),
+                ("[y]", _STYLE_EMPHASIS),
+                (" allow  ", _STYLE_META),
+            ]
+            if scope_info.supported:
+                options.extend(
+                    [
+                        ("[a]", _STYLE_EMPHASIS),
+                        (" always  ", _STYLE_META),
+                    ]
+                )
+            options.extend(
+                [
                     ("[n]", _STYLE_EMPHASIS),
                     (" deny  ", _STYLE_META),
                     ("[v]", _STYLE_EMPHASIS),
                     (" view", _STYLE_META),
+                ]
+            )
+            self.console.print(Text.assemble(*options), highlight=False)
+        elif scope_info.warning:
+            self.console.print(
+                _prefixed_text(
+                    prefix="  ",
+                    prefix_style=_STYLE_CONTENT,
+                    text=scope_info.warning,
+                    text_style=_STYLE_META,
                 ),
                 highlight=False,
             )
@@ -1361,14 +1429,26 @@ class RichSurface:
             if choice in {"1", "y"}:
                 return ApprovalDecision(allow=True)
             if choice in {"2", "a"}:
-                self._allow_for_session.add(request.kind)
-                return ApprovalDecision(allow=True, allow_for_session=True)
+                if scope_info.supported and scope_info.key is not None:
+                    self._allow_for_session.add(scope_info.key)
+                    return ApprovalDecision(allow=True, allow_for_session=True)
+                self.console.print(
+                    _prefixed_text(
+                        prefix="  ",
+                        prefix_style=_STYLE_CONTENT,
+                        text=scope_info.warning
+                        or "Allow for session is unavailable for this approval.",
+                        text_style=_STYLE_META,
+                    ),
+                    highlight=False,
+                )
+                return ApprovalDecision(allow=True)
             if choice in {"3", "n"}:
                 return ApprovalDecision(allow=False)
             if choice in {"4", "v"}:
                 self.console.print(
                     _prefixed_text(
-                        prefix="│ ",
+                        prefix=_bar_prefix(self.console),
                         prefix_style=_STYLE_CHROME,
                         text="Context",
                         text_style=_STYLE_EMPHASIS,

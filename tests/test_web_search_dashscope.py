@@ -5,11 +5,16 @@ import json
 import httpx
 import pytest
 
+from sylliptor_agent_cli.llm.provider_limits import ProviderRetrySettings
 from sylliptor_agent_cli.tools.web_search_dashscope import (
     DashScopeChatSearchError,
     _sources_from_urls,
     dashscope_chat_search,
 )
+
+
+def _public_resolver(_host: str, _port: int) -> list[str]:
+    return ["93.184.216.34"]
 
 
 def test_dashscope_chat_search_posts_enable_search_and_returns_sources() -> None:
@@ -69,6 +74,7 @@ def test_dashscope_chat_search_posts_enable_search_and_returns_sources() -> None
         model="qwen3.5-plus",
         include_domains=["docs.example.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "dashscope_chat"
@@ -202,6 +208,7 @@ def test_dashscope_chat_search_extracts_parenthesized_markdown_link_target_from_
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["sources"] == [{"url": "https://docs.example.com/spec", "title": ""}]
@@ -239,6 +246,7 @@ def test_dashscope_chat_search_extracts_markdown_link_title_parenthesized_target
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["sources"] == [
@@ -275,6 +283,7 @@ def test_dashscope_chat_search_extracts_bracket_query_url_from_plain_answer() ->
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["sources"] == [{"url": "https://docs.example.com/path?foo[bar]=1", "title": ""}]
@@ -305,6 +314,7 @@ def test_dashscope_chat_search_extracts_exclamation_url_from_plain_answer() -> N
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["sources"] == [{"url": "https://docs.example.com/Yahoo!", "title": ""}]
@@ -337,6 +347,7 @@ def test_dashscope_chat_search_extracts_url_with_legal_trailing_parenthesis_from
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["sources"] == [{"url": "https://docs.example.com/path?x=a)", "title": ""}]
@@ -373,6 +384,7 @@ def test_dashscope_chat_search_extracts_parenthesized_url_from_plain_answer() ->
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["sources"] == [
@@ -422,6 +434,7 @@ def test_dashscope_chat_search_structured_sources_preserve_parenthesized_url() -
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["sources"] == [
@@ -456,6 +469,7 @@ def test_dashscope_chat_search_plain_answer_canonicalizes_wrappers_without_dupli
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["sources"] == [{"url": "https://docs.example.com/spec", "title": ""}]
@@ -487,6 +501,7 @@ def test_dashscope_chat_search_plain_answer_canonicalizes_markdown_wrappers_with
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["sources"] == [{"url": "https://docs.example.com/spec", "title": ""}]
@@ -515,6 +530,7 @@ def test_dashscope_chat_search_extracts_urls_from_plain_answer() -> None:
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["answer"].startswith("Use the migration guide")
@@ -548,6 +564,7 @@ def test_dashscope_chat_search_parses_fenced_json_answer() -> None:
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["answer"] == "Use the official download page."
@@ -577,6 +594,7 @@ def test_dashscope_chat_search_parses_streaming_sse_response() -> None:
         api_key="dashscope-key",
         model="qwen3.5-plus",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["answer"] == "Use the docs."
@@ -606,6 +624,8 @@ def test_dashscope_chat_search_surfaces_http_errors() -> None:
             api_key="bad-key",
             model="qwen3.5-plus",
             transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
+            provider_retry_settings=ProviderRetrySettings(max_retries=0),
         )
 
 
@@ -623,4 +643,6 @@ def test_dashscope_chat_search_surfaces_timeout_with_configured_limit() -> None:
             api_key="dashscope-key",
             model="qwen3.5-plus",
             transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
+            provider_retry_settings=ProviderRetrySettings(max_retries=0),
         )

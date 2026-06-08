@@ -119,6 +119,16 @@ def _assert_encrypted_envelope(
     return envelope
 
 
+def _filesystem_enforces_private_mode(path: Path) -> bool:
+    if os.name == "nt":
+        return False
+    probe = path.parent / ".mode_probe"
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_text("", encoding="utf-8")
+    os.chmod(probe, 0o600)
+    return stat.S_IMODE(probe.stat().st_mode) == 0o600
+
+
 def _legacy_payload(record: McpOAuthTokenRecord | None = None) -> dict[str, Any]:
     return {
         "alpha": (
@@ -321,7 +331,7 @@ def test_token_store_weak_fallback_round_trip_logs_warning_and_persists_salt(
         expected_key_source=token_store_mod.KEY_SOURCE_WEAK_FALLBACK,
         forbidden_values=("access-one", "refresh-one"),
     )
-    if os.name != "nt":
+    if _filesystem_enforces_private_mode(salt_path):
         assert stat.S_IMODE(salt_path.stat().st_mode) == 0o600
 
 
@@ -759,8 +769,10 @@ def test_token_store_permissions_are_restrictive_on_posix(
         "alpha", _record(access_token="access-one", refresh_token="refresh-one")
     )
 
-    mode = stat.S_IMODE(mcp_oauth_token_store_path().stat().st_mode)
-    assert mode == 0o600
+    path = mcp_oauth_token_store_path()
+    if _filesystem_enforces_private_mode(path):
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode == 0o600
 
 
 def test_token_store_never_writes_into_project_scope(

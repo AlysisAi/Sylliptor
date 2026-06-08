@@ -42,6 +42,39 @@ def test_reconciliation_fills_missing_estimated_files_from_strong_hints(tmp_path
     assert any("inferred estimated_files from task text" in warning for warning in result.warnings)
 
 
+def test_reconciliation_clears_read_only_task_scope_before_execution(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "ConfigLoader.java").write_text("class ConfigLoader {}\n", encoding="utf-8")
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Read current src/ConfigLoader.java",
+                "description": "Inspect the current implementation before downstream fixes.",
+                "acceptance_criteria": ["Findings recorded."],
+                "estimated_files": ["src/ConfigLoader.java"],
+                "write_scope": ["src/ConfigLoader.java"],
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+    )
+
+    task = plan["tasks"][0]
+    assert result.changed is True
+    assert task["estimated_files"] == []
+    assert task["write_scope"] == []
+    assert task["analysis_only"] is True
+    assert task["task_kind"] == "analysis_only"
+    assert any("cleared file mutation scope" in warning for warning in result.warnings)
+
+
 def test_reconciliation_adds_explicit_task_paths_to_existing_wrong_scope(
     tmp_path: Path,
 ) -> None:
@@ -117,8 +150,8 @@ def test_reconciliation_warns_for_suspicious_missing_paths_without_crashing(tmp_
         "tasks": [
             {
                 "id": "T99",
-                "title": "Investigate missing path",
-                "description": "Check missing/nested/file.py handling.",
+                "title": "Update missing path handling",
+                "description": "Touch missing/nested/file.py handling.",
                 "acceptance_criteria": [],
                 "estimated_files": ["missing/nested/file.py"],
                 "write_scope": ["missing/nested/file.py"],
@@ -251,6 +284,37 @@ def test_reconciliation_drops_forbidden_user_anchor_and_restores_implementation_
     joined = " | ".join(result.warnings)
     assert "dropped forbidden estimated_files entries: USER_NOTES.md" in joined
     assert "dropped forbidden write_scope entries: USER_NOTES.md" in joined
+
+
+def test_reconciliation_preserves_implementation_path_when_preserve_targets_behavior(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "migrate_user.py").write_text("def migrate(user):\n    return user\n", encoding="utf-8")
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix migrate_user.py",
+                "description": "Preserve unknown fields in migrate_user.py while migrating users.",
+                "acceptance_criteria": ["Backward compatibility is preserved."],
+                "estimated_files": ["migrate_user.py"],
+                "write_scope": ["migrate_user.py"],
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+    )
+
+    assert result.changed is False
+    assert plan["tasks"][0]["write_scope"] == ["migrate_user.py"]
+    assert not any("dropped forbidden" in warning for warning in result.warnings)
 
 
 def test_reconciliation_drops_suspicious_off_request_paths_when_user_named_exact_files(
@@ -577,6 +641,94 @@ def test_reconciliation_adds_unique_named_code_file_for_behavior_task_with_tests
     assert "added repository symbol definition path(s) to write_scope: parser.py" in joined
 
 
+def test_reconciliation_adds_unique_named_java_file_for_behavior_task_with_tests_only_scope(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    (root / "src" / "main" / "java" / "com" / "example").mkdir(parents=True)
+    (root / "src" / "main" / "java" / "com" / "example" / "ConfigLoader.java").write_text(
+        "package com.example;\n\npublic final class ConfigLoader {\n}\n",
+        encoding="utf-8",
+    )
+    (root / "src" / "test" / "java" / "com" / "example").mkdir(parents=True)
+    (root / "src" / "test" / "java" / "com" / "example" / "ConfigLoaderTest.java").write_text(
+        "package com.example;\n\nclass ConfigLoaderTest {\n}\n",
+        encoding="utf-8",
+    )
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Implement ConfigLoader defaults",
+                "description": "Make ConfigLoader preserve explicit values and cover defaults.",
+                "acceptance_criteria": [
+                    "Add or update regression coverage for ConfigLoader defaults."
+                ],
+                "estimated_files": ["src/test/java/**/*.java"],
+                "write_scope": ["src/test/java/**/*.java"],
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+    )
+
+    assert result.changed is True
+    expected_path = "src/main/java/com/example/ConfigLoader.java"
+    assert plan["tasks"][0]["estimated_files"] == ["src/test/java/**/*.java", expected_path]
+    assert plan["tasks"][0]["write_scope"] == ["src/test/java/**/*.java", expected_path]
+    joined = " | ".join(result.warnings)
+    assert (
+        f"added repository symbol definition path(s) to estimated_files: {expected_path}" in joined
+    )
+    assert f"added repository symbol definition path(s) to write_scope: {expected_path}" in joined
+
+
+def test_reconciliation_handles_mixed_language_monorepo_java_symbol_grounding(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    (root / "web" / "src").mkdir(parents=True)
+    (root / "web" / "src" / "parser.ts").write_text(
+        "export function parseCsv(value: string) { return value; }\n",
+        encoding="utf-8",
+    )
+    (root / "service" / "src" / "main" / "java" / "com" / "example").mkdir(parents=True)
+    java_path = "service/src/main/java/com/example/CSVParser.java"
+    (root / java_path).write_text(
+        "package com.example;\n\npublic final class CSVParser {\n}\n",
+        encoding="utf-8",
+    )
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Implement CSVParser quoted-field handling",
+                "description": "Patch CSVParser in the Java service.",
+                "acceptance_criteria": ["CSVParser handles quoted commas."],
+                "estimated_files": ["service/src/test/java/**/*.java"],
+                "write_scope": ["service/src/test/java/**/*.java"],
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+    )
+
+    assert result.changed is True
+    assert java_path in plan["tasks"][0]["estimated_files"]
+    assert java_path in plan["tasks"][0]["write_scope"]
+    assert "web/src/parser.ts" not in plan["tasks"][0]["estimated_files"]
+
+
 def test_reconciliation_does_not_replace_broad_globs_from_planner_boilerplate(
     tmp_path: Path,
 ) -> None:
@@ -628,3 +780,144 @@ def test_reconciliation_does_not_replace_broad_globs_from_planner_boilerplate(
     assert not any(
         "search.py" in warning or "commands/tools.py" in warning for warning in result.warnings
     )
+
+
+def test_reconciliation_records_monorepo_target_and_drops_decoy_scope(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    (root / "services" / "api" / "src").mkdir(parents=True)
+    (root / "services" / "worker" / "src").mkdir(parents=True)
+    (root / "services" / "api" / "package.json").write_text(
+        '{"scripts":{"test":"vitest"}}\n',
+        encoding="utf-8",
+    )
+    (root / "services" / "worker" / "package.json").write_text("{}\n", encoding="utf-8")
+    (root / "services" / "api" / "src" / "config.ts").write_text("export {}\n", encoding="utf-8")
+    (root / "services" / "worker" / "src" / "config.ts").write_text(
+        "export {}\n",
+        encoding="utf-8",
+    )
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix API config",
+                "description": "Update APP_REGION precedence in the API service.",
+                "acceptance_criteria": ["API precedence is correct."],
+                "estimated_files": ["services/api/src/config.ts"],
+                "write_scope": ["services/api/src/config.ts"],
+            },
+            {
+                "id": "T02",
+                "title": "Fix worker config",
+                "description": "Update worker config.",
+                "acceptance_criteria": ["Worker config changes."],
+                "estimated_files": ["services/worker/src/config.ts"],
+                "write_scope": ["services/worker/src/config.ts"],
+            },
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+        user_text="Only fix API. Worker is a decoy and should remain unchanged.",
+    )
+
+    constraints = plan["planning_constraints"]
+    assert [item["path"] for item in constraints["target_roots"]] == ["services/api"]
+    assert [item["path"] for item in constraints["decoy_roots"]] == ["services/worker"]
+    assert plan["tasks"][0]["write_scope"] == ["services/api/src/config.ts"]
+    assert plan["tasks"][1]["write_scope"] == []
+    joined = " | ".join(result.warnings)
+    assert "dropped write_scope outside planning constraints" in joined
+
+
+def test_reconciliation_transcript_tail_can_ground_decoy_constraints(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    (root / "services" / "api").mkdir(parents=True)
+    (root / "services" / "worker").mkdir(parents=True)
+    (root / "services" / "api" / "package.json").write_text("{}\n", encoding="utf-8")
+    (root / "services" / "worker" / "package.json").write_text("{}\n", encoding="utf-8")
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Update worker implementation",
+                "description": "Touch services/worker/src/app.ts.",
+                "acceptance_criteria": ["Worker changes."],
+                "estimated_files": ["services/worker/src/app.ts"],
+                "write_scope": ["services/worker/src/app.ts"],
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+        transcript_tail=[
+            {
+                "role": "user",
+                "content": "Stay inside API only. Worker is a decoy.",
+            }
+        ],
+    )
+
+    assert plan["tasks"][0]["estimated_files"] == []
+    assert plan["tasks"][0]["write_scope"] == []
+    assert any("outside planning constraints" in warning for warning in result.warnings)
+
+
+def test_reconciliation_latest_retarget_replaces_stale_constraints(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / "services" / "api" / "src").mkdir(parents=True)
+    (root / "services" / "worker" / "src").mkdir(parents=True)
+    (root / "services" / "api" / "package.json").write_text("{}\n", encoding="utf-8")
+    (root / "services" / "worker" / "package.json").write_text("{}\n", encoding="utf-8")
+    (root / "services" / "worker" / "src" / "config.ts").write_text(
+        "export {}\n",
+        encoding="utf-8",
+    )
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "planning_constraints": {
+            "schema_version": 1,
+            "target_roots": [{"path": "services/api", "reason_code": "user_target_root"}],
+            "forbidden_roots": [],
+            "decoy_roots": [{"path": "services/worker", "reason_code": "decoy_path_constraint"}],
+            "unrelated_roots": [],
+        },
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix worker config",
+                "description": "Update services/worker config.",
+                "acceptance_criteria": ["Worker config changes."],
+                "estimated_files": ["services/worker/src/config.ts"],
+                "write_scope": ["services/worker/src/config.ts"],
+            }
+        ],
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+        transcript_tail=[
+            {"role": "user", "content": "Only fix API. Worker is a decoy."},
+            {"role": "user", "content": "Actually switch to fixing Worker now."},
+        ],
+    )
+
+    constraints = plan["planning_constraints"]
+    assert [item["path"] for item in constraints["target_roots"]] == ["services/worker"]
+    assert constraints["decoy_roots"] == []
+    assert plan["tasks"][0]["write_scope"] == ["services/worker/src/config.ts"]
+    assert result.changed is True

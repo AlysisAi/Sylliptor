@@ -17,10 +17,11 @@ from ..assets import (
     AssetSurfaceDetail,
     AssetSurfaceEntry,
     asset_reference_check,
+    bind_asset_to_matching_tasks,
 )
 from ..assets.surface import build_asset_surface
 from ..config import AppConfig, load_config
-from ..forge import ForgeError, RunPaths, load_current_run_paths, load_plan
+from ..forge import ForgeError, RunPaths, load_current_run_paths, load_plan, save_plan
 from ..surface.console import make_console
 
 assets_app = typer.Typer(add_completion=False, help="Manage first-class forge assets.")
@@ -148,6 +149,9 @@ def assets_add(
     else:
         _console().print("- comprehension: pending")
         _console().print(f"- next: sylliptor forge assets refresh {record.id} --path {path} --wait")
+    bound_task_ids = _bind_asset_to_current_plan(surface=surface, record=record)
+    if bound_task_ids:
+        _console().print("- bound tasks: " + ", ".join(bound_task_ids))
 
 
 @assets_app.command("delete")
@@ -369,6 +373,22 @@ def _load_surface_or_exit(path: Path) -> AssetSurface:
 
 def build_surface(*, cfg: AppConfig, run_paths: RunPaths) -> AssetSurface:
     return build_asset_surface(cfg=cfg, run_paths=run_paths)
+
+
+def _bind_asset_to_current_plan(*, surface: AssetSurface, record: Any) -> list[str]:
+    try:
+        plan = load_plan(surface.run_paths)
+        active_records = surface.index.records(include_deleted=False)
+        bound_task_ids = bind_asset_to_matching_tasks(
+            plan=plan,
+            record=record,
+            active_records=active_records,
+        )
+        if bound_task_ids:
+            save_plan(surface.run_paths, plan)
+        return bound_task_ids
+    except (ForgeError, AssetError):
+        return []
 
 
 def _resolve_title(title: str | None) -> str:

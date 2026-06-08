@@ -68,7 +68,7 @@ VERIFY_RUNNER_PREFIXES: frozenset[tuple[str, str]] = frozenset(
 VERIFY_PY_LAUNCHERS: frozenset[str] = frozenset({"py", "py.exe"})
 VERIFY_PYTHON_LAUNCHER_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
 VERIFY_MODULE_NAMES: frozenset[str] = frozenset({"pytest", "ruff", "unittest"})
-_WEB_SEARCH_MODES: set[str] = {"off", "auto"}
+_WEB_SEARCH_MODES: set[str] = {"off", "auto", "native", "external"}
 _REASONING_EFFORTS: set[str] = {"none", "minimal", "low", "medium", "high", "xhigh"}
 DEFAULT_FEEDBACK_GITHUB_REPO = "AlysisAi/Sylliptor"
 _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
@@ -149,6 +149,7 @@ class AppConfig(BaseModel):
             "explicit false preserves manual/discovery-only behavior."
         ),
     )
+    experimental_gemini_interactions_enabled: bool = False
     custom_tools_enabled: bool = True
     web_search_mode: str = "auto"
     web_search_adapter: str = "auto"
@@ -410,7 +411,7 @@ def load_config() -> AppConfig:
         raise ConfigError(f"Invalid config format (expected JSON object): {path}")
 
     # Allow unknown keys; stash them so we can round-trip. Map deprecated
-    # web_search keys into the simplified auto|off mode when older configs
+    # web_search keys into the legacy auto/off values when older configs
     # are loaded.
     known = {k: v for k, v in raw.items() if k in AppConfig.model_fields}
     if "web_search_mode" in raw:
@@ -593,7 +594,14 @@ def _matching_model_presets(model: str) -> tuple[tuple[Any, str], ...]:
 
     matches: list[tuple[Any, str]] = []
     for preset in PROFILE_PRESETS:
-        if preset.key == "custom":
+        if preset.key in {
+            "custom",
+            "openai-responses",
+            "anthropic-compat",
+            "anthropic-native",
+            "gemini-compat",
+            "gemini-native",
+        }:
             continue
         canonical = _canonicalize_model_for_preset(model, preset)
         if canonical is not None:
@@ -936,6 +944,7 @@ _SETTABLE_KEYS: set[str] = {
     "subagents_enabled",
     "skills_enabled",
     "skills_auto_invoke",
+    "experimental_gemini_interactions_enabled",
     "custom_tools_enabled",
     "task_max_steps",
     "subagent_max_steps",
@@ -987,6 +996,17 @@ _SETTABLE_KEYS: set[str] = {
 
 _VERIFY_LIKE_MODES: set[str] = {"off", "warn", "strict"}
 _MODEL_METADATA_POLICIES: set[str] = {"warn", "strict"}
+_ROLE_MODEL_NAMES: set[str] = {
+    "coding",
+    "planner",
+    "review",
+    "compactor",
+    "conflict_review",
+    "conflict_resolve",
+    "comprehension",
+    "router",
+}
+_ROLE_MODEL_CONFIG_PREFIXES: set[str] = {"role_models", "forge_role_models"}
 
 
 def _parse_command_list(value: str, *, key: str, allow_empty: bool) -> list[str]:
@@ -1475,10 +1495,59 @@ def resolve_role_temperature(cfg: AppConfig, *, role: str) -> float:
     return role_temperature
 
 
+def _role_model_key_parts(key: str) -> tuple[str, str] | None:
+    namespace, separator, role = str(key or "").partition(".")
+    if not separator or namespace not in _ROLE_MODEL_CONFIG_PREFIXES:
+        return None
+    role_key = role.strip().lower()
+    if not role_key:
+        raise ConfigError(f"{namespace} config key must include a role name")
+    if role_key not in _ROLE_MODEL_NAMES:
+        raise ConfigError(
+            f"{namespace}.{role_key} is not supported. "
+            f"Supported roles: {', '.join(sorted(_ROLE_MODEL_NAMES))}"
+        )
+    return namespace, role_key
+
+
+def _set_role_model_config_value(
+    cfg: AppConfig,
+    *,
+    namespace: str,
+    role: str,
+    value: str,
+) -> AppConfig:
+    extra_fields = dict(cfg.extra_fields or {})
+    raw_models = extra_fields.get(namespace)
+    models = dict(raw_models) if isinstance(raw_models, dict) else {}
+    normalized = str(value or "").strip()
+    if normalized:
+        models[role] = normalized
+    else:
+        models.pop(role, None)
+    if models:
+        extra_fields[namespace] = dict(sorted(models.items()))
+    else:
+        extra_fields.pop(namespace, None)
+    cfg.extra_fields = extra_fields
+    return cfg
+
+
 def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
+    role_model_parts = _role_model_key_parts(key)
+    if role_model_parts is not None:
+        namespace, role = role_model_parts
+        return _set_role_model_config_value(
+            cfg,
+            namespace=namespace,
+            role=role,
+            value=value,
+        )
+
     if key not in _SETTABLE_KEYS:
         raise ConfigError(
-            f"Unknown/unsupported key: {key}. Supported keys: {', '.join(sorted(_SETTABLE_KEYS))}"
+            f"Unknown/unsupported key: {key}. Supported keys: "
+            f"{', '.join(sorted(_SETTABLE_KEYS))}, role_models.<role>, forge_role_models.<role>"
         )
 
     if key == "base_url":
@@ -1618,6 +1687,10 @@ def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
             cfg.skills_auto_invoke = False
             return cfg
         raise ConfigError("skills_auto_invoke must be true/false")
+
+    if key == "experimental_gemini_interactions_enabled":
+        cfg.experimental_gemini_interactions_enabled = _coerce_bool(value, key=key)
+        return cfg
 
     if key == "custom_tools_enabled":
         v = value.strip().lower()

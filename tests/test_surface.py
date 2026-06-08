@@ -10,6 +10,7 @@ import pytest
 from rich.console import Console
 
 from sylliptor_agent_cli.agent_loop import AgentSession, ToolDef
+from sylliptor_agent_cli.approval_scope import exact_file_set_scope
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.interactive_input_guard import is_interactive_prompt_active
 from sylliptor_agent_cli.knowledge_capture import RecordingSurface
@@ -190,6 +191,7 @@ def test_rich_surface_approval_supports_view_and_allow_for_session(monkeypatch) 
         reason="review mode",
         preview="diff --git a/a.txt b/a.txt",
         files=["a.txt"],
+        allow_for_session_scope=exact_file_set_scope(["a.txt"], operation="fs_write"),
     )
     first = surface.request_approval(request)
     assert first.allow is True

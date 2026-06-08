@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -11,6 +12,12 @@ import typer
 
 from ... import __version__
 from ...config import AppConfig, ConfigError, config_path, load_config
+from ...provider_diagnostics import build_provider_diagnostics, validate_active_provider_live
+from ...provider_telemetry import (
+    diagnostic_bundle_payload,
+    last_provider_call_summary,
+    last_web_search_summary,
+)
 from ...sandbox_doctor import diagnose_sandbox
 from ...skills import resolve_skills_enabled
 from ...tools.availability import get_tool_availability
@@ -52,7 +59,7 @@ def _cli_module() -> Any:
     return cli
 
 
-app = typer.Typer(add_completion=False, help="Local CLI coding agent powered by any API.")
+app = typer.Typer(add_completion=False, help="Local CLI coding agent (multi-provider).")
 app.add_typer(config_app, name="config")
 app.add_typer(profile_app, name="profile")
 app.add_typer(update_app, name="update")
@@ -387,6 +394,55 @@ def _doctor_table(cfg: AppConfig) -> Table:
     return table
 
 
+def _provider_doctor_table(cfg: AppConfig) -> Table:
+    diagnostics = build_provider_diagnostics(cfg)
+    table = _Table(title="sylliptor doctor providers")
+    table.add_column("field")
+    table.add_column("value")
+    for key, value in diagnostics.rows():
+        table.add_row(key, value)
+    last_call = last_provider_call_summary()
+    if last_call:
+        table.add_row("last_call_provider", str(last_call.get("provider_key") or "(unknown)"))
+        table.add_row("last_call_protocol", str(last_call.get("protocol") or "(unknown)"))
+        table.add_row("last_call_status", str(last_call.get("status_category") or "(unknown)"))
+        table.add_row("last_call_latency_ms", str(last_call.get("latency_ms") or 0))
+        table.add_row("last_call_stream", "yes" if last_call.get("stream") else "no")
+        table.add_row(
+            "last_call_web_search",
+            str((last_call.get("web_search") or {}).get("backend_kind") or "off"),
+        )
+    last_search = last_web_search_summary()
+    if last_search:
+        table.add_row("last_web_search_adapter", str(last_search.get("web_search_adapter") or ""))
+        table.add_row(
+            "last_web_search_hosted",
+            "yes" if last_search.get("provider_hosted_search") else "no",
+        )
+        table.add_row("last_web_search_sources", str(last_search.get("source_count") or 0))
+    return table
+
+
+def _doctor_bundle_payload(cfg: AppConfig) -> dict[str, Any]:
+    diagnostics = build_provider_diagnostics(cfg)
+    return diagnostic_bundle_payload(
+        provider_diagnostics={key: value for key, value in diagnostics.rows()}
+    )
+
+
+def _provider_live_validation_table(cfg: AppConfig, *, timeout_s: float = 15.0) -> Table:
+    validation = _patchable("validate_active_provider_live", validate_active_provider_live)(
+        cfg,
+        timeout_s=timeout_s,
+    )
+    table = _Table(title="sylliptor doctor providers --live")
+    table.add_column("field")
+    table.add_column("value")
+    for key, value in validation.rows():
+        table.add_row(key, value)
+    return table
+
+
 @dataclass(frozen=True)
 class _ToolAvailabilityRow:
     name: str
@@ -530,7 +586,7 @@ def setup(
 def doctor(
     section: str | None = typer.Argument(
         None,
-        help="Optional check group. Use `sandbox` for safe runner diagnostics.",
+        help="Optional check group. Use `sandbox`, `providers`, or `bundle`.",
     ),
     smoke: bool = typer.Option(
         True,
@@ -542,14 +598,61 @@ def doctor(
         "--env",
         help="Show sandbox-related environment variable overrides.",
     ),
+    live: bool = typer.Option(
+        False,
+        "--live",
+        help="Run a minimal live text request for `doctor providers` after confirmation.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm live provider validation without prompting.",
+    ),
+    live_timeout: float = typer.Option(
+        15.0,
+        "--live-timeout",
+        min=1.0,
+        help="Timeout in seconds for `doctor providers --live`.",
+    ),
+    redacted: bool = typer.Option(
+        True,
+        "--redacted/--no-redacted",
+        help="Emit only redacted diagnostic data for `doctor bundle`.",
+    ),
 ) -> None:
     if section is not None:
         target = section.strip().lower()
+        if target == "sandbox":
+            _cli_module()._run_sandbox_doctor_command(include_smoke=smoke, include_env=env)
+            return
+        if target in {"provider", "providers"}:
+            cfg = _patchable("load_config", load_config)()
+            console = _console()
+            console.print(_provider_doctor_table(cfg))
+            if live:
+                console.print(
+                    "[yellow]Live provider validation sends one minimal text request and may "
+                    "incur provider cost or rate-limit usage.[/yellow]"
+                )
+                if not yes and not typer.confirm(
+                    "Run live provider validation for the active profile?", default=False
+                ):
+                    console.print("Live provider validation cancelled.")
+                    return
+                console.print(_provider_live_validation_table(cfg, timeout_s=live_timeout))
+            return
+        if target == "bundle":
+            if not redacted:
+                _console().print("[red]Only redacted doctor bundles are supported.[/red]")
+                raise typer.Exit(code=2)
+            cfg = _patchable("load_config", load_config)()
+            typer.echo(json.dumps(_doctor_bundle_payload(cfg), indent=2, sort_keys=True))
+            return
         if target != "sandbox":
-            _console().print("[red]Unknown doctor target.[/red] Use: sylliptor doctor sandbox")
+            _console().print(
+                "[red]Unknown doctor target.[/red] Use: sylliptor doctor sandbox|providers|bundle"
+            )
             raise typer.Exit(code=2)
-        _cli_module()._run_sandbox_doctor_command(include_smoke=smoke, include_env=env)
-        return
     console = _console()
     cfg = _patchable("load_config", load_config)()
     console.print(_doctor_table(cfg))
@@ -571,10 +674,11 @@ def tools() -> None:
         "[dim]Top-level readonly/Plan sessions can use ready web tools; nested readonly subagents keep them hidden.[/dim]"
     )
     console.print(
-        "[dim]Use `web_search_mode=off|auto` and optional `web_search_adapter`. `auto` can use "
-        "OpenAI Responses, xAI, Anthropic, Gemini, OpenRouter, DashScope Chat/Qwen, Kimi, "
-        "Zhipu/GLM, Doubao, Perplexity, Groq, Mistral, or Tavily when `TAVILY_API_KEY` is "
-        "set; legacy `on` and `web_search_enabled` values still load as `auto`.[/dim]"
+        "[dim]Use `web_search_mode=off|auto|native|external` and optional `web_search_adapter`. "
+        "`auto` can use OpenAI Responses, xAI, Anthropic, Gemini, OpenRouter, DashScope "
+        "Chat/Qwen, Kimi, Zhipu/GLM, Doubao, Perplexity, Groq, Mistral, or Tavily when "
+        "`TAVILY_API_KEY` is set. `native` never uses Tavily; `external` uses only external "
+        "search adapters. Legacy `on` and `web_search_enabled` values still load as `auto`.[/dim]"
     )
     console.print(
         "[dim]Custom tools are managed separately via `sylliptor tool list|info|trust|untrust`.[/dim]"

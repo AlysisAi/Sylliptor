@@ -8,12 +8,8 @@ import pytest
 
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.failure_category import FailureCategory
-from sylliptor_agent_cli.llm.openai_compat import (
-    PROVIDER_METADATA_KEY,
-    LLMError,
-    LLMResponse,
-    ToolCall,
-)
+from sylliptor_agent_cli.llm.metadata import PROVIDER_METADATA_KEY
+from sylliptor_agent_cli.llm.types import LLMError, LLMResponse, ToolCall
 from sylliptor_agent_cli.plan_assistant import (
     PLANNER_SYSTEM_PROMPT,
     _assistant_tool_call_message,
@@ -586,6 +582,9 @@ def test_run_planner_turn_retries_invalid_json_once_with_higher_temperature(monk
     assert result.error is None
     assert result.assistant_message == "Retry fixed JSON."
     assert result.request_retry_count == 0
+    assert result.schema_failures[0]["attempt"] == 1
+    assert result.schema_failures[0]["reason_code"] == "planner_schema_validation_failed"
+    assert result.schema_failures[0]["error"]
     assert temperatures == [0.2, 0.5]
     assert role_sequences == [["system", "user"], ["system", "user"]]
 
@@ -612,6 +611,7 @@ def test_run_planner_turn_retry_for_nonrepairable_schema_mismatch_keeps_two_mess
 
     assert result.plan_update is None
     assert result.error
+    assert [item["attempt"] for item in result.schema_failures] == [1, 2]
     assert role_sequences == [["system", "user"], ["system", "user"]]
 
 
@@ -634,6 +634,31 @@ def test_planner_retry_user_prompt_includes_base_context_and_schema_repair_instr
     assert "Validation error: assistant_message must be non-empty" in retry_prompt
     assert 'Previous response:\n{"assistant_message": ""}' in retry_prompt
     assert "Return ONLY one JSON object that matches the schema." in retry_prompt
+    assert "Preserve the latest user intent, target roots" in retry_prompt
+
+
+def test_planner_user_prompt_includes_monorepo_scope_constraints() -> None:
+    prompt = _planner_user_prompt(
+        plan=_base_plan(),
+        transcript_tail=[],
+        user_text="Only fix API. Worker is a decoy and should remain unchanged.",
+        workspace_context={
+            "workspace_kind": "git_repo",
+            "manifests": [
+                {"path": "services/api/package.json", "kind": "node"},
+                {"path": "services/worker/package.json", "kind": "node"},
+            ],
+            "observed_paths": [
+                "services/api/src/config.ts",
+                "services/worker/src/config.ts",
+            ],
+        },
+    )
+
+    assert "Planning scope constraints JSON:" in prompt
+    assert "services/api" in prompt
+    assert "services/worker" in prompt
+    assert "Decoy, unrelated, ignored, or forbidden paths" in prompt
 
 
 def test_planner_user_prompt_includes_relevant_knowledge_section() -> None:
@@ -964,6 +989,7 @@ def test_apply_plan_update_allows_non_mutating_analysis_task_without_file_scope(
     assert result.added_task_ids == ["T02"]
     assert plan["tasks"][-1]["estimated_files"] == []
     assert plan["tasks"][-1]["write_scope"] == []
+    assert plan["tasks"][-1]["analysis_only"] is True
 
 
 def test_apply_plan_update_clears_scope_for_non_mutating_analysis_task_with_paths() -> None:
@@ -989,6 +1015,7 @@ def test_apply_plan_update_clears_scope_for_non_mutating_analysis_task_with_path
     task = plan["tasks"][-1]
     assert task["estimated_files"] == []
     assert task["write_scope"] == []
+    assert task["analysis_only"] is True
     assert "cleared file mutation scope" in " | ".join(result.warnings)
 
 
@@ -1017,6 +1044,7 @@ def test_apply_plan_update_allows_analysis_task_with_documented_findings_without
     assert result.added_task_ids == ["T02"]
     assert plan["tasks"][-1]["estimated_files"] == []
     assert plan["tasks"][-1]["write_scope"] == []
+    assert plan["tasks"][-1]["analysis_only"] is True
 
 
 def test_apply_plan_update_rejects_analysis_task_with_documented_findings_and_mutating_work() -> (
@@ -1049,6 +1077,41 @@ def test_apply_plan_update_rejects_analysis_task_with_documented_findings_and_mu
         in joined_warnings
     )
     assert "Skipped task_add 'Analyze login bug'" in joined_warnings
+
+
+def test_apply_plan_update_clears_analysis_only_when_task_becomes_mutating() -> None:
+    plan = _base_plan()
+    plan["tasks"][0].update(
+        {
+            "title": "Investigate login failures",
+            "description": "Report findings only.",
+            "acceptance_criteria": ["Findings documented."],
+            "estimated_files": [],
+            "write_scope": [],
+            "analysis_only": True,
+        }
+    )
+
+    result = apply_plan_update(
+        plan,
+        {
+            "tasks_update": [
+                {
+                    "id": "T01",
+                    "title": "Fix login failures",
+                    "description": "Update auth.py implementation.",
+                    "acceptance_criteria": ["Login failures are fixed."],
+                    "estimated_files": ["auth.py"],
+                    "write_scope": ["auth.py"],
+                }
+            ]
+        },
+    )
+
+    assert result.changed is True
+    assert "analysis_only" not in plan["tasks"][0]
+    assert plan["tasks"][0]["estimated_files"] == ["auth.py"]
+    assert plan["tasks"][0]["write_scope"] == ["auth.py"]
 
 
 def test_apply_plan_update_allows_report_only_task_without_file_scope_when_text_mentions_changes() -> (
@@ -1229,6 +1292,38 @@ def test_apply_plan_update_sequences_test_file_task_after_implementation() -> No
                     "dependencies": [],
                     "estimated_files": ["test_habit_tracker.py"],
                     "write_scope": ["test_habit_tracker.py"],
+                },
+            ]
+        },
+    )
+
+    assert result.changed is True
+    assert plan["tasks"][-1]["dependencies"] == ["T02"]
+    assert "Added dependency T03 -> T02" in " | ".join(result.warnings)
+
+
+def test_apply_plan_update_sequences_ordered_follow_up_after_predecessor() -> None:
+    plan = _base_plan()
+
+    result = apply_plan_update(
+        plan,
+        {
+            "tasks_add": [
+                {
+                    "title": "Update src/calc.py helper behavior",
+                    "description": "Adjust the calculator helper behavior.",
+                    "acceptance_criteria": ["Helper behavior is updated."],
+                    "dependencies": [],
+                    "estimated_files": ["src/calc.py"],
+                    "write_scope": ["src/calc.py"],
+                },
+                {
+                    "title": "Update src/app.py caller after helper behavior",
+                    "description": "Update the app caller after the helper behavior changes.",
+                    "acceptance_criteria": ["Caller uses the updated helper behavior."],
+                    "dependencies": [],
+                    "estimated_files": ["src/app.py"],
+                    "write_scope": ["src/app.py"],
                 },
             ]
         },
@@ -1524,6 +1619,150 @@ def test_direction_change_preserves_completed_history_but_supersedes_planned_wor
     assert plan["tasks"][0]["status"] == "done"
     assert "superseded" not in plan["tasks"][0]
     assert plan["tasks"][1]["status"] == "superseded"
+    assert plan["tasks"][1]["superseded"]["reason_code"] == "user_changed_goal"
+
+
+def test_apply_plan_update_cannot_supersede_target_task_for_decoy_plan() -> None:
+    plan = _base_plan()
+    plan["planning_constraints"] = {
+        "schema_version": 1,
+        "target_roots": [{"path": "services/api", "reason_code": "user_target_root"}],
+        "forbidden_roots": [],
+        "decoy_roots": [{"path": "services/worker", "reason_code": "decoy_path_constraint"}],
+        "unrelated_roots": [],
+    }
+    plan["tasks"][0].update(
+        {
+            "title": "Fix API APP_REGION precedence",
+            "description": "Update services/api config precedence.",
+            "acceptance_criteria": ["API precedence is correct."],
+            "estimated_files": ["services/api/src/config.ts"],
+            "write_scope": ["services/api/src/config.ts"],
+        }
+    )
+
+    result = apply_plan_update(
+        plan,
+        {
+            "tasks_supersede": ["T01"],
+            "tasks_add": [
+                {
+                    "title": "Fix worker APP_REGION precedence",
+                    "description": "Update services/worker config.",
+                    "acceptance_criteria": ["Worker precedence changes."],
+                    "estimated_files": ["services/worker/src/config.ts"],
+                    "write_scope": ["services/worker/src/config.ts"],
+                }
+            ],
+        },
+        latest_user_text="Worker is a decoy. services/api is the target.",
+    )
+
+    assert result.superseded_task_ids == []
+    assert result.added_task_ids == []
+    assert plan["tasks"][0]["status"] == "planned"
+    joined = " | ".join(result.warnings)
+    assert "Ignored supersede for target-root task 'T01'" in joined
+    assert "violates planning scope constraints" in joined
+
+
+def test_apply_plan_update_uses_workspace_context_for_leaf_constraints() -> None:
+    plan = _base_plan()
+    plan["tasks"][0].update(
+        {
+            "title": "Fix API APP_REGION precedence",
+            "description": "Update services/api config precedence.",
+            "acceptance_criteria": ["API precedence is correct."],
+            "estimated_files": ["services/api/src/config.ts"],
+            "write_scope": ["services/api/src/config.ts"],
+        }
+    )
+
+    result = apply_plan_update(
+        plan,
+        {
+            "tasks_supersede": ["T01"],
+            "tasks_add": [
+                {
+                    "title": "Fix worker APP_REGION precedence",
+                    "description": "Update worker config.",
+                    "acceptance_criteria": ["Worker precedence changes."],
+                    "estimated_files": ["services/worker/src/config.ts"],
+                    "write_scope": ["services/worker/src/config.ts"],
+                }
+            ],
+        },
+        latest_user_text="Only fix API. Worker is a decoy and should remain unchanged.",
+        workspace_context={
+            "manifests": [
+                {"path": "services/api/package.json", "kind": "node"},
+                {"path": "services/worker/package.json", "kind": "node"},
+            ],
+            "observed_paths": [
+                "services/api/src/config.ts",
+                "services/worker/src/config.ts",
+            ],
+        },
+    )
+
+    assert result.superseded_task_ids == []
+    assert result.added_task_ids == []
+    assert plan["tasks"][0]["status"] == "planned"
+    constraints = plan["planning_constraints"]
+    assert [item["path"] for item in constraints["target_roots"]] == ["services/api"]
+    assert [item["path"] for item in constraints["decoy_roots"]] == ["services/worker"]
+
+
+def test_apply_plan_update_allows_explicit_retarget_and_records_scope_reason() -> None:
+    plan = _base_plan()
+    plan["planning_constraints"] = {
+        "schema_version": 1,
+        "target_roots": [{"path": "services/api", "reason_code": "user_target_root"}],
+        "forbidden_roots": [],
+        "decoy_roots": [{"path": "services/worker", "reason_code": "decoy_path_constraint"}],
+        "unrelated_roots": [],
+    }
+    plan["tasks"][0].update(
+        {
+            "title": "Fix API APP_REGION precedence",
+            "description": "Update services/api config precedence.",
+            "acceptance_criteria": ["API precedence is correct."],
+            "estimated_files": ["services/api/src/config.ts"],
+            "write_scope": ["services/api/src/config.ts"],
+        }
+    )
+
+    result = apply_plan_update(
+        plan,
+        {
+            "tasks_supersede": ["T01"],
+            "tasks_add": [
+                {
+                    "title": "Fix worker APP_REGION precedence",
+                    "description": "Update services/worker config.",
+                    "acceptance_criteria": ["Worker precedence changes."],
+                    "estimated_files": ["services/worker/src/config.ts"],
+                    "write_scope": ["services/worker/src/config.ts"],
+                }
+            ],
+        },
+        latest_user_text="Actually switch to fixing Worker now.",
+        workspace_context={
+            "manifests": [
+                {"path": "services/api/package.json", "kind": "node"},
+                {"path": "services/worker/package.json", "kind": "node"},
+            ],
+        },
+    )
+
+    assert result.superseded_task_ids == ["T01"]
+    assert result.added_task_ids == ["T02"]
+    assert plan["tasks"][0]["status"] == "superseded"
+    assert plan["tasks"][0]["superseded"]["reason_code"] == "invalid_out_of_scope"
+    assert plan["tasks"][1]["write_scope"] == ["services/worker/src/config.ts"]
+    constraints = plan["planning_constraints"]
+    assert [item["path"] for item in constraints["target_roots"]] == ["services/worker"]
+    assert constraints["decoy_roots"] == []
 
 
 def test_direction_change_replacement_task_must_have_runnable_scope() -> None:
@@ -1695,6 +1934,56 @@ def test_direction_change_detector_does_not_invalidate_on_report_only_mentions()
         assert result.changed is False
         assert plan["tasks"][0]["status"] == "planned"
         assert plan["requirements"] == ["Support TOML config"]
+
+
+def test_direction_change_detector_ignores_negated_drop_instruction() -> None:
+    plan = _base_plan()
+    plan["requirements"] = ["Unknown config keys from the local file are preserved."]
+    plan["tasks"] = [
+        {
+            "id": "T01",
+            "title": "Fix config precedence",
+            "description": "Preserve unknown config keys and validate timeout values.",
+            "acceptance_criteria": ["Unknown local-file keys are preserved."],
+            "dependencies": [],
+            "estimated_files": ["config_stack.py"],
+            "write_scope": ["config_stack.py"],
+            "status": "planned",
+        },
+        {
+            "id": "T02",
+            "title": "Add config regression tests",
+            "description": "Cover unknown-key preservation.",
+            "acceptance_criteria": ["Regression tests cover env overrides."],
+            "dependencies": ["T01"],
+            "estimated_files": ["tests/test_config_stack.py"],
+            "write_scope": ["tests/test_config_stack.py"],
+            "status": "planned",
+        },
+    ]
+
+    result = apply_plan_update(
+        plan,
+        {
+            "tasks_update": [
+                {
+                    "id": "T02",
+                    "acceptance_criteria": [
+                        "Regression test covers local unknown keys when env overrides timeout."
+                    ],
+                }
+            ]
+        },
+        latest_user_text=(
+            "Add a regression test where the local file contains an unknown key and env "
+            "overrides only timeout. Do not drop unrelated keys."
+        ),
+    )
+
+    assert result.superseded_task_ids == []
+    assert plan["tasks"][0]["status"] == "planned"
+    assert plan["tasks"][1]["status"] == "planned"
+    assert plan["requirements"] == ["Unknown config keys from the local file are preserved."]
 
 
 def test_replan_switch_from_old_approach_to_new_approach_supersedes_old_tasks() -> None:
@@ -3960,6 +4249,102 @@ def test_run_planner_turn_falls_back_for_thin_repo_locator_question(
     task = result.plan_update["tasks_add"][0]
     assert "src/**" in task["write_scope"]
     assert "cargo test" in " ".join(task["acceptance_criteria"])
+
+
+def test_run_planner_turn_falls_back_to_read_only_locator_when_update_is_unspecified(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
+
+    planner_payload = {
+        "assistant_message": "What specific change should the calculator make?",
+        "questions": ["What specific change should the calculator make?"],
+        "plan_update": None,
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(planner_payload)}}]},
+        )
+
+    result = run_planner_turn(
+        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
+        api_key_override=None,
+        plan=_base_plan(),
+        transcript_tail=[],
+        user_text=(
+            "Find where the calculator behavior lives, then plan the smallest safe update "
+            "with exact local file scope."
+        ),
+        workspace_context={
+            "workspace_kind": "git_repo",
+            "top_level_entries": [
+                {"path": "README.md", "kind": "file"},
+                {"path": "src", "kind": "dir"},
+            ],
+            "observed_paths": ["README.md", "src/app.py", "src/calc.py"],
+            "language_hints": ["python"],
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.error is None
+    assert result.questions == []
+    assert result.plan_update is not None
+    task = result.plan_update["tasks_add"][0]
+    assert task["title"] == "Locate requested repository implementation"
+    assert task["estimated_files"] == []
+    assert task["write_scope"] == []
+    assert "Do not change files" in " ".join(task["acceptance_criteria"])
+
+
+def test_run_planner_turn_keeps_mutating_locator_request_executable(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
+
+    planner_payload = {
+        "assistant_message": "I need more detail.",
+        "questions": ["What should happen after login?"],
+        "plan_update": None,
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(planner_payload)}}]},
+        )
+
+    result = run_planner_turn(
+        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
+        api_key_override=None,
+        plan=_base_plan(),
+        transcript_tail=[],
+        user_text="Find where the login implementation lives and fix the redirect bug.",
+        workspace_context={
+            "workspace_kind": "git_repo",
+            "top_level_entries": [
+                {"path": "src", "kind": "dir"},
+                {"path": "tests", "kind": "dir"},
+                {"path": "README.md", "kind": "file"},
+            ],
+            "observed_paths": ["src/auth.py", "tests/test_auth.py", "README.md"],
+            "language_hints": ["python"],
+            "likely_test_commands": ["pytest -q"],
+            "readme_paths": ["README.md"],
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.error is None
+    assert result.questions == []
+    assert result.plan_update is not None
+    task = result.plan_update["tasks_add"][0]
+    assert task["title"] == "Implement requested repository change"
+    assert task["estimated_files"] == ["src/**/*.py", "tests/**/*.py", "README.md"]
+    assert task["write_scope"] == ["src/**/*.py", "tests/**/*.py", "README.md"]
+    assert "Do not change files" not in " ".join(task["acceptance_criteria"])
 
 
 def test_run_planner_turn_preserves_greenfield_clarifying_questions(

@@ -8,6 +8,10 @@ import pytest
 from sylliptor_agent_cli.tools.web_search_tavily import TavilySearchError, tavily_search
 
 
+def _public_resolver(_host: str, _port: int) -> list[str]:
+    return ["93.184.216.34"]
+
+
 def test_tavily_search_returns_unified_contract_and_passes_include_domains() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert str(request.url) == "https://api.tavily.com/search"
@@ -47,6 +51,7 @@ def test_tavily_search_returns_unified_contract_and_passes_include_domains() -> 
         max_results=2,
         include_domains=["python-httpx.org", "github.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "tavily"
@@ -106,6 +111,7 @@ def test_tavily_search_truncates_snippets_and_marks_source_truncation() -> None:
         api_key="tavily-key",
         max_results=2,
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["sources_truncated"] is True
@@ -130,6 +136,7 @@ def test_tavily_search_handles_missing_or_partial_fields_gracefully() -> None:
         query="example guide",
         api_key="tavily-key",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["answer"] == ""
@@ -155,6 +162,7 @@ def test_tavily_search_surfaces_http_errors_cleanly() -> None:
             query="httpx docs",
             api_key="bad-key",
             transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
         )
 
 
@@ -167,6 +175,7 @@ def test_tavily_search_surfaces_invalid_json_cleanly() -> None:
             query="httpx docs",
             api_key="tavily-key",
             transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
         )
 
 
@@ -182,6 +191,7 @@ def test_tavily_search_surfaces_timeout_with_configured_limit() -> None:
             query="httpx docs",
             api_key="tavily-key",
             transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
         )
 
 

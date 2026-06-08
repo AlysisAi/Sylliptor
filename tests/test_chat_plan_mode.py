@@ -245,6 +245,39 @@ def test_chat_plan_command_on_off_status(tmp_path: Path, monkeypatch) -> None:
     assert captured["mode"] == "review"
 
 
+def test_back_outside_forge_is_harmless(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+
+    class _DummyStore:
+        session_id = "sid"
+
+    class _DummySession:
+        store = _DummyStore()
+        stream = False
+        mode = "review"
+        cfg = AppConfig(model="test-model", default_mode="review")
+
+        def run_turn(self, *_args: Any, **_kwargs: Any) -> int:
+            raise AssertionError("/back should be handled as a command")
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    monkeypatch.setattr(cli_mod, "create_session", lambda **_kwargs: _DummySession())
+
+    result = runner.invoke(
+        sylliptor_app,
+        ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
+        input="/back\nexit\n",
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 0
+    assert "Already in chat." in result.output
+    assert "Unknown command: /back" not in result.output
+
+
 @pytest.mark.parametrize("command", ["/plan mode", "/plan readonly", "/plan on"])
 def test_plan_mode_commands_enter_persistent_readonly_mode(
     tmp_path: Path,
@@ -1969,21 +2002,6 @@ def test_execute_plan_refuses_execution_unready_mutating_task_after_reconciliati
         (
             {
                 "id": "T01",
-                "title": "Investigate login issue",
-                "description": "Read-only analysis only; report findings.",
-                "acceptance_criteria": ["Findings documented."],
-                "dependencies": [],
-                "estimated_files": [],
-                "write_scope": [],
-                "branch": "",
-                "status": "planned",
-                "attempts": 0,
-            },
-            "R1",
-        ),
-        (
-            {
-                "id": "T01",
                 "title": "Fix calculator seed behavior",
                 "description": "Update implementation code.",
                 "acceptance_criteria": ["Calculator seed behavior is implemented."],
@@ -2027,7 +2045,7 @@ def test_execute_plan_refuses_execution_unready_mutating_task_after_reconciliati
         ),
     ],
 )
-def test_execute_plan_blocks_r1_r4_before_swarm(
+def test_execute_plan_blocks_validation_failures_before_swarm(
     tmp_path: Path,
     monkeypatch,
     task: dict[str, Any],
@@ -2077,7 +2095,75 @@ def test_execute_plan_blocks_r1_r4_before_swarm(
     assert expected_rule in rendered
 
 
-def test_forge_execute_plan_fails_fast_when_same_run_is_locked(
+def test_execute_plan_allows_report_only_task_before_swarm(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    paths = create_plan_run(repo)
+    plan = load_plan(paths)
+    plan["tasks"].append(
+        {
+            "id": "T01",
+            "title": "Investigate login issue",
+            "description": "Read-only analysis only; report findings.",
+            "acceptance_criteria": ["Findings documented."],
+            "dependencies": [],
+            "estimated_files": [],
+            "write_scope": [],
+            "branch": "",
+            "status": "planned",
+            "attempts": 0,
+        }
+    )
+    save_plan(paths, plan)
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_swarm(**kwargs: Any) -> int:
+        calls.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli_mod, "run_swarm", fake_run_swarm)
+    chat_impl_mod._sync_cli_globals(cli_mod)
+
+    class _CaptureConsole:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def print(self, renderable: Any = "", *args: Any, **kwargs: Any) -> None:
+            _ = args, kwargs
+            self.messages.append(str(renderable))
+
+    console = _CaptureConsole()
+    forge_state = cli_mod._ForgeChatState(
+        ui_mode="forge",
+        paths=paths,
+        plan=load_plan(paths),
+    )
+    session = SimpleNamespace(
+        cfg=AppConfig(model="test-model"),
+        client=SimpleNamespace(api_key=""),
+        store=SimpleNamespace(enabled=False),
+        yes=False,
+    )
+
+    result = chat_impl_mod._handle_forge_chat_command(
+        input_text="/execute plan",
+        forge_state=forge_state,
+        session=session,
+        console=console,
+    )
+
+    rendered = "\n".join(console.messages)
+    assert result == "handled"
+    assert "Execution blocked" not in rendered
+    assert len(calls) == 1
+    assert calls[0]["plan"]["tasks"][0]["title"] == "Investigate login issue"
+
+
+def test_forge_execute_plan_reports_timeout_when_same_run_stays_locked(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -2108,6 +2194,7 @@ def test_forge_execute_plan_fails_fast_when_same_run_is_locked(
     )
 
     monkeypatch.setattr(forge_mod, "now_iso", lambda: "2035-01-01T00:00:00+00:00")
+    monkeypatch.setenv("SYLLIPTOR_FORGE_LOCK_WAIT_TIMEOUT_S", "0")
     monkeypatch.setattr(
         cli_mod,
         "run_swarm",

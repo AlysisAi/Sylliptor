@@ -374,7 +374,8 @@ def test_set_model_canonicalizes_gemini_stale_preview_aliases(
     set_config_value(cfg, "model", alias)
 
     profile = get_active_profile(cfg)
-    assert profile.name == "gemini"
+    assert profile.name == "gemini-compat"
+    assert profile.protocol == "openai_compat"
     assert cfg.model == expected
     assert profile.default_model == expected
 
@@ -749,6 +750,10 @@ def test_set_web_search_mode_validation_and_deprecated_alias() -> None:
     assert cfg.web_search_mode == "auto"
     cfg = set_config_value(cfg, "web_search_mode", "off")
     assert cfg.web_search_mode == "off"
+    cfg = set_config_value(cfg, "web_search_mode", "native")
+    assert cfg.web_search_mode == "native"
+    cfg = set_config_value(cfg, "web_search_mode", "external")
+    assert cfg.web_search_mode == "external"
     cfg = set_config_value(cfg, "web_search_enabled", "true")
     assert cfg.web_search_mode == "auto"
     cfg = set_config_value(cfg, "web_search_enabled", "off")
@@ -1199,6 +1204,35 @@ def test_set_toolbar_items_validation() -> None:
         set_config_value(cfg, "toolbar_items", '["mode", "unknown"]')
     with pytest.raises(ConfigError):
         set_config_value(cfg, "toolbar_items", '["mode", 123]')
+
+
+def test_set_role_model_router_config_value() -> None:
+    cfg = AppConfig()
+    cfg.extra_fields = {"role_models": {"coding": "coding-model"}}
+
+    cfg = set_config_value(cfg, "role_models.router", "gpt-5.4-mini")
+    assert cfg.extra_fields["role_models"] == {
+        "coding": "coding-model",
+        "router": "gpt-5.4-mini",
+    }
+
+    cfg = set_config_value(cfg, "role_models.router", "")
+    assert cfg.extra_fields["role_models"] == {"coding": "coding-model"}
+
+
+def test_set_forge_role_model_router_config_value() -> None:
+    cfg = AppConfig()
+
+    cfg = set_config_value(cfg, "forge_role_models.router", "cheap-router-model")
+    assert cfg.extra_fields["forge_role_models"] == {"router": "cheap-router-model"}
+
+    cfg = set_config_value(cfg, "forge_role_models.router", "   ")
+    assert "forge_role_models" not in cfg.extra_fields
+
+
+def test_set_role_model_config_rejects_unknown_role() -> None:
+    with pytest.raises(ConfigError, match="role_models.bogus is not supported"):
+        set_config_value(AppConfig(), "role_models.bogus", "model")
 
 
 def test_clone_cfg_preserves_extra_fields_deep_copy() -> None:

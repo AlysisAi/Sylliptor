@@ -82,6 +82,34 @@ def test_mirror_copies_primary_may_need_and_pinned_assets(tmp_path: Path) -> Non
     assert manifest["primary"][0]["comprehension_version"] == 1
 
 
+def test_mirror_infers_primary_asset_for_attached_spec_task(tmp_path: Path) -> None:
+    surface = _surface(tmp_path)
+    record = surface.add_asset(
+        write_text_asset_source(tmp_path, "feature_spec.md", "Add a greeting.\n"),
+        title="Feature spec",
+        comprehend="sync",
+    ).record
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    task = {
+        "id": "T01",
+        "title": "Update README.md using attached feature spec",
+        "description": "Manual planning chat task: Update README.md using attached feature spec",
+        "acceptance_criteria": [],
+        "dependencies": [],
+        "estimated_files": ["README.md"],
+        "write_scope": ["README.md"],
+    }
+
+    mirror = mirror_task_assets(
+        task=task, plan={"tasks": [task]}, surface=surface, workspace_path=workspace
+    )
+
+    assert mirror.primary[0].asset_id == record.id
+    assert mirror.primary[0].raw_workspace_path is not None
+    assert mirror.primary[0].raw_workspace_path.read_text(encoding="utf-8") == "Add a greeting.\n"
+
+
 def test_mirror_records_tombstoned_reference_without_copying(tmp_path: Path) -> None:
     surface = _surface(tmp_path)
     record = surface.add_asset(

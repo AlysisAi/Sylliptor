@@ -12,7 +12,7 @@ from typing import Any, Literal
 from ..atomic_io import atomic_write_json
 from ..forge import now_iso
 from .models import AssetError, AssetNotFoundError, AssetRecord, ComprehensionRecord
-from .plan_binding import task_asset_briefing
+from .plan_binding import task_asset_briefing_for_execution
 from .surface import AssetSurface
 
 _MIRROR_REL_ROOT = ".sylliptor/task_assets"
@@ -67,7 +67,8 @@ def mirror_task_assets(
     backup = workspace / ".sylliptor" / f"task_assets.backup.{uuid.uuid4().hex}"
     try:
         staging_root.mkdir(parents=True, exist_ok=False)
-        briefing = task_asset_briefing(task)
+        active_records = surface.index.records(include_deleted=False)
+        briefing = task_asset_briefing_for_execution(task, records=active_records)
         primary_specs = briefing.primary if briefing is not None else []
         may_need_specs = briefing.may_need if briefing is not None else []
         primary = [

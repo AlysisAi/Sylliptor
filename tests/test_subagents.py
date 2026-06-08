@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from sylliptor_agent_cli import agent_loop
+from sylliptor_agent_cli.agent.turn.core import _resolve_subagent_turn_policy
 from sylliptor_agent_cli.agent_loop import SYSTEM_PROMPT, ToolDef, build_tools, create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.runtime_kind import RuntimeKind
@@ -1431,6 +1432,39 @@ def test_create_session_omits_subagent_system_guidance_when_subagents_unavailabl
         assert "Subagent delegation" not in nested_prompt
     finally:
         nested_session.close()
+
+
+def test_subagent_policy_can_soft_disable_explicit_requests_for_managed_execution() -> None:
+    registry = {
+        "explorer": SubagentDefinition(
+            name="explorer",
+            description="Explore the repository.",
+            system_prompt="Explore.",
+        )
+    }
+
+    strict_policy = _resolve_subagent_turn_policy(
+        instruction="Use the explorer subagent to inspect the current parser.",
+        subagents_enabled=False,
+        subagent_depth=0,
+        subagent_registry=registry,
+        turn_tools={},
+        repo_turn_execution_intent="plan_or_analysis_only",
+    )
+    managed_policy = _resolve_subagent_turn_policy(
+        instruction="Use the explorer subagent to inspect the current parser.",
+        subagents_enabled=False,
+        enforce_explicit_request=False,
+        subagent_depth=0,
+        subagent_registry=registry,
+        turn_tools={},
+        repo_turn_execution_intent="plan_or_analysis_only",
+    )
+
+    assert strict_policy.unavailable is True
+    assert managed_policy.unavailable is False
+    assert managed_policy.level == "off"
+    assert managed_policy.reason == "subagents_disabled"
 
 
 def test_create_session_untrusted_prompt_prelude_preserves_base_system_prompt(

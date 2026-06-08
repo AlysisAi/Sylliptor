@@ -4,7 +4,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from .llm.openai_compat import LLMError
+from .llm.types import LLMError
 from .plan_assistant import compact_workspace_context_for_planner
 from .usage_tracker import build_usage_record
 

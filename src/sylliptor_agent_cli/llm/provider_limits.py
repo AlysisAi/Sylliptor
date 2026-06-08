@@ -144,6 +144,7 @@ def run_provider_limited_call(
     operation: str,
     sleep_fn: Callable[[float], None] | None = None,
     random_fn: Callable[[], float] | None = None,
+    on_retry: Callable[[int, str, float], None] | None = None,
 ) -> T:
     settings = retry_settings or ProviderRetrySettings()
     canonical_key = canonical_provider_key(provider_key)
@@ -163,6 +164,11 @@ def run_provider_limited_call(
             if retry_reason is None or retries_used >= settings.max_retries:
                 raise
             wait_seconds = _retry_delay_seconds(settings, retries_used, jitter)
+            if on_retry is not None:
+                try:
+                    on_retry(retries_used + 1, retry_reason, wait_seconds)
+                except Exception:  # noqa: BLE001 - observers must not change retry behavior.
+                    _LOGGER.debug("provider_retry_observer_failed", exc_info=True)
             _LOGGER.info(
                 f"{retry_reason}, retrying",
                 extra={

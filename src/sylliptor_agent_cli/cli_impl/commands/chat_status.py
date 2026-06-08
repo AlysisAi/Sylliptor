@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from .cli_common import *
 from .update import _cached_update_status_summary
+from ...llm.protocols import OPENAI_COMPAT_PROTOCOL, get_provider_protocol_capabilities
+from ...profiles import get_active_profile, resolve_effective_base_url
+from ...provider_telemetry import last_provider_call_summary, last_web_search_summary
 
 
 def _print_chat_status(
@@ -27,18 +30,24 @@ def _print_chat_status(
         cfg=resolved_cfg,
         api_key=session_api_key,
     )
+    active_protocol, streaming_supported = _active_protocol_status(
+        cfg=resolved_cfg,
+        client=getattr(session, "client", None),
+    )
     table = _Table(title="Chat Status")
     table.add_column("setting")
-    table.add_column("value")
+    table.add_column("value", overflow="fold")
     table.add_row("mode", str(mode))
     table.add_row("trace", _chat_trace_level(session))
     table.add_row("model", str(model))
+    table.add_row("protocol", active_protocol)
     table.add_row(
         "api_key_source",
         _api_key_source_label(str(getattr(session, "api_key_source", "missing") or "missing")),
     )
     table.add_row("temperature", str(temperature))
     table.add_row("stream", "on" if stream else "off")
+    table.add_row("streaming_supported", streaming_supported)
     table.add_row(
         "subagents",
         "on" if bool(getattr(session, "subagents_enabled", False)) else "off",
@@ -111,6 +120,37 @@ def _print_chat_status(
     )
     table.add_row("web_search_note", web_search_status.summary)
     table.add_row("web_search_setup", web_search_status.setup_hint)
+    last_call = last_provider_call_summary()
+    if last_call:
+        table.add_row(
+            "last_provider_call",
+            (
+                f"{last_call.get('provider_key') or '?'} / "
+                f"{last_call.get('protocol') or '?'} / "
+                f"{last_call.get('status_category') or '?'} / "
+                f"{last_call.get('latency_ms') or 0}ms"
+            ),
+        )
+        stream_summary = last_call.get("streaming") if isinstance(last_call, dict) else None
+        if isinstance(stream_summary, dict):
+            table.add_row(
+                "last_stream",
+                (
+                    f"events={stream_summary.get('event_count') or 0}, "
+                    f"deltas={stream_summary.get('text_delta_count') or 0}, "
+                    f"first_token_ms={stream_summary.get('first_token_latency_ms')}"
+                ),
+            )
+    last_search = last_web_search_summary()
+    if last_search:
+        table.add_row(
+            "last_web_search",
+            (
+                f"{last_search.get('web_search_mode') or '?'} / "
+                f"{last_search.get('web_search_adapter') or '?'} / "
+                f"sources={last_search.get('source_count') or 0}"
+            ),
+        )
     registry = getattr(session, "model_registry", None)
     resolved_model_name = str(model).strip()
     if registry is not None and resolved_model_name:
@@ -141,10 +181,33 @@ def _print_chat_status(
             for key, value in _bundled_catalog_provenance_rows(meta=meta, registry=registry):
                 table.add_row(key, value)
     console.print(table)
-    console.print(f"workspace_root: {root.resolve()}", soft_wrap=True)
-    console.print(f"focus_dir: {focus_dir.resolve()}", soft_wrap=True)
-    console.print(f"active_workdir: {active_workdir.resolve()}", soft_wrap=True)
-    console.print(f"active_workdir_relpath: {active_workdir_relpath}", soft_wrap=True)
+
+
+def _active_protocol_status(*, cfg: AppConfig | None, client: Any) -> tuple[str, str]:
+    protocol = str(getattr(client, "protocol", "") or "").strip()
+    provider_key = str(getattr(client, "provider_key", "") or "").strip()
+    if cfg is not None:
+        try:
+            profile = get_active_profile(cfg)
+            protocol = protocol or str(profile.protocol or OPENAI_COMPAT_PROTOCOL).strip()
+            provider_key = provider_key or str(profile.name or "").strip()
+            base_url = resolve_effective_base_url(cfg=cfg, profile=profile)
+        except Exception:  # noqa: BLE001
+            base_url = str(getattr(client, "base_url", "") or "")
+    else:
+        base_url = str(getattr(client, "base_url", "") or "")
+    protocol = protocol or OPENAI_COMPAT_PROTOCOL
+    capabilities = get_provider_protocol_capabilities(
+        provider_key=provider_key,
+        protocol=protocol,
+    )
+    if capabilities is not None:
+        supported = "yes" if capabilities.supports_streaming else "no"
+    else:
+        supported = "yes" if protocol == OPENAI_COMPAT_PROTOCOL else "unknown"
+    if not provider_key and base_url:
+        provider_key = base_url
+    return protocol, supported
 
 
 def _print_chat_pwd(*, console: Console, session: Any) -> None:
@@ -153,11 +216,11 @@ def _print_chat_pwd(*, console: Console, session: Any) -> None:
     focus_relpath = str(getattr(session, "focus_relpath", ".") or ".")
     active_workdir = Path(resolve_session_active_workdir_path(session))
     active_workdir_relpath = str(resolve_session_active_workdir_relpath(session) or ".")
-    console.print(f"active_workdir: {active_workdir}", soft_wrap=True)
-    console.print(f"active_workdir_relpath: {active_workdir_relpath}", soft_wrap=True)
-    console.print(f"focus_dir: {focus_dir}", soft_wrap=True)
-    console.print(f"focus_relpath: {focus_relpath}", soft_wrap=True)
-    console.print(f"workspace_root: {root}", soft_wrap=True)
+    console.print(f"active_workdir: {active_workdir}")
+    console.print(f"active_workdir_relpath: {active_workdir_relpath}")
+    console.print(f"focus_dir: {focus_dir}")
+    console.print(f"focus_relpath: {focus_relpath}")
+    console.print(f"workspace_root: {root}")
 
 
 def _model_metadata_uses_bundled_catalog(*, meta: Any, registry: Any) -> bool:

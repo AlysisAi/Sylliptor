@@ -254,6 +254,7 @@ def _migrate_locked(
     plan["schema_version"] = PLAN_SCHEMA_VERSION_V2
     plan["assets"] = []
     plan["legacy_assets_migrated_at"] = now_iso()
+    _bind_migrated_assets_to_matching_tasks(plan=plan, surface=surface, migrated=migrated)
     from ..forge import save_plan
 
     save_plan(run_paths, plan)
@@ -266,6 +267,32 @@ def _migrate_locked(
         plan_assets_array_cleared=True,
         plan_v2_written=True,
     )
+
+
+def _bind_migrated_assets_to_matching_tasks(
+    *,
+    plan: dict[str, Any],
+    surface: AssetSurface,
+    migrated: list[MigratedLegacyAsset],
+) -> None:
+    if not migrated:
+        return
+    from .plan_binding import bind_asset_to_matching_tasks
+
+    try:
+        active_records = surface.index.records(include_deleted=False)
+    except AssetError:
+        return
+    by_id = {record.id: record for record in active_records}
+    for item in migrated:
+        record = by_id.get(item.new_asset_id)
+        if record is None:
+            continue
+        bind_asset_to_matching_tasks(
+            plan=plan,
+            record=record,
+            active_records=active_records,
+        )
 
 
 def _read_plan(path: Path) -> dict[str, Any]:

@@ -1,6 +1,7 @@
 # ruff: noqa: F821
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -24,6 +25,16 @@ _TERMINALS_USAGE_LINES = (
     "       /terminals kill <process_id>",
     "       /terminals help",
 )
+
+
+def _print_forge_lock_wait_notice(console: Console, info: dict[str, Any]) -> None:
+    diagnostic = str(info.get("diagnostic") or "").strip()
+    warnings = ["Another Forge execution is mutating this workspace; queued and waiting."]
+    if diagnostic:
+        warnings.append(diagnostic)
+    _print_forge_warning_messages(
+        console=console, label="Forge execution queued", warnings=warnings
+    )
 
 
 def _sync_command_globals(source_globals: dict[str, Any]) -> None:
@@ -71,6 +82,9 @@ def _handle_chat_command(
 
     if cmd in {"exit", "quit", "/exit", "/quit"}:
         return "exit"
+    if cmd == "/back":
+        console.print("Already in chat.")
+        return "handled"
     if parsed_forge_enter is not None:
         if parsed_forge_enter.usage_error is not None:
             console.print(f"[red]{parsed_forge_enter.usage_error}[/red]")
@@ -1489,6 +1503,7 @@ def _handle_forge_chat_command(
             run_mutation_guard = acquire_swarm_mutation_guard(
                 paths,
                 mode="forge_swarm:chat",
+                on_wait=lambda info: _print_forge_lock_wait_notice(console, info),
             )
         except ForgeError as e:
             _print_forge_error(
@@ -1500,6 +1515,9 @@ def _handle_forge_chat_command(
         try:
             append_transcript_note(paths, role="user", message=trimmed)
 
+            if bool(getattr(run_mutation_guard, "acquired_after_wait", False)):
+                plan.clear()
+                plan.update(load_plan(paths))
             workspace_context = _workspace_context_payload_for_paths(
                 paths=paths,
                 refresh_if_stale=True,
@@ -1658,6 +1676,7 @@ def _handle_forge_chat_command(
                                     plan,
                                     sanitized_enrichment.plan_update,
                                     latest_user_text=enrichment_user_text,
+                                    workspace_context=workspace_context,
                                 )
                                 reconciliation_target_ids = list(
                                     dict.fromkeys(
@@ -1818,6 +1837,18 @@ def _handle_forge_chat_command(
                 return "handled"
 
             summary_path = paths.execution_dir / "swarm_summary.md"
+            summary_json_path = paths.execution_dir / "swarm_summary.json"
+            run_status = ""
+            run_clean: bool | None = None
+            if summary_json_path.exists():
+                try:
+                    summary_payload = json.loads(summary_json_path.read_text(encoding="utf-8"))
+                    run_status = str(summary_payload.get("status") or "").strip()
+                    raw_clean = summary_payload.get("clean")
+                    if isinstance(raw_clean, bool):
+                        run_clean = raw_clean
+                except Exception:  # noqa: BLE001
+                    run_status = ""
             try:
                 plan_after_execution = load_plan(paths)
             except Exception:  # noqa: BLE001
@@ -1828,6 +1859,11 @@ def _handle_forge_chat_command(
             )
             if total_tasks <= 0:
                 headline = "Execution finished."
+            elif run_clean is False and run_status:
+                headline = (
+                    f"Execution finished with verification status `{run_status}` · "
+                    f"{done_tasks} done · {failed_tasks} failed · {remaining_tasks} remaining."
+                )
             elif failed_tasks == 0 and remaining_tasks == 0 and code == 0:
                 headline = f"Execution complete · {total_tasks} tasks finished."
             elif failed_tasks == 0:

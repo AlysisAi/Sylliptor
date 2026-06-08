@@ -20,9 +20,10 @@ from .config import (
 from .execution_shared import safe_task_file_component
 from .forge import RunPaths, ensure_execution_dirs, now_iso
 from .git_safe import build_git_cmd
+from .llm.base import ChatClient
 from .llm.factory import _resolve_base_url, make_llm_client
-from .llm.openai_compat import LLMError
 from .llm.openai_compat import OpenAICompatClient as _OpenAICompatClient
+from .llm.types import LLMError
 from .model_metadata_policy import (
     ActiveModelRef,
     ModelMetadataPolicyError,
@@ -267,7 +268,7 @@ def _request_retry_line(*, retry_count: int, retry_state: str) -> str | None:
 
 def _request_conflict_review_response(
     *,
-    client: _OpenAICompatClient,
+    client: ChatClient,
     messages: list[dict[str, str]],
 ) -> tuple[Any, int]:
     retry_count = 0
@@ -300,7 +301,7 @@ def _make_conflict_review_llm_client(
     cfg: AppConfig,
     api_key: str,
     model_name: str,
-):
+) -> ChatClient:
     temperature = resolve_role_temperature(cfg, role="conflict_review")
     if OpenAICompatClient is _OpenAICompatClient:
         return make_llm_client(

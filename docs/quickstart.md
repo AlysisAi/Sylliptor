@@ -33,7 +33,9 @@ cd /path/to/project
 sylliptor
 ```
 
-On a fresh install, the setup wizard asks for an API key, default model, and workspace. Re-run it
+On a fresh install, the setup wizard asks for an API key, default model, optional
+router model, and workspace. Leave the router model unset to inherit the default,
+or choose a smaller/cheaper model for lightweight request routing. Re-run setup
 anytime:
 
 ```bash
@@ -86,7 +88,7 @@ Useful chat commands:
 - `/status`: show mode, workspace, and active model
 - `/pwd`: show workspace root, focus directory, and active workdir
 - `/mode`: inspect or change execution mode
-- `/config`: open the inline configuration menu
+- `/config`: open the inline configuration menu, including router model and limits
 - `/forge`: start the plan-driven workflow for larger tasks
 
 ## Workspace Binding
@@ -130,9 +132,9 @@ sylliptor tools
 ```
 
 Web search is optional and configuration-dependent. In this public build, `web_search` is available
-through OpenAI Responses, supported DashScope/Qwen endpoints, or Tavily when `TAVILY_API_KEY` is
-set. Other provider profiles can still be valid chat providers without being native `web_search`
-backends.
+through supported provider-native search adapters and external backends such as Tavily when
+configured. Other provider profiles can still be valid chat providers without being native
+`web_search` backends.
 
 Inspect custom tools discovered for the current workspace:
 

@@ -107,7 +107,7 @@ def profile_show(name: str = typer.Argument(..., help="Profile name.")) -> None:
 @profile_app.command("add")
 def profile_add(
     name: str = typer.Argument(..., help="Profile name."),
-    base_url: str = typer.Option(..., "--base-url", help="Model provider API base URL."),
+    base_url: str = typer.Option(..., "--base-url", help="OpenAI-compatible base URL."),
     api_key_env: str | None = typer.Option(None, "--api-key-env", help="API key env var."),
     header: list[str] | None = typer.Option(None, "--header", help="Extra request header k=v."),
     default_model: str = typer.Option("", "--default-model", help="Default model."),
@@ -256,18 +256,116 @@ def profile_preset(
     console.print(f"Added profile {name} from preset {preset.key}.")
 
 
+@profile_app.command("convert")
+def profile_convert(
+    name: str | None = typer.Argument(
+        None,
+        help="Profile name. Defaults to the active profile.",
+    ),
+    target: str = typer.Option(
+        ...,
+        "--to",
+        help="Conversion target: native or compatibility.",
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip confirmation."),
+) -> None:
+    """Convert a first-party profile between native and compatibility protocols."""
+    from ...profile_presets import (
+        convert_profile_to_preset,
+        normalize_conversion_target,
+        target_preset_for_profile_conversion,
+    )
+    from ...profiles import add_profile, get_profile, set_active_profile
+
+    console = _console()
+    cfg = _patchable("load_config", load_config)()
+    profile_name = str(name or (cfg.extra_fields or {}).get("active_profile") or "").strip()
+    if not profile_name:
+        console.print(
+            "[red]Profile error:[/red] No profile name supplied and no active profile set."
+        )
+        raise typer.Exit(code=2)
+    profile = get_profile(cfg, profile_name)
+    if profile is None:
+        console.print(f"[red]Profile not found:[/red] {profile_name}")
+        raise typer.Exit(code=2)
+    try:
+        normalized_target = normalize_conversion_target(target)
+    except ValueError as exc:
+        console.print(f"[red]Profile error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+    preset = target_preset_for_profile_conversion(profile, target=normalized_target)
+    if preset is None:
+        console.print(
+            "[red]Profile error:[/red] Only OpenAI, Anthropic, and Gemini profiles can be "
+            "converted between native and compatibility protocols."
+        )
+        raise typer.Exit(code=2)
+    converted = convert_profile_to_preset(profile, preset)
+    if converted.to_dict() == profile.to_dict():
+        console.print(
+            f"Profile {profile.name} is already using the {normalized_target} preset "
+            f"({preset.key})."
+        )
+        return
+
+    table = _Table(title=f"Convert profile {profile.name}")
+    table.add_column("field")
+    table.add_column("before")
+    table.add_column("after")
+    table.add_row("preset", profile.name, preset.key)
+    table.add_row("protocol", profile.protocol, converted.protocol)
+    table.add_row("base_url", profile.base_url, converted.base_url)
+    table.add_row(
+        "default_model", profile.default_model or "(empty)", converted.default_model or "(empty)"
+    )
+    table.add_row("web_search_adapter", profile.web_search_adapter, converted.web_search_adapter)
+    table.add_row(
+        "web_search_model",
+        profile.web_search_model or "(empty)",
+        converted.web_search_model or "(empty)",
+    )
+    table.add_row(
+        "api_key",
+        _profile_api_key_status(cfg, profile.name),
+        _profile_api_key_status(cfg, profile.name),
+    )
+    console.print(table)
+
+    if not yes and not typer.confirm(
+        f"Convert profile {profile.name} to {normalized_target}?", default=False
+    ):
+        console.print("Cancelled.")
+        return
+
+    add_profile(cfg, converted)
+    if str((cfg.extra_fields or {}).get("active_profile") or "") == profile.name:
+        set_active_profile(cfg, profile.name)
+    save_config(cfg)
+    console.print(f"Converted profile {profile.name} to {normalized_target} ({preset.key}).")
+
+
 @profile_app.command("presets")
 def profile_presets() -> None:
     """List available provider presets."""
-    from ...profile_presets import PROFILE_PRESETS
+    from ...profile_presets import PROFILE_PRESETS, preset_protocol_kind, preset_selection_label
 
     table = _Table(title="Provider Presets")
     table.add_column("key")
     table.add_column("label")
+    table.add_column("kind")
+    table.add_column("protocol")
     table.add_column("base_url")
     table.add_column("web_search")
     for preset in PROFILE_PRESETS:
-        table.add_row(preset.key, preset.label, preset.base_url, preset.web_search_adapter)
+        table.add_row(
+            preset.key,
+            preset_selection_label(preset),
+            preset_protocol_kind(preset),
+            preset.protocol,
+            preset.base_url,
+            preset.web_search_adapter,
+        )
     _console().print(table)
 
 

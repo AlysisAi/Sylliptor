@@ -296,6 +296,45 @@ def test_resolve_integration_verify_commands_rescans_candidate_root_when_repo_sc
     assert resolved.source == "repo_scan.likely_test_commands_fallback"
 
 
+def test_resolve_integration_verify_commands_preserves_focus_when_rescanning_candidate_root(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base"
+    service = base / "service"
+    (service / "app").mkdir(parents=True)
+    (service / "tests").mkdir()
+    (service / "app" / "config.py").write_text("def load_mode():\n    return 'dev'\n")
+    (service / "tests" / "test_config.py").write_text(
+        "from app.config import load_mode\n\n\ndef test_load_mode():\n    assert load_mode() == 'dev'\n",
+        encoding="utf-8",
+    )
+    focused_scan = scan_workspace(context=resolve_workspace_context(service))
+
+    candidate = tmp_path / "candidate"
+    candidate_service = candidate / "service"
+    (candidate_service / "app").mkdir(parents=True)
+    (candidate_service / "tests").mkdir()
+    (candidate_service / "app" / "config.py").write_text(
+        "def load_mode():\n    return 'prod'\n",
+        encoding="utf-8",
+    )
+    (candidate_service / "tests" / "test_config.py").write_text(
+        "from app.config import load_mode\n\n\ndef test_load_mode():\n    assert load_mode() == 'prod'\n",
+        encoding="utf-8",
+    )
+
+    resolved = resolve_integration_verify_commands(
+        cfg=AppConfig(model="test-model"),
+        integration_verify_cmd=None,
+        verify_cmd=None,
+        root=candidate,
+        repo_scan=focused_scan,
+    )
+
+    assert resolved.commands == ("PYTHONPATH=service pytest -q service",)
+    assert resolved.source == "repo_scan.likely_test_commands_fallback"
+
+
 def test_run_integration_gate_writes_artifacts_and_payloads(tmp_path: Path, monkeypatch) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -340,7 +379,12 @@ def test_run_integration_gate_writes_artifacts_and_payloads(tmp_path: Path, monk
     assert payload["merged_task_ids"] == ["T01"]
     assert payload["merged_paths"] == ["src/parser.py"]
     assert payload["failure_category"] == FailureCategory.VERIFICATION_FAILED.value
+    assert payload["policy_outcome"] == "failed_tolerated_by_warn_policy"
+    assert payload["tolerated_failure"] is True
     assert payload["verified_root"] == "."
+    assert "Policy Outcome: `failed_tolerated_by_warn_policy`" in result.summary_path.read_text(
+        encoding="utf-8"
+    )
     assert payload["verify_artifact_path"].endswith("execution/integration/batch_001/verify.txt")
     assert "stdout line" in result.stdout_path.read_text(encoding="utf-8")
     assert "stderr line" in result.stderr_path.read_text(encoding="utf-8")

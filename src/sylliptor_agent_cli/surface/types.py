@@ -82,6 +82,7 @@ class ApprovalRequest:
     files: list[str] = field(default_factory=list)
     command: str | None = None
     metadata: dict[str, object] = field(default_factory=dict)
+    allow_for_session_scope: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .cli_common import *
+from .forge_asset_view import forge_asset_view_count
 
 
 def _run_plan_mode_approval_loop(
@@ -263,7 +264,7 @@ def _show_forge_plan_summary(*, console: Console, paths: RunPaths, plan: dict[st
     summary = str(plan.get("summary") or "").strip() or "(not set)"
     tasks = plan.get("tasks") or []
     task_count = len(tasks) if isinstance(tasks, list) else 0
-    asset_count = len(plan.get("assets") or [])
+    asset_count = forge_asset_view_count(paths, plan)
     _print_forge_meta(
         console=console,
         message=f"Run {paths.run_id} · {task_count} tasks · {asset_count} assets",
@@ -755,6 +756,7 @@ def _run_forge_planner_turn_controller(
             plan,
             raw_plan_update,
             latest_user_text=user_text,
+            workspace_context=planner_state.workspace_context,
         )
         summary_line = summarize_plan_update(apply_result)
         reconciliation_result = None
@@ -1087,6 +1089,7 @@ def _build_forge_exec_instruction_bundle(
     api_key: str | None = None,
     subagents_enabled: bool = False,
     leading_sections: list[str] | None = None,
+    relevant_assets_section: str | None = None,
 ) -> Any:
     return _shared_build_task_execution_instruction_bundle(
         plan=plan,
@@ -1104,6 +1107,7 @@ def _build_forge_exec_instruction_bundle(
         api_key=api_key,
         subagents_enabled=subagents_enabled,
         leading_sections=leading_sections,
+        relevant_assets_section=relevant_assets_section,
         managed_execution_startup_headroom=True,
     )
 

@@ -75,6 +75,14 @@ class IntegrationGateResult:
     def summary(self) -> str:
         return self.verify_result.summary
 
+    @property
+    def policy_outcome(self) -> str:
+        if self.passed:
+            return "passed"
+        if self.mode == "warn":
+            return "failed_tolerated_by_warn_policy"
+        return "failed_blocking"
+
     def to_payload(self, *, root: Path) -> dict[str, object]:
         verified_root = self.verified_root or root
         return {
@@ -85,6 +93,8 @@ class IntegrationGateResult:
             "mode": self.mode,
             "phase": self.phase,
             "passed": self.passed,
+            "policy_outcome": self.policy_outcome,
+            "tolerated_failure": self.policy_outcome == "failed_tolerated_by_warn_policy",
             "summary": self.summary,
             "failure_category": self.verify_result.failure_category_value,
             "command_source": self.command_source,
@@ -173,11 +183,7 @@ def resolve_integration_verify_commands(
             source="config.integration_verify_commands",
         )
 
-    verify_resolution = (
-        _resolve_verify_selection(None)
-        if root is not None
-        else _resolve_verify_selection(repo_scan)
-    )
+    verify_resolution = _resolve_verify_selection(repo_scan)
 
     raw_source = verify_resolution.source
     source = {
@@ -460,10 +466,15 @@ def _render_command_stream(result: VerifyRunResult, *, stream_name: str) -> str:
 
 def _render_integration_summary(*, result: IntegrationGateResult, root: Path) -> str:
     verified_root = result.verified_root or root
-    phase_label = (
-        "pre-merge candidate" if result.phase == "pre_merge_candidate" else "post-merge base"
-    )
-    task_heading = "Batch Tasks" if result.phase == "pre_merge_candidate" else "Merged Tasks"
+    if result.phase == "pre_merge_candidate":
+        phase_label = "pre-merge candidate"
+        task_heading = "Batch Tasks"
+    elif result.phase == "final_repo":
+        phase_label = "final repo"
+        task_heading = "Final Repo Tasks"
+    else:
+        phase_label = "post-merge base"
+        task_heading = "Merged Tasks"
     lines = [
         "# Integration Gate Summary",
         "",
@@ -471,6 +482,7 @@ def _render_integration_summary(*, result: IntegrationGateResult, root: Path) ->
         f"- Phase: `{phase_label}`",
         f"- Mode: `{result.mode}`",
         f"- Passed: `{'yes' if result.passed else 'no'}`",
+        f"- Policy Outcome: `{result.policy_outcome}`",
         f"- Summary: {result.summary}",
         f"- Command Source: `{result.command_source}`",
         f"- Verified Root: `{_display_path(root, verified_root)}`",

@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from .llm.openai_compat import strip_provider_metadata_from_message
+from .llm.metadata import strip_provider_metadata_from_message
 from .token_budget import estimate_tokens
 
 _MEMORY_MARKER = "<<<SYLLIPTOR_CONVERSATION_MEMORY_JSON>>>"

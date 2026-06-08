@@ -111,6 +111,63 @@ def test_assets_add_wait_blocks_until_comprehension_finishes(tmp_path: Path, mon
     assert "comprehension: ready" in result.output
 
 
+def test_assets_add_binds_matching_existing_task(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    paths = create_plan_run(repo)
+    save_plan(
+        paths,
+        {
+            "schema_version": 2,
+            "run_id": paths.run_id,
+            "created_at": "2026-05-03T00:00:00+00:00",
+            "updated_at": "2026-05-03T00:00:00+00:00",
+            "project_goal": "Use attached spec",
+            "summary": "Use attached spec",
+            "requirements": [],
+            "tasks": [
+                {
+                    "id": "T01",
+                    "title": "Update README.md using attached feature spec",
+                    "description": "Manual planning chat task: Update README.md using attached feature spec",
+                    "acceptance_criteria": [],
+                    "dependencies": [],
+                    "estimated_files": ["README.md"],
+                    "write_scope": ["README.md"],
+                    "status": "planned",
+                    "attempts": 0,
+                }
+            ],
+            "assets": [],
+        },
+    )
+    source = write_text_asset_source(repo, "feature_spec.md", "Add a greeting.\n")
+    _patch_surface_builder(monkeypatch)
+
+    result = runner.invoke(
+        sylliptor_app,
+        [
+            "forge",
+            "assets",
+            "add",
+            os.fspath(source),
+            "--path",
+            os.fspath(repo),
+            "--title",
+            "Feature spec",
+            "--wait",
+        ],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 0
+    assert "bound tasks: T01" in result.output
+    plan = json.loads(paths.plan_json_path.read_text(encoding="utf-8"))
+    asset_id = AssetIndex(paths).records()[0].id
+    assert plan["tasks"][0]["asset_briefing"]["primary"][0]["asset_id"] == asset_id
+
+
 def test_assets_add_without_wait_stages_pending_asset(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     repo = tmp_path / "repo"

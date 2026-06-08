@@ -14,6 +14,11 @@ from pathlib import Path, PurePosixPath
 from time import perf_counter
 from typing import Any
 
+from ..approval_scope import (
+    exact_command_scope,
+    exact_file_set_scope,
+    exact_verify_command_set_scope,
+)
 from ..config import AppConfig, ConfigError, resolve_role_temperature
 from ..custom_tools import (
     CustomToolDiscoveryResult,
@@ -474,6 +479,7 @@ def build_tools(
     root = root.resolve()
     workspace_context = resolve_workspace_context(root)
     surface = surface or NoopSurface()
+    host_managed_approvals = bool(getattr(surface, "host_managed_approvals", False))
     resolved_runtime_kind = normalize_runtime_kind(
         runtime_kind, fallback=RuntimeKind.INTERACTIVE_CHAT
     )
@@ -632,7 +638,7 @@ def build_tools(
         if mode == "readonly":
             raise AgentRuntimeError(f"Blocked in readonly mode: {kind}")
         if mode == "review":
-            if non_interactive:
+            if non_interactive and not host_managed_approvals:
                 raise AgentRuntimeError(
                     "Confirmation required for sensitive command. Re-run with --yes or adjust plan."
                 )
@@ -642,6 +648,9 @@ def build_tools(
                     reason="review mode requires confirmation for write operations",
                     preview=preview,
                     files=files or [],
+                    allow_for_session_scope=exact_file_set_scope(files or [], operation=kind)
+                    if files
+                    else None,
                 )
             )
             if not decision.allow:
@@ -662,7 +671,7 @@ def build_tools(
         if not decision.allowed:
             raise AgentRuntimeError(f"Blocked command: {decision.reason}")
         if mode == "review":
-            if non_interactive:
+            if non_interactive and not host_managed_approvals:
                 raise AgentRuntimeError(
                     "Confirmation required for sensitive command. Re-run with --yes or adjust plan."
                 )
@@ -672,6 +681,7 @@ def build_tools(
                     reason="review mode requires confirmation for shell commands",
                     preview=cmd,
                     command=cmd,
+                    allow_for_session_scope=exact_command_scope(cmd, kind=tool_name),
                 )
             )
             if not decision.allow:
@@ -679,7 +689,7 @@ def build_tools(
             return
         # auto mode
         if decision.needs_confirm and not yes:
-            if non_interactive:
+            if non_interactive and not host_managed_approvals:
                 raise AgentRuntimeError(
                     "Confirmation required for sensitive command. Re-run with --yes or adjust plan."
                 )
@@ -689,6 +699,7 @@ def build_tools(
                     reason=f"sensitive command: {decision.reason}",
                     preview=cmd,
                     command=cmd,
+                    allow_for_session_scope=exact_command_scope(cmd, kind=tool_name),
                 )
             )
             if not choice.allow:
@@ -720,7 +731,7 @@ def build_tools(
         )
 
         if mode == "review":
-            if non_interactive:
+            if non_interactive and not host_managed_approvals:
                 raise AgentRuntimeError(
                     "Confirmation required for sensitive command. Re-run with --yes or adjust plan."
                 )
@@ -730,6 +741,7 @@ def build_tools(
                     reason="review mode requires confirmation for verification commands",
                     preview=preview,
                     command=command_label,
+                    allow_for_session_scope=exact_verify_command_set_scope(commands),
                 )
             )
             if not decision.allow:
@@ -737,7 +749,7 @@ def build_tools(
             return
 
         if sensitive_reason and not yes:
-            if non_interactive:
+            if non_interactive and not host_managed_approvals:
                 raise AgentRuntimeError(
                     "Confirmation required for sensitive command. Re-run with --yes or adjust plan."
                 )
@@ -747,6 +759,7 @@ def build_tools(
                     reason=f"sensitive command in verification set: {sensitive_reason}",
                     preview=preview,
                     command=command_label,
+                    allow_for_session_scope=exact_verify_command_set_scope(commands),
                 )
             )
             if not choice.allow:
@@ -1243,7 +1256,7 @@ def build_tools(
             f"args:\n{args_preview}"
         )
         if _custom_tool_requires_approval(spec):
-            if non_interactive:
+            if non_interactive and not host_managed_approvals:
                 raise AgentRuntimeError(
                     "Confirmation required for custom tool execution. Re-run with --yes or adjust plan."
                 )

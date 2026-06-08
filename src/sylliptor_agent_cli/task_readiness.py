@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .direction_change import filter_obsolete_direction_paths
+from .file_classification import is_docs_path, is_test_path
 from .task_scope import (
     extract_forbidden_repo_path_hints,
     extract_repo_path_hints,
@@ -62,18 +63,23 @@ _NON_MUTATING_TASK_ACTIONS = frozenset(
         "assess",
         "audit",
         "compare",
+        "diagnose",
         "examine",
         "explain",
         "explore",
+        "find",
         "inspect",
         "investigate",
+        "identify",
         "locate",
         "map",
         "report",
         "review",
         "summarize",
         "summarise",
+        "survey",
         "triage",
+        "understand",
     }
 )
 _NON_MUTATING_TASK_PHRASES = (
@@ -82,6 +88,7 @@ _NON_MUTATING_TASK_PHRASES = (
     "investigate and report",
     "no code changes",
     "no file changes",
+    "read current",
     "read-only",
     "readonly",
     "report findings",
@@ -160,6 +167,9 @@ _TASK_ACTION_TOKEN_CANONICAL_MAP = {
     "documented": "document",
     "documenting": "document",
     "documents": "document",
+    "diagnosed": "diagnose",
+    "diagnoses": "diagnose",
+    "diagnosing": "diagnose",
     "edited": "edit",
     "editing": "edit",
     "edits": "edit",
@@ -175,9 +185,15 @@ _TASK_ACTION_TOKEN_CANONICAL_MAP = {
     "explored": "explore",
     "explores": "explore",
     "exploring": "explore",
+    "found": "find",
+    "finding": "find",
+    "finds": "find",
     "fixed": "fix",
     "fixes": "fix",
     "fixing": "fix",
+    "identified": "identify",
+    "identifies": "identify",
+    "identifying": "identify",
     "improved": "improve",
     "improves": "improve",
     "improving": "improve",
@@ -223,9 +239,15 @@ _TASK_ACTION_TOKEN_CANONICAL_MAP = {
     "reported": "report",
     "reporting": "report",
     "reports": "report",
+    "read": "read",
+    "reading": "read",
+    "reads": "read",
     "reviewed": "review",
     "reviewing": "review",
     "reviews": "review",
+    "surveyed": "survey",
+    "surveying": "survey",
+    "surveys": "survey",
     "summarised": "summarise",
     "summarises": "summarise",
     "summarising": "summarise",
@@ -244,6 +266,9 @@ _TASK_ACTION_TOKEN_CANONICAL_MAP = {
     "triaged": "triage",
     "triages": "triage",
     "triaging": "triage",
+    "understood": "understand",
+    "understanding": "understand",
+    "understands": "understand",
     "updated": "update",
     "updates": "update",
     "updating": "update",
@@ -259,6 +284,22 @@ _TASK_ACTION_TOKEN_CANONICAL_MAP = {
     "wrote": "write",
 }
 
+TASK_KIND_ANALYSIS_ONLY = "analysis_only"
+TASK_KIND_IMPLEMENTATION = "implementation"
+TASK_KIND_TEST_ONLY = "test_only"
+TASK_KIND_VERIFICATION_ONLY = "verification_only"
+TASK_KIND_DOCUMENTATION_ONLY = "documentation_only"
+TASK_KIND_UNKNOWN = "unknown"
+
+ZERO_DIFF_ANALYSIS_OK = "analysis_artifact"
+ZERO_DIFF_REQUIRES_VERIFICATION = "requires_verification"
+ZERO_DIFF_SUSPICIOUS = "needs_attention"
+
+_VERIFICATION_ONLY_RE = re.compile(
+    r"^\s*(?:run\s+)?(?:verify|verification|validate|validation|check|tests?)\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class TaskFileScopeNormalization:
@@ -266,6 +307,9 @@ class TaskFileScopeNormalization:
     write_scope: list[str]
     warnings: list[str]
     requires_runnable_scope: bool
+    task_kind: str = TASK_KIND_UNKNOWN
+    task_kind_reason: str = "unclassified"
+    zero_diff_policy: str = ZERO_DIFF_SUSPICIOUS
 
 
 @dataclass(frozen=True)
@@ -274,6 +318,19 @@ class ExecutionUnreadyTask:
     title: str
     status: str
     warning: str
+
+
+@dataclass(frozen=True)
+class TaskLifecycleClassification:
+    kind: str
+    reason_code: str
+    mutating: bool
+    requires_runnable_scope: bool
+    zero_diff_policy: str
+
+    @property
+    def read_only(self) -> bool:
+        return not self.mutating
 
 
 def normalized_text_list(value: Any) -> list[str]:
@@ -339,6 +396,10 @@ def contains_mutating_task_signal(text: str) -> bool:
     return any(token in _MUTATING_TASK_ACTIONS for token in _normalized_task_action_tokens(text))
 
 
+def has_mutating_task_action_clause(text: str) -> bool:
+    return _has_mutating_task_action_clause(text, allowed_tokens=frozenset())
+
+
 def _has_mutating_task_action_clause(text: str, *, allowed_tokens: frozenset[str]) -> bool:
     folded = (text or "").casefold()
     previous_token = ""
@@ -398,6 +459,8 @@ def is_clearly_non_mutating_task(
         return True
     if has_explicit_non_mutating_phrase and not has_mutating_action_clause:
         return True
+    if first_title_word == "read" and not has_mutating_action_clause:
+        return True
     if first_title_word in _NON_MUTATING_TASK_ACTIONS:
         if not has_mutating_action_clause:
             return True
@@ -408,6 +471,155 @@ def is_clearly_non_mutating_task(
     if first_title_word in _NON_MUTATING_TASK_ACTIONS:
         return True
     return has_explicit_non_mutating_phrase
+
+
+def _normalized_scoped_paths(*, estimated_files: list[str], write_scope: list[str]) -> list[str]:
+    return _dedupe_keep_order([*estimated_files, *write_scope])
+
+
+def _coerce_explicit_task_kind(value: Any) -> str | None:
+    raw = str(value or "").strip().casefold().replace("-", "_")
+    if not raw:
+        return None
+    aliases = {
+        "analysis": TASK_KIND_ANALYSIS_ONLY,
+        "analysis_only": TASK_KIND_ANALYSIS_ONLY,
+        "discovery": TASK_KIND_ANALYSIS_ONLY,
+        "read_only": TASK_KIND_ANALYSIS_ONLY,
+        "readonly": TASK_KIND_ANALYSIS_ONLY,
+        "report_only": TASK_KIND_ANALYSIS_ONLY,
+        "implementation": TASK_KIND_IMPLEMENTATION,
+        "mutation": TASK_KIND_IMPLEMENTATION,
+        "mutating": TASK_KIND_IMPLEMENTATION,
+        "test": TASK_KIND_TEST_ONLY,
+        "test_only": TASK_KIND_TEST_ONLY,
+        "verification": TASK_KIND_VERIFICATION_ONLY,
+        "verification_only": TASK_KIND_VERIFICATION_ONLY,
+        "docs": TASK_KIND_DOCUMENTATION_ONLY,
+        "documentation": TASK_KIND_DOCUMENTATION_ONLY,
+        "documentation_only": TASK_KIND_DOCUMENTATION_ONLY,
+        "unknown": TASK_KIND_UNKNOWN,
+    }
+    return aliases.get(raw)
+
+
+def _classification_for_kind(kind: str, *, reason_code: str) -> TaskLifecycleClassification:
+    if kind == TASK_KIND_ANALYSIS_ONLY:
+        return TaskLifecycleClassification(
+            kind=kind,
+            reason_code=reason_code,
+            mutating=False,
+            requires_runnable_scope=False,
+            zero_diff_policy=ZERO_DIFF_ANALYSIS_OK,
+        )
+    if kind == TASK_KIND_VERIFICATION_ONLY:
+        return TaskLifecycleClassification(
+            kind=kind,
+            reason_code=reason_code,
+            mutating=False,
+            requires_runnable_scope=False,
+            zero_diff_policy=ZERO_DIFF_REQUIRES_VERIFICATION,
+        )
+    if kind == TASK_KIND_TEST_ONLY:
+        return TaskLifecycleClassification(
+            kind=kind,
+            reason_code=reason_code,
+            mutating=True,
+            requires_runnable_scope=True,
+            zero_diff_policy=ZERO_DIFF_SUSPICIOUS,
+        )
+    if kind == TASK_KIND_DOCUMENTATION_ONLY:
+        return TaskLifecycleClassification(
+            kind=kind,
+            reason_code=reason_code,
+            mutating=True,
+            requires_runnable_scope=True,
+            zero_diff_policy=ZERO_DIFF_SUSPICIOUS,
+        )
+    if kind == TASK_KIND_IMPLEMENTATION:
+        return TaskLifecycleClassification(
+            kind=kind,
+            reason_code=reason_code,
+            mutating=True,
+            requires_runnable_scope=True,
+            zero_diff_policy=ZERO_DIFF_REQUIRES_VERIFICATION,
+        )
+    return TaskLifecycleClassification(
+        kind=TASK_KIND_UNKNOWN,
+        reason_code=reason_code,
+        mutating=True,
+        requires_runnable_scope=True,
+        zero_diff_policy=ZERO_DIFF_SUSPICIOUS,
+    )
+
+
+def classify_task_lifecycle(
+    *,
+    title: str,
+    description: str,
+    acceptance_criteria: list[str],
+    estimated_files: list[str] | None = None,
+    write_scope: list[str] | None = None,
+    explicit_analysis_only: bool | None = None,
+    explicit_task_kind: Any = None,
+) -> TaskLifecycleClassification:
+    explicit_kind = _coerce_explicit_task_kind(explicit_task_kind)
+    if explicit_analysis_only is True:
+        return _classification_for_kind(
+            TASK_KIND_ANALYSIS_ONLY,
+            reason_code="explicit_analysis_only",
+        )
+    if explicit_kind is not None:
+        return _classification_for_kind(
+            explicit_kind,
+            reason_code=f"explicit_task_kind:{explicit_kind}",
+        )
+
+    acceptance = normalized_text_list(acceptance_criteria)
+    if is_clearly_non_mutating_task(
+        title=title,
+        description=description,
+        acceptance_criteria=acceptance,
+    ):
+        return _classification_for_kind(
+            TASK_KIND_ANALYSIS_ONLY,
+            reason_code="non_mutating_intent",
+        )
+
+    text = task_text_blob(
+        title=title,
+        description=description,
+        acceptance_criteria=acceptance,
+    )
+    has_mutating_clause = _has_mutating_task_action_clause(text, allowed_tokens=frozenset())
+    if _VERIFICATION_ONLY_RE.search(text) and not has_mutating_clause:
+        return _classification_for_kind(
+            TASK_KIND_VERIFICATION_ONLY,
+            reason_code="verification_intent",
+        )
+
+    scoped_paths = _normalized_scoped_paths(
+        estimated_files=list(estimated_files or []),
+        write_scope=list(write_scope or []),
+    )
+    if scoped_paths and all(is_test_path(path) for path in scoped_paths):
+        return _classification_for_kind(TASK_KIND_TEST_ONLY, reason_code="test_scope")
+    if scoped_paths and all(is_docs_path(path) for path in scoped_paths):
+        return _classification_for_kind(
+            TASK_KIND_DOCUMENTATION_ONLY,
+            reason_code="documentation_scope",
+        )
+    if scoped_paths:
+        return _classification_for_kind(
+            TASK_KIND_IMPLEMENTATION,
+            reason_code="runnable_file_scope",
+        )
+    if contains_mutating_task_signal(text):
+        return _classification_for_kind(
+            TASK_KIND_IMPLEMENTATION,
+            reason_code="mutating_intent",
+        )
+    return _classification_for_kind(TASK_KIND_UNKNOWN, reason_code="ambiguous_intent")
 
 
 def has_runnable_local_file_scope(
@@ -450,22 +662,23 @@ def task_requires_runnable_file_scope(
     estimated_files: list[str],
     write_scope: list[str],
 ) -> bool:
+    lifecycle = classify_task_lifecycle(
+        title=title,
+        description=description,
+        acceptance_criteria=acceptance_criteria,
+        estimated_files=estimated_files,
+        write_scope=write_scope,
+    )
+    if lifecycle.requires_runnable_scope:
+        return True
     text = task_text_blob(
         title=title,
         description=description,
         acceptance_criteria=acceptance_criteria,
     )
-    if is_clearly_non_mutating_task(
-        title=title,
-        description=description,
-        acceptance_criteria=acceptance_criteria,
-    ):
-        return False
-    if estimated_files or write_scope:
-        return True
     if extract_repo_path_hints(text):
-        return True
-    return True
+        return lifecycle.mutating
+    return lifecycle.requires_runnable_scope
 
 
 def normalize_task_file_fields(
@@ -497,11 +710,14 @@ def normalize_task_file_fields(
         description=description,
         acceptance_criteria=acceptance_criteria,
     )
-    clearly_non_mutating = is_clearly_non_mutating_task(
+    initial_lifecycle = classify_task_lifecycle(
         title=title,
         description=description,
         acceptance_criteria=acceptance_criteria,
+        estimated_files=normalized_estimated,
+        write_scope=normalized_write_scope,
     )
+    clearly_non_mutating = initial_lifecycle.kind == TASK_KIND_ANALYSIS_ONLY
     forbidden_paths = extract_forbidden_repo_path_hints(
         "\n".join([task_text, str(latest_user_text or "")])
     )
@@ -585,7 +801,14 @@ def normalize_task_file_fields(
 
     filtered_estimated = _dedupe_keep_order(filtered_estimated)
     filtered_write_scope = _dedupe_keep_order(filtered_write_scope)
-    if clearly_non_mutating:
+    lifecycle = classify_task_lifecycle(
+        title=title,
+        description=description,
+        acceptance_criteria=acceptance_criteria,
+        estimated_files=filtered_estimated,
+        write_scope=filtered_write_scope,
+    )
+    if lifecycle.kind == TASK_KIND_ANALYSIS_ONLY:
         if filtered_estimated or filtered_write_scope:
             warnings.append(
                 f"{warning_prefix}: cleared file mutation scope for analysis-only/report-only task"
@@ -595,6 +818,9 @@ def normalize_task_file_fields(
             write_scope=[],
             warnings=warnings,
             requires_runnable_scope=False,
+            task_kind=lifecycle.kind,
+            task_kind_reason=lifecycle.reason_code,
+            zero_diff_policy=lifecycle.zero_diff_policy,
         )
     expanded_write_scope: list[str] = list(filtered_write_scope)
     added_to_write_scope: list[str] = []
@@ -625,6 +851,9 @@ def normalize_task_file_fields(
         write_scope=expanded_write_scope,
         warnings=warnings,
         requires_runnable_scope=requires_runnable_scope,
+        task_kind=lifecycle.kind,
+        task_kind_reason=lifecycle.reason_code,
+        zero_diff_policy=lifecycle.zero_diff_policy,
     )
 
 

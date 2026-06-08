@@ -28,6 +28,7 @@ from .forge import (
     WorkspaceRiskLevel,
     find_task,
     format_workspace_context_summary_lines,
+    load_plan,
     refresh_workspace_context_artifacts,
     save_plan,
     set_task_status,
@@ -85,7 +86,7 @@ from .replanning import (
     run_replanning_attempt,
 )
 from .review_gate import ReviewError, ReviewOutcome, review_task
-from .run_lock import RunMutationGuard, acquire_run_mutation_guard
+from .run_lock import RunMutationGuard, acquire_run_mutation_guard, workspace_mutation_run_id
 from .surface.console import make_console
 from .surface.rich_surface import _truncate_inline
 from .swarm_backend import (
@@ -94,7 +95,11 @@ from .swarm_backend import (
     SwarmBackend,
     select_swarm_backend,
 )
-from .swarm_scheduler import canonical_task_status, compute_schedule
+from .swarm_scheduler import (
+    canonical_task_status,
+    compute_schedule,
+    is_expected_red_regression_precursor,
+)
 from .swarm_trace import (
     SerializedSwarmTraceSink,
     SwarmTraceSink,
@@ -111,6 +116,8 @@ from .verify_gate import ResolvedVerifyCommands, resolve_verify_command_selectio
 from .workspace_binding import WorkspaceBinding
 
 DEFAULT_SWARM_MAX_STEPS = 50
+_LOCK_WAIT_TIMEOUT_ENV = "SYLLIPTOR_FORGE_LOCK_WAIT_TIMEOUT_S"
+_LOCK_POLL_INTERVAL_ENV = "SYLLIPTOR_FORGE_LOCK_POLL_INTERVAL_S"
 
 
 @dataclass(frozen=True)
@@ -146,6 +153,35 @@ class ReadyBatchItem:
     @property
     def branch(self) -> str:
         return str(self.task.get("branch") or "")
+
+
+@dataclass(frozen=True)
+class SwarmRunOutcome:
+    status: str
+    clean: bool
+    exit_code: int
+    verification_status: str
+    reason_codes: tuple[str, ...]
+    task_status_counts: dict[str, int]
+    integration_total: int
+    integration_failed: int
+    final_integration_batch: str | None = None
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "status": self.status,
+            "clean": self.clean,
+            "exit_code": self.exit_code,
+            "verification_status": self.verification_status,
+            "reason_codes": list(self.reason_codes),
+            "task_status_counts": dict(self.task_status_counts),
+            "integration": {
+                "total": self.integration_total,
+                "failed": self.integration_failed,
+                "final_batch": self.final_integration_batch,
+            },
+        }
 
 
 def _result_agent_exception_summary(result: TaskWorkerResult | None) -> str | None:
@@ -248,17 +284,131 @@ def _default_swarm_trace_path(paths: RunPaths) -> Path:
     return paths.execution_dir / "trace" / "swarm_trace.jsonl"
 
 
+@dataclass(frozen=True)
+class _CompositeMutationGuard:
+    workspace_guard: RunMutationGuard
+    run_guard: RunMutationGuard
+
+    @property
+    def run_id(self) -> str:
+        return self.run_guard.run_id
+
+    @property
+    def mode(self) -> str:
+        return self.run_guard.mode
+
+    @property
+    def run_dir(self) -> Path:
+        return self.run_guard.run_dir
+
+    @property
+    def workspace_root(self) -> Path:
+        return self.run_guard.workspace_root
+
+    @property
+    def owner_token(self) -> str:
+        return self.run_guard.owner_token
+
+    @property
+    def lock_path(self) -> Path:
+        return self.run_guard.lock_path
+
+    @property
+    def recovery_path(self) -> Path:
+        return self.run_guard.recovery_path
+
+    @property
+    def acquired_after_wait(self) -> bool:
+        return self.workspace_guard.acquired_after_wait or self.run_guard.acquired_after_wait
+
+    @property
+    def wait_started_at(self) -> str | None:
+        return self.workspace_guard.wait_started_at or self.run_guard.wait_started_at
+
+    @property
+    def wait_finished_at(self) -> str | None:
+        return self.workspace_guard.wait_finished_at or self.run_guard.wait_finished_at
+
+    def release(self) -> None:
+        self.run_guard.release()
+        self.workspace_guard.release()
+
+
+def _env_float(name: str) -> float | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def acquire_swarm_mutation_guard(
     paths: RunPaths,
     *,
     mode: str = "forge_swarm",
-) -> RunMutationGuard:
-    return acquire_run_mutation_guard(
-        run_id=paths.run_id,
-        mode=mode,
-        run_dir=paths.run_dir,
-        workspace_root=paths.root,
+    wait: bool = True,
+    wait_timeout_s: float | None = None,
+    poll_interval_s: float | None = None,
+    on_wait: Callable[[dict[str, Any]], None] | None = None,
+    owner_session_id: str | None = None,
+) -> RunMutationGuard | _CompositeMutationGuard:
+    effective_wait_timeout_s = (
+        _env_float(_LOCK_WAIT_TIMEOUT_ENV) if wait_timeout_s is None else wait_timeout_s
     )
+    effective_poll_interval_s = (
+        _env_float(_LOCK_POLL_INTERVAL_ENV) if poll_interval_s is None else poll_interval_s
+    )
+    if effective_poll_interval_s is None:
+        effective_poll_interval_s = 1.0
+    workspace_guard = acquire_run_mutation_guard(
+        run_id=workspace_mutation_run_id(paths.root),
+        mode=f"{mode}:workspace",
+        run_dir=paths.runtime_dir / "workspace_execution",
+        workspace_root=paths.root,
+        wait=wait,
+        wait_timeout_s=effective_wait_timeout_s,
+        poll_interval_s=effective_poll_interval_s,
+        on_wait=on_wait,
+        owner_session_id=owner_session_id,
+    )
+    try:
+        run_guard = acquire_run_mutation_guard(
+            run_id=paths.run_id,
+            mode=mode,
+            run_dir=paths.run_dir,
+            workspace_root=paths.root,
+            wait=wait,
+            wait_timeout_s=effective_wait_timeout_s,
+            poll_interval_s=effective_poll_interval_s,
+            on_wait=on_wait,
+            owner_session_id=owner_session_id,
+        )
+    except Exception:
+        workspace_guard.release()
+        raise
+    return _CompositeMutationGuard(workspace_guard=workspace_guard, run_guard=run_guard)
+
+
+def _write_concurrency_revalidation_artifact(
+    *,
+    paths: RunPaths,
+    guard: RunMutationGuard | _CompositeMutationGuard,
+    plan_changed: bool,
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "reason_code": "queued_execution_revalidated",
+        "run_id": paths.run_id,
+        "workspace_root": os.fspath(paths.root),
+        "acquired_after_wait": bool(getattr(guard, "acquired_after_wait", False)),
+        "wait_started_at": getattr(guard, "wait_started_at", None),
+        "wait_finished_at": getattr(guard, "wait_finished_at", None),
+        "plan_reloaded": True,
+        "plan_changed": plan_changed,
+    }
+    atomic_write_json(paths.execution_dir / "concurrency_revalidation.json", payload)
 
 
 def _write_merge_result(paths: RunPaths, outcome: MergeOutcome) -> Path:
@@ -557,6 +707,153 @@ def _swarm_binding_summary_lines(
     ]
 
 
+def _integration_phase_label(phase: str) -> str:
+    if phase == "pre_merge_candidate":
+        return "pre-merge candidate"
+    if phase == "final_repo":
+        return "final repo"
+    return "post-merge"
+
+
+_FAILURE_LIKE_STATUSES = frozenset(
+    {
+        "failed",
+        "verify_failed",
+        "candidate_rejected",
+        "changes_requested",
+        "merge_conflict",
+        "blocked_integration",
+    }
+)
+_NON_EXECUTABLE_SUCCESS_STATUSES = frozenset({"done", "superseded", "invalidated"})
+
+
+def _task_status_counts(plan: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for task in plan.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        status = canonical_task_status(str(task.get("status") or ""))
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _compute_swarm_run_outcome(
+    *,
+    plan: dict[str, Any],
+    integration_results: list[IntegrationGateResult],
+    review_blocked: bool,
+    remote_blocked_any: bool,
+    integration_blocked: bool,
+    only: str | None,
+    max_tasks: int | None,
+    dry_run: bool,
+) -> SwarmRunOutcome:
+    counts = _task_status_counts(plan)
+    statuses = list(counts)
+    failed_integration = [item for item in integration_results if not item.passed]
+    final_integration = next(
+        (item for item in reversed(integration_results) if item.phase == "final_repo"),
+        None,
+    )
+    reason_codes: list[str] = []
+    exit_code = 0
+    status = "clean"
+    verification_status = "passed" if integration_results else "not_run"
+
+    if review_blocked:
+        reason_codes.append("review_blocked")
+    if remote_blocked_any:
+        reason_codes.append("remote_blocked")
+    if integration_blocked:
+        reason_codes.append("integration_blocked")
+    if review_blocked or remote_blocked_any or integration_blocked:
+        exit_code = 1
+        status = "failed"
+
+    if any(item in _FAILURE_LIKE_STATUSES for item in statuses):
+        exit_code = 1
+        status = "failed"
+        reason_codes.append("task_failed_or_blocked")
+
+    is_full_run = only is None and max_tasks is None and not dry_run
+    if is_full_run and any(item not in _NON_EXECUTABLE_SUCCESS_STATUSES for item in statuses):
+        exit_code = 1
+        status = "incomplete"
+        reason_codes.append("tasks_remaining")
+
+    if final_integration is not None:
+        if final_integration.passed:
+            verification_status = "passed"
+        elif final_integration.mode == "warn":
+            verification_status = "failed_tolerated_by_warn_policy"
+            status = "integration_failed_warn_mode"
+            exit_code = 1
+            reason_codes.append("final_integration_failed_warn_mode")
+        else:
+            verification_status = "failed_blocking"
+            status = "failed"
+            exit_code = 1
+            reason_codes.append("final_integration_failed")
+    elif failed_integration and status == "clean":
+        if all(item.mode == "warn" for item in failed_integration):
+            verification_status = "failed_tolerated_by_warn_policy"
+            status = "completed_with_verification_warnings"
+            reason_codes.append("integration_failed_warn_mode")
+        else:
+            verification_status = "failed_blocking"
+            status = "failed"
+            exit_code = 1
+            reason_codes.append("integration_failed")
+    elif failed_integration:
+        verification_status = (
+            "failed_tolerated_by_warn_policy"
+            if all(item.mode == "warn" for item in failed_integration)
+            else "failed_blocking"
+        )
+
+    clean = status == "clean" and exit_code == 0 and verification_status in {"passed", "not_run"}
+    return SwarmRunOutcome(
+        status=status,
+        clean=clean,
+        exit_code=exit_code,
+        verification_status=verification_status,
+        reason_codes=tuple(dict.fromkeys(reason_codes)),
+        task_status_counts=counts,
+        integration_total=len(integration_results),
+        integration_failed=len(failed_integration),
+        final_integration_batch=(
+            final_integration.batch_label if final_integration is not None else None
+        ),
+    )
+
+
+def _write_swarm_summary_json(
+    *,
+    paths: RunPaths,
+    outcome: SwarmRunOutcome,
+    integration_results: list[IntegrationGateResult],
+) -> Path:
+    summary_json_path = paths.execution_dir / "swarm_summary.json"
+    payload = outcome.to_payload()
+    payload["run_id"] = paths.run_id
+    integration_payload = payload.get("integration")
+    if isinstance(integration_payload, dict):
+        integration_payload["results"] = [
+            {
+                "batch_label": item.batch_label,
+                "phase": item.phase,
+                "mode": item.mode,
+                "passed": item.passed,
+                "summary_path": _repo_rel(paths.root, item.summary_path),
+                "merged_task_ids": list(item.merged_task_ids),
+            }
+            for item in integration_results
+        ]
+    atomic_write_json(summary_json_path, payload)
+    return summary_json_path
+
+
 def _write_swarm_summary(
     *,
     paths: RunPaths,
@@ -573,6 +870,7 @@ def _write_swarm_summary(
     schedule_preview: list[list[str]],
     workspace_summary_lines: list[str],
     binding_summary_lines: list[str],
+    run_outcome: SwarmRunOutcome | None = None,
 ) -> Path:
     summary_path = paths.execution_dir / "swarm_summary.md"
     lines = [
@@ -582,10 +880,16 @@ def _write_swarm_summary(
         f"- Backend: `{backend_name}`",
         f"- Base Branch: `{base_branch}`",
         f"- Dry Run: `{'yes' if dry_run else 'no'}`",
-        "",
-        "## Workspace Context",
-        "",
     ]
+    if run_outcome is not None:
+        lines.extend(
+            [
+                f"- Run Status: `{run_outcome.status}`",
+                f"- Clean: `{'yes' if run_outcome.clean else 'no'}`",
+                f"- Verification Status: `{run_outcome.verification_status}`",
+            ]
+        )
+    lines.extend(["", "## Workspace Context", ""])
     if workspace_summary_lines:
         lines.extend(f"- {line}" for line in workspace_summary_lines)
     else:
@@ -655,7 +959,7 @@ def _write_swarm_summary(
     if integration_results:
         for item in integration_results:
             status = "passed" if item.passed else "failed"
-            phase = "pre-merge candidate" if item.phase == "pre_merge_candidate" else "post-merge"
+            phase = _integration_phase_label(item.phase)
             lines.append(
                 f"- `{item.batch_label}` {phase} {status} ({item.mode}); batch tasks: "
                 f"{', '.join(item.merged_task_ids) or '(none)'}; summary: "
@@ -703,7 +1007,11 @@ def _write_swarm_summary(
         for outcome in merge_outcomes:
             if not outcome.success and outcome.conflict_review_path:
                 lines.append(f"- Review conflict report: `{outcome.conflict_review_path}`")
-    elif any(not item.passed for item in integration_results):
+    elif (
+        run_outcome is not None
+        and not run_outcome.clean
+        and run_outcome.verification_status.startswith("failed")
+    ):
         lines.append(
             f"- Review integration artifacts under `{_repo_rel(paths.root, paths.execution_integration_dir)}`."
         )
@@ -714,6 +1022,13 @@ def _write_swarm_summary(
             lines.append(
                 f"- Review replanning artifacts under `{_repo_rel(paths.root, paths.plan_replans_dir)}`."
             )
+    elif any(not item.passed for item in integration_results):
+        lines.append(
+            f"- Review integration artifacts under `{_repo_rel(paths.root, paths.execution_integration_dir)}`."
+        )
+        lines.append(
+            f"- Review open integration issues: `{_repo_rel(paths.root, paths.execution_integration_issues_path)}`."
+        )
     else:
         lines.append("- Review reports under `.sylliptor/runs/<run_id>/execution/reports/`.")
     atomic_write_text(summary_path, "\n".join(lines).rstrip() + "\n")
@@ -802,6 +1117,65 @@ def _mark_remaining_tasks_blocked_by_integration(
     if changed:
         save_plan(paths, plan)
     return blocked
+
+
+def _task_has_unfinished_direct_dependent(plan: dict[str, Any], task_id: str) -> bool:
+    unfinished_statuses = {"planned", "todo", "in_progress"}
+    for task in plan.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        deps = [str(dep).strip() for dep in (task.get("dependencies") or []) if str(dep).strip()]
+        if task_id not in deps:
+            continue
+        status = canonical_task_status(str(task.get("status") or ""))
+        if status in unfinished_statuses:
+            return True
+    return False
+
+
+def _ready_items_have_unfinished_dependents(
+    *,
+    plan: dict[str, Any],
+    ready_items: list[ReadyBatchItem],
+) -> bool:
+    return any(_task_has_unfinished_direct_dependent(plan, item.task_id) for item in ready_items)
+
+
+def _should_defer_red_regression_ready_task(plan: dict[str, Any], task: dict[str, Any]) -> bool:
+    task_id = str(task.get("id") or "").strip()
+    return bool(
+        task_id
+        and is_expected_red_regression_precursor(task)
+        and _task_has_unfinished_direct_dependent(plan, task_id)
+    )
+
+
+def _deferred_red_dependency_tasks_for_ready_items(
+    *,
+    plan: dict[str, Any],
+    ready_items: list[ReadyBatchItem],
+) -> list[dict[str, Any]]:
+    wanted: set[str] = set()
+    for item in ready_items:
+        wanted.update(
+            str(dep).strip() for dep in (item.task.get("dependencies") or []) if str(dep).strip()
+        )
+    if not wanted:
+        return []
+    existing = {item.task_id for item in ready_items}
+    out: list[dict[str, Any]] = []
+    for task in plan.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("id") or "").strip()
+        if task_id not in wanted or task_id in existing:
+            continue
+        if canonical_task_status(str(task.get("status") or "")) != "ready_for_merge":
+            continue
+        if not is_expected_red_regression_precursor(task):
+            continue
+        out.append(task)
+    return out
 
 
 def _recover_stale_in_progress(
@@ -911,12 +1285,14 @@ def _reject_ready_batch_items(
 def _verify_ready_batch_candidate(
     *,
     paths: RunPaths,
+    plan: dict[str, Any],
     cfg: AppConfig,
     workspace_scan,
     backend: SwarmBackend,
     batch_index: int,
     base_branch: str,
     integration_mode: str,
+    allow_transient_dependent_integration_warning: bool,
     integration_verify_cmd: list[str] | None,
     verify_cmd: list[str] | None,
     keep_worktrees: bool,
@@ -999,6 +1375,23 @@ def _verify_ready_batch_candidate(
     if result is None:
         return None, None
     if result.passed:
+        return result, None
+    if (
+        integration_mode == "warn"
+        and allow_transient_dependent_integration_warning
+        and _ready_items_have_unfinished_dependents(
+            plan=plan,
+            ready_items=ready_items,
+        )
+    ):
+        trace(
+            "integration.lifecycle",
+            (
+                f"Pre-merge batch candidate verification failed ({result.batch_label}) "
+                "but at least one task has unfinished planned dependents; accepting the "
+                "batch as a transient integration warning so dependent work can run."
+            ),
+        )
         return result, None
     reason = (
         f"pre-merge batch candidate verification failed ({result.batch_label}): {result.summary}"
@@ -1439,7 +1832,7 @@ def run_swarm(
     delete_branch_fn: Callable[[Path, str], None] = delete_branch,
     branch_exists_fn: Callable[[Path, str], bool] = branch_exists,
     current_branch_fn: Callable[[Path], str] = current_branch,
-    run_mutation_guard: RunMutationGuard | None = None,
+    run_mutation_guard: RunMutationGuard | _CompositeMutationGuard | None = None,
 ) -> int:
     owns_run_mutation_guard = run_mutation_guard is None
     if run_mutation_guard is None:
@@ -1474,6 +1867,21 @@ def run_swarm(
         )
 
     try:
+        if bool(getattr(run_mutation_guard, "acquired_after_wait", False)):
+            previous_plan_text = json.dumps(plan, sort_keys=True, default=str)
+            reloaded_plan = load_plan(paths)
+            reloaded_plan_text = json.dumps(reloaded_plan, sort_keys=True, default=str)
+            plan.clear()
+            plan.update(reloaded_plan)
+            _write_concurrency_revalidation_artifact(
+                paths=paths,
+                guard=run_mutation_guard,
+                plan_changed=previous_plan_text != reloaded_plan_text,
+            )
+            _trace(
+                "concurrency.revalidation",
+                "Queued Forge execution acquired the workspace guard; reloaded current plan before scheduling.",
+            )
         backend = select_swarm_backend(
             paths=paths,
             ensure_worktree_fn=ensure_worktree_fn,
@@ -1581,6 +1989,9 @@ def run_swarm(
         blocked_task_ids_this_run: set[str] = set()
         integration_gate_index = 0
         integration_blocked = False
+        tolerated_integration_failures: list[IntegrationGateResult] = []
+        final_gate_task_ids: list[str] = []
+        final_gate_paths: list[str] = []
         recovered_tasks: dict[str, str] = _recover_stale_in_progress(paths=paths, plan=plan)
         for task_id, status in recovered_tasks.items():
             _trace(
@@ -1751,6 +2162,18 @@ def run_swarm(
             for task in plan.get("tasks") or []:
                 status = canonical_task_status(str(task.get("status") or ""))
                 if status == "ready_for_merge":
+                    if _should_defer_red_regression_ready_task(plan, task):
+                        task_id = str(task.get("id") or "")
+                        _trace(
+                            "merge.lifecycle",
+                            (
+                                "Deferring expected-red regression task until its dependent "
+                                "implementation is ready for the same pre-merge candidate."
+                            ),
+                            task_id=task_id,
+                            verbosity="full",
+                        )
+                        continue
                     pending_ready.append(task)
                 if retry_merge_conflicts and status == "merge_conflict":
                     pending_ready.append(task)
@@ -2004,12 +2427,14 @@ def run_swarm(
             pending_task_ids = [item.task_id for item in pending_ready_items]
             startup_integration_result, startup_rejection_reason = _verify_ready_batch_candidate(
                 paths=paths,
+                plan=plan,
                 cfg=cfg,
                 workspace_scan=workspace_scan,
                 backend=backend,
                 batch_index=integration_gate_index,
                 base_branch=selected_base,
                 integration_mode=effective_integration_mode,
+                allow_transient_dependent_integration_warning=(effective_replanning_mode == "off"),
                 integration_verify_cmd=integration_verify_cmd,
                 verify_cmd=verify_cmd,
                 keep_worktrees=keep_worktrees,
@@ -2022,6 +2447,16 @@ def run_swarm(
             )
             if startup_integration_result is not None:
                 integration_results.append(startup_integration_result)
+            if (
+                startup_integration_result is not None
+                and not startup_integration_result.passed
+                and startup_rejection_reason is None
+            ):
+                tolerated_integration_failures.append(startup_integration_result)
+                record_integration_failure_knowledge(
+                    paths=paths,
+                    result=startup_integration_result,
+                )
             if startup_rejection_reason is not None:
                 if startup_integration_result is not None:
                     record_integration_failure_knowledge(
@@ -2076,7 +2511,7 @@ def run_swarm(
                 (
                     pending_merged_task_ids,
                     pending_remote_task_ids,
-                    _pending_merged_paths,
+                    pending_merged_paths,
                     pending_promoted_knowledge,
                     batch_task_attempt_resolutions,
                 ) = _merge_ready_batch_items_into_base(
@@ -2100,6 +2535,8 @@ def run_swarm(
                 pending_task_attempt_resolutions = (
                     batch_task_attempt_resolutions or pending_task_attempt_resolutions
                 )
+                final_gate_task_ids.extend(pending_merged_task_ids)
+                final_gate_paths.extend(pending_merged_paths)
                 if remote_settings.enabled and pending_remote_task_ids:
                     _trace(
                         "remote.lifecycle",
@@ -2143,8 +2580,10 @@ def run_swarm(
                         )
                 if pending_promoted_knowledge or pending_task_attempt_resolutions:
                     rebuild_knowledge_index(paths)
-                if startup_integration_result is not None and len(pending_merged_task_ids) == len(
-                    pending_task_ids
+                if (
+                    startup_integration_result is not None
+                    and startup_integration_result.passed
+                    and len(pending_merged_task_ids) == len(pending_task_ids)
                 ):
                     record_integration_resolution_knowledge(
                         paths=paths,
@@ -2885,18 +3324,116 @@ def run_swarm(
                         )
                     )
 
+                deferred_current_items = [
+                    item
+                    for item in ready_items
+                    if _should_defer_red_regression_ready_task(plan, item.task)
+                ]
+                if deferred_current_items:
+                    for item in deferred_current_items:
+                        _trace(
+                            "merge.lifecycle",
+                            (
+                                "Deferring expected-red regression task until its dependent "
+                                "implementation is ready for the same pre-merge candidate."
+                            ),
+                            task_id=item.task_id,
+                            verbosity="full",
+                        )
+                    deferred_ids = {item.task_id for item in deferred_current_items}
+                    ready_items = [item for item in ready_items if item.task_id not in deferred_ids]
+
                 if ready_items:
+                    deferred_dependency_items: list[ReadyBatchItem] = []
+                    deferred_dependency_error: str | None = None
+                    for dependency_task in _deferred_red_dependency_tasks_for_ready_items(
+                        plan=plan,
+                        ready_items=ready_items,
+                    ):
+                        dependency_task_id = str(dependency_task.get("id") or "")
+                        dependency_branch = str(dependency_task.get("branch") or "")
+                        if not dependency_task_id or not dependency_branch:
+                            continue
+                        try:
+                            dependency_workspace = backend.load_task_workspace(
+                                root=paths.root,
+                                run_dir=paths.run_dir,
+                                task_id=dependency_task_id,
+                                branch=dependency_branch,
+                                base_branch=selected_base,
+                            )
+                        except GitOpsError as e:
+                            deferred_dependency_error = (
+                                "deferred expected-red regression dependency workspace "
+                                f"could not be loaded: {e}"
+                            )
+                            _mark_status(paths, plan, dependency_task_id, "failed")
+                            execution_skipped[dependency_task_id] = deferred_dependency_error
+                            _trace(
+                                "worktree.error",
+                                deferred_dependency_error,
+                                task_id=dependency_task_id,
+                            )
+                            continue
+                        deferred_dependency_items.append(
+                            ReadyBatchItem(
+                                task=dependency_task,
+                                prepared_workspace=dependency_workspace,
+                                changed_files=tuple(
+                                    _load_worker_changed_files(paths, dependency_task_id)
+                                ),
+                                report_path_raw=os.fspath(
+                                    paths.execution_reports_dir / f"{dependency_task_id}.md"
+                                ),
+                            )
+                        )
+                    if deferred_dependency_items:
+                        dependency_ids = ", ".join(
+                            item.task_id for item in deferred_dependency_items
+                        )
+                        batch_ids = ", ".join(item.task_id for item in ready_items)
+                        _trace(
+                            "merge.lifecycle",
+                            (
+                                "Including deferred expected-red regression dependency "
+                                f"{dependency_ids} with ready implementation batch {batch_ids}."
+                            ),
+                            verbosity="full",
+                        )
+                        ready_items = [*deferred_dependency_items, *ready_items]
+                    if deferred_dependency_error is not None:
+                        batch_task_attempt_resolutions = (
+                            _reject_ready_batch_items(
+                                paths=paths,
+                                plan=plan,
+                                backend=backend,
+                                keep_worktrees=keep_worktrees,
+                                ready_items=ready_items,
+                                reason=deferred_dependency_error,
+                                merge_outcomes=merge_outcomes,
+                                execution_skipped=execution_skipped,
+                                cleanup_nonmerged_workspace=_cleanup_nonmerged_workspace,
+                            )
+                            or batch_task_attempt_resolutions
+                        )
+                        if batch_task_attempt_resolutions:
+                            rebuild_knowledge_index(paths)
+                        continue
                     integration_gate_index += 1
                     batch_task_ids = [item.task_id for item in ready_items]
                     batch_integration_result, batch_rejection_reason = (
                         _verify_ready_batch_candidate(
                             paths=paths,
+                            plan=plan,
                             cfg=cfg,
                             workspace_scan=workspace_scan,
                             backend=backend,
                             batch_index=integration_gate_index,
                             base_branch=selected_base,
                             integration_mode=effective_integration_mode,
+                            allow_transient_dependent_integration_warning=(
+                                effective_replanning_mode == "off"
+                            ),
                             integration_verify_cmd=integration_verify_cmd,
                             verify_cmd=verify_cmd,
                             keep_worktrees=keep_worktrees,
@@ -2910,6 +3447,16 @@ def run_swarm(
                     )
                     if batch_integration_result is not None:
                         integration_results.append(batch_integration_result)
+                    if (
+                        batch_integration_result is not None
+                        and not batch_integration_result.passed
+                        and batch_rejection_reason is None
+                    ):
+                        tolerated_integration_failures.append(batch_integration_result)
+                        record_integration_failure_knowledge(
+                            paths=paths,
+                            result=batch_integration_result,
+                        )
                     if batch_rejection_reason is not None:
                         if batch_integration_result is not None:
                             record_integration_failure_knowledge(
@@ -2977,7 +3524,7 @@ def run_swarm(
                         (
                             batch_merged_task_ids,
                             batch_remote_task_ids,
-                            _batch_merged_paths,
+                            batch_merged_paths,
                             merged_batch_promoted_knowledge,
                             merged_batch_task_attempt_resolutions,
                         ) = _merge_ready_batch_items_into_base(
@@ -3004,6 +3551,8 @@ def run_swarm(
                         batch_task_attempt_resolutions = (
                             batch_task_attempt_resolutions or merged_batch_task_attempt_resolutions
                         )
+                        final_gate_task_ids.extend(batch_merged_task_ids)
+                        final_gate_paths.extend(batch_merged_paths)
                         if remote_settings.enabled and batch_remote_task_ids:
                             _trace(
                                 "remote.lifecycle",
@@ -3051,9 +3600,11 @@ def run_swarm(
                                     )
                         if batch_promoted_knowledge or batch_task_attempt_resolutions:
                             rebuild_knowledge_index(paths)
-                        if batch_integration_result is not None and len(
-                            batch_merged_task_ids
-                        ) == len(batch_task_ids):
+                        if (
+                            batch_integration_result is not None
+                            and batch_integration_result.passed
+                            and len(batch_merged_task_ids) == len(batch_task_ids)
+                        ):
                             record_integration_resolution_knowledge(
                                 paths=paths,
                                 result=batch_integration_result,
@@ -3093,6 +3644,63 @@ def run_swarm(
             if schedule_recompute_requested:
                 continue
 
+        if (
+            tolerated_integration_failures
+            and not integration_blocked
+            and effective_integration_mode != "off"
+            and final_gate_task_ids
+        ):
+            integration_gate_index += 1
+            final_task_ids = list(dict.fromkeys(final_gate_task_ids))
+            final_paths = list(dict.fromkeys(final_gate_paths))
+            final_integration_result = _run_batch_integration_gate(
+                paths=paths,
+                cfg=cfg,
+                workspace_scan=workspace_scan,
+                batch_index=integration_gate_index,
+                integration_mode=effective_integration_mode,
+                integration_verify_cmd=integration_verify_cmd,
+                verify_cmd=verify_cmd,
+                merged_task_ids=final_task_ids,
+                merged_paths=final_paths,
+                root=paths.root,
+                phase="final_repo",
+                trace=lambda phase, message: _trace(phase, message),
+                task_trace=lambda task_id, message: _trace(
+                    "integration.error",
+                    message,
+                    task_id=task_id,
+                ),
+                integration_runner=integration_runner,
+            )
+            if final_integration_result is not None:
+                integration_results.append(final_integration_result)
+                if final_integration_result.passed:
+                    record_integration_resolution_knowledge(
+                        paths=paths,
+                        result=final_integration_result,
+                    )
+                else:
+                    record_integration_failure_knowledge(
+                        paths=paths,
+                        result=final_integration_result,
+                    )
+
+        run_outcome = _compute_swarm_run_outcome(
+            plan=plan,
+            integration_results=integration_results,
+            review_blocked=review_blocked,
+            remote_blocked_any=remote_blocked_any,
+            integration_blocked=integration_blocked,
+            only=only,
+            max_tasks=max_tasks,
+            dry_run=False,
+        )
+        _write_swarm_summary_json(
+            paths=paths,
+            outcome=run_outcome,
+            integration_results=integration_results,
+        )
         summary_path = _write_swarm_summary(
             paths=paths,
             backend_name=backend.name,
@@ -3112,38 +3720,16 @@ def run_swarm(
             schedule_preview=executed_batch_history,
             workspace_summary_lines=workspace_summary_lines,
             binding_summary_lines=binding_summary_lines,
+            run_outcome=run_outcome,
         )
-        exit_code = 0
-        if review_blocked or remote_blocked_any or integration_blocked:
-            exit_code = 1
-
-        failure_like_statuses = {
-            "failed",
-            "verify_failed",
-            "candidate_rejected",
-            "changes_requested",
-            "merge_conflict",
-            "blocked_integration",
-        }
-        non_executable_success_statuses = {"done", "superseded", "invalidated"}
-        tasks = plan.get("tasks") or []
-        canonical_statuses = [
-            canonical_task_status(str(task.get("status") or ""))
-            for task in tasks
-            if isinstance(task, dict)
-        ]
-        if any(status in failure_like_statuses for status in canonical_statuses):
-            exit_code = 1
-
-        is_full_run = only is None and max_tasks is None and not dry_run
-        if is_full_run and any(
-            status not in non_executable_success_statuses for status in canonical_statuses
-        ):
-            exit_code = 1
+        exit_code = run_outcome.exit_code
 
         _trace(
             "swarm.lifecycle",
-            f"Swarm completed with exit code {exit_code}. Summary: {summary_path}.",
+            (
+                f"Swarm completed with exit code {exit_code}. Status: "
+                f"{run_outcome.status}. Summary: {summary_path}."
+            ),
         )
         return exit_code
     except Exception as e:

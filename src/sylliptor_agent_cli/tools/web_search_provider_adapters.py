@@ -13,6 +13,7 @@ from ..llm.provider_limits import (
     run_provider_limited_call,
 )
 from ..safety import SafeHttpError, safe_http_request
+from ..safety.safe_http import Resolver
 from ..web_research import extract_public_web_urls, normalize_web_url
 from .http_timeout import build_http_timeout_budget, format_http_timeout_error
 
@@ -71,6 +72,7 @@ def _post_json(
     payload: dict[str, Any],
     timeout_s: float,
     transport: httpx.BaseTransport | None,
+    resolver: Resolver | None,
     provider_key: str,
     provider_concurrency_caps: dict[str, int] | None,
     provider_retry_settings: ProviderRetrySettings | None,
@@ -88,6 +90,7 @@ def _post_json(
                     headers=headers,
                     json=payload,
                     _transport=transport,  # type: ignore[arg-type]
+                    _resolver=resolver,
                 )
             )
         except httpx.TimeoutException as e:
@@ -425,6 +428,7 @@ def moonshot_kimi_search(
     allowed_domains: list[str] | None,
     timeout_s: float,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
     provider_concurrency_caps: dict[str, int] | None = None,
     provider_retry_settings: ProviderRetrySettings | None = None,
 ) -> dict[str, Any]:
@@ -455,6 +459,7 @@ def moonshot_kimi_search(
             payload=payload,
             timeout_s=timeout_s,
             transport=transport,
+            resolver=resolver,
             provider_key="moonshot",
             provider_concurrency_caps=provider_concurrency_caps,
             provider_retry_settings=provider_retry_settings,
@@ -547,6 +552,7 @@ def zhipu_web_search(
     allowed_domains: list[str] | None,
     timeout_s: float,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
     provider_concurrency_caps: dict[str, int] | None = None,
     provider_retry_settings: ProviderRetrySettings | None = None,
 ) -> dict[str, Any]:
@@ -586,6 +592,7 @@ def zhipu_web_search(
         payload=payload,
         timeout_s=timeout_s,
         transport=transport,
+        resolver=resolver,
         provider_key="zhipu",
         provider_concurrency_caps=provider_concurrency_caps,
         provider_retry_settings=provider_retry_settings,
@@ -624,6 +631,7 @@ def volcengine_web_search(
     allowed_domains: list[str] | None,
     timeout_s: float,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
     provider_concurrency_caps: dict[str, int] | None = None,
     provider_retry_settings: ProviderRetrySettings | None = None,
 ) -> dict[str, Any]:
@@ -644,6 +652,7 @@ def volcengine_web_search(
         },
         timeout_s=timeout_s,
         transport=transport,
+        resolver=resolver,
         provider_key="volcengine",
         provider_concurrency_caps=provider_concurrency_caps,
         provider_retry_settings=provider_retry_settings,
@@ -682,12 +691,13 @@ def anthropic_messages_search(
     allowed_domains: list[str] | None,
     timeout_s: float,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
     provider_concurrency_caps: dict[str, int] | None = None,
     provider_retry_settings: ProviderRetrySettings | None = None,
 ) -> dict[str, Any]:
     url = f"{base_url.rstrip('/')}/messages"
     tool: dict[str, Any] = {
-        "type": "web_search_20250305",
+        "type": "web_search_20260209",
         "name": "web_search",
         "max_uses": 3,
     }
@@ -716,6 +726,7 @@ def anthropic_messages_search(
         payload=payload,
         timeout_s=timeout_s,
         transport=transport,
+        resolver=resolver,
         provider_key="anthropic",
         provider_concurrency_caps=provider_concurrency_caps,
         provider_retry_settings=provider_retry_settings,
@@ -806,6 +817,7 @@ def gemini_grounding_search(
     allowed_domains: list[str] | None,
     timeout_s: float,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
     provider_concurrency_caps: dict[str, int] | None = None,
     provider_retry_settings: ProviderRetrySettings | None = None,
 ) -> dict[str, Any]:
@@ -827,6 +839,7 @@ def gemini_grounding_search(
         payload=payload,
         timeout_s=timeout_s,
         transport=transport,
+        resolver=resolver,
         provider_key="gemini",
         provider_concurrency_caps=provider_concurrency_caps,
         provider_retry_settings=provider_retry_settings,
@@ -913,6 +926,7 @@ def openrouter_web_search(
     allowed_domains: list[str] | None,
     timeout_s: float,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
     provider_concurrency_caps: dict[str, int] | None = None,
     provider_retry_settings: ProviderRetrySettings | None = None,
 ) -> dict[str, Any]:
@@ -942,6 +956,7 @@ def openrouter_web_search(
         },
         timeout_s=timeout_s,
         transport=transport,
+        resolver=resolver,
         provider_key="openrouter",
         provider_concurrency_caps=provider_concurrency_caps,
         provider_retry_settings=provider_retry_settings,
@@ -982,6 +997,7 @@ def perplexity_sonar_search(
     allowed_domains: list[str] | None,
     timeout_s: float,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
     provider_concurrency_caps: dict[str, int] | None = None,
     provider_retry_settings: ProviderRetrySettings | None = None,
 ) -> dict[str, Any]:
@@ -1003,6 +1019,7 @@ def perplexity_sonar_search(
         payload=payload,
         timeout_s=timeout_s,
         transport=transport,
+        resolver=resolver,
         provider_key="perplexity",
         provider_concurrency_caps=provider_concurrency_caps,
         provider_retry_settings=provider_retry_settings,
@@ -1052,6 +1069,7 @@ def groq_compound_search(
     allowed_domains: list[str] | None,
     timeout_s: float,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
     provider_concurrency_caps: dict[str, int] | None = None,
     provider_retry_settings: ProviderRetrySettings | None = None,
 ) -> dict[str, Any]:
@@ -1072,6 +1090,7 @@ def groq_compound_search(
         payload=payload,
         timeout_s=timeout_s,
         transport=transport,
+        resolver=resolver,
         provider_key="groq",
         provider_concurrency_caps=provider_concurrency_caps,
         provider_retry_settings=provider_retry_settings,
@@ -1126,6 +1145,7 @@ def mistral_conversations_search(
     allowed_domains: list[str] | None,
     timeout_s: float,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
     provider_concurrency_caps: dict[str, int] | None = None,
     provider_retry_settings: ProviderRetrySettings | None = None,
 ) -> dict[str, Any]:
@@ -1147,6 +1167,7 @@ def mistral_conversations_search(
         payload=payload,
         timeout_s=timeout_s,
         transport=transport,
+        resolver=resolver,
         provider_key="mistral",
         provider_concurrency_caps=provider_concurrency_caps,
         provider_retry_settings=provider_retry_settings,

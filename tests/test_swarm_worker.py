@@ -302,6 +302,84 @@ def test_run_task_worker_mirrors_plan_assets_into_worktree(tmp_path: Path, monke
     )
 
 
+def test_run_task_worker_moves_known_root_scratch_files_to_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    paths = create_plan_run(repo)
+    plan = load_plan(paths)
+    task = add_task(
+        plan,
+        title="Update implementation",
+        estimated_files=["src/in_scope.py"],
+        branch="feat/t01-scratch",
+    )
+    save_plan(paths, plan)
+    worktree_repo = paths.run_dir / "worktrees" / str(task["id"]) / "repo"
+    worktree_repo.mkdir(parents=True, exist_ok=True)
+    _init_git_repo(worktree_repo)
+
+    def fake_run_agent(**_kwargs) -> int:  # type: ignore[no-untyped-def]
+        (worktree_repo / "src").mkdir(parents=True, exist_ok=True)
+        (worktree_repo / "src" / "in_scope.py").write_text("print('ok')\n", encoding="utf-8")
+        (worktree_repo / "_pytest_out.txt").write_text("debug output\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr("sylliptor_agent_cli.swarm_worker.run_agent", fake_run_agent)
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.swarm_worker.build_execution_reporting_diff_with_commit_range",
+        lambda *_a, **_k: SimpleNamespace(
+            changed_files=("src/in_scope.py", "_pytest_out.txt"),
+            patch_text="added: src/in_scope.py\nadded: _pytest_out.txt\n",
+        ),
+    )
+    monkeypatch.setattr("sylliptor_agent_cli.swarm_worker.stage_all", lambda _root: None)
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.swarm_worker.unstage_staged_prefixes", lambda *_a, **_k: []
+    )
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.swarm_worker.ensure_not_staged_prefixes", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.swarm_worker.staged_files",
+        lambda _root: ["src/in_scope.py"],
+    )
+    monkeypatch.setattr("sylliptor_agent_cli.swarm_worker.commit_all", lambda *_a, **_k: "deadbeef")
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.swarm_worker.format_patch_stdout", lambda *_a, **_k: "PATCH\n"
+    )
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.swarm_worker.changed_files_between",
+        lambda *_a, **_k: ["src/in_scope.py"],
+    )
+
+    result = run_task_worker(
+        task=task,
+        plan=load_plan(paths),
+        worktree_repo_path=worktree_repo,
+        base_branch="main",
+        run_paths=paths,
+        cfg=AppConfig(model="test-model"),
+        mode="auto",
+        yes=True,
+        max_steps=5,
+        api_key_override="k",
+        no_log=True,
+        console=_console(),
+        scope_mode="strict",
+        verify_mode="off",
+    )
+
+    scratch_artifact = paths.execution_dir / "scratch" / str(task["id"]) / "_pytest_out.txt"
+    assert result.success is True
+    assert "_pytest_out.txt" not in result.changed_files
+    assert not (worktree_repo / "_pytest_out.txt").exists()
+    assert scratch_artifact.read_text(encoding="utf-8") == "debug output\n"
+    assert result.scope_diagnostics is not None
+    assert result.scope_diagnostics[0]["classification"] == "scratch_diagnostic_artifact"
+
+
 def test_run_task_worker_no_log_reports_retained_session_artifacts_truthfully(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1121,6 +1199,147 @@ def test_run_task_worker_accepts_diagnostic_zero_diff_without_verification(
     report = (paths.execution_reports_dir / f"{task['id']}.md").read_text(encoding="utf-8")
     assert "- No-Op Reason: diagnostic_analysis_only" in report
     assert "- Merge Result: no merge required (analysis-only no-op)" in report
+
+
+def test_run_task_worker_accepts_read_scope_zero_diff_without_baseline_verification(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _repo, paths, task, worktree_repo = _prepare_zero_diff_worker_case(tmp_path)
+    plan = load_plan(paths)
+    task = plan["tasks"][0]
+    task["title"] = "Read current config_loader.py and test_config_loader.py"
+    task["description"] = "Inspect current files before downstream implementation tasks run."
+    task["estimated_files"] = ["config_loader.py", "test_config_loader.py"]
+    task["write_scope"] = ["config_loader.py", "test_config_loader.py"]
+    save_plan(paths, plan)
+    _configure_zero_diff_worker(monkeypatch)
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.swarm_worker.run_task_verification",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("read-only diagnostic no-op should not require verification")
+        ),
+    )
+
+    result = run_task_worker(
+        task=task,
+        plan=load_plan(paths),
+        worktree_repo_path=worktree_repo,
+        base_branch="main",
+        run_paths=paths,
+        cfg=AppConfig(model="test-model"),
+        mode="auto",
+        yes=True,
+        max_steps=5,
+        api_key_override="k",
+        no_log=True,
+        console=_console(),
+        scope_mode="strict",
+        verify_mode="warn",
+        verify_commands=["pytest -q"],
+    )
+
+    assert result.success is True
+    assert result.effective_result_kind == "success_noop"
+    assert result.noop_reason == "diagnostic_analysis_only"
+    assert result.task_kind == "analysis_only"
+    assert result.to_json()["task_kind"] == "analysis_only"
+
+
+def test_run_task_worker_accepts_diagnostic_rust_build_metadata_side_effects(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _repo, paths, task, worktree_repo = _prepare_zero_diff_worker_case(tmp_path)
+    plan = load_plan(paths)
+    task = plan["tasks"][0]
+    task["title"] = "Locate duration parser implementation and tests"
+    task["description"] = "Inspect the current Rust parser layout before implementation tasks run."
+    task["estimated_files"] = []
+    task["write_scope"] = []
+    save_plan(paths, plan)
+    (worktree_repo / "Cargo.toml").write_text(
+        '[package]\nname = "demo"\nversion = "0.1.0"\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("sylliptor_agent_cli.swarm_worker.run_agent", lambda **_kwargs: 0)
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.swarm_worker.build_execution_reporting_diff_with_commit_range",
+        lambda *_a, **_k: SimpleNamespace(
+            changed_files=("Cargo.lock", "target/debug/demo"),
+            patch_text="PATCH\n",
+        ),
+    )
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.swarm_worker.list_changed_files_including_untracked",
+        lambda _root: ["Cargo.lock", "target/debug/demo"],
+    )
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.swarm_worker.run_task_verification",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("diagnostic side-effect no-op should not require verification")
+        ),
+    )
+
+    result = run_task_worker(
+        task=task,
+        plan=load_plan(paths),
+        worktree_repo_path=worktree_repo,
+        base_branch="main",
+        run_paths=paths,
+        cfg=AppConfig(model="test-model"),
+        mode="auto",
+        yes=True,
+        max_steps=5,
+        api_key_override="k",
+        no_log=True,
+        console=_console(),
+        scope_mode="strict",
+        verify_mode="warn",
+        verify_commands=["cargo test"],
+    )
+
+    assert result.success is True
+    assert result.commit_hash is None
+    assert result.changed_files == []
+    assert result.effective_result_kind == "success_noop"
+    assert result.noop_reason == "diagnostic_analysis_only"
+    report = (paths.execution_reports_dir / f"{task['id']}.md").read_text(encoding="utf-8")
+    assert "generated Rust build metadata" in report
+
+
+def test_run_task_worker_accepts_report_only_zero_diff_without_title_keyword(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _repo, paths, task, worktree_repo = _prepare_zero_diff_worker_case(tmp_path)
+    plan = load_plan(paths)
+    task = plan["tasks"][0]
+    task["title"] = "Compare build options"
+    task["description"] = "Read-only analysis only; report findings."
+    task["acceptance_criteria"] = ["Findings documented."]
+    save_plan(paths, plan)
+    _configure_zero_diff_worker(monkeypatch)
+
+    result = run_task_worker(
+        task=task,
+        plan=load_plan(paths),
+        worktree_repo_path=worktree_repo,
+        base_branch="main",
+        run_paths=paths,
+        cfg=AppConfig(model="test-model"),
+        mode="auto",
+        yes=True,
+        max_steps=5,
+        api_key_override="k",
+        no_log=True,
+        console=_console(),
+        scope_mode="strict",
+        verify_mode="off",
+    )
+
+    assert result.success is True
+    assert result.commit_hash is None
+    assert result.effective_result_kind == "success_noop"
+    assert result.noop_reason == "diagnostic_analysis_only"
 
 
 def test_run_task_worker_rejects_locate_diagnostic_noop_after_nonzero_exit(
@@ -4573,6 +4792,9 @@ def test_run_task_worker_uses_coding_role_model(tmp_path: Path, monkeypatch) -> 
         )
         captured["compaction_profile"] = kwargs.get("compaction_profile")
         captured["subagents_enabled"] = kwargs.get("subagents_enabled")
+        captured["enforce_explicit_subagent_requests"] = kwargs.get(
+            "enforce_explicit_subagent_requests"
+        )
         return 0
 
     monkeypatch.setattr("sylliptor_agent_cli.swarm_worker.run_agent", fake_run_agent)
@@ -4622,6 +4844,7 @@ def test_run_task_worker_uses_coding_role_model(tmp_path: Path, monkeypatch) -> 
     assert captured["enable_conversation_summarization"] is True
     assert captured["compaction_profile"] == "execution"
     assert captured["subagents_enabled"] is False
+    assert captured["enforce_explicit_subagent_requests"] is False
 
 
 def test_run_task_worker_passes_images_when_opted_in_and_vision_supported(

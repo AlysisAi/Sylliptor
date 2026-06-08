@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from ..safety import SafeHttpError, safe_http_request
+from ..safety.safe_http import Resolver
 from .http_timeout import build_http_timeout_budget, format_http_timeout_error
 
 
@@ -60,6 +61,7 @@ def tavily_search(
     include_domains: list[str] | None = None,
     timeout_s: float = 45.0,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
 ) -> dict[str, Any]:
     validated_query = str(query or "").strip()
     if not validated_query:
@@ -103,6 +105,7 @@ def tavily_search(
                 headers=headers,
                 json=payload,
                 _transport=transport,  # type: ignore[arg-type]
+                _resolver=resolver,
             )
         )
     except httpx.TimeoutException as e:

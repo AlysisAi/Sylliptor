@@ -31,10 +31,14 @@ from ..config import (
 from ..profile_presets import (
     PROFILE_PRESETS,
     ProfilePreset,
+    advanced_provider_selection_presets,
     find_preset_for_base_url,
     find_preset_for_profile,
     make_profile_from_preset,
     model_options_for_preset,
+    preset_protocol_summary,
+    preset_selection_label,
+    provider_selection_presets,
 )
 from ..profiles import (
     ProfileSpec,
@@ -42,6 +46,7 @@ from ..profiles import (
     set_active_profile,
     validate_base_url,
 )
+from ..provider_diagnostics import provider_diagnostic_warning_lines
 from ..surface.console import make_console
 from ..surface.styles import STYLE_CONTENT, STYLE_DIM, STYLE_EMPHASIS
 from ..web_search_adapters import WEB_SEARCH_ADAPTER_CHOICES, normalize_web_search_adapter
@@ -54,11 +59,13 @@ ROLE_ORDER: tuple[str, ...] = (
     "conflict_review",
     "conflict_resolve",
 )
+ROLE_MODEL_ORDER: tuple[str, ...] = (*ROLE_ORDER, "router")
+FORGE_ROLE_ORDER: tuple[str, ...] = ROLE_MODEL_ORDER
 SECTION_VALUES: tuple[tuple[str, str], ...] = (
     ("profile", "Provider Profile"),
     ("api_key", "API Key"),
     ("default", "Default Model"),
-    ("router", "Execution Limits"),
+    ("router", "Routing & Limits"),
     ("subagents", "Subagent model overrides"),
     ("forge", "Forge model overrides"),
 )
@@ -77,6 +84,7 @@ _ROLE_DESCRIPTIONS: dict[str, str] = {
     "compactor": "summarizing long conversations",
     "conflict_review": "reviewing merge conflicts",
     "conflict_resolve": "resolving merge conflicts",
+    "router": "classifying chat, tool, and repository turns",
 }
 _FIELD_LABELS: dict[str, str] = {
     "max_steps": "Max steps per response",
@@ -87,6 +95,8 @@ _API_KEY_ENV_PROMPT = "API key env var name (NOT the key itself, e.g. 'ANTHROPIC
 _API_KEY_ENV_FIELD_NAME = "API key env var name"
 _SECRET_FORCE_TOKEN = "force"
 _CUSTOM_MODEL_VALUE = "__custom_model__"
+_INHERIT_DEFAULT_MODEL_VALUE = "__inherit_default_model__"
+_ADVANCED_PROVIDER_PRESETS_VALUE = "__advanced_provider_presets__"
 
 
 @dataclass(frozen=True)
@@ -167,6 +177,11 @@ class ConfigMenuState:
                 "max_steps": _format_integer(getattr(cfg, "max_steps", 25)),
                 "task_max_steps": _format_integer(getattr(cfg, "task_max_steps", 100)),
                 "subagent_max_steps": _format_integer(getattr(cfg, "subagent_max_steps", 16)),
+                "stream": "true" if bool(getattr(cfg, "stream", False)) else "false",
+                "web_search_mode": str(getattr(cfg, "web_search_mode", "auto") or "auto"),
+                "web_search_adapter": str(getattr(cfg, "web_search_adapter", "auto") or "auto"),
+                "web_search_base_url": str(getattr(cfg, "web_search_base_url", "") or ""),
+                "web_search_model": str(getattr(cfg, "web_search_model", "") or ""),
             },
             thinking_label=thinking_label,
             role_models=role_models,
@@ -189,9 +204,9 @@ class ConfigMenuState:
         return {
             "fields": {key: str(value) for key, value in sorted(self.fields.items())},
             "thinking_label": self.thinking_label,
-            "role_models": {role: str(self.role_models.get(role, "")) for role in ROLE_ORDER},
+            "role_models": {role: str(self.role_models.get(role, "")) for role in ROLE_MODEL_ORDER},
             "forge_role_models": {
-                role: str(self.forge_role_models.get(role, "")) for role in ROLE_ORDER
+                role: str(self.forge_role_models.get(role, "")) for role in FORGE_ROLE_ORDER
             },
             "role_temperatures": {
                 role: str(self.role_temperatures.get(role, ""))
@@ -350,6 +365,12 @@ class ConfigMenuState:
         cfg = AppConfig(
             model=str(self.fields.get("model", "") or ""),
             base_url=str(self.fields.get("base_url", "") or ""),
+            stream=str(self.fields.get("stream", "false")).strip().lower()
+            in {"1", "true", "yes", "on"},
+            web_search_mode=str(self.fields.get("web_search_mode", "auto") or "auto"),
+            web_search_adapter=str(self.fields.get("web_search_adapter", "auto") or "auto"),
+            web_search_base_url=str(self.fields.get("web_search_base_url", "") or "") or None,
+            web_search_model=str(self.fields.get("web_search_model", "") or "") or None,
         )
         cfg.extra_fields = {"profiles": dict(self.profiles)}
         if self.active_profile:
@@ -448,24 +469,31 @@ class ConfigMenuState:
                 changes["llm_reasoning_effort"] = desired_reasoning_effort
             _set_thinking_label_hint(cfg, self.thinking_label)
 
-        role_models = _non_empty_role_values(self.role_models)
-        current_role_models = _non_empty_role_values(
-            _normalized_role_model_values(cfg.extra_fields.get("role_models"))
+        raw_role_models = cfg.extra_fields.get("role_models")
+        role_models = _role_model_storage_values(raw_role_models, self.role_models)
+        current_role_models = _role_model_storage_values(
+            raw_role_models,
+            _normalized_role_model_values(raw_role_models),
         )
         if current_role_models != role_models:
             if role_models:
-                cfg.extra_fields["role_models"] = dict(role_models)
+                cfg.extra_fields["role_models"] = dict(sorted(role_models.items()))
             else:
                 cfg.extra_fields.pop("role_models", None)
             changes["role_models"] = dict(role_models)
 
-        forge_role_models = _non_empty_role_values(self.forge_role_models)
-        current_forge_role_models = _non_empty_role_values(
-            _normalized_role_model_values(cfg.extra_fields.get("forge_role_models"))
+        raw_forge_role_models = cfg.extra_fields.get("forge_role_models")
+        forge_role_models = _role_model_storage_values(
+            raw_forge_role_models,
+            self.forge_role_models,
+        )
+        current_forge_role_models = _role_model_storage_values(
+            raw_forge_role_models,
+            _normalized_role_model_values(raw_forge_role_models),
         )
         if current_forge_role_models != forge_role_models:
             if forge_role_models:
-                cfg.extra_fields["forge_role_models"] = dict(forge_role_models)
+                cfg.extra_fields["forge_role_models"] = dict(sorted(forge_role_models.items()))
             else:
                 cfg.extra_fields.pop("forge_role_models", None)
             changes["forge_role_models"] = dict(forge_role_models)
@@ -607,7 +635,9 @@ def _default_model_summary_text(state: ConfigMenuState) -> str:
 
 
 def _limits_summary_text(state: ConfigMenuState) -> str:
+    router_model = str(state.role_models.get("router", "") or "").strip() or "inherit default"
     return (
+        f"router {router_model} · "
         f"steps {state.fields['max_steps']}/{state.fields['task_max_steps']}/"
         f"{state.fields['subagent_max_steps']} · "
         f"routing {state.fields['routing_mode']} · "
@@ -624,14 +654,14 @@ def _override_summary_text(values: dict[str, str]) -> str:
 
 def _top_level_menu_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
     subagent_values = {
-        **state.role_models,
+        **{role: state.role_models.get(role, "") for role in ROLE_ORDER},
         **{f"{role}_temperature": value for role, value in state.role_temperatures.items()},
     }
     return [
         ("profile", "Provider Profile", _profile_summary_text(state)),
         ("api_key", "API Key", _api_key_summary_text(state)),
         ("default", "Default Model", _default_model_summary_text(state)),
-        ("router", "Execution Limits", _limits_summary_text(state)),
+        ("router", "Routing & Limits", _limits_summary_text(state)),
         ("subagents", "Subagent model overrides", _override_summary_text(subagent_values)),
         (
             "forge",
@@ -662,14 +692,14 @@ def _role_description(role: str) -> str:
     return _ROLE_DESCRIPTIONS.get(str(role), "role-specific work")
 
 
-def _print_role_explainer(console: Console) -> None:
+def _print_role_explainer(console: Console, *, roles: tuple[str, ...] = ROLE_ORDER) -> None:
     from rich.table import Table
 
     console.print("[dim]Roles:[/dim]")
     table = Table(show_header=False, box=None, padding=(0, 2), collapse_padding=True)
     table.add_column("role", no_wrap=True, style="dim")
     table.add_column("description", no_wrap=False, style="dim")
-    for role in ROLE_ORDER:
+    for role in roles:
         table.add_row(role, _role_description(role))
     console.print(table)
 
@@ -1165,7 +1195,7 @@ def _run_provider_section(state: ConfigMenuState, console: Console) -> None:
             rows=[
                 ("switch", "Switch active profile", "Choose another configured profile."),
                 ("add_preset", "Add from preset", "Pick a known provider (OpenAI, Anthropic, ...)"),
-                ("add_custom", "Add custom", "Use any API base URL"),
+                ("add_custom", "Add custom", "Use any OpenAI-compatible base URL"),
                 ("edit", "Edit current", "Change URL, key env, default model, headers, notes"),
                 ("remove", "Remove", "Delete a profile (applied on save)"),
                 ("back", "Back", "Return to the menu"),
@@ -1206,17 +1236,30 @@ def _run_profile_switch(state: ConfigMenuState, console: Console) -> None:
     )
     if selected:
         state.set_active_profile_name(selected)
+        _print_state_provider_diagnostic_warnings(state, console)
 
 
 def _run_profile_add_preset(state: ConfigMenuState, console: Console) -> None:
-    rows = [(preset.key, preset.label, _preset_description(preset)) for preset in PROFILE_PRESETS]
+    rows = _provider_picker_rows(_ordered_profile_presets_for_setup())
     selected = _run_config_picker(
         console=console,
         title="Provider Profile",
         subtitle="Pick a provider preset",
         rows=rows,
-        current_value="openai",
+        current_value=rows[0][0] if rows else "openai-responses",
     )
+    if selected == _ADVANCED_PROVIDER_PRESETS_VALUE:
+        advanced_rows = [
+            (preset.key, preset_selection_label(preset), _preset_description(preset))
+            for preset in _advanced_profile_presets_for_setup()
+        ]
+        selected = _run_config_picker(
+            console=console,
+            title="Advanced Provider Profile",
+            subtitle="Pick a compatibility, gateway, local, custom, or legacy provider preset",
+            rows=advanced_rows,
+            current_value=advanced_rows[0][0] if advanced_rows else "openai",
+        )
     if not selected:
         return
     preset = next(preset for preset in PROFILE_PRESETS if preset.key == selected)
@@ -1238,15 +1281,41 @@ def _run_profile_add_preset(state: ConfigMenuState, console: Console) -> None:
     state.add_profile_spec(profile)
     console.print(f"[green]Profile {profile.name} added.[/green]")
     _print_preset_warning(console, preset)
+    _print_state_provider_diagnostic_warnings(state, console)
 
 
 def _preset_description(preset: ProfilePreset) -> str:
+    prefix = preset_protocol_summary(preset)
     if preset.notes:
-        return preset.notes
+        return f"{prefix}. {preset.notes}"
     parsed = urlparse(preset.base_url)
     if parsed.netloc:
-        return parsed.netloc
-    return "Use any API base URL"
+        return f"{prefix}. Host: {parsed.netloc}"
+    return f"{prefix}. Use any OpenAI-compatible base URL"
+
+
+def _ordered_profile_presets_for_setup() -> list[ProfilePreset]:
+    return provider_selection_presets()
+
+
+def _advanced_profile_presets_for_setup() -> list[ProfilePreset]:
+    return advanced_provider_selection_presets()
+
+
+def _provider_picker_rows(presets: list[ProfilePreset]) -> list[tuple[str, str, str]]:
+    rows = [
+        (preset.key, preset_selection_label(preset), _preset_description(preset))
+        for preset in presets
+    ]
+    rows.append(
+        (
+            _ADVANCED_PROVIDER_PRESETS_VALUE,
+            "Advanced / gateway / legacy providers",
+            "Show OpenAI-compatible gateways, local endpoints, custom endpoints, and legacy "
+            "first-party compatibility presets.",
+        )
+    )
+    return rows
 
 
 def _print_preset_warning(console: Console, preset: ProfilePreset) -> None:
@@ -1266,10 +1335,11 @@ def _run_profile_add_custom(state: ConfigMenuState, console: Console) -> None:
         extra_headers=headers,
         web_search_adapter="auto",
         web_search_model="",
-        notes="Custom model API endpoint.",
+        notes="Custom OpenAI-compatible endpoint.",
     )
     state.add_profile_spec(profile)
     console.print(f"[green]Profile {profile.name} added.[/green]")
+    _print_state_provider_diagnostic_warnings(state, console)
 
 
 def _prompt_web_search_adapter(console: Console, current: str) -> str:
@@ -1296,6 +1366,7 @@ def _run_profile_edit_current(state: ConfigMenuState, console: Console) -> None:
         )
         return
     profile = ProfileSpec.from_dict(state.active_profile, state.profiles[state.active_profile])
+    console.print(f"[dim]Protocol:[/dim] {profile.protocol} [dim](advanced/read-only)[/dim]")
     console.print(_build_profile_edit_current_panel(profile.name))
     console.print(
         "[dim]Note: the API key itself is stored separately (encrypted in keyring). "
@@ -1329,6 +1400,19 @@ def _run_profile_edit_current(state: ConfigMenuState, console: Console) -> None:
         extra_headers=headers,
         notes=notes,
     )
+    _print_state_provider_diagnostic_warnings(state, console)
+
+
+def _print_state_provider_diagnostic_warnings(
+    state: ConfigMenuState,
+    console: Console,
+) -> None:
+    try:
+        issues = provider_diagnostic_warning_lines(state._resolution_cfg())
+    except ConfigError:
+        return
+    for issue in issues:
+        console.print(f"[yellow]Provider diagnostic: {issue}[/yellow]")
 
 
 def _build_profile_edit_current_panel(profile_name: str) -> Panel:
@@ -1345,6 +1429,12 @@ def _build_profile_edit_current_panel(profile_name: str) -> Panel:
             Text("  Web search model", style="dim"),
             Text("  Extra headers", style="dim"),
             Text("  Notes", style="dim"),
+            Text(""),
+            Text("Advanced/read-only here:", style=STYLE_EMPHASIS),
+            Text(
+                "  Protocol (use `sylliptor profile convert --to native|compatibility`)",
+                style="dim",
+            ),
             Text(""),
             Text("Stored separately:", style=STYLE_EMPHASIS),
             Text("  The actual API key", style="dim"),
@@ -1499,21 +1589,97 @@ def _default_model_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
 
 
 def _active_preset(state: ConfigMenuState) -> ProfilePreset | None:
-    preset = find_preset_for_base_url(state.fields.get("base_url", ""))
-    if preset is not None:
-        return preset
+    if state.active_profile and state.active_profile in state.profiles:
+        profile = ProfileSpec.from_dict(state.active_profile, state.profiles[state.active_profile])
+        preset = find_preset_for_profile(profile)
+        if preset is not None:
+            state_base_url = str(state.fields.get("base_url", "") or "").strip().rstrip("/")
+            profile_base_url = str(profile.base_url or "").strip().rstrip("/")
+            if not state_base_url or state_base_url == profile_base_url:
+                return preset
+            base_url_preset = find_preset_for_base_url(state_base_url)
+            return base_url_preset or preset
 
-    if not state.active_profile or state.active_profile not in state.profiles:
-        return None
-    profile = ProfileSpec.from_dict(state.active_profile, state.profiles[state.active_profile])
-    return find_preset_for_profile(profile)
+    return find_preset_for_base_url(state.fields.get("base_url", ""))
+
+
+def _prompt_router_model(console: Console, state: ConfigMenuState) -> str:
+    rows = _router_model_rows(state)
+    current_model = str(state.role_models.get("router", "") or "").strip()
+    row_values = {value for value, _label, _description in rows}
+    current_value = (
+        current_model
+        if current_model in row_values
+        else (_CUSTOM_MODEL_VALUE if current_model else _INHERIT_DEFAULT_MODEL_VALUE)
+    )
+    selected = _run_config_picker(
+        console=console,
+        title="Router Model",
+        subtitle="Pick a cheap model for request routing, or inherit the default model.",
+        rows=rows,
+        current_value=current_value,
+    )
+    if selected is None:
+        raise Abort()
+    if selected == _INHERIT_DEFAULT_MODEL_VALUE:
+        return ""
+    if selected == _CUSTOM_MODEL_VALUE:
+        return _prompt_text("Router model", current_model)
+    return selected
+
+
+def _router_model_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    default_model = str(state.fields.get("model") or "").strip()
+    inherit_description = (
+        f"Use default model {default_model}"
+        if default_model
+        else "Use the configured default model"
+    )
+    rows.append(
+        (
+            _INHERIT_DEFAULT_MODEL_VALUE,
+            "Inherit default model",
+            inherit_description,
+        )
+    )
+    seen.add(_INHERIT_DEFAULT_MODEL_VALUE)
+
+    current_model = str(state.role_models.get("router", "") or "").strip()
+    if current_model:
+        rows.append((current_model, current_model, "current router override"))
+        seen.add(current_model)
+
+    preset = _active_preset(state)
+    if preset is not None:
+        for value, label, description in model_options_for_preset(preset):
+            if value in seen:
+                continue
+            seen.add(value)
+            rows.append((value, label, description))
+
+    rows.append(
+        (
+            _CUSTOM_MODEL_VALUE,
+            "Type a custom model name",
+            "Use any model supported by the active provider",
+        )
+    )
+    return rows
 
 
 def _run_router_section(state: ConfigMenuState, console: Console) -> None:
     console.print()
-    console.rule("[bold]Execution Limits[/bold]")
-    console.print("[dim]How the agent routes requests and how many tool steps it may take.[/dim]")
+    console.rule("[bold]Routing & Limits[/bold]")
+    console.print(
+        "[dim]Choose the model used for lightweight request routing and how many tool steps "
+        "the agent may take.[/dim]"
+    )
+    role_model_snapshot = dict(state.role_models)
+    fields_snapshot = dict(state.fields)
     try:
+        state.set_role_model("router", _prompt_router_model(console, state))
         routing_mode_rows = [
             ("auto", "Auto", "Pick code or chat path per request intent"),
             ("code_only", "Code-only", "Always treat the request as a code task"),
@@ -1526,7 +1692,7 @@ def _run_router_section(state: ConfigMenuState, console: Console) -> None:
             current_value=state.fields["routing_mode"],
         )
         if routing_mode is None:
-            return
+            raise Abort()
         state.set_routing_mode(routing_mode)
         step_budget_rows = [
             ("adaptive", "Adaptive", "Sylliptor adjusts the budget based on task complexity"),
@@ -1540,7 +1706,7 @@ def _run_router_section(state: ConfigMenuState, console: Console) -> None:
             current_value=state.fields["step_budget_policy"],
         )
         if step_budget_policy is None:
-            return
+            raise Abort()
         state.set_step_budget_policy(step_budget_policy)
 
         state.set_max_steps(
@@ -1557,8 +1723,10 @@ def _run_router_section(state: ConfigMenuState, console: Console) -> None:
             )
         )
     except (Abort, EOFError, KeyboardInterrupt):
+        state.role_models = dict(role_model_snapshot)
+        state.fields = dict(fields_snapshot)
         console.print("")
-        _print_section_cancelled(console, "Execution Limits")
+        _print_section_cancelled(console, "Routing & Limits")
         return
 
 
@@ -1569,7 +1737,7 @@ def _run_subagent_section(state: ConfigMenuState, console: Console) -> None:
         "[dim]Override the model used by the agent's internal roles. Leave empty to inherit "
         "the default model.[/dim]"
     )
-    _print_role_explainer(console)
+    _print_role_explainer(console, roles=ROLE_ORDER)
     role_model_snapshot = dict(state.role_models)
     role_temp_snapshot = dict(state.role_temperatures)
     try:
@@ -1593,7 +1761,7 @@ def _run_subagent_section(state: ConfigMenuState, console: Console) -> None:
         _print_section_cancelled(console, "Subagent model overrides")
         return
 
-    overrides = _non_empty_role_values(state.role_models)
+    overrides = _non_empty_role_values(state.role_models, roles=ROLE_ORDER)
     if overrides:
         console.print(f"[dim]{_pluralize(len(overrides), 'override')} set.[/dim]")
     else:
@@ -1607,10 +1775,10 @@ def _run_forge_section(state: ConfigMenuState, console: Console) -> None:
         "[dim]Override the model used by Forge swarm roles. Leave empty to inherit the "
         "subagent override, then the default model.[/dim]"
     )
-    _print_role_explainer(console)
+    _print_role_explainer(console, roles=FORGE_ROLE_ORDER)
     role_model_snapshot = dict(state.forge_role_models)
     try:
-        for role in ROLE_ORDER:
+        for role in FORGE_ROLE_ORDER:
             model = _prompt_override_text(
                 f"  {_role_label(role)} model (Enter to skip)",
                 state.forge_role_models.get(role, ""),
@@ -1622,7 +1790,7 @@ def _run_forge_section(state: ConfigMenuState, console: Console) -> None:
         _print_section_cancelled(console, "Forge model overrides")
         return
 
-    overrides = _non_empty_role_values(state.forge_role_models)
+    overrides = _non_empty_role_values(state.forge_role_models, roles=FORGE_ROLE_ORDER)
     if overrides:
         console.print(f"[dim]{_pluralize(len(overrides), 'override')} set.[/dim]")
     else:
@@ -1878,7 +2046,7 @@ def _set_thinking_label_hint(cfg: AppConfig, label: str) -> None:
 
 def _normalize_role(role: str) -> str:
     role_key = str(role or "").strip().lower()
-    if role_key not in ROLE_ORDER:
+    if role_key not in ROLE_MODEL_ORDER:
         raise KeyError(f"Unknown role: {role}")
     return role_key
 
@@ -1917,7 +2085,7 @@ def _thinking_config_text(value: bool | None) -> str:
 
 def _normalized_role_model_values(raw: Any) -> dict[str, str]:
     source = raw if isinstance(raw, dict) else {}
-    values = {role: "" for role in ROLE_ORDER}
+    values = {role: "" for role in ROLE_MODEL_ORDER}
     for key, value in source.items():
         role = str(key).strip().lower()
         if role in values:
@@ -1925,18 +2093,42 @@ def _normalized_role_model_values(raw: Any) -> dict[str, str]:
     return values
 
 
-def _non_empty_role_values(values: dict[str, str]) -> dict[str, str]:
+def _non_empty_role_values(
+    values: dict[str, str],
+    *,
+    roles: tuple[str, ...] = ROLE_MODEL_ORDER,
+) -> dict[str, str]:
     out: dict[str, str] = {}
-    for role in ROLE_ORDER:
+    for role in roles:
         value = str(values.get(role, "")).strip()
         if value:
             out[role] = value
     return out
 
 
+def _role_model_storage_values(
+    raw: Any,
+    values: dict[str, str],
+    *,
+    roles: tuple[str, ...] = ROLE_MODEL_ORDER,
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    source = raw if isinstance(raw, dict) else {}
+    modeled_roles = set(roles)
+    for key, value in source.items():
+        role = str(key).strip().lower()
+        if not role or role in modeled_roles:
+            continue
+        model = str(value).strip()
+        if model:
+            out[role] = model
+    out.update(_non_empty_role_values(values, roles=roles))
+    return out
+
+
 def _role_text_map_from_snapshot(raw: Any) -> dict[str, str]:
     source = raw if isinstance(raw, dict) else {}
-    return {role: str(source.get(role, "")) for role in ROLE_ORDER}
+    return {role: str(source.get(role, "")) for role in ROLE_MODEL_ORDER}
 
 
 def _finite_float(raw: Any, *, fallback: float | None) -> float | None:

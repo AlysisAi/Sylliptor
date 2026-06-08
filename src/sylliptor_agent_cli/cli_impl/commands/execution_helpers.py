@@ -2,6 +2,7 @@
 # Legacy split module: dependencies are synced by cli_surface.py.
 from __future__ import annotations
 
+from ...task_dependencies import infer_ordered_predecessor_dependency
 from .cli_common import *
 
 
@@ -223,6 +224,16 @@ def _task_dependency_blockers(plan: dict[str, Any], task: dict[str, Any]) -> lis
         dep_status = str(dep_task.get("status") or "")
         if dep_status != "done":
             blockers.append(f"{dep_id} ({dep_status or 'unknown'})")
+    tasks = [item for item in plan.get("tasks") or [] if isinstance(item, dict)]
+    inferred = infer_ordered_predecessor_dependency(tasks=tasks, task=task)
+    if inferred is not None and inferred.depends_on not in {str(dep).strip() for dep in deps}:
+        dep_task = find_task(plan, inferred.depends_on)
+        if dep_task is None:
+            blockers.append(f"{inferred.depends_on} (missing, inferred)")
+        else:
+            dep_status = str(dep_task.get("status") or "")
+            if dep_status != "done":
+                blockers.append(f"{inferred.depends_on} ({dep_status or 'unknown'}, inferred)")
     return blockers
 
 

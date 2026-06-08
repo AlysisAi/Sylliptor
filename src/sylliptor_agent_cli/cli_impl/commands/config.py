@@ -34,6 +34,12 @@ def config_show() -> None:
     data["api_key_source"] = "stored" if api_key.source == "stored:legacy" else api_key.source
     data["credentials_path"] = os.fspath(credentials_path())
     data["active_profile"] = str((cfg.extra_fields or {}).get("active_profile") or "")
+    role_models = (cfg.extra_fields or {}).get("role_models")
+    forge_role_models = (cfg.extra_fields or {}).get("forge_role_models")
+    data["role_models"] = dict(role_models) if isinstance(role_models, dict) else {}
+    data["forge_role_models"] = (
+        dict(forge_role_models) if isinstance(forge_role_models, dict) else {}
+    )
     console.print_json(json.dumps(data))
 
 

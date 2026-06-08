@@ -763,7 +763,15 @@ class SessionWebResearchTracker:
             "queries": [query] if query else [],
             "normalized_queries": [normalized_query] if normalized_query else [],
             "backend": "",
+            "backend_adapter": "",
+            "protocol": "",
+            "chat_protocol": "",
+            "search_protocol": "",
             "provider": "",
+            "provider_hosted_search": False,
+            "external_search_provider": "",
+            "citation_count": 0,
+            "source_count": 0,
             "allowed_domains": allowed_domains,
             "external_web_access": external_web_access,
             "response_id": "",
@@ -790,7 +798,15 @@ class SessionWebResearchTracker:
                 "queries": [],
                 "normalized_queries": [],
                 "backend": "",
+                "backend_adapter": "",
+                "protocol": "",
+                "chat_protocol": "",
+                "search_protocol": "",
                 "provider": "",
+                "provider_hosted_search": False,
+                "external_search_provider": "",
+                "citation_count": 0,
+                "source_count": 0,
                 "allowed_domains": [],
                 "external_web_access": None,
                 "response_id": "",
@@ -852,7 +868,30 @@ class SessionWebResearchTracker:
         entry["queries"] = query_list
         entry["normalized_queries"] = normalized_queries
         entry["backend"] = str(result.get("backend") or "").strip()
+        entry["backend_adapter"] = str(
+            result.get("backend_adapter") or result.get("backend") or ""
+        ).strip()
+        entry["protocol"] = str(result.get("protocol") or entry["backend_adapter"]).strip()
+        entry["chat_protocol"] = str(result.get("chat_protocol") or entry["protocol"]).strip()
+        entry["search_protocol"] = str(
+            result.get("search_protocol") or entry["backend_adapter"]
+        ).strip()
         entry["provider"] = str(result.get("backend") or "").strip()
+        entry["provider_hosted_search"] = bool(result.get("provider_hosted_search"))
+        entry["external_search_provider"] = str(
+            result.get("external_search_provider") or ""
+        ).strip()
+        raw_citation_count = result.get("citation_count")
+        if isinstance(raw_citation_count, int):
+            entry["citation_count"] = raw_citation_count
+        else:
+            citations = result.get("citations")
+            entry["citation_count"] = len(citations) if isinstance(citations, list) else 0
+        raw_source_count = result.get("source_count")
+        if isinstance(raw_source_count, int):
+            entry["source_count"] = raw_source_count
+        else:
+            entry["source_count"] = len(returned_sources)
         entry["allowed_domains"] = [
             str(item or "").strip().lower()
             for item in list(result.get("allowed_domains") or entry.get("allowed_domains") or [])

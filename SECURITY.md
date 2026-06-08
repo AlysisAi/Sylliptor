@@ -2,13 +2,13 @@
 
 ## Supported Versions
 
-Sylliptor tracks security support by release line and repository branch. During the
-0.9 beta series, security fixes are handled on the `main` branch and shipped in the
-next beta patch release.
+Sylliptor tracks security support by release line and repository branch. Security
+fixes for the current 0.9 release line are handled on the `main` branch and shipped
+in the next patch release.
 
 | Release line / branch | Supported |
 | --------------------- | --------- |
-| 0.9.x beta / `main`   | Yes       |
+| 0.9.x / `main`        | Yes       |
 | Earlier lines         | No        |
 
 ## Reporting a Vulnerability

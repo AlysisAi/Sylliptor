@@ -19,9 +19,10 @@ from .config import (
 from .diff_paths import parse_patch_changed_files as _parse_patch_changed_files
 from .execution_shared import safe_task_file_component
 from .forge import RunPaths, ensure_execution_dirs, now_iso
+from .llm.base import ChatClient
 from .llm.factory import _resolve_base_url, make_llm_client
-from .llm.openai_compat import LLMError
 from .llm.openai_compat import OpenAICompatClient as _OpenAICompatClient
+from .llm.types import LLMError
 from .model_metadata_policy import (
     ActiveModelRef,
     ModelMetadataPolicyError,
@@ -224,7 +225,7 @@ def _make_review_llm_client(
     cfg: AppConfig,
     api_key: str,
     model_name: str,
-):
+) -> ChatClient:
     temperature = resolve_role_temperature(cfg, role="review")
     if OpenAICompatClient is _OpenAICompatClient:
         return make_llm_client(

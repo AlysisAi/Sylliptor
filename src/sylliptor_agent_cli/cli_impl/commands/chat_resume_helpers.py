@@ -2,6 +2,8 @@
 # Legacy split module: dependencies are synced by cli_surface.py.
 from __future__ import annotations
 
+import copy
+
 from .cli_common import *
 
 
@@ -198,7 +200,7 @@ def _generate_session_summary_with_model(
 
     try:
         from ...llm.factory import make_llm_client
-        from ...llm.openai_compat import LLMError
+        from ...llm.types import LLMError
         from ...model_metadata_policy import (
             ActiveModelRef,
             ModelMetadataPolicyError,
@@ -666,17 +668,85 @@ def _resolve_chat_resume_direct_session_id(*, raw_value: str, sessions_dir: Path
     return normalized_id
 
 
-def _load_chat_resume_messages(path: Path) -> list[dict[str, str]]:
-    out: list[dict[str, str]] = []
+def _load_chat_resume_messages(path: Path) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    pending_tool_calls: list[dict[str, Any]] = []
+    pending_tool_index = 0
 
     def _append_message(role: str, raw_content: Any) -> None:
+        nonlocal pending_tool_calls, pending_tool_index
         if not isinstance(raw_content, str):
             return
         if not raw_content.strip():
             return
+        if role == "user":
+            pending_tool_calls = []
+            pending_tool_index = 0
         if out and out[-1].get("role") == role and out[-1].get("content") == raw_content:
             return
         out.append({"role": role, "content": raw_content})
+
+    def _append_internal_message(raw_message: Any) -> bool:
+        nonlocal pending_tool_calls, pending_tool_index
+        if not isinstance(raw_message, dict):
+            return False
+        role = str(raw_message.get("role") or "").strip()
+        if role not in {"assistant", "user", "tool"}:
+            return False
+        if role != "assistant":
+            return False
+        content = raw_message.get("content")
+        tool_calls = raw_message.get("tool_calls")
+        if not isinstance(content, str) and not isinstance(tool_calls, list):
+            return False
+        message = copy.deepcopy(raw_message)
+        if out and out[-1] == message:
+            return True
+        out.append(message)
+        pending_tool_calls = [call for call in tool_calls or [] if isinstance(call, dict)]
+        pending_tool_index = 0
+        return True
+
+    def _tool_result_content(payload: dict[str, Any]) -> str:
+        raw_content = payload.get("content")
+        if isinstance(raw_content, str):
+            return raw_content
+        if "result" not in payload:
+            return ""
+        try:
+            return json.dumps(
+                payload.get("result"),
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return str(payload.get("result") or "")
+
+    def _append_tool_result(payload: dict[str, Any]) -> None:
+        nonlocal pending_tool_index
+        if not pending_tool_calls:
+            return
+        tool_call_id = str(payload.get("tool_call_id") or "").strip()
+        if not tool_call_id and pending_tool_index < len(pending_tool_calls):
+            tool_call_id = str(pending_tool_calls[pending_tool_index].get("id") or "").strip()
+        pending_ids = {
+            str(call.get("id") or "").strip()
+            for call in pending_tool_calls
+            if str(call.get("id") or "").strip()
+        }
+        if not tool_call_id or (pending_ids and tool_call_id not in pending_ids):
+            return
+        content = _tool_result_content(payload)
+        if not content:
+            return
+        out.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": content,
+            }
+        )
+        pending_tool_index += 1
 
     for event in read_session_events(path):
         if not isinstance(event, dict):
@@ -689,11 +759,17 @@ def _load_chat_resume_messages(path: Path) -> list[dict[str, str]]:
         if event_type == "user_message":
             _append_message("user", _user_message_display_content(payload))
         elif event_type in {"assistant_message", "final", "route_decision"}:
+            if event_type == "assistant_message" and _append_internal_message(
+                payload.get("message")
+            ):
+                continue
             # Some historical/non-repo paths may persist only `final` or `route_decision.reply`.
             content = payload.get("content")
             if not isinstance(content, str) or not content.strip():
                 content = payload.get("reply")
             _append_message("assistant", content)
+        elif event_type == "tool_result":
+            _append_tool_result(payload)
     return out
 
 
@@ -1207,7 +1283,7 @@ def _resume_chat_session(
     *,
     session: Any,
     target_session_id: str,
-) -> tuple[bool, str, list[dict[str, str]]]:
+) -> tuple[bool, str, list[dict[str, Any]]]:
     from ..chat_resume import _resume_chat_session_impl
 
     return _resume_chat_session_impl(

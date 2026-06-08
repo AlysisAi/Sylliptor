@@ -2,12 +2,25 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
-from .direction_change import filter_obsolete_direction_paths
+from .direction_change import detect_direction_change, filter_obsolete_direction_paths
+from .file_classification import (
+    CODE_SCAN_SKIP_DIR_NAMES,
+    is_code_implementation_path,
+    is_symbol_scannable_path,
+    symbol_definition_regex,
+)
+from .planning_constraints import (
+    filter_scope_entries_for_planning_constraints,
+    planning_constraints_from_plan,
+    update_plan_planning_constraints,
+)
 from .swarm_scheduler import canonical_task_status
 from .task_readiness import (
+    TASK_KIND_ANALYSIS_ONLY,
+    classify_task_lifecycle,
     has_runnable_local_file_scope,
     task_readiness_warning,
     task_requires_runnable_file_scope,
@@ -23,37 +36,6 @@ _GLOB_CHARS = ("*", "?", "[")
 _TASK_ID_HINT_RE = re.compile(r"\bT\d+\b", re.IGNORECASE)
 _NON_EXECUTABLE_OBSOLETE_STATUSES = frozenset({"superseded", "invalidated"})
 _SYMBOL_CANDIDATE_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b")
-_SYMBOL_SCAN_EXTENSIONS = frozenset(
-    {
-        ".cjs",
-        ".go",
-        ".js",
-        ".jsx",
-        ".mjs",
-        ".mts",
-        ".py",
-        ".rs",
-        ".ts",
-        ".tsx",
-    }
-)
-_SYMBOL_SCAN_EXCLUDED_DIRS = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".sylliptor",
-        ".venv",
-        "__pycache__",
-        "build",
-        "dist",
-        "node_modules",
-        "target",
-        "vendor",
-    }
-)
 _SYMBOL_CANDIDATE_STOPWORDS = frozenset(
     {
         "add",
@@ -144,6 +126,25 @@ def reconcile_plan_with_workspace(
     changed = False
     warnings: list[str] = []
     task_updates: dict[str, dict[str, Any]] = {}
+    planning_constraints = None
+    constraints_changed = False
+    candidate_constraint_messages = _candidate_user_messages(
+        transcript_tail=transcript_tail,
+        user_text=user_text,
+    )[:4]
+    for constraint_text in reversed(candidate_constraint_messages):
+        planning_constraints, message_changed = update_plan_planning_constraints(
+            plan,
+            text=constraint_text,
+            workspace_context=workspace_context,
+            direction_change=detect_direction_change(constraint_text),
+        )
+        constraints_changed = constraints_changed or message_changed
+    if planning_constraints is None:
+        planning_constraints = planning_constraints_from_plan(plan)
+    if constraints_changed:
+        changed = True
+        warnings.append("Recorded planning scope constraints from latest user direction.")
 
     task_entries = [(index, task) for index, task in enumerate(tasks_raw) if isinstance(task, dict)]
     task_count = len(task_entries)
@@ -398,6 +399,39 @@ def reconcile_plan_with_workspace(
                 if write_symbol_warning:
                     warnings.append(f"Task {task_id}: {write_symbol_warning}")
 
+        estimated_files, estimated_constraint_violations = (
+            filter_scope_entries_for_planning_constraints(
+                estimated_files,
+                task={
+                    **task,
+                    "estimated_files": estimated_files,
+                    "write_scope": estimated_files,
+                },
+                constraints=planning_constraints,
+            )
+        )
+        if estimated_constraint_violations:
+            warnings.append(
+                f"Task {task_id}: dropped estimated_files outside planning constraints: "
+                + ", ".join(
+                    f"{item.path} ({item.classification}; {item.reason_code})"
+                    for item in estimated_constraint_violations[:6]
+                )
+            )
+        write_scope, write_constraint_violations = filter_scope_entries_for_planning_constraints(
+            write_scope,
+            task={**task, "estimated_files": write_scope, "write_scope": write_scope},
+            constraints=planning_constraints,
+        )
+        if write_constraint_violations:
+            warnings.append(
+                f"Task {task_id}: dropped write_scope outside planning constraints: "
+                + ", ".join(
+                    f"{item.path} ({item.classification}; {item.reason_code})"
+                    for item in write_constraint_violations[:6]
+                )
+            )
+
         for path in write_scope:
             if path in task_anchor_set:
                 continue
@@ -405,6 +439,22 @@ def reconcile_plan_with_workspace(
                 warnings.append(
                     f"Task {task_id}: write_scope entry may be suspicious or missing: {path}"
                 )
+
+        lifecycle = classify_task_lifecycle(
+            title=str(task.get("title") or "").strip(),
+            description=str(task.get("description") or "").strip(),
+            acceptance_criteria=_string_list(task.get("acceptance_criteria")),
+            estimated_files=estimated_files,
+            write_scope=write_scope,
+            explicit_analysis_only=True if task.get("analysis_only") is True else None,
+        )
+        if lifecycle.kind == TASK_KIND_ANALYSIS_ONLY:
+            if estimated_files or write_scope:
+                warnings.append(
+                    f"Task {task_id}: cleared file mutation scope for analysis-only/report-only task"
+                )
+            estimated_files = []
+            write_scope = []
 
         if task_requires_runnable_file_scope(
             title=str(task.get("title") or "").strip(),
@@ -430,6 +480,29 @@ def reconcile_plan_with_workspace(
         if write_scope != current_write_scope:
             task["write_scope"] = write_scope
             patch["write_scope"] = write_scope
+        scope_changed = "estimated_files" in patch or "write_scope" in patch
+        should_persist_lifecycle = (
+            scope_changed
+            or "task_kind" in task
+            or "task_kind_reason" in task
+            or lifecycle.kind == TASK_KIND_ANALYSIS_ONLY
+        )
+        if should_persist_lifecycle and task.get("task_kind") != lifecycle.kind:
+            task["task_kind"] = lifecycle.kind
+            patch["task_kind"] = lifecycle.kind
+        if should_persist_lifecycle and task.get("task_kind_reason") != lifecycle.reason_code:
+            task["task_kind_reason"] = lifecycle.reason_code
+            patch["task_kind_reason"] = lifecycle.reason_code
+        if lifecycle.kind == TASK_KIND_ANALYSIS_ONLY and task.get("analysis_only") is not True:
+            task["analysis_only"] = True
+            patch["analysis_only"] = True
+        elif (
+            lifecycle.kind != TASK_KIND_ANALYSIS_ONLY
+            and task.get("analysis_only") is True
+            and task.get("task_kind") != TASK_KIND_ANALYSIS_ONLY
+        ):
+            task.pop("analysis_only", None)
+            patch["analysis_only"] = None
         if patch:
             task_updates[task_id] = patch
             changed = True
@@ -835,33 +908,19 @@ def _iter_symbol_scan_files(workspace_root: Path) -> list[Path]:
             rel_parts = path.resolve().relative_to(workspace_root).parts
         except (OSError, ValueError):
             continue
-        if any(part in _SYMBOL_SCAN_EXCLUDED_DIRS for part in rel_parts):
+        if any(part.casefold() in CODE_SCAN_SKIP_DIR_NAMES for part in rel_parts):
             continue
         if not path.is_file():
             continue
-        if path.suffix.casefold() not in _SYMBOL_SCAN_EXTENSIONS:
+        rel_path = "/".join(part for part in rel_parts if part)
+        if not is_symbol_scannable_path(rel_path):
             continue
         files.append(path)
     return files
 
 
 def _symbol_definition_regex(symbol: str, suffix: str) -> re.Pattern[str]:
-    escaped = re.escape(symbol)
-    if suffix == ".py":
-        return re.compile(rf"(?m)^\s*(?:async\s+def|def|class)\s+{escaped}\b")
-    if suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts"}:
-        return re.compile(
-            rf"(?m)^\s*(?:export\s+)?(?:async\s+)?function\s+{escaped}\b"
-            rf"|^\s*(?:export\s+)?(?:const|let|var)\s+{escaped}\s*="
-            rf"|^\s*(?:export\s+)?class\s+{escaped}\b"
-        )
-    if suffix == ".go":
-        return re.compile(rf"(?m)^\s*func\s+(?:\([^)]*\)\s*)?{escaped}\b")
-    if suffix == ".rs":
-        return re.compile(
-            rf"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:fn|struct|enum|trait)\s+{escaped}\b"
-        )
-    return re.compile(rf"\b{escaped}\b")
+    return symbol_definition_regex(symbol, suffix)
 
 
 def _file_text(path: Path) -> str:
@@ -935,25 +994,6 @@ def _resolve_named_code_file_paths(
         if len(candidate_paths) == 1:
             grounded.extend(candidate_paths)
     return _dedupe_keep_order(grounded)[:3]
-
-
-def _is_probable_test_path(path: str) -> bool:
-    pure = PurePosixPath(path)
-    lowered_name = pure.name.casefold()
-    lowered_parts = {part.casefold() for part in pure.parts}
-    return (
-        "test" in lowered_parts
-        or "tests" in lowered_parts
-        or lowered_name.startswith("test_")
-        or lowered_name.endswith("_test.py")
-        or ".test." in lowered_name
-        or ".spec." in lowered_name
-    )
-
-
-def is_code_implementation_path(path: str) -> bool:
-    pure = PurePosixPath(path)
-    return pure.suffix.casefold() in _SYMBOL_SCAN_EXTENSIONS and not _is_probable_test_path(path)
 
 
 def _is_concrete_code_implementation_path(path: str) -> bool:

@@ -22,6 +22,13 @@
   <a href="https://github.com/sponsors/AlysisAi"><img src="https://img.shields.io/github/sponsors/AlysisAi?label=Sponsor&logo=GitHub" alt="GitHub Sponsors"></a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/AlysisAi/Sylliptor/actions/workflows/ci.yml"><img src="https://github.com/AlysisAi/Sylliptor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://pypi.org/project/sylliptor-agent-cli/"><img src="https://img.shields.io/pypi/v/sylliptor-agent-cli.svg" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/sylliptor-agent-cli/"><img src="https://img.shields.io/pypi/pyversions/sylliptor-agent-cli.svg" alt="Python versions"></a>
+  <a href="https://github.com/AlysisAi/Sylliptor/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/sylliptor-agent-cli.svg" alt="License"></a>
+</p>
+
 ---
 
 ## Why Sylliptor
@@ -72,7 +79,7 @@ sylliptor config set model "your-model"
 sylliptor chat
 ```
 
-On a fresh install, running `sylliptor` opens a 3-step setup wizard for API key, default model, and workspace. Re-run anytime:
+On a fresh install, running `sylliptor` opens a guided setup wizard for provider, API key, default model, optional router model, and workspace. Re-run anytime:
 
 ```bash
 sylliptor setup

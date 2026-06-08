@@ -240,6 +240,76 @@ def test_scheduler_filters_by_dependency_and_only_ids() -> None:
     assert schedule.skipped["T03"] == "filtered by --only"
 
 
+def test_scheduler_respects_inferred_ordered_dependency_without_mutating_plan() -> None:
+    tasks = [
+        {
+            "id": "T01",
+            "title": "Implement auth API",
+            "description": "Add the auth endpoint.",
+            "status": "planned",
+            "dependencies": [],
+            "estimated_files": ["src/auth.py"],
+            "write_scope": ["src/auth.py"],
+        },
+        {
+            "id": "T02",
+            "title": "Then update auth docs",
+            "description": "Then document auth usage after the previous work lands.",
+            "status": "planned",
+            "dependencies": [],
+            "estimated_files": ["docs/auth.md"],
+            "write_scope": ["docs/auth.md"],
+        },
+    ]
+
+    schedule = compute_schedule(
+        base_branch="main",
+        tasks=tasks,
+        parallel=2,
+        max_tasks=None,
+        retry_failed=False,
+    )
+
+    assert [c.task_id for c in schedule.runnable] == ["T01"]
+    assert schedule.skipped["T02"] == "dependency not done: T01 (planned)"
+    assert [b.task_ids for b in schedule.batches] == [["T01"]]
+    assert tasks[1]["dependencies"] == []
+
+
+def test_scheduler_allows_implementation_after_ready_red_regression_precursor() -> None:
+    tasks = [
+        {
+            "id": "T01",
+            "title": "Add red regression tests for slug behavior",
+            "description": "Tests capture the current bug and fail before fix.",
+            "status": "ready_for_merge",
+            "dependencies": [],
+            "estimated_files": ["tests/test_slug.py"],
+            "write_scope": ["tests/test_slug.py"],
+        },
+        {
+            "id": "T02",
+            "title": "Fix slug behavior",
+            "description": "Implement the slugger change.",
+            "status": "planned",
+            "dependencies": ["T01"],
+            "estimated_files": ["slugger.py"],
+            "write_scope": ["slugger.py"],
+        },
+    ]
+
+    schedule = compute_schedule(
+        base_branch="main",
+        tasks=tasks,
+        parallel=2,
+        max_tasks=None,
+        retry_failed=False,
+    )
+
+    assert [c.task_id for c in schedule.runnable] == ["T02"]
+    assert "T02" not in schedule.skipped
+
+
 def test_scheduler_treats_legacy_todo_as_planned_and_respects_retry_failed() -> None:
     tasks = [
         {

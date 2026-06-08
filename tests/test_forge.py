@@ -261,6 +261,23 @@ def test_explicit_path_hint_still_recovers_scope_for_likely_runnable_task(
     assert task["write_scope"] == [expected_path]
 
 
+def test_manual_task_infers_ordered_dependency_from_predecessor_cue() -> None:
+    plan = {"tasks": []}
+
+    first = add_task(
+        plan,
+        title="Update src/calc.py helper behavior",
+        description="Manual planning chat task: Update src/calc.py helper behavior",
+    )
+    second = add_task(
+        plan,
+        title="Update src/app.py caller after helper behavior",
+        description="Manual planning chat task: Update src/app.py caller after helper behavior",
+    )
+
+    assert second["dependencies"] == [first["id"]]
+
+
 @pytest.mark.parametrize(
     ("title", "description", "acceptance"),
     [
@@ -317,6 +334,7 @@ def test_manual_task_allows_analysis_only_scope_free_entry(
 
     assert task["estimated_files"] == []
     assert task["write_scope"] == []
+    assert task["analysis_only"] is True
 
 
 def test_manual_task_rejects_report_only_text_with_mutating_action_clause() -> None:

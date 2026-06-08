@@ -29,7 +29,7 @@ from ..config import (
 )
 from ..forge import RunPaths, now_iso
 from ..llm.factory import make_llm_client
-from ..llm.openai_compat import LLMError, LLMResponse
+from ..llm.types import LLMError, LLMResponse
 from ..model_registry import ModelRegistry
 from ..model_router import ROLE_COMPREHENSION, resolve_model_for_role
 from ..profiles import ProfileSpec, get_profile

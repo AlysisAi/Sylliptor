@@ -455,7 +455,7 @@ def _resume_chat_session(
     *,
     session: Any,
     target_session_id: str,
-) -> tuple[bool, str, list[dict[str, str]]]:
+) -> tuple[bool, str, list[dict[str, Any]]]:
     raw_requested_id = str(target_session_id or "").strip()
     if not raw_requested_id:
         return False, "[red]Usage:[/red] /resume <index|session_id>", []

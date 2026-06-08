@@ -86,12 +86,16 @@ from .swarm_trace import (
     SwarmWorkerTraceSurface,
     build_swarm_trace_event,
 )
+from .task_readiness import TASK_KIND_ANALYSIS_ONLY, classify_task_lifecycle
 from .task_scope import (
-    check_scope,
+    SCRATCH_ARTIFACT_ENV,
+    ScopeViolationDiagnostic,
+    assess_scope_changes,
     is_non_material_untracked_path,
     list_changed_files_including_untracked,
     list_untracked_packaging_metadata_paths,
     normalize_scope_patterns,
+    relocate_known_scratch_artifacts,
 )
 from .verify_gate import (
     ResolvedVerifyCommands,
@@ -180,6 +184,7 @@ class TaskWorkerResult:
     failure_reason: str | None = None
     failure_category: FailureCategory | str | None = None
     scope_violation_files: list[str] | None = None
+    scope_diagnostics: list[dict[str, Any]] | None = None
     allowed_scope: list[str] | None = None
     agent_exit_code: int = 0
     salvaged_nonzero_exit: bool = False
@@ -187,6 +192,8 @@ class TaskWorkerResult:
     agent_exception_summary: str | None = None
     result_kind: str | None = None
     noop_reason: str | None = None
+    task_kind: str | None = None
+    task_lifecycle_reason: str | None = None
 
     @property
     def effective_result_kind(self) -> str:
@@ -234,6 +241,7 @@ class TaskWorkerResult:
             if self.success
             else failure_category_value(self.failure_category),
             "scope_violation_files": self.scope_violation_files,
+            "scope_diagnostics": self.scope_diagnostics,
             "allowed_scope": self.allowed_scope,
             "agent_exit_code": self.agent_exit_code,
             "salvaged_nonzero_exit": self.salvaged_nonzero_exit,
@@ -242,6 +250,8 @@ class TaskWorkerResult:
             "result_kind": self.effective_result_kind,
             "noop_success": self.noop_success,
             "noop_reason": self.noop_reason,
+            "task_kind": self.task_kind,
+            "task_lifecycle_reason": self.task_lifecycle_reason,
         }
 
 
@@ -349,7 +359,11 @@ def _protected_path_violations(paths: list[str], prefixes: list[str]) -> list[st
 
 
 def _scope_violation_message(
-    *, violations: list[str], allowed_scope: list[str], blocked: bool
+    *,
+    violations: list[str],
+    allowed_scope: list[str],
+    blocked: bool,
+    diagnostics: list[dict[str, Any]] | None = None,
 ) -> str:
     violations_preview = ", ".join(violations[:20])
     if len(violations) > 20:
@@ -358,9 +372,48 @@ def _scope_violation_message(
         f"Out-of-scope file changes detected ({len(violations)}): {violations_preview}. "
         f"Allowed scope: {allowed_scope or ['(none)']}."
     )
+    if diagnostics:
+        classes = sorted(
+            {
+                str(item.get("classification") or "unknown")
+                for item in diagnostics
+                if not bool(item.get("allowed"))
+            }
+        )
+        if classes:
+            message += f" Scope classifications: {', '.join(classes)}."
     if blocked:
         message += " Task was blocked due to strict scope isolation."
     return message
+
+
+def _scope_diagnostics_payload(
+    diagnostics: list[ScopeViolationDiagnostic],
+) -> list[dict[str, Any]]:
+    return [item.to_payload() for item in diagnostics]
+
+
+def _scope_recovery_warning(diagnostic: ScopeViolationDiagnostic) -> str:
+    return (
+        "Scope recovery: "
+        f"{diagnostic.classification} for {diagnostic.path} "
+        f"({diagnostic.reason_code}; action={diagnostic.recommended_action})."
+    )
+
+
+def _scratch_artifact_section(scratch_dir: Path) -> str:
+    return "\n".join(
+        [
+            "## Scratch Artifacts",
+            "",
+            "Temporary diagnostic dumps, command-output captures, and ad hoc test logs must not be",
+            "written in the repository root. Use the managed scratch artifact directory below,",
+            f"or `{SCRATCH_ARTIFACT_ENV}` when the shell environment exposes it. Use `/tmp` only",
+            "for throwaway files that do not need to be retained.",
+            f"Managed scratch artifact directory: `{scratch_dir}`.",
+            "",
+        ]
+    )
 
 
 def _merge_changed_files(*path_groups: list[str]) -> list[str]:
@@ -382,10 +435,58 @@ def _task_is_diagnostic_analysis_only(task: dict[str, Any]) -> bool:
     raw_flag = task.get("analysis_only")
     if isinstance(raw_flag, bool):
         return raw_flag
+    lifecycle = classify_task_lifecycle(
+        title=str(task.get("title") or "").strip(),
+        description=str(task.get("description") or "").strip(),
+        acceptance_criteria=[
+            str(item or "")
+            for item in (task.get("acceptance_criteria") or [])
+            if str(item or "").strip()
+        ],
+        estimated_files=[
+            str(item or "")
+            for item in (task.get("estimated_files") or [])
+            if str(item or "").strip()
+        ],
+        write_scope=[
+            str(item or "") for item in (task.get("write_scope") or []) if str(item or "").strip()
+        ],
+    )
+    if lifecycle.kind == TASK_KIND_ANALYSIS_ONLY:
+        return True
     title = str(task.get("title") or "").strip()
     if not title or not _DIAGNOSTIC_TASK_TITLE_RE.search(title):
         return False
     return _MUTATING_TASK_TEXT_RE.search(title) is None
+
+
+def _path_has_cargo_manifest(root: Path, rel_dir: str) -> bool:
+    normalized = str(rel_dir or "").strip().replace("\\", "/").strip("/")
+    candidate = root if not normalized else root / normalized
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return (candidate / "Cargo.toml").is_file()
+
+
+def _is_rust_build_metadata_path_for_repo(root: Path, path: str) -> bool:
+    normalized = str(path or "").strip().replace("\\", "/").strip("/")
+    if not normalized or normalized.startswith("../") or "/../" in normalized:
+        return False
+    parts = [part for part in normalized.split("/") if part]
+    if not parts:
+        return False
+    if parts[-1] == "Cargo.lock":
+        return _path_has_cargo_manifest(root, "/".join(parts[:-1]))
+    if "target" in parts:
+        target_index = parts.index("target")
+        return _path_has_cargo_manifest(root, "/".join(parts[:target_index]))
+    return False
+
+
+def _diagnostic_side_effects_are_rust_build_metadata(root: Path, paths: list[str]) -> bool:
+    return bool(paths) and all(_is_rust_build_metadata_path_for_repo(root, path) for path in paths)
 
 
 def _task_allows_conditional_noop(task: dict[str, Any]) -> bool:
@@ -758,6 +859,24 @@ def run_task_worker(
     verify_path = run_paths.execution_verify_dir / f"{safe_task}.txt"
     baseline_verify_path = run_paths.execution_verify_dir / f"{safe_task}.baseline.txt"
     allowed_scope = normalize_scope_patterns(task, root=worktree_repo_path)
+    task_lifecycle = classify_task_lifecycle(
+        title=task_title,
+        description=str(task.get("description") or "").strip(),
+        acceptance_criteria=[
+            str(item or "")
+            for item in (task.get("acceptance_criteria") or [])
+            if str(item or "").strip()
+        ],
+        estimated_files=[
+            str(item or "")
+            for item in (task.get("estimated_files") or [])
+            if str(item or "").strip()
+        ],
+        write_scope=[
+            str(item or "") for item in (task.get("write_scope") or []) if str(item or "").strip()
+        ],
+        explicit_analysis_only=True if task.get("analysis_only") is True else None,
+    )
     diagnostic_analysis_only = _task_is_diagnostic_analysis_only(task)
     conditional_noop_allowed = _task_allows_conditional_noop(task)
     prompt_verification_enabled = (
@@ -774,6 +893,9 @@ def run_task_worker(
         run_paths=run_paths,
         worktree_repo_path=worktree_repo_path,
     )
+    scratch_artifact_dir = run_paths.execution_dir / "scratch" / safe_task
+    scratch_artifact_dir.mkdir(parents=True, exist_ok=True)
+    scratch_artifact_section = _scratch_artifact_section(scratch_artifact_dir)
     asset_setup_warnings: list[str] = []
     asset_setup_error: str | None = None
     asset_usage_logger = AssetUsageLogger(run_paths=run_paths, task_id=task_id)
@@ -831,7 +953,7 @@ def run_task_worker(
         authoritative_verification_commands=(verify_cmds if prompt_verification_enabled else None),
         api_key=api_key_override,
         subagents_enabled=False,
-        leading_sections=[prepared_knowledge.prompt_section],
+        leading_sections=[scratch_artifact_section, prepared_knowledge.prompt_section],
     )
     asset_allocation: TaskAssetAllocation | None = None
     relevant_assets_section = ""
@@ -894,7 +1016,7 @@ def run_task_worker(
             ),
             api_key=api_key_override,
             subagents_enabled=False,
-            leading_sections=[prepared_knowledge.prompt_section],
+            leading_sections=[scratch_artifact_section, prepared_knowledge.prompt_section],
             relevant_assets_section=relevant_assets_section,
         )
     instruction = instruction_bundle.instruction
@@ -999,9 +1121,9 @@ def run_task_worker(
                     verify_cmds if prompt_verification_enabled else None
                 ),
                 subagents_enabled=False,
+                enforce_explicit_subagent_requests=False,
                 mcp_manager=task_asset_mcp_manager,
             )
-            task_asset_mcp_manager = None
     except Exception as e:  # noqa: BLE001
         run_code = 1
         agent_run_exception = True
@@ -1043,10 +1165,17 @@ def run_task_worker(
         )
         scope_inspection_error = f"scope inspection failed: {e}"
     patch_path.write_text(reporting_diff.patch_text, encoding="utf-8")
+    scratch_scope_diagnostics = relocate_known_scratch_artifacts(
+        root=worktree_repo_path,
+        artifact_dir=scratch_artifact_dir,
+    )
+    relocated_scratch_paths = {item.path for item in scratch_scope_diagnostics}
     changed_files = _merge_changed_files(
         list(reporting_diff.changed_files),
         list_changed_files_including_untracked(worktree_repo_path),
     )
+    if relocated_scratch_paths:
+        changed_files = [path for path in changed_files if path not in relocated_scratch_paths]
     agent_added_non_material_paths: list[str] = []
     if head_before_run and head_after_run and head_after_run != head_before_run:
         agent_added_non_material_paths = [
@@ -1063,6 +1192,7 @@ def run_task_worker(
                 path for path in changed_files if path not in agent_added_non_material_paths
             ]
     warnings: list[str] = list(asset_setup_warnings)
+    warnings.extend(_scope_recovery_warning(item) for item in scratch_scope_diagnostics)
 
     commit_hash: str | None = None
     verify_failed = False
@@ -1070,9 +1200,23 @@ def run_task_worker(
     verify_payload: dict[str, Any] | None = None
     failure_reason: str | None = None
     scope_violation_files: list[str] = []
+    scope_diagnostics: list[dict[str, Any]] = _scope_diagnostics_payload(scratch_scope_diagnostics)
     result_kind: str | None = None
     noop_reason: str | None = None
     material_changes_detected = bool(changed_files)
+    diagnostic_tolerated_side_effects: list[str] = []
+    if (
+        diagnostic_analysis_only
+        and material_changes_detected
+        and _diagnostic_side_effects_are_rust_build_metadata(worktree_repo_path, changed_files)
+    ):
+        diagnostic_tolerated_side_effects = list(changed_files)
+        changed_files = []
+        material_changes_detected = False
+        warnings.append(
+            "Diagnostic analysis-only task produced generated Rust build metadata "
+            f"({', '.join(diagnostic_tolerated_side_effects[:20])}); ignored for merge."
+        )
     nonzero_agent_exit = run_code != 0 and run_err is None and not agent_run_exception
     strict_scope_blocked = False
     success = False
@@ -1155,6 +1299,7 @@ def run_task_worker(
         nonlocal failure_category
         nonlocal changed_files
         nonlocal scope_violation_files
+        nonlocal scope_diagnostics
 
         before_verify_snapshot = snapshot_workspace_tree(worktree_repo_path)
         verify_result = run_task_verification(
@@ -1175,6 +1320,17 @@ def run_task_worker(
             after_snapshot=after_verify_snapshot,
         )
         verify_mutation_paths = list(verify_mutation_diff.changed_files)
+        verify_extra_diagnostics = relocate_known_scratch_artifacts(
+            root=worktree_repo_path,
+            artifact_dir=scratch_artifact_dir,
+        )
+        if verify_extra_diagnostics:
+            relocated_verify_scratch = {item.path for item in verify_extra_diagnostics}
+            verify_mutation_paths = [
+                path for path in verify_mutation_paths if path not in relocated_verify_scratch
+            ]
+            warnings.extend(_scope_recovery_warning(item) for item in verify_extra_diagnostics)
+            scope_diagnostics.extend(_scope_diagnostics_payload(verify_extra_diagnostics))
         verification_ok = True
 
         if verify_mutation_paths:
@@ -1189,12 +1345,15 @@ def run_task_worker(
                 verify_mutation_msg += ", ..."
             verify_mutation_msg += "."
             if scope_mode in {"warn", "strict"}:
-                scope_ok, verify_scope_violations = check_scope(
+                scope_assessment = assess_scope_changes(
                     verify_mutation_paths,
                     allowed_scope,
+                    task=task,
                     root=worktree_repo_path,
                 )
-                if not scope_ok:
+                scope_diagnostics.extend(_scope_diagnostics_payload(scope_assessment.diagnostics))
+                if not scope_assessment.ok:
+                    verify_scope_violations = scope_assessment.blocking_paths
                     scope_violation_files = _merge_changed_files(
                         scope_violation_files,
                         verify_scope_violations,
@@ -1203,6 +1362,7 @@ def run_task_worker(
                         violations=verify_scope_violations,
                         allowed_scope=allowed_scope,
                         blocked=scope_mode == "strict" or fail_on_repo_mutation,
+                        diagnostics=_scope_diagnostics_payload(scope_assessment.diagnostics),
                     )
                     if commit_hash is not None:
                         scope_msg += " Verification commands modified repository state after the task commit."
@@ -1346,13 +1506,28 @@ def run_task_worker(
         else:
             warnings.append(scope_inspection_error)
     if scope_mode in {"warn", "strict"}:
-        scope_ok, violations = check_scope(changed_files, allowed_scope, root=worktree_repo_path)
-        if not scope_ok:
+        scope_assessment = assess_scope_changes(
+            changed_files,
+            allowed_scope,
+            task=task,
+            root=worktree_repo_path,
+            extra_diagnostics=scratch_scope_diagnostics,
+        )
+        changed_files = list(scope_assessment.effective_changed_files)
+        scope_diagnostics = _scope_diagnostics_payload(scope_assessment.diagnostics)
+        for diagnostic in scope_assessment.diagnostics:
+            if diagnostic.allowed and diagnostic.classification != "in_scope":
+                warning = _scope_recovery_warning(diagnostic)
+                if warning not in warnings:
+                    warnings.append(warning)
+        if not scope_assessment.ok:
+            violations = scope_assessment.blocking_paths
             scope_violation_files = list(violations)
             scope_msg = _scope_violation_message(
                 violations=violations,
                 allowed_scope=allowed_scope,
                 blocked=scope_mode == "strict",
+                diagnostics=scope_diagnostics,
             )
             if scope_mode == "strict":
                 strict_scope_blocked = True
@@ -1597,6 +1772,8 @@ def run_task_worker(
         verify_summary=verify_summary,
         verify_payload=verify_payload,
         verify_command_source=verify_command_source,
+        task_kind=task_lifecycle.kind,
+        task_lifecycle_reason=task_lifecycle.reason_code,
         base_branch=base_branch,
         task_branch=task_branch,
         commit_hash=commit_hash,
@@ -1694,6 +1871,7 @@ def run_task_worker(
         failure_reason=failure_reason,
         failure_category=failure_category,
         scope_violation_files=(list(scope_violation_files) if scope_violation_files else None),
+        scope_diagnostics=(list(scope_diagnostics) if scope_diagnostics else None),
         allowed_scope=list(allowed_scope),
         agent_exit_code=run_code,
         salvaged_nonzero_exit=salvaged_nonzero_exit,
@@ -1701,6 +1879,8 @@ def run_task_worker(
         agent_exception_summary=agent_exception_summary,
         result_kind=result_kind,
         noop_reason=noop_reason,
+        task_kind=task_lifecycle.kind,
+        task_lifecycle_reason=task_lifecycle.reason_code,
     )
     issue_paths = changed_files or list(allowed_scope)
     if runtime_artifacts_changed:

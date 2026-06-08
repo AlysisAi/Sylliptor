@@ -255,12 +255,14 @@ def test_tools_command_output_is_concise_and_user_readable(monkeypatch) -> None:
     assert "Top-level readonly/Plan sessions can use ready web tools" in result.output
     assert "Custom tools are managed separately via `sylliptor tool" in result.output
     assert "trust|untrust`" in result.output
-    assert "web_search_mode=off|auto" in result.output
+    assert "web_search_mode=off|auto|native|external" in result.output
     assert "OpenAI Responses" in result.output
     assert "DashScope Chat" in result.output
     assert "Tavily" in result.output
     assert "TAVILY_API_KEY" in result.output
-    assert "legacy `on`" in result.output
+    assert "native` never uses Tavily" in result.output
+    assert "external` uses only external" in result.output
+    assert "Legacy `on`" in result.output
     assert "`web_search_enabled` values still load as `auto`" in result.output
     assert "browser support" not in result.output.lower()
     assert "exa support" not in result.output.lower()

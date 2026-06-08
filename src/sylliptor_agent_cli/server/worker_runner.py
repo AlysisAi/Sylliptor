@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import platform
 import queue
@@ -13,6 +12,7 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
+from ..atomic_io import atomic_write_json
 from ..branding import default_sandbox_docker_image, env_get
 from ..bwrap_etc import ensure_minimal_etc_dir
 from .settings import ServerSettings
@@ -414,10 +414,18 @@ class JobRunner:
             state = self._jobs.get(job_id)
             if state is None:
                 raise ServerStoreError(f"Job not found: {job_id}")
+            status = state.status
+            job_paths = self._job_paths.get(job_id)
+            if (
+                status in _TERMINAL_JOB_STATUSES
+                and job_paths is not None
+                and not job_paths.result_path.exists()
+            ):
+                status = "running" if state.started_at is not None else "queued"
             return JobStatus(
                 job_id=state.job_id,
                 run_id=state.run_id,
-                status=state.status,
+                status=status,
                 created_at=state.created_at,
                 started_at=state.started_at,
                 finished_at=state.finished_at,
@@ -565,10 +573,7 @@ class JobRunner:
             "error": state.error,
             "logs_path": state.logs_path,
         }
-        job_paths.meta_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(job_paths.meta_path, payload)
 
     def _write_result(self, job_paths: JobPaths, state: JobState, *, error: str | None) -> None:
         payload = {
@@ -580,7 +585,4 @@ class JobRunner:
             "started_at": state.started_at,
             "finished_at": state.finished_at,
         }
-        job_paths.result_path.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(job_paths.result_path, payload)

@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -341,7 +342,22 @@ def _commit_repo_update(worktree_repo_path: Path, relative_path: str, content: s
     ).stdout.strip()
 
 
-def test_run_swarm_rejects_concurrent_same_run_writer_and_preserves_artifacts(
+def _thread_diagnostics(
+    *,
+    thread: threading.Thread,
+    result: dict[str, object],
+) -> str:
+    active_threads = ", ".join(
+        f"{item.name}(daemon={item.daemon}, alive={item.is_alive()})"
+        for item in threading.enumerate()
+    )
+    return (
+        f"{thread.name} did not finish cleanly; "
+        f"alive={thread.is_alive()}; result={result!r}; active_threads=[{active_threads}]"
+    )
+
+
+def test_run_swarm_queues_concurrent_same_workspace_writer_and_revalidates_plan(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "repo"
@@ -358,7 +374,10 @@ def test_run_swarm_rejects_concurrent_same_run_writer_and_preserves_artifacts(
     worker_started = threading.Event()
     release_worker = threading.Event()
     first_finished = threading.Event()
+    second_finished = threading.Event()
+    second_worker_started = threading.Event()
     first_result: dict[str, object] = {}
+    second_result: dict[str, object] = {}
 
     def blocking_worker_runner(**kwargs):  # type: ignore[no-untyped-def]
         worktree_repo_path = Path(kwargs["worktree_repo_path"])
@@ -415,65 +434,113 @@ def test_run_swarm_rejects_concurrent_same_run_writer_and_preserves_artifacts(
         finally:
             first_finished.set()
 
-    first_thread = threading.Thread(target=run_first_swarm, daemon=True)
+    first_thread = threading.Thread(
+        target=run_first_swarm,
+        name="forge-concurrent-run-test",
+        daemon=True,
+    )
     first_thread.start()
-    assert worker_started.wait(timeout=10)
-
-    plan_snapshot = paths.plan_json_path.read_text(encoding="utf-8")
-    with pytest.raises(
-        Exception,
-        match="Another Forge execution is already mutating this run",
-    ):
-        run_swarm(
-            paths=paths,
-            plan=load_plan(paths),
-            cfg=AppConfig(model="test-model"),
-            mode="auto",
-            yes=False,
-            max_steps=10,
-            api_key_override="k",
-            no_log=False,
-            parallel=1,
-            base_branch="main",
-            max_tasks=None,
-            max_attempts=None,
-            dry_run=False,
-            keep_worktrees=True,
-            retry_failed=False,
-            retry_changes_requested=False,
-            only=None,
-            retry_merge_conflicts=False,
-            review=False,
-            verify_mode="off",
-            console=_null_console(),
-            worker_runner=lambda **_kwargs: (_ for _ in ()).throw(
-                AssertionError("second swarm execution should not start workers")
-            ),
-            current_branch_fn=lambda _root: "main",
+    try:
+        assert worker_started.wait(timeout=10), _thread_diagnostics(
+            thread=first_thread,
+            result=first_result,
         )
 
-    assert paths.plan_json_path.read_text(encoding="utf-8") == plan_snapshot
-    assert list(paths.execution_dir.glob("worker_results/*.json")) == []
-    assert list(paths.execution_dir.glob("merge_results/*.json")) == []
-    assert not (paths.execution_dir / "swarm_summary.md").exists()
+        def run_second_swarm() -> None:
+            try:
+                second_result["code"] = run_swarm(
+                    paths=paths,
+                    plan=load_plan(paths),
+                    cfg=AppConfig(model="test-model"),
+                    mode="auto",
+                    yes=False,
+                    max_steps=10,
+                    api_key_override="k",
+                    no_log=False,
+                    parallel=1,
+                    base_branch="main",
+                    max_tasks=None,
+                    max_attempts=None,
+                    dry_run=False,
+                    keep_worktrees=True,
+                    retry_failed=False,
+                    retry_changes_requested=False,
+                    only=None,
+                    retry_merge_conflicts=False,
+                    review=False,
+                    verify_mode="off",
+                    console=_null_console(),
+                    worker_runner=lambda **_kwargs: (
+                        second_worker_started.set(),
+                        (_ for _ in ()).throw(
+                            AssertionError("second swarm execution should not start workers")
+                        ),
+                    )[1],
+                    current_branch_fn=lambda _root: "main",
+                )
+            except BaseException as exc:  # noqa: BLE001
+                second_result["exc"] = exc
+            finally:
+                second_finished.set()
 
-    release_worker.set()
-    assert first_finished.wait(timeout=10)
-    first_thread.join(timeout=10)
+        second_thread = threading.Thread(
+            target=run_second_swarm,
+            name="forge-concurrent-run-second-test",
+            daemon=True,
+        )
+        second_thread.start()
+        wait_dir = paths.runtime_dir / "workspace_execution"
+        for _ in range(40):
+            if list(wait_dir.glob("active_execution.waiting.*.json")):
+                break
+            if second_finished.is_set():
+                break
+            threading.Event().wait(0.05)
+        assert list(wait_dir.glob("active_execution.waiting.*.json"))
+        assert not second_finished.is_set()
+        assert not second_worker_started.is_set()
+    finally:
+        release_worker.set()
+        first_thread.join(timeout=10)
+
+    assert first_finished.is_set(), _thread_diagnostics(
+        thread=first_thread,
+        result=first_result,
+    )
+    assert not first_thread.is_alive(), _thread_diagnostics(
+        thread=first_thread,
+        result=first_result,
+    )
 
     assert "exc" not in first_result
     assert first_result["code"] == 0
     assert (repo / "src.txt").read_text(encoding="utf-8") == "after\n"
+    assert second_finished.wait(timeout=10), _thread_diagnostics(
+        thread=second_thread,
+        result=second_result,
+    )
+    assert not second_thread.is_alive(), _thread_diagnostics(
+        thread=second_thread,
+        result=second_result,
+    )
+    assert "exc" not in second_result
+    assert second_result["code"] == 0
+    assert not second_worker_started.is_set()
 
     worker_results = list(paths.execution_dir.glob("worker_results/*.json"))
     merge_results = list(paths.execution_dir.glob("merge_results/*.json"))
     assert [path.name for path in worker_results] == ["T01.json"]
     assert [path.name for path in merge_results] == ["T01.json"]
+    revalidation = json.loads(
+        (paths.execution_dir / "concurrency_revalidation.json").read_text(encoding="utf-8")
+    )
+    assert revalidation["reason_code"] == "queued_execution_revalidated"
+    assert revalidation["plan_reloaded"] is True
     summary = (paths.execution_dir / "swarm_summary.md").read_text(encoding="utf-8")
-    assert "Another Forge execution is already mutating this run" not in summary
+    assert "Another Forge execution is already mutating" not in summary
 
 
-def test_forge_swarm_cli_fails_fast_when_same_run_is_locked(
+def test_forge_swarm_cli_reports_structured_timeout_when_same_run_stays_locked(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -515,7 +582,7 @@ def test_forge_swarm_cli_fails_fast_when_same_run_is_locked(
     result = runner.invoke(
         sylliptor_app,
         ["forge", "swarm", "--path", os.fspath(repo), "--mode", "auto"],
-        env=_env(tmp_path),
+        env={**_env(tmp_path), "SYLLIPTOR_FORGE_LOCK_WAIT_TIMEOUT_S": "0"},
     )
 
     assert result.exit_code == 2
@@ -524,6 +591,75 @@ def test_forge_swarm_cli_fails_fast_when_same_run_is_locked(
     assert list(paths.execution_dir.glob("worker_results/*.json")) == []
     assert list(paths.execution_dir.glob("merge_results/*.json")) == []
     assert not (paths.execution_dir / "swarm_summary.md").exists()
+
+
+def test_forge_swarm_reports_timeout_when_same_workspace_stays_locked_by_another_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    first_paths = create_plan_run(repo)
+    second_paths = create_plan_run(repo)
+    plan = load_plan(second_paths)
+    add_task(plan, title="Task B", estimated_files=["src.txt"], branch="feat/t01-b")
+    save_plan(second_paths, plan)
+    plan_snapshot = second_paths.plan_json_path.read_text(encoding="utf-8")
+    workspace_lock_dir = second_paths.runtime_dir / "workspace_execution"
+    workspace_lock_dir.mkdir(parents=True, exist_ok=True)
+
+    write_run_mutation_lock_metadata(
+        workspace_lock_dir / "active_execution.lock.json",
+        {
+            "schema_version": 1,
+            "run_id": f"workspace:{os.fspath(repo.resolve())}",
+            "mode": "forge_swarm:other:workspace",
+            "kind": "lock",
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "acquired_at": "2026-03-26T00:00:00+00:00",
+            "owner_token": "other-owner",
+            "workspace_root": os.fspath(repo.resolve()),
+            "run_dir": os.fspath(first_paths.run_dir),
+        },
+    )
+
+    monkeypatch.setenv("SYLLIPTOR_FORGE_LOCK_WAIT_TIMEOUT_S", "0")
+    with pytest.raises(
+        Exception, match="Another Forge execution is already mutating this workspace"
+    ):
+        run_swarm(
+            paths=second_paths,
+            plan=load_plan(second_paths),
+            cfg=AppConfig(model="test-model"),
+            mode="auto",
+            yes=False,
+            max_steps=10,
+            api_key_override="k",
+            no_log=False,
+            parallel=1,
+            base_branch=None,
+            max_tasks=None,
+            max_attempts=None,
+            dry_run=False,
+            keep_worktrees=True,
+            retry_failed=False,
+            retry_changes_requested=False,
+            only=None,
+            retry_merge_conflicts=False,
+            review=False,
+            verify_mode="off",
+            console=_null_console(),
+            worker_runner=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("workspace-locked swarm should not start workers")
+            ),
+        )
+
+    assert second_paths.plan_json_path.read_text(encoding="utf-8") == plan_snapshot
+    assert list(second_paths.execution_dir.glob("worker_results/*.json")) == []
+    assert list(second_paths.execution_dir.glob("merge_results/*.json")) == []
+    assert not (second_paths.execution_dir / "swarm_summary.md").exists()
 
 
 def _integration_result(
@@ -5823,6 +5959,394 @@ def test_swarm_defaults_integration_gate_to_warn_mode(tmp_path: Path) -> None:
     assert gate_calls == [("warn", "pre_merge_candidate")]
 
 
+def test_swarm_warn_allows_transient_red_candidate_with_unfinished_dependent(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "workspace"
+    repo.mkdir()
+    _init_git_repo_with_head(repo)
+    (repo / "producer.py").write_text(
+        "def event():\n    return {'type': 'ping', 'data': {}}\n",
+        encoding="utf-8",
+    )
+    (repo / "README.md").write_text("Contract uses type/data.\n", encoding="utf-8")
+    subprocess.run(["git", "-C", repo, "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            repo,
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "contract fixture",
+        ],
+        check=True,
+    )
+
+    paths = create_plan_run(repo)
+    plan = load_plan(paths)
+    producer = add_task(
+        plan,
+        title="Update producer contract",
+        estimated_files=["producer.py"],
+        write_scope=["producer.py"],
+        branch="feat/t01-producer",
+    )
+    docs = add_task(
+        plan,
+        title="Update README contract docs",
+        dependencies=[str(producer["id"])],
+        estimated_files=["README.md"],
+        write_scope=["README.md"],
+        branch="feat/t02-docs",
+    )
+    save_plan(paths, plan)
+
+    gate_batches: list[list[str]] = []
+
+    def fake_worker_runner(**kwargs):  # type: ignore[no-untyped-def]
+        task = kwargs["task"]
+        worktree_repo_path = Path(kwargs["worktree_repo_path"])
+        if str(task["id"]) == str(producer["id"]):
+            commit_hash = _commit_repo_update(
+                worktree_repo_path,
+                "producer.py",
+                "def event():\n    return {'event_type': 'ping', 'payload': {}}\n",
+            )
+            changed_files = ["producer.py"]
+        else:
+            commit_hash = _commit_repo_update(
+                worktree_repo_path,
+                "README.md",
+                "Contract uses event_type/payload.\n",
+            )
+            changed_files = ["README.md"]
+        return _worker_result_for_path(
+            run_paths=paths,
+            task_id=str(task["id"]),
+            branch=str(task["branch"]),
+            worktree_path=worktree_repo_path,
+            success=True,
+            summary="ok",
+            commit_hash=commit_hash,
+            changed_files=changed_files,
+            verify_summary="verification passed (1/1)",
+        )
+
+    def fake_integration_runner(**kwargs):  # type: ignore[no-untyped-def]
+        merged_task_ids = list(kwargs["merged_task_ids"])
+        gate_batches.append(merged_task_ids)
+        passed = len(gate_batches) > 1
+        return _integration_result(
+            paths=paths,
+            batch_index=kwargs["batch_index"],
+            mode=kwargs["mode"],
+            merged_task_ids=merged_task_ids,
+            passed=passed,
+            summary="integration passed" if passed else "README contract still stale",
+            phase=str(kwargs.get("phase") or "post_merge"),
+        )
+
+    code = run_swarm(
+        paths=paths,
+        plan=plan,
+        cfg=AppConfig(model="test-model"),
+        mode="auto",
+        yes=False,
+        max_steps=10,
+        api_key_override="k",
+        no_log=False,
+        parallel=1,
+        base_branch=None,
+        max_tasks=None,
+        max_attempts=None,
+        dry_run=False,
+        keep_worktrees=True,
+        retry_failed=False,
+        retry_changes_requested=False,
+        only=None,
+        retry_merge_conflicts=False,
+        review=False,
+        verify_mode="off",
+        integration_mode="warn",
+        console=_null_console(),
+        worker_runner=fake_worker_runner,
+        integration_runner=fake_integration_runner,
+    )
+
+    assert code == 0
+    assert gate_batches == [
+        [str(producer["id"])],
+        [str(docs["id"])],
+        [str(producer["id"]), str(docs["id"])],
+    ]
+    final_plan = _load_json(paths.plan_json_path)
+    statuses = {entry["id"]: entry["status"] for entry in final_plan["tasks"]}
+    assert statuses[str(producer["id"])] == "done"
+    assert statuses[str(docs["id"])] == "done"
+    summary_json = _load_json(paths.execution_dir / "swarm_summary.json")
+    assert summary_json["status"] == "clean"
+    assert summary_json["clean"] is True
+    assert summary_json["integration"]["final_batch"] == "batch_003"
+    issue_files = list((paths.knowledge_issues_dir / "batch_001").glob("*.md"))
+    assert issue_files
+    assert "event_type/payload" in (repo / "README.md").read_text(encoding="utf-8")
+
+
+def test_swarm_warn_final_repo_failure_reports_non_clean_status(tmp_path: Path) -> None:
+    repo = tmp_path / "workspace"
+    repo.mkdir()
+    _init_git_repo_with_head(repo)
+    (repo / "producer.py").write_text(
+        "def event():\n    return {'type': 'ping', 'data': {}}\n",
+        encoding="utf-8",
+    )
+    (repo / "README.md").write_text("Contract uses type/data.\n", encoding="utf-8")
+    subprocess.run(["git", "-C", repo, "add", "-A"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            repo,
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "contract fixture",
+        ],
+        check=True,
+    )
+
+    paths = create_plan_run(repo)
+    plan = load_plan(paths)
+    producer = add_task(
+        plan,
+        title="Update producer contract",
+        estimated_files=["producer.py"],
+        write_scope=["producer.py"],
+        branch="feat/t01-producer",
+    )
+    docs = add_task(
+        plan,
+        title="Update README contract docs",
+        dependencies=[str(producer["id"])],
+        estimated_files=["README.md"],
+        write_scope=["README.md"],
+        branch="feat/t02-docs",
+    )
+    save_plan(paths, plan)
+
+    gate_phases: list[str] = []
+
+    def fake_worker_runner(**kwargs):  # type: ignore[no-untyped-def]
+        task = kwargs["task"]
+        worktree_repo_path = Path(kwargs["worktree_repo_path"])
+        if str(task["id"]) == str(producer["id"]):
+            commit_hash = _commit_repo_update(
+                worktree_repo_path,
+                "producer.py",
+                "def event():\n    return {'event_type': 'ping', 'payload': {}}\n",
+            )
+            changed_files = ["producer.py"]
+        else:
+            commit_hash = _commit_repo_update(
+                worktree_repo_path,
+                "README.md",
+                "Contract uses event_type/payload.\n",
+            )
+            changed_files = ["README.md"]
+        return _worker_result_for_path(
+            run_paths=paths,
+            task_id=str(task["id"]),
+            branch=str(task["branch"]),
+            worktree_path=worktree_repo_path,
+            success=True,
+            summary="ok",
+            commit_hash=commit_hash,
+            changed_files=changed_files,
+            verify_summary="verification passed (1/1)",
+        )
+
+    def fake_integration_runner(**kwargs):  # type: ignore[no-untyped-def]
+        phase = str(kwargs.get("phase") or "post_merge")
+        gate_phases.append(phase)
+        passed = phase == "pre_merge_candidate" and len(gate_phases) > 1
+        return _integration_result(
+            paths=paths,
+            batch_index=kwargs["batch_index"],
+            mode=kwargs["mode"],
+            merged_task_ids=list(kwargs["merged_task_ids"]),
+            passed=passed,
+            summary="integration passed" if passed else "final repo validation failed",
+            phase=phase,
+        )
+
+    code = run_swarm(
+        paths=paths,
+        plan=plan,
+        cfg=AppConfig(model="test-model"),
+        mode="auto",
+        yes=False,
+        max_steps=10,
+        api_key_override="k",
+        no_log=False,
+        parallel=1,
+        base_branch=None,
+        max_tasks=None,
+        max_attempts=None,
+        dry_run=False,
+        keep_worktrees=True,
+        retry_failed=False,
+        retry_changes_requested=False,
+        only=None,
+        retry_merge_conflicts=False,
+        review=False,
+        verify_mode="off",
+        integration_mode="warn",
+        console=_null_console(),
+        worker_runner=fake_worker_runner,
+        integration_runner=fake_integration_runner,
+    )
+
+    assert code == 1
+    assert gate_phases == ["pre_merge_candidate", "pre_merge_candidate", "final_repo"]
+    final_plan = _load_json(paths.plan_json_path)
+    statuses = {entry["id"]: entry["status"] for entry in final_plan["tasks"]}
+    assert statuses[str(producer["id"])] == "done"
+    assert statuses[str(docs["id"])] == "done"
+    summary_json = _load_json(paths.execution_dir / "swarm_summary.json")
+    assert summary_json["status"] == "integration_failed_warn_mode"
+    assert summary_json["clean"] is False
+    assert summary_json["verification_status"] == "failed_tolerated_by_warn_policy"
+    summary_md = (paths.execution_dir / "swarm_summary.md").read_text(encoding="utf-8")
+    assert "- Run Status: `integration_failed_warn_mode`" in summary_md
+    assert "final repo failed (warn)" in summary_md
+
+
+def test_swarm_batches_expected_red_regression_with_dependent_implementation(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "workspace"
+    repo.mkdir()
+    (repo / "slugger.py").write_text(
+        "def slug(value):\n    return value\n",
+        encoding="utf-8",
+    )
+
+    paths = create_plan_run(repo)
+    plan = load_plan(paths)
+    tests = add_task(
+        plan,
+        title="Add red regression tests for slug behavior",
+        description="Tests capture the current bug and fail before fix.",
+        acceptance_criteria=["The regression test fails before fix and passes after fix."],
+        estimated_files=["tests/test_slugger.py"],
+        write_scope=["tests/test_slugger.py"],
+        branch="feat/t01-red-tests",
+    )
+    impl = add_task(
+        plan,
+        title="Fix slug behavior",
+        description="Implement normalized slug output.",
+        dependencies=[str(tests["id"])],
+        estimated_files=["slugger.py"],
+        write_scope=["slugger.py"],
+        branch="feat/t02-impl",
+    )
+    save_plan(paths, plan)
+
+    gate_batches: list[list[str]] = []
+
+    def fake_worker_runner(**kwargs):  # type: ignore[no-untyped-def]
+        task = kwargs["task"]
+        worktree_repo_path = Path(kwargs["worktree_repo_path"])
+        if str(task["id"]) == str(tests["id"]):
+            test_dir = worktree_repo_path / "tests"
+            test_dir.mkdir(exist_ok=True)
+            (test_dir / "test_slugger.py").write_text(
+                "from slugger import slug\n\n\ndef test_slug_spaces():\n"
+                "    assert slug('Hello World') == 'hello-world'\n",
+                encoding="utf-8",
+            )
+            changed_files = ["tests/test_slugger.py"]
+        else:
+            (worktree_repo_path / "slugger.py").write_text(
+                "def slug(value):\n    return value.strip().lower().replace(' ', '-')\n",
+                encoding="utf-8",
+            )
+            changed_files = ["slugger.py"]
+        subprocess.run(["git", "-C", worktree_repo_path, "add", "-A"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                worktree_repo_path,
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "task update",
+            ],
+            check=True,
+        )
+        return _snapshot_worker_result(run_paths=paths, task=task, changed_files=changed_files)
+
+    def fake_integration_runner(**kwargs):  # type: ignore[no-untyped-def]
+        merged_task_ids = list(kwargs["merged_task_ids"])
+        gate_batches.append(merged_task_ids)
+        return _integration_result(
+            paths=paths,
+            batch_index=kwargs["batch_index"],
+            mode=kwargs["mode"],
+            merged_task_ids=merged_task_ids,
+            passed=True,
+            summary="combined candidate is green",
+            phase=str(kwargs.get("phase") or "post_merge"),
+        )
+
+    code = run_swarm(
+        paths=paths,
+        plan=plan,
+        cfg=AppConfig(model="test-model"),
+        mode="auto",
+        yes=False,
+        max_steps=10,
+        api_key_override="k",
+        no_log=False,
+        parallel=2,
+        base_branch=None,
+        max_tasks=None,
+        max_attempts=None,
+        dry_run=False,
+        keep_worktrees=True,
+        retry_failed=False,
+        retry_changes_requested=False,
+        only=None,
+        retry_merge_conflicts=False,
+        review=False,
+        verify_mode="off",
+        integration_mode="warn",
+        console=_null_console(),
+        worker_runner=fake_worker_runner,
+        integration_runner=fake_integration_runner,
+    )
+
+    assert code == 0
+    assert gate_batches == [[str(tests["id"]), str(impl["id"])]]
+    final_plan = _load_json(paths.plan_json_path)
+    statuses = {entry["id"]: entry["status"] for entry in final_plan["tasks"]}
+    assert statuses[str(tests["id"])] == "done"
+    assert statuses[str(impl["id"])] == "done"
+
+
 def test_swarm_rejects_red_pre_merge_candidate_without_applying_snapshot_batch(
     tmp_path: Path,
 ) -> None:
@@ -6321,6 +6845,7 @@ def test_swarm_accepts_green_pre_merge_candidate_via_real_integration_gate_git_b
             verify_summary="verification disabled (--verify off)",
         )
 
+    integration_command = f"{sys.executable} -m pytest -q -s test_calc.py"
     code = run_swarm(
         paths=paths,
         plan=plan,
@@ -6343,6 +6868,7 @@ def test_swarm_accepts_green_pre_merge_candidate_via_real_integration_gate_git_b
         review=False,
         verify_mode="off",
         integration_mode=None,
+        integration_verify_cmd=[integration_command],
         console=_null_console(),
         worker_runner=worker_runner,
     )
@@ -6357,10 +6883,10 @@ def test_swarm_accepts_green_pre_merge_candidate_via_real_integration_gate_git_b
     assert statuses[str(impl["id"])] == "done"
     assert statuses[str(tests["id"])] == "done"
     result_payload = _load_json(paths.execution_integration_dir / "batch_001" / "result.json")
-    assert result_payload["commands"] == ["pytest -q"]
-    assert result_payload["command_source"] == "repo_scan.likely_test_commands_fallback"
+    assert result_payload["commands"] == [integration_command]
+    assert result_payload["command_source"] == "cli.integration_verify_cmd"
     assert result_payload["passed"] is True
-    assert result_payload["command_results"][0]["command"] == "pytest -q"
+    assert result_payload["command_results"][0]["command"] == integration_command
     assert result_payload["verified_root"].endswith("/_batch_candidates/batch_001/repo")
 
 
@@ -6413,6 +6939,7 @@ def test_swarm_accepts_green_pre_merge_candidate_via_real_integration_gate_snaps
             verify_summary="verification disabled (--verify off)",
         )
 
+    integration_command = f"{sys.executable} -m pytest -q -s test_calc.py"
     code = run_swarm(
         paths=paths,
         plan=plan,
@@ -6435,6 +6962,7 @@ def test_swarm_accepts_green_pre_merge_candidate_via_real_integration_gate_snaps
         review=False,
         verify_mode="off",
         integration_mode=None,
+        integration_verify_cmd=[integration_command],
         console=_null_console(),
         worker_runner=worker_runner,
     )
@@ -6449,8 +6977,8 @@ def test_swarm_accepts_green_pre_merge_candidate_via_real_integration_gate_snaps
     assert statuses[str(impl["id"])] == "done"
     assert statuses[str(tests["id"])] == "done"
     result_payload = _load_json(paths.execution_integration_dir / "batch_001" / "result.json")
-    assert result_payload["commands"] == ["pytest -q"]
-    assert result_payload["command_source"] == "repo_scan.likely_test_commands_fallback"
+    assert result_payload["commands"] == [integration_command]
+    assert result_payload["command_source"] == "cli.integration_verify_cmd"
     assert result_payload["passed"] is True
 
 

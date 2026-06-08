@@ -15,9 +15,8 @@ GROQ_COMPOUND_ADAPTER = "groq_compound"
 MISTRAL_CONVERSATIONS_ADAPTER = "mistral_conversations"
 TAVILY_ADAPTER = "tavily"
 
-VALID_WEB_SEARCH_ADAPTERS: frozenset[str] = frozenset(
+NATIVE_WEB_SEARCH_ADAPTERS: frozenset[str] = frozenset(
     {
-        AUTO_WEB_SEARCH_ADAPTER,
         OPENAI_RESPONSES_ADAPTER,
         XAI_RESPONSES_ADAPTER,
         ANTHROPIC_MESSAGES_ADAPTER,
@@ -30,10 +29,26 @@ VALID_WEB_SEARCH_ADAPTERS: frozenset[str] = frozenset(
         PERPLEXITY_SONAR_ADAPTER,
         GROQ_COMPOUND_ADAPTER,
         MISTRAL_CONVERSATIONS_ADAPTER,
-        TAVILY_ADAPTER,
+    }
+)
+EXTERNAL_WEB_SEARCH_ADAPTERS: frozenset[str] = frozenset({TAVILY_ADAPTER})
+
+VALID_WEB_SEARCH_ADAPTERS: frozenset[str] = frozenset(
+    {
+        AUTO_WEB_SEARCH_ADAPTER,
+        *NATIVE_WEB_SEARCH_ADAPTERS,
+        *EXTERNAL_WEB_SEARCH_ADAPTERS,
     }
 )
 WEB_SEARCH_ADAPTER_CHOICES: tuple[str, ...] = tuple(sorted(VALID_WEB_SEARCH_ADAPTERS))
+
+
+def web_search_adapter_is_native(adapter: str) -> bool:
+    return str(adapter or "").strip().lower() in NATIVE_WEB_SEARCH_ADAPTERS
+
+
+def web_search_adapter_is_external(adapter: str) -> bool:
+    return str(adapter or "").strip().lower() in EXTERNAL_WEB_SEARCH_ADAPTERS
 
 
 def normalize_web_search_adapter(raw: object) -> str:

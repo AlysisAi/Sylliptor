@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -106,8 +107,17 @@ def test_repo_scan_readme_pycon_examples_add_doctest_commands(tmp_path: Path) ->
     scan = scan_workspace(context=resolve_workspace_context(tmp_path))
 
     assert scan.likely_test_commands == [
-        f"{sys.executable} -m doctest README.md",
-        f"{sys.executable} -m pytest --doctest-glob=README.md -q README.md",
+        shlex.join([sys.executable, "-m", "doctest", "README.md"]),
+        shlex.join(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--doctest-glob=README.md",
+                "-q",
+                "README.md",
+            ]
+        ),
     ]
 
 
@@ -172,6 +182,52 @@ def test_repo_scan_prefers_focus_conventions_and_collects_readmes(tmp_path: Path
     assert scan.conventions_path == "packages/api/CONVENTIONS.md"
     assert any("Focus readme" in item["excerpt"] for item in scan.readme_excerpts)
     assert scan.conventions_excerpt == "Keep handlers small."
+
+
+def test_repo_scan_uses_focus_pythonpath_for_subdir_python_tests(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _commit(repo)
+    service = repo / "service"
+    (service / "app").mkdir(parents=True)
+    (service / "tests").mkdir()
+    (service / "app" / "config.py").write_text(
+        "def load_mode():\n    return 'dev'\n",
+        encoding="utf-8",
+    )
+    (service / "tests" / "test_config.py").write_text(
+        "from app.config import load_mode\n\n\ndef test_load_mode():\n    assert load_mode() == 'dev'\n",
+        encoding="utf-8",
+    )
+
+    scan = scan_workspace(context=resolve_workspace_context(service))
+
+    assert scan.focus_relpath == "service"
+    assert scan.likely_test_commands == ["PYTHONPATH=service pytest -q service"]
+
+
+def test_repo_scan_prefers_focus_python_tests_over_root_python_tests(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _commit(repo)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_root.py").write_text(
+        "def test_root():\n    assert True\n",
+        encoding="utf-8",
+    )
+    service = repo / "service"
+    (service / "app").mkdir(parents=True)
+    (service / "tests").mkdir()
+    (service / "app" / "config.py").write_text("VALUE = 'service'\n", encoding="utf-8")
+    (service / "tests" / "test_config.py").write_text(
+        "from app.config import VALUE\n\n\ndef test_config():\n    assert VALUE == 'service'\n",
+        encoding="utf-8",
+    )
+
+    scan = scan_workspace(context=resolve_workspace_context(service))
+
+    assert scan.focus_relpath == "service"
+    assert scan.likely_test_commands == ["PYTHONPATH=service pytest -q service"]
 
 
 def test_repo_scan_likely_test_commands_are_conservative_and_deterministic(tmp_path: Path) -> None:

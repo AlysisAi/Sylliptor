@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-06-08
+
+### Added
+
+- Native API protocols for OpenAI, Anthropic, and Gemini provider profiles.
+- Provider-native and external web search backends, including Tavily when configured.
+- Router model selection in setup and configuration so lightweight routing can use a cheaper model.
+
+### Fixed
+
+- Hardened provider diagnostics, Forge/runtime status reporting, asset display, and cross-platform test behavior.
+- Improved configuration, profile, MCP, hook, and tool output handling for clearer public CLI behavior.
+
 ## [0.9.0b2] - 2026-05-09
 
 ### Fixed

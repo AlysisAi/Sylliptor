@@ -99,7 +99,7 @@ def _create_chat_session(
 
 def _run_chat_command(session: object, command: str) -> tuple[object, str]:
     buffer = io.StringIO()
-    console = Console(file=buffer, force_terminal=False, width=140)
+    console = Console(file=buffer, force_terminal=False, width=4096)
     result = chat_impl_mod._handle_chat_command_impl(
         cli_mod,
         input_text=command,

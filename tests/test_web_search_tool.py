@@ -19,6 +19,10 @@ from sylliptor_agent_cli.tools.web_search import (
 )
 
 
+def _public_resolver(_host: str, _port: int) -> list[str]:
+    return ["93.184.216.34"]
+
+
 def _configured_cfg(
     *,
     mode: str = "auto",
@@ -92,6 +96,14 @@ def test_web_search_returns_structured_openai_result_and_dedupes_sources() -> No
     assert result["query"] == "docs example"
     assert result["answer"] == "Read the official docs."
     assert result["backend"] == "openai_responses"
+    assert result["protocol"] == "openai_compat"
+    assert result["chat_protocol"] == "openai_compat"
+    assert result["search_protocol"] == "openai_responses"
+    assert result["backend_adapter"] == "openai_responses"
+    assert result["provider_hosted_search"] is True
+    assert result["external_search_provider"] is None
+    assert result["citation_count"] == 1
+    assert result["source_count"] == 2
     assert result["model"] == "search-model"
     assert result["response_id"] == "resp_1"
     assert result["sources_truncated"] is False
@@ -139,6 +151,61 @@ def test_web_search_auto_status_falls_back_to_tavily_when_openai_not_ready(
     assert status.provider == "tavily"
     assert status.base_url is None
     assert status.model is None
+    assert runtime is not None
+    assert runtime.provider == "tavily"
+
+
+def test_web_search_auto_status_prefers_native_when_external_is_also_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+
+    status = resolve_web_search_runtime_status(cfg=_configured_cfg(), api_key="main-key")
+    runtime = resolve_web_search_runtime(cfg=_configured_cfg(), api_key="main-key", strict=True)
+
+    assert status.registration_ready is True
+    assert status.provider == "openai_responses"
+    assert runtime is not None
+    assert runtime.provider == "openai_responses"
+
+
+def test_web_search_native_status_never_selects_tavily_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+
+    cfg = _configured_cfg(mode="native", base_url="https://example-proxy.invalid/v1")
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="main-key")
+
+    assert status.mode == "native"
+    assert status.registration_ready is False
+    assert status.provider is None
+    assert status.availability_label == "native-unavailable"
+    assert any("Native mode never falls back to Tavily" in note for note in status.notes)
+    assert not any("TAVILY_API_KEY" in note for note in status.notes)
+
+    with pytest.raises(
+        WebSearchError,
+        match="web_search is not available in native mode.*Native mode never falls back to Tavily",
+    ):
+        resolve_web_search_runtime(cfg=cfg, api_key="main-key", strict=True)
+
+
+def test_web_search_external_status_selects_tavily_and_ignores_ready_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+
+    cfg = _configured_cfg(mode="external")
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="main-key")
+    runtime = resolve_web_search_runtime(cfg=cfg, api_key="main-key", strict=True)
+
+    assert status.mode == "external"
+    assert status.registration_ready is True
+    assert status.provider == "tavily"
     assert runtime is not None
     assert runtime.provider == "tavily"
 
@@ -244,6 +311,60 @@ def test_web_search_explicit_tavily_override_uses_only_tavily(
     assert "explicit adapter selected tavily" in status.notes
 
 
+def test_web_search_native_mode_rejects_explicit_external_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+
+    cfg = AppConfig(
+        model="main-model",
+        base_url="https://api.openai.com/v1",
+        web_search_mode="native",
+        web_search_adapter="tavily",
+    )
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="main-key")
+
+    assert status.mode == "native"
+    assert status.registration_ready is False
+    assert status.provider is None
+    assert "explicit adapter selected tavily" in status.notes
+    assert any("web_search_mode=native is incompatible" in note for note in status.notes)
+
+    with pytest.raises(
+        WebSearchError,
+        match="web_search_mode=native is incompatible with web_search_adapter=tavily",
+    ):
+        resolve_web_search_runtime(cfg=cfg, api_key="main-key", strict=True)
+
+
+def test_web_search_external_mode_rejects_explicit_native_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+
+    cfg = AppConfig(
+        model="main-model",
+        base_url="https://api.openai.com/v1",
+        web_search_mode="external",
+        web_search_adapter="openai_responses",
+    )
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="main-key")
+
+    assert status.mode == "external"
+    assert status.registration_ready is False
+    assert status.provider is None
+    assert "explicit adapter selected openai_responses" in status.notes
+    assert any("web_search_mode=external is incompatible" in note for note in status.notes)
+
+    with pytest.raises(
+        WebSearchError,
+        match="web_search_mode=external is incompatible with web_search_adapter=openai_responses",
+    ):
+        resolve_web_search_runtime(cfg=cfg, api_key="main-key", strict=True)
+
+
 def test_web_search_explicit_dashscope_override_uses_only_dashscope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -315,14 +436,87 @@ def test_web_search_auto_can_fall_back_from_openai_to_tavily_in_same_call(
         cfg=_configured_cfg(),
         api_key="main-key",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "tavily"
+    assert result["protocol"] == "openai_compat"
+    assert result["chat_protocol"] == "openai_compat"
+    assert result["search_protocol"] == "tavily"
+    assert result["backend_adapter"] == "tavily"
+    assert result["provider_hosted_search"] is False
+    assert result["external_search_provider"] == "tavily"
+    assert result["citation_count"] == 1
+    assert result["source_count"] == 1
     assert result["answer"] == "Use the Tavily fallback answer."
     assert result["response_id"] == "tavily_req_2"
     assert result["citations"][0]["start_index"] is None
     assert result["citations"][0]["end_index"] is None
     assert result["sources"][0]["snippet"] == "Fallback snippet"
+
+
+def test_web_search_native_mode_does_not_fallback_to_tavily_in_same_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    seen_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(str(request.url.host))
+        if request.url.host == "api.tavily.com":
+            raise AssertionError("native mode must not call Tavily")
+        return httpx.Response(400, json={"error": {"message": "OpenAI failure"}})
+
+    with pytest.raises(WebSearchError, match="OpenAI failure"):
+        web_search(
+            query="failing docs",
+            cfg=_configured_cfg(mode="native"),
+            api_key="main-key",
+            transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
+        )
+
+    assert seen_hosts == ["api.openai.com"]
+
+
+def test_web_search_external_mode_calls_only_tavily(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    seen_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(str(request.url.host))
+        if request.url.host == "api.openai.com":
+            raise AssertionError("external mode must not call native provider search")
+        return httpx.Response(
+            200,
+            json={
+                "request_id": "external_tavily",
+                "answer": "External Tavily answer.",
+                "results": [
+                    {
+                        "title": "External docs",
+                        "url": "https://docs.example.com/external",
+                        "content": "External snippet",
+                    }
+                ],
+            },
+        )
+
+    result = web_search(
+        query="external docs",
+        cfg=_configured_cfg(mode="external"),
+        api_key="main-key",
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+    )
+
+    assert seen_hosts == ["api.tavily.com"]
+    assert result["backend"] == "tavily"
+    assert result["response_id"] == "external_tavily"
 
 
 def test_web_search_auto_reports_combined_error_when_all_backends_fail(
@@ -347,6 +541,7 @@ def test_web_search_auto_reports_combined_error_when_all_backends_fail(
             cfg=_configured_cfg(),
             api_key="main-key",
             transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
         )
 
 
@@ -378,6 +573,7 @@ def test_web_search_tavily_output_contract_stays_stable(
         api_key="main-key",
         allowed_domains=["docs.example.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result == {
@@ -401,6 +597,14 @@ def test_web_search_tavily_output_contract_stays_stable(
         "queries": ["migration guide"],
         "model": None,
         "backend": "tavily",
+        "protocol": "openai_compat",
+        "chat_protocol": "openai_compat",
+        "search_protocol": "tavily",
+        "backend_adapter": "tavily",
+        "provider_hosted_search": False,
+        "external_search_provider": "tavily",
+        "citation_count": 1,
+        "source_count": 1,
         "allowed_domains": ["docs.example.com"],
         "external_web_access": True,
         "response_id": "tavily_req_3",
@@ -486,6 +690,7 @@ def test_web_search_plumbs_allowed_domains_and_external_access_to_openai_request
         allowed_domains=["docs.python.org"],
         external_web_access=False,
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "openai_responses"
@@ -543,6 +748,7 @@ def test_web_search_dispatches_to_dashscope_chat_backend(
         ),
         api_key="main-key",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "dashscope_chat"
@@ -589,6 +795,7 @@ def test_web_search_dispatches_to_xai_responses_backend(
         ),
         api_key="xai-key",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "xai_responses"
@@ -606,7 +813,7 @@ def test_web_search_dispatches_to_anthropic_messages_backend(
         assert request.headers["x-api-key"] == "ant-key"
         assert request.headers["accept-encoding"] == "identity"
         body = json.loads(request.content.decode("utf-8"))
-        assert body["tools"][0]["type"] == "web_search_20250305"
+        assert body["tools"][0]["type"] == "web_search_20260209"
         assert body["tools"][0]["allowed_domains"] == ["docs.example.com"]
         return httpx.Response(
             200,
@@ -650,6 +857,7 @@ def test_web_search_dispatches_to_anthropic_messages_backend(
         api_key="ant-key",
         allowed_domains=["docs.example.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "anthropic_messages"
@@ -715,6 +923,7 @@ def test_web_search_dispatches_to_gemini_grounding_backend(
         api_key="gem-key",
         allowed_domains=["docs.example.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "gemini_grounding"
@@ -778,6 +987,7 @@ def test_web_search_dispatches_to_openrouter_web_backend(
         api_key="or-key",
         allowed_domains=["docs.example.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "openrouter_web"
@@ -868,6 +1078,7 @@ def test_web_search_dispatches_to_moonshot_kimi_backend(
         api_key="moonshot-key",
         allowed_domains=["docs.example.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "moonshot_kimi"
@@ -936,6 +1147,7 @@ def test_web_search_dispatches_to_zhipu_web_search_backend(
         max_sources=5,
         allowed_domains=["docs.example.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "zhipu_web_search"
@@ -1003,6 +1215,7 @@ def test_web_search_dispatches_to_volcengine_web_search_backend(
         api_key="ark-key",
         allowed_domains=["docs.example.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "volcengine_web_search"
@@ -1058,6 +1271,7 @@ def test_web_search_openrouter_answer_without_sources_falls_back_to_tavily_in_au
         ),
         api_key="or-key",
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "tavily"
@@ -1093,6 +1307,7 @@ def test_web_search_openrouter_answer_without_sources_errors_when_explicit(
             ),
             api_key="or-key",
             transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
         )
 
 
@@ -1134,6 +1349,7 @@ def test_web_search_dispatches_to_perplexity_sonar_backend(
         api_key="pplx-key",
         allowed_domains=["docs.example.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "perplexity_sonar"
@@ -1189,6 +1405,7 @@ def test_web_search_dispatches_to_groq_compound_backend(
         api_key="groq-key",
         allowed_domains=["docs.example.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "groq_compound"
@@ -1238,6 +1455,7 @@ def test_web_search_dispatches_to_mistral_conversations_backend(
         api_key="mistral-key",
         allowed_domains=["docs.example.com"],
         transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
     )
 
     assert result["backend"] == "mistral_conversations"
@@ -1289,6 +1507,7 @@ def test_web_search_does_not_fall_back_to_tavily_when_external_web_access_is_fal
             api_key="main-key",
             external_web_access=False,
             transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
         )
 
 

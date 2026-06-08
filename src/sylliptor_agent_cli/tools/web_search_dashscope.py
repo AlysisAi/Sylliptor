@@ -14,6 +14,7 @@ from ..llm.provider_limits import (
     run_provider_limited_call,
 )
 from ..safety import SafeHttpError, safe_http_request
+from ..safety.safe_http import Resolver
 from ..web_research import extract_public_web_urls, normalize_web_url
 from .http_timeout import build_http_timeout_budget, format_http_timeout_error
 
@@ -283,6 +284,7 @@ def dashscope_chat_search(
     include_domains: list[str] | None = None,
     timeout_s: float = 45.0,
     transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
     provider_key: str | None = None,
     provider_concurrency_caps: dict[str, int] | None = None,
     provider_retry_settings: ProviderRetrySettings | None = None,
@@ -333,6 +335,7 @@ def dashscope_chat_search(
                     headers=headers,
                     json=payload,
                     _transport=transport,  # type: ignore[arg-type]
+                    _resolver=resolver,
                 )
             )
         except httpx.TimeoutException as e:

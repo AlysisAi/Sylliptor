@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..runtime_artifacts import RUNTIME_ARTIFACT_DIR_NAMES
+from ..file_classification import CODE_SCAN_SKIP_DIR_NAMES, symbol_search_backend_for_path
 
 
 class SymbolSearchError(RuntimeError):
@@ -21,23 +21,7 @@ _MAX_RESULTS = 200
 _MAX_FILE_BYTES = 512 * 1024
 _MAX_INLINE_CHARS = 240
 _MAX_NOTE_PATHS = 3
-_DEFAULT_SKIP_DIRS = {
-    ".git",
-    ".venv",
-    "venv",
-    "node_modules",
-    "dist",
-    "build",
-} | set(RUNTIME_ARTIFACT_DIR_NAMES)
-_SUPPORTED_SUFFIX_TO_BACKEND = {
-    ".py": "python_ast",
-    ".js": "js_ts_heuristic",
-    ".jsx": "js_ts_heuristic",
-    ".ts": "js_ts_heuristic",
-    ".tsx": "js_ts_heuristic",
-    ".mjs": "js_ts_heuristic",
-    ".cjs": "js_ts_heuristic",
-}
+_DEFAULT_SKIP_DIRS = set(CODE_SCAN_SKIP_DIR_NAMES)
 _JS_TS_BLOCK_KEYWORDS = {"if", "for", "while", "switch", "catch", "function", "class"}
 _JS_TS_FUNCTION_RE = re.compile(
     r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\("
@@ -54,6 +38,37 @@ _JS_TS_CLASS_FIELD_RE = re.compile(
     r"([A-Za-z_$][\w$]*)\s*(?:\?)?(.*)$"
 )
 _JS_TS_PENDING_ASSIGNMENT_MAX_LINES = 8
+_JAVA_IDENTIFIER = r"[A-Za-z_$][\w$]*"
+_JAVA_ANNOTATION_PREFIX = r"(?:@[A-Za-z_$][\w$.]*(?:\([^)]*\))?\s+)*"
+_JAVA_MODIFIER_PREFIX = (
+    r"(?:(?:public|protected|private|abstract|static|final|sealed|non-sealed|strictfp|"
+    r"synchronized|native|default|transient|volatile)\s+)*"
+)
+_JAVA_GENERIC_METHOD_PREFIX = r"(?:<[^;{}()]+>\s+)?"
+_JAVA_DECL_PREFIX = _JAVA_ANNOTATION_PREFIX + _JAVA_MODIFIER_PREFIX
+_JAVA_TYPE_RE = re.compile(
+    rf"^{_JAVA_DECL_PREFIX}(?P<kind>class|interface|enum|record)\s+"
+    rf"(?P<name>{_JAVA_IDENTIFIER})\b"
+)
+_JAVA_METHOD_RE = re.compile(
+    rf"^{_JAVA_DECL_PREFIX}{_JAVA_GENERIC_METHOD_PREFIX}"
+    rf"(?P<return>[\w$<>\[\].?,\s]+?)\s+(?P<name>{_JAVA_IDENTIFIER})\s*\("
+)
+_JAVA_CONSTRUCTOR_RE = re.compile(rf"^{_JAVA_DECL_PREFIX}(?P<name>{_JAVA_IDENTIFIER})\s*\(")
+_JAVA_BLOCK_KEYWORDS = {
+    "catch",
+    "do",
+    "else",
+    "for",
+    "if",
+    "new",
+    "return",
+    "switch",
+    "synchronized",
+    "throw",
+    "try",
+    "while",
+}
 
 
 @dataclass(frozen=True)
@@ -82,6 +97,12 @@ class _JsTsPendingAssignment:
     rhs_fragments: list[str]
     scope_depth: int
     fallback_kind: str | None = None
+
+
+@dataclass(frozen=True)
+class _JavaTypeScope:
+    name: str
+    body_depth: int
 
 
 def _clip_inline(text: str, *, max_chars: int = _MAX_INLINE_CHARS) -> str:
@@ -909,6 +930,132 @@ def _extract_js_ts_symbols(*, root: Path, path: Path, text: str) -> list[_Symbol
     return symbols
 
 
+def _sanitize_java_line(line: str, *, in_block_comment: bool) -> tuple[str, bool]:
+    out: list[str] = []
+    index = 0
+    quote: str | None = None
+    line_len = len(line)
+    while index < line_len:
+        ch = line[index]
+        nxt = line[index + 1] if index + 1 < line_len else ""
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if quote is not None:
+            if ch == "\\":
+                index += 2
+                continue
+            if ch == quote:
+                quote = None
+            index += 1
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            index += 2
+            continue
+        if ch == "/" and nxt == "/":
+            break
+        if ch in {"'", '"'}:
+            quote = ch
+            index += 1
+            continue
+
+        out.append(ch)
+        index += 1
+
+    return "".join(out), in_block_comment
+
+
+def _extract_java_symbols(*, root: Path, path: Path, text: str) -> list[_SymbolEntry]:
+    rel_path = _rel_path(root, path)
+    symbols: list[_SymbolEntry] = []
+    brace_depth = 0
+    in_block_comment = False
+    pending_type_name: str | None = None
+    type_stack: list[_JavaTypeScope] = []
+
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        sanitized, in_block_comment = _sanitize_java_line(
+            raw_line,
+            in_block_comment=in_block_comment,
+        )
+        stripped = sanitized.strip()
+        if not stripped:
+            continue
+
+        depth_before = brace_depth
+        while type_stack and depth_before < type_stack[-1].body_depth:
+            type_stack.pop()
+
+        if pending_type_name is not None and "{" in stripped:
+            type_stack.append(_JavaTypeScope(name=pending_type_name, body_depth=depth_before + 1))
+            pending_type_name = None
+
+        source_signature = _clip_inline(raw_line.strip())
+        type_match = _JAVA_TYPE_RE.match(stripped)
+        if type_match:
+            type_name = type_match.group("name")
+            symbols.append(
+                _SymbolEntry(
+                    path=rel_path,
+                    line=line_number,
+                    kind="class",
+                    name=type_name,
+                    simple_name=type_name,
+                    signature=source_signature,
+                )
+            )
+            type_tail = stripped[type_match.end() :]
+            if "{" in type_tail:
+                type_stack.append(_JavaTypeScope(name=type_name, body_depth=depth_before + 1))
+            else:
+                pending_type_name = type_name
+        elif type_stack and depth_before == type_stack[-1].body_depth:
+            class_name = type_stack[-1].name
+            method_match = _JAVA_METHOD_RE.match(stripped)
+            method_name = method_match.group("name") if method_match else ""
+            if method_name and method_name not in _JAVA_BLOCK_KEYWORDS:
+                qualified_name = f"{class_name}.{method_name}"
+                symbols.append(
+                    _SymbolEntry(
+                        path=rel_path,
+                        line=line_number,
+                        kind="method",
+                        name=qualified_name,
+                        simple_name=method_name,
+                        signature=source_signature,
+                    )
+                )
+            elif not method_match:
+                constructor_match = _JAVA_CONSTRUCTOR_RE.match(stripped)
+                constructor_name = constructor_match.group("name") if constructor_match else ""
+                if constructor_name == class_name:
+                    qualified_name = f"{class_name}.{constructor_name}"
+                    symbols.append(
+                        _SymbolEntry(
+                            path=rel_path,
+                            line=line_number,
+                            kind="method",
+                            name=qualified_name,
+                            simple_name=constructor_name,
+                            signature=source_signature,
+                        )
+                    )
+
+        brace_depth = max(0, brace_depth + stripped.count("{") - stripped.count("}"))
+        while type_stack and brace_depth < type_stack[-1].body_depth:
+            type_stack.pop()
+
+    return symbols
+
+
 def _matches_query(entry: _SymbolEntry, *, query: str, exact: bool) -> bool:
     if exact:
         return query == entry.name or query == entry.simple_name
@@ -964,7 +1111,7 @@ def symbol_search(
 
     for path in candidate_files:
         rel_path = _rel_path(root, path)
-        backend = _SUPPORTED_SUFFIX_TO_BACKEND.get(path.suffix.lower())
+        backend = symbol_search_backend_for_path(rel_path)
         if backend is None:
             if len(skipped_unsupported) < _MAX_NOTE_PATHS:
                 skipped_unsupported.append(rel_path)
@@ -995,8 +1142,10 @@ def symbol_search(
                 if len(skipped_unparsable) < _MAX_NOTE_PATHS:
                     skipped_unparsable.append(rel_path)
                 continue
-        else:
+        elif backend == "js_ts_heuristic":
             symbols = _extract_js_ts_symbols(root=root, path=path, text=text)
+        else:
+            symbols = _extract_java_symbols(root=root, path=path, text=text)
 
         parsed_files += 1
         parsed_backends.add(backend)
@@ -1041,6 +1190,8 @@ def symbol_search(
         backend_name = "python_ast"
     elif parsed_backends == {"js_ts_heuristic"}:
         backend_name = "js_ts_heuristic"
+    elif parsed_backends == {"java_heuristic"}:
+        backend_name = "java_heuristic"
     elif parsed_backends:
         backend_name = "mixed_static"
     else:

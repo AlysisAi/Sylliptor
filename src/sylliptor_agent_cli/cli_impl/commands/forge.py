@@ -18,6 +18,7 @@ from ...forge import (
 from ...review_gate import ReviewError, review_task
 from . import _patchable
 from ._shared import Mode, _console, _Table
+from .forge_asset_view import forge_asset_view_count, forge_asset_view_entries
 
 
 def _cli_module() -> Any:
@@ -124,40 +125,21 @@ def forge_show(
             )
     console.print(task_table)
 
-    assets = plan.get("assets") or []
-    indexed_assets = []
-    if not assets:
-        try:
-            from ...assets.index import AssetIndex
-
-            indexed_assets = AssetIndex(paths).records(include_deleted=False)
-        except Exception:
-            indexed_assets = []
+    assets = forge_asset_view_entries(paths, plan)
     asset_table = _Table(title="Assets")
+    asset_table.add_column("source")
     asset_table.add_column("stored_path")
     asset_table.add_column("size_bytes")
     if assets:
         for asset in assets:
             asset_table.add_row(
-                str(asset.get("stored_path", "")),
-                str(asset.get("size_bytes", "")),
+                asset.source,
+                asset.stored_path,
+                "" if asset.size_bytes is None else str(asset.size_bytes),
             )
-    elif indexed_assets:
-        for asset in indexed_assets:
-            asset_table.add_row(asset.stored_path, str(asset.size_bytes))
     console.print(asset_table)
-    if assets or indexed_assets:
-        try:
-            from pathlib import Path
-
-            names = [
-                Path(str(asset.get("stored_path", ""))).name
-                for asset in assets
-                if asset.get("stored_path")
-            ]
-            names.extend(asset.original_filename for asset in indexed_assets)
-        except Exception:
-            names = []
+    if assets:
+        names = [asset.display_name for asset in assets if asset.display_name]
         if names:
             console.print(f"Asset files: {', '.join(names)}")
 
@@ -186,7 +168,7 @@ def forge_status(
     table.add_row("plan_json", os.fspath(paths.plan_json_path))
     table.add_row("plan_md", os.fspath(paths.plan_md_path))
     table.add_row("tasks", str(len(plan.get("tasks") or [])))
-    table.add_row("assets", str(len(plan.get("assets") or [])))
+    table.add_row("assets", str(forge_asset_view_count(paths, plan)))
     console.print(table)
 
 

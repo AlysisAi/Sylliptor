@@ -1,12 +1,43 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any
 
+from .file_classification import is_code_implementation_path, is_test_path
+from .task_dependencies import infer_ordered_predecessor_dependency
 from .task_scope import (
     is_explicit_repo_path_pattern,
     normalize_claimed_scope_patterns,
     normalize_repo_path_list,
+)
+
+_EXPECTED_RED_REGRESSION_TEXT_RE = re.compile(
+    r"\b(?:red|known[- ]?failing|expected\s+to\s+fail|fail(?:s|ing)?\s+before\s+fix|"
+    r"regression)\b.{0,120}\btests?\b"
+    r"|\btests?\b.{0,120}\b(?:red|known[- ]?failing|expected\s+to\s+fail|"
+    r"fail(?:s|ing)?\s+before\s+fix|regression)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_SUPPORT_SCOPE_DIRS = frozenset(
+    {
+        ".github",
+        ".sylliptor",
+        "__tests__",
+        "doc",
+        "docs",
+        "example",
+        "examples",
+        "fixture",
+        "fixtures",
+        "note",
+        "notes",
+        "spec",
+        "specs",
+        "test",
+        "tests",
+    }
 )
 
 
@@ -95,12 +126,94 @@ def _preview_items(items: list[str] | tuple[str, ...], *, limit: int = 3) -> str
     return ", ".join(values[:limit]) + f", +{hidden} more"
 
 
-def _to_candidate(task: dict[str, Any]) -> TaskCandidate:
+def _task_text(task: dict[str, Any]) -> str:
+    acceptance = task.get("acceptance_criteria") or []
+    if not isinstance(acceptance, list):
+        acceptance = []
+    return " ".join(
+        part
+        for part in [
+            str(task.get("title") or ""),
+            str(task.get("description") or ""),
+            *(str(item or "") for item in acceptance),
+        ]
+        if part
+    )
+
+
+def _is_test_or_support_scope_path(path: str) -> bool:
+    normalized = str(path or "").strip().replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+    if normalized.endswith("/**"):
+        normalized = normalized[:-3].strip("/")
+    return is_test_path(normalized)
+
+
+def _is_primary_implementation_scope_path(path: str) -> bool:
+    normalized = str(path or "").strip().replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+    if _is_test_or_support_scope_path(normalized):
+        return False
+    if normalized.endswith("/**"):
+        parts = [part.casefold() for part in normalized[:-3].strip("/").split("/") if part]
+        return bool(parts) and not any(
+            part.startswith(".") or part in _SUPPORT_SCOPE_DIRS for part in parts
+        )
+    name = PurePosixPath(normalized).name.casefold()
+    if name in {"readme", "readme.md"} or name.endswith((".md", ".rst", ".txt")):
+        return False
+    if name in {
+        "cargo.toml",
+        "go.mod",
+        "package.json",
+        "pyproject.toml",
+        "requirements.txt",
+        "setup.py",
+    }:
+        return True
+    return is_code_implementation_path(normalized)
+
+
+def _task_has_primary_implementation_scope(task: dict[str, Any]) -> bool:
+    paths = [
+        *normalize_repo_path_list(task.get("estimated_files")),
+        *normalize_repo_path_list(task.get("write_scope")),
+    ]
+    return any(_is_primary_implementation_scope_path(path) for path in paths)
+
+
+def is_expected_red_regression_precursor(task: dict[str, Any]) -> bool:
+    text = _task_text(task)
+    if not _EXPECTED_RED_REGRESSION_TEXT_RE.search(text):
+        return False
+    paths = [
+        *normalize_repo_path_list(task.get("estimated_files")),
+        *normalize_repo_path_list(task.get("write_scope")),
+    ]
+    return bool(paths) and all(_is_test_or_support_scope_path(path) for path in paths)
+
+
+def _effective_dependencies(
+    *,
+    task: dict[str, Any],
+    tasks: list[dict[str, Any]],
+) -> tuple[str, ...]:
+    deps_raw = task.get("dependencies") or []
+    deps = [str(x).strip() for x in deps_raw if str(x).strip()]
+    if not deps:
+        inferred = infer_ordered_predecessor_dependency(tasks=tasks, task=task)
+        if inferred is not None and inferred.depends_on not in deps:
+            deps.append(inferred.depends_on)
+    return tuple(deps)
+
+
+def _to_candidate(task: dict[str, Any], *, tasks: list[dict[str, Any]]) -> TaskCandidate:
     task_id = str(task.get("id") or "").strip()
     title = str(task.get("title") or "").strip()
     status = canonical_task_status(str(task.get("status") or ""))
-    deps_raw = task.get("dependencies") or []
-    deps = tuple(str(x).strip() for x in deps_raw if str(x).strip())
+    deps = _effective_dependencies(task=task, tasks=tasks)
     parallel_group = str(task.get("parallel_group") or "").strip()
     attempts_raw = task.get("attempts")
     try:
@@ -152,6 +265,12 @@ def _deps_done(
         dep = task_by_id.get(dep_id)
         if dep is None:
             return False, f"dependency missing: {dep_id}"
+        if (
+            dep.status == "ready_for_merge"
+            and is_expected_red_regression_precursor(dep.task)
+            and _task_has_primary_implementation_scope(candidate.task)
+        ):
+            continue
         if dep.status != "done":
             return False, f"dependency not done: {dep_id} ({dep.status})"
     return True, ""
@@ -165,7 +284,7 @@ def select_task_candidates(
     max_attempts: int | None = None,
     only_ids: set[str] | None = None,
 ) -> tuple[list[TaskCandidate], list[TaskCandidate], dict[str, str]]:
-    candidates = [_to_candidate(task) for task in tasks]
+    candidates = [_to_candidate(task, tasks=tasks) for task in tasks]
     task_by_id = {c.task_id: c for c in candidates}
 
     runnable: list[TaskCandidate] = []

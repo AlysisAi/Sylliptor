@@ -2,6 +2,7 @@
 # Dependencies are injected at runtime from sylliptor_agent_cli.cli to preserve monkeypatch surfaces.
 from __future__ import annotations
 
+import inspect
 import json
 import os
 from pathlib import Path
@@ -11,11 +12,30 @@ import typer
 from click import get_current_context
 from click.core import ParameterSource
 
+from ..assets import AssetError
+from ..assets.budget_allocator import (
+    TaskAssetAllocation,
+    allocate_task_assets,
+    write_task_asset_allocation,
+)
+from ..assets.surface import build_asset_surface
+from ..assets.usage_logger import AssetUsageLogger
+from ..assets.worker_mirror import TaskAssetMirror, mirror_task_assets
+from ..assets.worker_section import render_relevant_assets_section
+from ..assets.worker_tools import build_worker_asset_mcp_manager, compose_worker_asset_mcp_manager
+from ..error_text import sanitize_error_summary, sanitize_optional_error_summary
+from ..model_registry import ModelRegistry
 from ..plan_validation import PlannerFailedError, raise_for_execution_ready_plan
-from ..run_lock import acquire_run_mutation_guard
 from ..runtime_kind import RuntimeKind
 from ..swarm_orchestrator import acquire_swarm_mutation_guard
 from ..swarm_scheduler import canonical_task_status
+from ..task_readiness import is_clearly_non_mutating_task
+from ..task_scope import (
+    assess_scope_changes,
+    is_non_material_untracked_path,
+    normalize_scope_patterns,
+    relocate_known_scratch_artifacts,
+)
 
 _PROTECTED_GLOBAL_NAMES: set[str] = set()
 
@@ -35,6 +55,15 @@ def _sync_cli_globals(cli_mod: Any) -> None:
 def _path_binding_source() -> str:
     current_ctx = get_current_context(silent=True)
     path_source = current_ctx.get_parameter_source("path") if current_ctx is not None else None
+    if path_source is not None and path_source is not ParameterSource.DEFAULT:
+        return "explicit_path"
+
+    caller = inspect.currentframe()
+    caller = caller.f_back if caller is not None else None
+    path_value = caller.f_locals.get("path") if caller is not None else None
+    if path_value not in (None, ".", Path(".")):
+        return "explicit_path"
+
     if path_source is None or path_source is ParameterSource.DEFAULT:
         return "cwd"
     return "explicit_path"
@@ -47,6 +76,15 @@ def _missing_swarm_run_error(*, binding: WorkspaceBinding) -> ForgeError:
         f"Start with `sylliptor forge plan --path {requested}` or enter Forge "
         "from chat after starting sylliptor inside a project folder."
     )
+
+
+def _print_forge_lock_wait_notice(console: Any, info: dict[str, Any]) -> None:
+    diagnostic = str(info.get("diagnostic") or "").strip()
+    console.print(
+        "[yellow]Forge execution queued:[/yellow] another execution is mutating this workspace; waiting for it to finish."
+    )
+    if diagnostic:
+        console.print(f"[dim]{diagnostic}[/dim]")
 
 
 def _render_planner_reply(
@@ -153,6 +191,89 @@ def _task_declares_explicit_write_scope(task: dict[str, Any]) -> bool:
     if isinstance(raw, str):
         return bool(raw.strip())
     return False
+
+
+def _task_is_analysis_only(task: dict[str, Any]) -> bool:
+    raw_flag = task.get("analysis_only")
+    if isinstance(raw_flag, bool):
+        return raw_flag
+    return is_clearly_non_mutating_task(
+        title=str(task.get("title") or "").strip(),
+        description=str(task.get("description") or "").strip(),
+        acceptance_criteria=[
+            str(item or "")
+            for item in (task.get("acceptance_criteria") or [])
+            if str(item or "").strip()
+        ],
+    )
+
+
+def _empty_forge_exec_task_asset_mirror(
+    workspace_path: Path,
+    *,
+    task_id: str = "",
+) -> TaskAssetMirror:
+    workspace = workspace_path.resolve()
+    return TaskAssetMirror(
+        workspace_path=workspace,
+        manifest_path=workspace / ".sylliptor" / "task_assets" / "manifest.json",
+        primary=[],
+        may_need=[],
+        pinned=[],
+        task_id=task_id,
+    )
+
+
+def _combined_forge_exec_image_paths(
+    *,
+    legacy_paths: list[str],
+    mirror: TaskAssetMirror,
+    allocation: TaskAssetAllocation | None,
+    cfg: Any,
+    role_model: str,
+    model_registry: ModelRegistry,
+    usage_logger: AssetUsageLogger,
+) -> list[str] | None:
+    combined: list[str] = []
+    seen: set[str] = set()
+
+    def _append(path: str) -> None:
+        try:
+            normalized = os.fspath(Path(path).resolve())
+        except OSError:
+            return
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        combined.append(normalized)
+
+    for path in legacy_paths:
+        _append(path)
+    if cfg.assets.worker.inline_images and model_registry.get(role_model).supports_vision:
+        decision_by_id = {
+            decision.asset_id: decision.mode
+            for decision in (allocation.decisions if allocation else [])
+        }
+        max_new = max(0, int(cfg.assets.worker.max_inline_images))
+        added_new = 0
+        for entry in mirror.primary:
+            if entry.kind != "image" or entry.status != "mirrored":
+                continue
+            if decision_by_id.get(entry.asset_id) not in {"full_inline", "focused_extract"}:
+                continue
+            if entry.raw_workspace_path is None or not entry.raw_workspace_path.exists():
+                continue
+            before = len(combined)
+            _append(os.fspath(entry.raw_workspace_path))
+            if len(combined) > before:
+                usage_logger.inline_injection(asset_id=entry.asset_id, kind=entry.kind)
+                added_new += 1
+                if added_new >= max_new:
+                    break
+    max_total = max(0, int(cfg.assets.worker.max_inline_images))
+    if max_total > 0:
+        combined = combined[:max_total]
+    return combined or None
 
 
 def _append_patch_debug_section(patch_path: Path, *, title: str, patch_text: str) -> None:
@@ -595,8 +716,14 @@ def forge_swarm(
                 raise _missing_swarm_run_error(binding=binding) from e
             raise
         plan = load_plan(paths)
-        run_mutation_guard = acquire_swarm_mutation_guard(paths, mode="forge_swarm:cli")
+        run_mutation_guard = acquire_swarm_mutation_guard(
+            paths,
+            mode="forge_swarm:cli",
+            on_wait=lambda info: _print_forge_lock_wait_notice(console, info),
+        )
         try:
+            if bool(getattr(run_mutation_guard, "acquired_after_wait", False)):
+                plan = load_plan(paths)
             reconciliation_result, _ = _reconcile_plan_for_paths(
                 paths=paths,
                 plan=plan,
@@ -846,17 +973,62 @@ def forge_exec(
         raise typer.Exit(code=2)
 
     try:
-        run_mutation_guard = acquire_run_mutation_guard(
-            run_id=paths.run_id,
+        run_mutation_guard = acquire_swarm_mutation_guard(
+            paths,
             mode=f"forge_exec:{task_id}",
-            run_dir=paths.run_dir,
-            workspace_root=paths.root,
+            on_wait=lambda info: _print_forge_lock_wait_notice(console, info),
         )
     except ForgeError as e:
         console.print(f"[red]Forge error:[/red] {e}")
         raise typer.Exit(code=2) from e
 
     try:
+        if bool(getattr(run_mutation_guard, "acquired_after_wait", False)):
+            plan = load_plan(paths)
+            task = find_task(plan, task_id)
+            if task is None:
+                console.print(
+                    "[red]Forge error:[/red] Queued Forge exec revalidated the current plan "
+                    f"and task no longer exists: {task_id}"
+                )
+                raise typer.Exit(code=2)
+            task_status = canonical_task_status(str(task.get("status") or ""))
+            if task_status in {"done", "superseded", "invalidated"}:
+                console.print(
+                    "[red]Forge error:[/red] Queued Forge exec revalidated the current plan "
+                    f"and task is no longer executable ({task_status}): {task_id}."
+                )
+                raise typer.Exit(code=2)
+            run_cfg.model = resolve_model_for_role(
+                cfg=effective,
+                role=ROLE_CODING,
+                plan=plan,
+                prefer_context="forge",
+            )
+            verify_commands = []
+            verify_command_source = None
+            if verify_mode != "off":
+                verify_selection = resolve_authoritative_task_verify_command_selection(
+                    cfg=effective,
+                    verify_cmd=verify_cmd,
+                    task=task,
+                    root=paths.root,
+                    plan_requirements=[
+                        str(item).strip()
+                        for item in (plan.get("requirements") or [])
+                        if str(item).strip()
+                    ],
+                )
+                verify_commands = list(verify_selection.commands)
+                verify_command_source = verify_selection.source
+                run_cfg.verify_commands = list(verify_commands)
+            blockers = _task_dependency_blockers(plan, task)
+            if blockers:
+                console.print(
+                    "[red]Forge error:[/red] Dependencies are not done: " + ", ".join(blockers)
+                )
+                raise typer.Exit(code=2)
+
         pr_base_branch: str | None = None
         pr_task_branch: str | None = None
         commit_hash: str | None = None
@@ -949,10 +1121,57 @@ def forge_exec(
         before_runtime_snapshot: dict[str, str] | None = None
         reporting_baseline: Any | None = None
         recording_surface = RecordingSurface(_make_rich_surface(console=console))
+        asset_setup_error: str | None = None
+        asset_setup_warnings: list[str] = []
+        asset_usage_logger = AssetUsageLogger(run_paths=paths, task_id=task_id)
+        asset_model_registry = ModelRegistry(cfg=run_cfg)
+        asset_surface = (
+            build_asset_surface(
+                cfg=run_cfg,
+                run_paths=paths,
+                model_registry=asset_model_registry,
+            )
+            if run_cfg.assets.enabled
+            else None
+        )
+        task_asset_mirror = _empty_forge_exec_task_asset_mirror(paths.root, task_id=task_id)
+        if asset_surface is not None:
+            try:
+                task_asset_mirror = mirror_task_assets(
+                    task=task,
+                    plan=plan,
+                    surface=asset_surface,
+                    workspace_path=paths.root,
+                )
+            except AssetError as exc:
+                if run_cfg.assets.worker.fail_on_mirror_error:
+                    asset_setup_error = (
+                        f"forge exec asset mirror failed: {sanitize_error_summary(str(exc))}"
+                    )
+                else:
+                    asset_setup_warnings.append(
+                        "forge exec asset mirror skipped: "
+                        f"{sanitize_optional_error_summary(str(exc))}"
+                    )
+        scope_warnings.extend(asset_setup_warnings)
+        for entry in [
+            *task_asset_mirror.primary,
+            *task_asset_mirror.may_need,
+            *task_asset_mirror.pinned,
+        ]:
+            asset_usage_logger.mirror(
+                asset_id=entry.asset_id,
+                kind=entry.kind,
+                status=entry.status,
+            )
+        has_mirrored_task_assets = bool(
+            task_asset_mirror.primary or task_asset_mirror.may_need or task_asset_mirror.pinned
+        )
 
         run_code = 1
-        run_err: str | None = None
+        run_err: str | None = asset_setup_error
         task_mcp_manager: Any | None = None
+        asset_allocation: TaskAssetAllocation | None = None
         try:
             task_mcp_manager = _build_forge_task_scoped_mcp_manager(
                 workspace_root=paths.root,
@@ -982,13 +1201,86 @@ def forge_exec(
                 subagents_enabled=False,
                 leading_sections=[prepared_knowledge.prompt_section, mcp_context_section],
             )
+            relevant_assets_section = ""
+            if asset_surface is not None and task_asset_mirror.primary:
+                asset_allocation = allocate_task_assets(
+                    task=task,
+                    plan=plan,
+                    mirror=task_asset_mirror,
+                    cfg=run_cfg,
+                    model_registry=asset_model_registry,
+                    instruction_token_budget=instruction_bundle.budget.final_instruction_budget,
+                    api_key=api_key_override,
+                )
+                for decision in asset_allocation.decisions:
+                    asset_usage_logger.allocation_decision(
+                        asset_id=decision.asset_id,
+                        mode=decision.mode,
+                    )
+                relevant_assets_section = render_relevant_assets_section(
+                    mirror=task_asset_mirror,
+                    allocation=asset_allocation,
+                    cfg=run_cfg,
+                    surface=asset_surface,
+                    model_registry=asset_model_registry,
+                    api_key=api_key_override,
+                )
+            elif asset_surface is not None and (
+                task_asset_mirror.may_need or task_asset_mirror.pinned
+            ):
+                asset_allocation = TaskAssetAllocation(
+                    task_id=task_id,
+                    decisions=[],
+                    elapsed_ms=0,
+                    model=None,
+                    tokens_used={},
+                    fallback_used=False,
+                    fallback_reason=None,
+                )
+                relevant_assets_section = render_relevant_assets_section(
+                    mirror=task_asset_mirror,
+                    allocation=asset_allocation,
+                    cfg=run_cfg,
+                    surface=asset_surface,
+                    model_registry=asset_model_registry,
+                    api_key=api_key_override,
+                )
+            if relevant_assets_section:
+                instruction_bundle = _build_forge_exec_instruction_bundle(
+                    plan=plan,
+                    task=task,
+                    root=paths.root,
+                    cfg=run_cfg,
+                    role_model=run_cfg.model,
+                    mode=effective_mode,
+                    yes=yes,
+                    deny_write_prefixes=[".sylliptor"],
+                    allow_write_globs=allowed_scope if scope_mode == "strict" else None,
+                    non_interactive=run_non_interactive,
+                    verification_enabled=prompt_verification_enabled,
+                    authoritative_verification_commands=(
+                        verify_commands if prompt_verification_enabled else None
+                    ),
+                    api_key=api_key_override,
+                    subagents_enabled=False,
+                    leading_sections=[prepared_knowledge.prompt_section, mcp_context_section],
+                    relevant_assets_section=relevant_assets_section,
+                )
             instruction = instruction_bundle.instruction
             _write_execution_context_artifact(
                 paths=paths,
                 task_id=task_id,
                 context_text=instruction_bundle.artifact_text,
             )
-            task_image_paths = list(instruction_bundle.image_paths) or None
+            task_image_paths = _combined_forge_exec_image_paths(
+                legacy_paths=list(instruction_bundle.image_paths),
+                mirror=task_asset_mirror,
+                allocation=asset_allocation,
+                cfg=run_cfg,
+                role_model=run_cfg.model,
+                model_registry=asset_model_registry,
+                usage_logger=asset_usage_logger,
+            )
             task_step_budget = _resolve_managed_task_step_budget(
                 cfg=run_cfg,
                 plan=plan,
@@ -1012,39 +1304,52 @@ def forge_exec(
                 paths.root,
                 before_commit=head_before_run,
             )
-            run_code = run_agent(
-                cfg=run_cfg,
-                root=paths.root,
-                instruction=instruction,
-                mode=effective_mode,
-                runtime_kind=RuntimeKind.FORGE_EXEC,
-                yes=yes,
-                max_steps=task_step_budget.resolved_max_steps,
-                no_log=no_log,
-                api_key_override=api_key_override,
-                console=console,
-                surface=recording_surface,
-                image_paths=task_image_paths,
-                deny_write_prefixes=[".sylliptor"],
-                allow_write_globs=allowed_scope if scope_mode == "strict" else None,
-                non_interactive=run_non_interactive,
-                session_log_dir_override=runtime_sessions_dir,
-                session_id_override=runtime_session_id,
-                usage_role=f"forge_exec:{task_id}",
-                enable_compaction=False,
-                enable_tool_output_offload=True,
-                enable_conversation_summarization=True,
-                compaction_profile="execution",
-                enable_chat_turn_step_budget=False,
-                one_shot_execution=True,
-                verification_enabled=prompt_verification_enabled,
-                authoritative_verification_commands=(
-                    verify_commands if prompt_verification_enabled else None
-                ),
-                subagents_enabled=False,
-                mcp_manager=task_mcp_manager,
-            )
-            task_mcp_manager = None
+            if run_err is None:
+                if asset_surface is not None and has_mirrored_task_assets:
+                    task_mcp_manager = compose_worker_asset_mcp_manager(
+                        base_manager=task_mcp_manager,
+                        asset_manager=build_worker_asset_mcp_manager(
+                            cfg=run_cfg,
+                            surface=asset_surface,
+                            model_registry=asset_model_registry,
+                            mirror=task_asset_mirror,
+                            usage_logger=asset_usage_logger,
+                            api_key=api_key_override,
+                        ),
+                    )
+                run_code = run_agent(
+                    cfg=run_cfg,
+                    root=paths.root,
+                    instruction=instruction,
+                    mode=effective_mode,
+                    runtime_kind=RuntimeKind.FORGE_EXEC,
+                    yes=yes,
+                    max_steps=task_step_budget.resolved_max_steps,
+                    no_log=no_log,
+                    api_key_override=api_key_override,
+                    console=console,
+                    surface=recording_surface,
+                    image_paths=task_image_paths,
+                    deny_write_prefixes=[".sylliptor"],
+                    allow_write_globs=allowed_scope if scope_mode == "strict" else None,
+                    non_interactive=run_non_interactive,
+                    session_log_dir_override=runtime_sessions_dir,
+                    session_id_override=runtime_session_id,
+                    usage_role=f"forge_exec:{task_id}",
+                    enable_compaction=False,
+                    enable_tool_output_offload=True,
+                    enable_conversation_summarization=True,
+                    compaction_profile="execution",
+                    enable_chat_turn_step_budget=False,
+                    one_shot_execution=True,
+                    verification_enabled=prompt_verification_enabled,
+                    authoritative_verification_commands=(
+                        verify_commands if prompt_verification_enabled else None
+                    ),
+                    subagents_enabled=False,
+                    enforce_explicit_subagent_requests=False,
+                    mcp_manager=task_mcp_manager,
+                )
         except Exception as e:  # noqa: BLE001
             run_code = 1
             run_err = str(e)
@@ -1093,6 +1398,17 @@ def forge_exec(
             path for path in runtime_artifact_changes if path not in authorized_runtime_side_effects
         ]
         runtime_artifacts_changed = bool(runtime_artifact_changes)
+        if asset_allocation is not None:
+            write_task_asset_allocation(
+                run_paths=paths,
+                allocation=asset_allocation,
+                started_at=started_at,
+            )
+        asset_usage_logger.summary(
+            primary_count=len(task_asset_mirror.primary),
+            may_need_count=len(task_asset_mirror.may_need),
+            pinned_count=len(task_asset_mirror.pinned),
+        )
         try:
             exec_artifacts = _write_exec_log_artifacts(
                 paths=paths,
@@ -1106,7 +1422,10 @@ def forge_exec(
         finally:
             _cleanup_execution_private_sessions_dir(runtime_sessions_dir)
 
-        patch_path = paths.execution_patches_dir / f"{_safe_task_file_component(task_id)}.diff"
+        safe_task_component = _safe_task_file_component(task_id)
+        patch_path = paths.execution_patches_dir / f"{safe_task_component}.diff"
+        scratch_artifact_dir = paths.execution_dir / "scratch" / safe_task_component
+        scratch_artifact_dir.mkdir(parents=True, exist_ok=True)
         success = run_code == 0 and not runtime_artifacts_changed
         pr_report_state_upgraded = False
         head_after_run = head_commit(paths.root) if paths.has_head_commit else None
@@ -1119,7 +1438,14 @@ def forge_exec(
         finally:
             _cleanup_task_local_workspace_baseline(reporting_baseline)
         patch_path.write_text(report_diff.patch_text, encoding="utf-8")
+        scratch_scope_diagnostics = relocate_known_scratch_artifacts(
+            root=paths.root,
+            artifact_dir=scratch_artifact_dir,
+        )
+        relocated_scratch_paths = {item.path for item in scratch_scope_diagnostics}
         changed_files = list(report_diff.changed_files)
+        if relocated_scratch_paths:
+            changed_files = [path for path in changed_files if path not in relocated_scratch_paths]
         agent_added_non_material_paths: list[str] = []
         if head_before_run and head_after_run and head_after_run != head_before_run:
             agent_added_non_material_paths = [
@@ -1148,6 +1474,13 @@ def forge_exec(
         scope_changed_files = pr_material_changed_files if pr else changed_files
         scope_inspection_error = report_diff.inspection_error
         scope_violation_files: list[str] = []
+        scope_diagnostics = [item.to_payload() for item in scratch_scope_diagnostics]
+        for diagnostic in scratch_scope_diagnostics:
+            scope_warnings.append(
+                "Scope recovery: "
+                f"{diagnostic.classification} for {diagnostic.path} "
+                f"({diagnostic.reason_code}; action={diagnostic.recommended_action})."
+            )
         material_changes_detected = bool(pr_material_changed_files)
         nonzero_agent_exit = run_code != 0 and run_err is None
         strict_scope_blocked = False
@@ -1155,6 +1488,9 @@ def forge_exec(
         pr_nonzero_salvage_allowed = False
         pr_nonzero_salvage_attempted = False
         no_material_changes_blocked = False
+        result_kind: str | None = None
+        noop_reason: str | None = None
+        analysis_only_noop_accepted = False
         if scope_mode in {"warn", "strict"}:
             if scope_inspection_error:
                 if scope_mode == "strict":
@@ -1163,16 +1499,43 @@ def forge_exec(
                     run_err = (run_err + "; " if run_err else "") + scope_inspection_error
                 else:
                     scope_warnings.append(scope_inspection_error)
-            scope_ok, violations = check_scope(scope_changed_files, allowed_scope, root=paths.root)
-            if not scope_ok:
+            scope_assessment = assess_scope_changes(
+                scope_changed_files,
+                allowed_scope,
+                task=task,
+                root=paths.root,
+                extra_diagnostics=scratch_scope_diagnostics,
+            )
+            scope_changed_files = list(scope_assessment.effective_changed_files)
+            scope_diagnostics = [item.to_payload() for item in scope_assessment.diagnostics]
+            for diagnostic in scope_assessment.diagnostics:
+                if diagnostic.allowed:
+                    warning = (
+                        "Scope recovery: "
+                        f"{diagnostic.classification} for {diagnostic.path} "
+                        f"({diagnostic.reason_code}; action={diagnostic.recommended_action})."
+                    )
+                    if warning not in scope_warnings:
+                        scope_warnings.append(warning)
+            if not scope_assessment.ok:
+                violations = scope_assessment.blocking_paths
                 scope_violation_files = list(violations)
                 preview = ", ".join(violations[:20])
                 if len(violations) > 20:
                     preview += ", ..."
+                classes = sorted(
+                    {
+                        str(item.get("classification") or "unknown")
+                        for item in scope_diagnostics
+                        if not bool(item.get("allowed"))
+                    }
+                )
                 scope_msg = (
                     f"Out-of-scope file changes detected ({len(violations)}): {preview}. "
                     f"Allowed scope: {allowed_scope or ['(none)']}."
                 )
+                if classes:
+                    scope_msg += f" Scope classifications: {', '.join(classes)}."
                 if scope_mode == "strict":
                     strict_scope_blocked = True
                     success = False
@@ -1187,19 +1550,66 @@ def forge_exec(
         if pr and not runtime_artifacts_changed and not material_changes_detected:
             success = False
 
-        if (
-            not pr
-            and run_code == 0
-            and not runtime_artifacts_changed
-            and not material_changes_detected
-            and _task_declares_explicit_write_scope(task)
-        ):
-            no_material_changes_blocked = True
-            success = False
-            run_err = (run_err + "; " if run_err else "") + (
-                "No material file changes were detected for a task with explicit write_scope. "
-                "The task was rejected because its expected local file update was not produced."
-            )
+        if run_code == 0 and not runtime_artifacts_changed and not material_changes_detected:
+            if _task_is_analysis_only(task):
+                if pr:
+                    if not pr_base_branch:
+                        success = False
+                        run_err = (run_err + "; " if run_err else "") + (
+                            "missing PR base branch context for analysis-only no-op cleanup"
+                        )
+                        merge_result = "not merged: analysis-only no-op cleanup failed"
+                    else:
+                        try:
+                            checkout_branch(
+                                paths.root,
+                                pr_base_branch,
+                                base_branch=pr_base_branch,
+                            )
+                            if (
+                                keep_branch
+                                or not pr_task_branch
+                                or pr_task_branch == pr_base_branch
+                            ):
+                                merge_result = (
+                                    "no merge required (analysis-only no-op; branch kept)"
+                                )
+                            else:
+                                try:
+                                    delete_branch(paths.root, pr_task_branch)
+                                    merge_result = (
+                                        "no merge required (analysis-only no-op; branch deleted)"
+                                    )
+                                except GitOpsError as cleanup_err:
+                                    scope_warnings.append(
+                                        "Branch cleanup warning: "
+                                        f"failed to delete {pr_task_branch}: {cleanup_err}"
+                                    )
+                                    merge_result = (
+                                        "no merge required (analysis-only no-op; "
+                                        f"branch delete warning: {cleanup_err})"
+                                    )
+                            success = True
+                        except GitOpsError as e:
+                            success = False
+                            run_err = (run_err + "; " if run_err else "") + (
+                                f"PR no-op cleanup failed: {e}"
+                            )
+                            merge_result = f"not merged: analysis-only no-op cleanup failed: {e}"
+                else:
+                    success = True
+                if success:
+                    result_kind = "success_noop"
+                    noop_reason = "analysis_only"
+                    analysis_only_noop_accepted = True
+                    verify_summary = "verification skipped: analysis-only task made no changes"
+            elif _task_declares_explicit_write_scope(task):
+                no_material_changes_blocked = True
+                success = False
+                run_err = (run_err + "; " if run_err else "") + (
+                    "No material file changes were detected for a task with explicit write_scope. "
+                    "The task was rejected because its expected local file update was not produced."
+                )
 
         pr_nonzero_salvage_allowed = (
             pr
@@ -1409,15 +1819,27 @@ def forge_exec(
                             f"({len(verify_mutation_paths)}): {preview}."
                         )
                         if scope_mode in {"warn", "strict"}:
-                            scope_ok, verify_scope_violations = check_scope(
+                            scope_assessment = assess_scope_changes(
                                 verify_mutation_paths,
                                 allowed_scope,
+                                task=task,
                                 root=paths.root,
                             )
-                            if not scope_ok:
+                            scope_diagnostics.extend(
+                                item.to_payload() for item in scope_assessment.diagnostics
+                            )
+                            if not scope_assessment.ok:
+                                verify_scope_violations = scope_assessment.blocking_paths
                                 scope_violation_files = _merge_changed_files(
                                     scope_violation_files,
                                     verify_scope_violations,
+                                )
+                                classes = sorted(
+                                    {
+                                        item.classification
+                                        for item in scope_assessment.diagnostics
+                                        if not item.allowed
+                                    }
                                 )
                                 scope_msg = (
                                     f"Out-of-scope file changes detected ({len(verify_scope_violations)}): "
@@ -1430,6 +1852,8 @@ def forge_exec(
                                     " Task was blocked due to strict scope isolation."
                                     " Verification commands modified repository state after the task commit."
                                 )
+                                if classes:
+                                    scope_msg += f" Scope classifications: {', '.join(classes)}."
                                 if scope_mode == "strict":
                                     success = False
                                     commit_hash = None
@@ -1675,6 +2099,8 @@ def forge_exec(
             summary = "Task blocked by strict verification gate."
         elif review_blocked:
             summary = "Task blocked by review gate (changes requested)."
+        elif analysis_only_noop_accepted:
+            summary = "Analysis-only task completed successfully with no repository changes."
         elif run_code == 0 and success:
             summary = "Task execution completed successfully."
         elif pr and can_attempt_pr_flow and run_code == 0:
@@ -1694,6 +2120,7 @@ def forge_exec(
             paths=paths,
             task=task,
             result="success" if success else "failure",
+            result_kind=result_kind,
             summary=summary,
             started_at=started_at,
             finished_at=finished_at,
@@ -1712,6 +2139,7 @@ def forge_exec(
             merge_commit_hash=merge_commit_hash,
             merge_result=merge_result,
             salvaged_nonzero_exit=bool(pr_nonzero_salvage_attempted and success),
+            noop_reason=noop_reason,
             remote_lines=_remote_report_lines(remote_record),
         )
         persisted_capture = persist_execution_knowledge_capture(

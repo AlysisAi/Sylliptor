@@ -9,10 +9,8 @@ from time import perf_counter
 from typing import Any, Literal
 
 from ...config import resolve_role_temperature
-from ...llm.openai_compat import (
-    LLMError,
-    attach_provider_metadata_to_assistant_message,
-)
+from ...llm.metadata import assistant_message_from_response
+from ...llm.types import LLMError
 from ...runtime_kind import RuntimeKind
 from ...step_budget import StepBudgetRequest, resolve_step_budget
 from ...subagents import SubagentDefinition
@@ -282,6 +280,7 @@ def _resolve_subagent_turn_policy(
     *,
     instruction: str,
     subagents_enabled: bool,
+    enforce_explicit_request: bool = True,
     subagent_depth: int,
     subagent_registry: dict[str, SubagentDefinition] | None,
     turn_tools: dict[str, ToolDef],
@@ -304,7 +303,7 @@ def _resolve_subagent_turn_policy(
                 reason=reason,
                 available_subagents=available_names,
             )
-            if explicit_request
+            if explicit_request and enforce_explicit_request
             else _SubagentTurnPolicy(level="off", reason=reason)
         )
     if not subagents_enabled:
@@ -315,7 +314,7 @@ def _resolve_subagent_turn_policy(
                 reason=reason,
                 available_subagents=available_names,
             )
-            if explicit_request
+            if explicit_request and enforce_explicit_request
             else _SubagentTurnPolicy(level="off", reason=reason)
         )
     if "subagent_run" not in turn_tools:
@@ -326,7 +325,7 @@ def _resolve_subagent_turn_policy(
                 reason=reason,
                 available_subagents=available_names,
             )
-            if explicit_request
+            if explicit_request and enforce_explicit_request
             else _SubagentTurnPolicy(level="off", reason=reason)
         )
     if explicit_request:
@@ -759,6 +758,7 @@ def run_turn(
                     non_repo_streamed_text_emitted = True
                 self.surface.on_assistant_token(delta)
 
+            final_assistant_message: dict[str, Any] | None = None
             final_text = _route_reply_for_non_repo_turn(
                 route_decision,
                 explicit_language_override=turn_language_explicit,
@@ -786,7 +786,7 @@ def run_turn(
                     respond_non_repo_turn = _patchable(
                         "_respond_non_repo_turn", _respond_non_repo_turn
                     )
-                    final_text = respond_non_repo_turn(
+                    non_repo_response = respond_non_repo_turn(
                         client=route_client,
                         instruction=instruction,
                         route=route_decision.route,
@@ -802,6 +802,14 @@ def run_turn(
                         stream=self.stream,
                         on_text_delta=_on_non_repo_text_delta if self.stream else None,
                     )
+                    assistant_message_candidate = getattr(
+                        non_repo_response,
+                        "assistant_message",
+                        None,
+                    )
+                    if isinstance(assistant_message_candidate, dict):
+                        final_assistant_message = assistant_message_candidate
+                    final_text = str(non_repo_response or "").strip()
                 except LLMError as err:
                     _record_turn_llm_error(err)
                     raise
@@ -818,8 +826,13 @@ def run_turn(
                     _record_turn_llm_error(err)
                     raise
             assistant_message_emitted = True
-            self.messages.append({"role": "assistant", "content": final_text})
-            self.store.append("assistant_message", {"content": final_text})
+            if final_assistant_message is None:
+                final_assistant_message = {"role": "assistant", "content": final_text}
+            self.messages.append(final_assistant_message)
+            self.store.append(
+                "assistant_message",
+                {"content": final_text, "message": final_assistant_message},
+            )
             self.store.append("final", {"content": final_text})
             _emit_assistant_message_events(
                 self.surface,
@@ -917,6 +930,7 @@ def run_turn(
     subagent_turn_policy = _resolve_subagent_turn_policy(
         instruction=instruction,
         subagents_enabled=self.subagents_enabled,
+        enforce_explicit_request=self.enforce_explicit_subagent_requests,
         subagent_depth=self.subagent_depth,
         subagent_registry=self.subagent_registry,
         turn_tools=turn_tools,
@@ -1291,6 +1305,7 @@ def run_turn(
             names = ", ".join(tc.name for tc in tool_calls[:3])
             if len(tool_calls) > 3:
                 names += ", ..."
+            assistant_message = assistant_message_from_response(resp)
             _phase_update_key(
                 "phase_running_tool_steps",
                 count=len(tool_calls),
@@ -1299,30 +1314,14 @@ def run_turn(
             last_visible_assistant_text = self._emit_assistant_message_if_changed(
                 text=resp.content or "",
                 prior_visible_text=last_visible_assistant_text,
-                extra_payload={"tool_calls": [tc.name for tc in tool_calls]},
+                extra_payload={
+                    "tool_calls": [tc.name for tc in tool_calls],
+                    "message": assistant_message,
+                },
                 streamed_text_emitted=streamed_text_emitted,
             )
             assistant_message_emitted = True
-            self.messages.append(
-                attach_provider_metadata_to_assistant_message(
-                    {
-                        "role": "assistant",
-                        "content": resp.content or "",
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": json.dumps(tc.arguments),
-                                },
-                            }
-                            for tc in tool_calls
-                        ],
-                    },
-                    resp,
-                )
-            )
+            self.messages.append(assistant_message)
 
             step_had_action_progress = False
             step_had_successful_action_progress = False
@@ -1348,6 +1347,7 @@ def run_turn(
                 tool_call_payload: dict[str, Any] = {
                     "name": tc.name,
                     "arguments": tc.arguments,
+                    "tool_call_id": tc.id,
                     "step": step,
                 }
                 tool_call_payload.update(_tool_event_metadata(tool))
@@ -1686,10 +1686,6 @@ def run_turn(
                         meta=meta,
                     )
                 )
-                self.store.append(
-                    "tool_result",
-                    {"name": tc.name, "result": result, "step": step},
-                )
                 content_for_message = json.dumps(
                     result,
                     ensure_ascii=True,
@@ -1732,6 +1728,16 @@ def run_turn(
                                 "error": offload_result.error,
                             },
                         )
+                self.store.append(
+                    "tool_result",
+                    {
+                        "name": tc.name,
+                        "result": result,
+                        "content": content_for_message,
+                        "tool_call_id": tc.id,
+                        "step": step,
+                    },
+                )
                 self.messages.append(
                     {
                         "role": "tool",
@@ -2126,8 +2132,12 @@ def run_turn(
                 assistant_message_emitted = True
                 return _finish_turn(1, reason="subagent_required_retry_exhausted")
             subagent_required_nudges_sent += 1
-            self.messages.append({"role": "assistant", "content": final_text})
-            self.store.append("assistant_message", {"content": final_text})
+            assistant_message = assistant_message_from_response(resp, content=final_text)
+            self.messages.append(assistant_message)
+            self.store.append(
+                "assistant_message",
+                {"content": final_text, "message": assistant_message},
+            )
             nudge = _subagent_required_nudge_message(subagent_turn_policy)
             self.messages.append({"role": "system", "content": nudge})
             self.store.append(
@@ -2263,8 +2273,12 @@ def run_turn(
             one_shot_non_final_continuations += 1
             if fingerprint:
                 non_final_progress_fingerprints.add(fingerprint)
-            self.messages.append({"role": "assistant", "content": final_text})
-            self.store.append("assistant_message", {"content": final_text})
+            assistant_message = assistant_message_from_response(resp, content=final_text)
+            self.messages.append(assistant_message)
+            self.store.append(
+                "assistant_message",
+                {"content": final_text, "message": assistant_message},
+            )
             continuation_nudge = _runtime_text(continuation_nudge_key)
             self.messages.append({"role": "system", "content": continuation_nudge})
             self.store.append(
@@ -2445,8 +2459,12 @@ def run_turn(
 
                 execution_state.increment_repair_attempts_for_stage(gate_stage)
                 if final_text:
-                    self.messages.append({"role": "assistant", "content": final_text})
-                    self.store.append("assistant_message", {"content": final_text})
+                    assistant_message = assistant_message_from_response(resp, content=final_text)
+                    self.messages.append(assistant_message)
+                    self.store.append(
+                        "assistant_message",
+                        {"content": final_text, "message": assistant_message},
+                    )
                 nudge = _completion_gate_nudge_message(
                     gate_problems,
                     prefix_key=completion_gate_nudge_prefix_key,
@@ -2512,6 +2530,7 @@ def run_turn(
             _phase_update_key("phase_writing_final_response")
         self._emit_final_assistant_text(
             final_text=final_text,
+            assistant_response=resp,
             language=turn_language,
             script=turn_script,
             explicit_language_override=turn_language_explicit,

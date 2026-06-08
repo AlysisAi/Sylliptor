@@ -142,6 +142,7 @@ Common keys:
 - `task_max_steps`
 - `stream`
 - `routing_mode`
+- `role_models.router`
 - `subagents_enabled`
 - `custom_tools_enabled`
 - `web_search_mode`
@@ -160,6 +161,7 @@ Useful environment overrides:
 - `SYLLIPTOR_CONFIG_DIR`: overrides the user config directory used for `config.json`, `credentials.json`, and the MCP OAuth token store.
 - `SYLLIPTOR_BASE_URL`
 - `SYLLIPTOR_MODEL`
+- `SYLLIPTOR_MODEL_ROUTER`
 - `SYLLIPTOR_LLM_TIMEOUT_S`
 - `SYLLIPTOR_ROUTING_MODE`
 - `SYLLIPTOR_WEB_SEARCH_API_KEY`
@@ -167,6 +169,10 @@ Useful environment overrides:
 - `SYLLIPTOR_WEB_SEARCH_MODEL`
 - `SYLLIPTOR_WEB_SEARCH_TIMEOUT_S`
 - `TAVILY_API_KEY`
+
+`role_models.router` overrides the model used for lightweight routing. Leave it
+unset to inherit `model`, or set it to a smaller/cheaper model while keeping the
+main coding model stronger.
 
 ## Profiles
 
@@ -177,11 +183,14 @@ Useful commands:
 
 ```bash
 sylliptor profile presets
-sylliptor profile preset anthropic
-sylliptor profile set-key anthropic --stdin
-sylliptor profile use anthropic
+sylliptor profile preset <provider-preset>
+sylliptor profile set-key <profile> --stdin
+sylliptor profile use <profile>
 sylliptor profile list
 ```
+
+OpenAI, Anthropic, and Gemini profiles can use their native API protocols.
+Other provider and gateway profiles use the OpenAI-compatible protocol.
 
 Presets are convenience templates, not hard constraints. Custom profiles can
 point at model provider endpoints.
@@ -216,11 +225,8 @@ document retrieval.
 
 `web_search` is a discovery tool. It appears only when search is enabled and a
 supported backend is ready. In this public build, web search is available
-through:
-
-- OpenAI Responses when configured for search
-- supported DashScope/Qwen web-search endpoints
-- Tavily when `TAVILY_API_KEY` is set
+through supported provider-native search adapters and external backends such as
+Tavily when configured.
 
 Other chat provider profiles can still be valid model providers without being
 native `web_search` backends.
@@ -331,6 +337,8 @@ running it.
 
 - If `sylliptor chat` shows a network or model error, verify the API key, base
   URL, model name, and network access.
+- If provider setup fails, run `sylliptor doctor providers` for redacted
+  provider diagnostics.
 - If shell commands cannot run, check the selected execution mode and sandbox
   setup.
 - If web search is unavailable, run `sylliptor tools` and check `web_search`

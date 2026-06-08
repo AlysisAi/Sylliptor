@@ -15,7 +15,8 @@ from ..language_policy import (
     normalize_language_name,
     normalize_script_name,
 )
-from ..llm.openai_compat import LLMError, attach_provider_metadata_to_assistant_message
+from ..llm.metadata import assistant_message_from_response
+from ..llm.types import LLMError
 from ..runtime_kind import RuntimeKind
 from ..session_store import SessionStore
 from ..surface import ToolEndEvent, ToolOutputEvent, ToolStartEvent
@@ -1142,6 +1143,20 @@ def _route_reply_for_non_repo_turn(
     return reply
 
 
+class _NonRepoResponseText(str):
+    assistant_message: dict[str, Any] | None
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        assistant_message: dict[str, Any] | None = None,
+    ) -> _NonRepoResponseText:
+        obj = str.__new__(cls, value)
+        obj.assistant_message = assistant_message
+        return obj
+
+
 def _respond_non_repo_turn(
     *,
     client: Any,
@@ -1202,34 +1217,32 @@ def _respond_non_repo_turn(
 
         tool_calls = list(getattr(response, "tool_calls", []) or [])
         if not tool_calls:
-            return str(getattr(response, "content", "") or "").strip()
-
-        messages.append(
-            attach_provider_metadata_to_assistant_message(
-                {
-                    "role": "assistant",
-                    "content": str(getattr(response, "content", "") or ""),
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
-                },
-                response,
+            content = str(getattr(response, "content", "") or "").strip()
+            return _NonRepoResponseText(
+                content,
+                assistant_message=(
+                    assistant_message_from_response(response, content=content) if content else None
+                ),
             )
-        )
+
+        assistant_message = assistant_message_from_response(response)
+        messages.append(assistant_message)
+        if store is not None:
+            store.append(
+                "assistant_message",
+                {
+                    "content": str(getattr(response, "content", "") or ""),
+                    "tool_calls": [tc.name for tc in tool_calls],
+                    "message": assistant_message,
+                },
+            )
         for tc in tool_calls:
             tool = active_tool_defs.get(tc.name)
             if store is not None:
                 payload: dict[str, Any] = {
                     "name": tc.name,
                     "arguments": tc.arguments,
+                    "tool_call_id": tc.id,
                     "step": step,
                 }
                 payload.update(_tool_event_metadata(tool))
@@ -1296,12 +1309,24 @@ def _respond_non_repo_turn(
                     )
                 )
             if store is not None:
-                store.append("tool_result", {"name": tc.name, "result": result, "step": step})
+                content_for_message = json.dumps(result, ensure_ascii=True, separators=(",", ":"))
+                store.append(
+                    "tool_result",
+                    {
+                        "name": tc.name,
+                        "result": result,
+                        "content": content_for_message,
+                        "tool_call_id": tc.id,
+                        "step": step,
+                    },
+                )
+            else:
+                content_for_message = json.dumps(result, ensure_ascii=True, separators=(",", ":"))
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": json.dumps(result, ensure_ascii=True, separators=(",", ":")),
+                    "content": content_for_message,
                 }
             )
     return ""

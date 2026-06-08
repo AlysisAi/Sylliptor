@@ -5,7 +5,14 @@ from pathlib import Path
 
 from sylliptor_agent_cli.runtime_artifacts import is_runtime_artifact_path
 from sylliptor_agent_cli.task_scope import (
+    SCOPE_CLASS_DANGEROUS_UNRELATED,
+    SCOPE_CLASS_EXPECTED_COMPANION,
+    SCOPE_CLASS_FORBIDDEN,
+    SCOPE_CLASS_LIKELY_MISSING_SCOPE,
+    assess_scope_changes,
     check_scope,
+    companion_generated_paths_for,
+    extract_forbidden_repo_path_hint_records,
     extract_forbidden_repo_path_hints,
     extract_repo_path_hints,
     is_agent_internal_scope_path,
@@ -17,6 +24,7 @@ from sylliptor_agent_cli.task_scope import (
     normalize_claimed_scope_patterns,
     normalize_repo_path_entry,
     normalize_scope_patterns,
+    relocate_known_scratch_artifacts,
     scope_path_matches_pattern,
 )
 
@@ -683,6 +691,11 @@ def test_root_scratch_outputs_are_non_material_untracked_paths() -> None:
     assert is_non_material_untracked_path("pytest_full.txt") is True
     assert is_non_material_untracked_path("run-output.txt") is True
     assert is_non_material_untracked_path("wheel_log.txt") is True
+    assert is_non_material_untracked_path("_tmp_content.txt") is True
+    assert is_non_material_untracked_path("_d2.txt") is True
+    assert is_non_material_untracked_path("_data.txt") is False
+    assert is_non_material_untracked_path("_draft.txt") is False
+    assert is_non_material_untracked_path("_document.txt") is False
     assert is_non_material_untracked_path("src/output.txt") is False
     assert is_non_material_untracked_path("README.md") is False
 
@@ -836,3 +849,141 @@ def test_list_changed_files_including_untracked_returns_empty_on_git_timeout(
     assert all(env["GIT_TERMINAL_PROMPT"] == "0" for env in seen_envs)
     assert all(env["GIT_ASKPASS"] == "" for env in seen_envs)
     assert all(env["SSH_ASKPASS"] == "" for env in seen_envs)
+
+
+def test_forbidden_parser_does_not_treat_preserve_behavior_as_path_ban() -> None:
+    assert extract_forbidden_repo_path_hints("preserve unknown fields in migrate_user.py") == []
+    assert (
+        extract_forbidden_repo_path_hints("preserve backward compatibility in config_loader.py")
+        == []
+    )
+    assert extract_forbidden_repo_path_hints("keep existing behavior while editing parser.py") == []
+    assert extract_forbidden_repo_path_hints("maintain comments in src/Foo.java") == []
+
+
+def test_forbidden_parser_extracts_direct_path_instructions_with_evidence() -> None:
+    records = extract_forbidden_repo_path_hint_records(
+        "Do not edit services/worker/app/settings.py. Leave README.md unchanged."
+    )
+
+    assert [item.path for item in records] == [
+        "services/worker/app/settings.py",
+        "README.md",
+    ]
+    assert records[0].reason_code == "direct_path_forbidden_instruction"
+    assert "Do not edit" in records[0].evidence
+    assert records[1].reason_code in {
+        "direct_path_forbidden_instruction",
+        "path_must_remain_unchanged",
+    }
+    assert extract_forbidden_repo_path_hints("Do not touch package-lock.json") == [
+        "package-lock.json"
+    ]
+    assert extract_forbidden_repo_path_hints("Exclude docs/generated.md") == ["docs/generated.md"]
+
+
+def test_cargo_manifest_scope_allows_cargo_lock_companion(tmp_path: Path) -> None:
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "demo"\nversion = "0.1.0"\n', encoding="utf-8"
+    )
+    (tmp_path / "Cargo.lock").write_text("# lock\n", encoding="utf-8")
+    task = {
+        "title": "Update Rust dependencies",
+        "description": "Edit Cargo.toml.",
+        "write_scope": ["Cargo.toml"],
+        "estimated_files": ["Cargo.toml"],
+    }
+
+    allowed = normalize_scope_patterns(task, root=tmp_path)
+    assessment = assess_scope_changes(
+        ["Cargo.toml", "Cargo.lock"],
+        allowed,
+        task=task,
+        root=tmp_path,
+    )
+
+    assert "Cargo.lock" in allowed
+    assert assessment.ok is True
+    assert any(
+        item.classification == SCOPE_CLASS_EXPECTED_COMPANION and item.path == "Cargo.lock"
+        for item in assessment.diagnostics
+    )
+
+
+def test_node_package_scope_allows_detected_lockfile_only(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text('{"packageManager":"pnpm@9.0.0"}\n', encoding="utf-8")
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n", encoding="utf-8")
+    (tmp_path / "package-lock.json").write_text("{}\n", encoding="utf-8")
+
+    assert companion_generated_paths_for("package.json", root=tmp_path) == ["pnpm-lock.yaml"]
+
+    task = {
+        "title": "Update package metadata",
+        "description": "Edit package.json.",
+        "write_scope": ["package.json"],
+        "estimated_files": ["package.json"],
+    }
+    allowed = normalize_scope_patterns(task, root=tmp_path)
+
+    assert "pnpm-lock.yaml" in allowed
+    assert "package-lock.json" not in allowed
+    assert assess_scope_changes(["pnpm-lock.yaml"], allowed, task=task, root=tmp_path).ok
+    blocked = assess_scope_changes(["package-lock.json"], allowed, task=task, root=tmp_path)
+    assert blocked.ok is False
+    assert blocked.blocking_paths == ["package-lock.json"]
+
+
+def test_unrelated_lockfile_edit_remains_blocked(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text('{"packageManager":"npm@10.0.0"}\n', encoding="utf-8")
+    (tmp_path / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    task = {"write_scope": ["package.json"], "estimated_files": ["package.json"]}
+    allowed = normalize_scope_patterns(task, root=tmp_path)
+
+    assessment = assess_scope_changes(
+        ["other/package-lock.json"],
+        allowed,
+        task=task,
+        root=tmp_path,
+    )
+
+    assert assessment.ok is False
+    assert assessment.diagnostics[0].classification == SCOPE_CLASS_DANGEROUS_UNRELATED
+
+
+def test_known_root_scratch_artifacts_are_moved_to_artifacts(tmp_path: Path) -> None:
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    (tmp_path / "_test_dump.txt").write_text("debug\n", encoding="utf-8")
+    (tmp_path / "test_lines_dump.txt").write_text("lines\n", encoding="utf-8")
+    artifact_dir = tmp_path / ".sylliptor" / "runs" / "run_1" / "execution" / "scratch" / "T01"
+
+    diagnostics = relocate_known_scratch_artifacts(root=tmp_path, artifact_dir=artifact_dir)
+
+    assert sorted(item.path for item in diagnostics) == ["_test_dump.txt", "test_lines_dump.txt"]
+    assert not (tmp_path / "_test_dump.txt").exists()
+    assert not (tmp_path / "test_lines_dump.txt").exists()
+    assert (artifact_dir / "_test_dump.txt").read_text(encoding="utf-8") == "debug\n"
+    assert all(item.allowed for item in diagnostics)
+
+
+def test_scope_assessment_classifies_missing_scope_and_forbidden_paths(tmp_path: Path) -> None:
+    task = {
+        "title": "Fix src/app.py",
+        "description": "Do not edit secrets.txt.",
+        "write_scope": ["src/app.py"],
+        "estimated_files": ["src/app.py"],
+    }
+    assessment = assess_scope_changes(
+        ["src/helper.py", "secrets.txt"],
+        ["src/app.py"],
+        task=task,
+        root=tmp_path,
+    )
+
+    assert assessment.ok is False
+    by_path = {item.path: item for item in assessment.diagnostics}
+    assert by_path["src/helper.py"].classification == SCOPE_CLASS_LIKELY_MISSING_SCOPE
+    assert by_path["src/helper.py"].recommended_action == "create_scope_delta_proposal"
+    assert by_path["secrets.txt"].classification == SCOPE_CLASS_FORBIDDEN
+    assert by_path["secrets.txt"].recommended_action == "reject_hard"

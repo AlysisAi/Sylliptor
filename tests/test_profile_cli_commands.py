@@ -94,8 +94,9 @@ def test_profile_preset_clones_into_named_profile(monkeypatch, tmp_path: Path) -
 
     assert result.exit_code == 0
     profile = load_config().extra_fields["profiles"]["claude"]
-    assert profile["base_url"] == "https://api.anthropic.com/v1/"
-    assert profile["default_model"] == "claude-opus-4-7"
+    assert profile["protocol"] == "anthropic_messages"
+    assert profile["base_url"] == "https://api.anthropic.com/v1"
+    assert profile["default_model"] == "claude-sonnet-4-6"
     assert profile["extra_headers"] == {}
 
 
@@ -117,6 +118,9 @@ def test_profile_presets_lists_known_presets(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert "anthropic" in result.output
+    assert "compatibility" in result.output
+    assert "native" in result.output
+    assert "openai_responses" in result.output
     assert "openrouter" in result.output
     assert "qwen-us" in result.output
 
@@ -133,4 +137,82 @@ def test_qwen_us_preset_uses_dashscope_virginia_endpoint(monkeypatch, tmp_path: 
     assert result.exit_code == 0
     profile = load_config().extra_fields["profiles"]["qwen-us"]
     assert profile["base_url"] == "https://dashscope-us.aliyuncs.com/compatible-mode/v1"
-    assert profile["default_model"] == "qwen3.6-plus"
+    assert profile["default_model"] == "qwen3.7-plus"
+
+
+def test_profile_convert_to_native_updates_protocol_without_exposing_key(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _seed_profiles(tmp_path, monkeypatch)
+    cfg = load_config()
+    add_profile(
+        cfg,
+        ProfileSpec(
+            name="anthropic",
+            base_url="https://api.anthropic.com/v1",
+            default_model="claude-sonnet-4-6",
+            web_search_adapter="anthropic_messages",
+            web_search_model="legacy-search-model",
+        ),
+    )
+    save_config(cfg)
+    set_key = CliRunner().invoke(
+        sylliptor_app,
+        ["profile", "set-key", "anthropic", "--key", "sk-ant-test"],
+        env=_env(tmp_path),
+    )
+    assert set_key.exit_code == 0
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        ["profile", "convert", "anthropic", "--to", "native", "--yes"],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "anthropic_messages" in result.output
+    assert "web_search_model" in result.output
+    assert "legacy-search-model" in result.output
+    assert "sk-ant-test" not in result.output
+    profile = load_config().extra_fields["profiles"]["anthropic"]
+    assert profile["protocol"] == "anthropic_messages"
+    assert profile["base_url"] == "https://api.anthropic.com/v1"
+    assert profile["web_search_adapter"] == "anthropic_messages"
+    assert profile["web_search_model"] == ""
+    assert load_persisted_profile_keys()["anthropic"] == "sk-ant-test"
+
+
+def test_profile_convert_to_compatibility_updates_gemini_native_profile(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    cfg = AppConfig(model="gemini-3-flash-preview")
+    cfg.extra_fields = {"profiles": {}, "active_profile": ""}
+    add_profile(
+        cfg,
+        ProfileSpec(
+            name="gemini-native",
+            protocol="gemini_generate_content",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            api_key_env="GEMINI_API_KEY",
+            default_model="gemini-3-flash-preview",
+            web_search_adapter="gemini_grounding",
+        ),
+    )
+    set_active_profile(cfg, "gemini-native")
+    save_config(cfg)
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        ["profile", "convert", "--to", "compatibility", "--yes"],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 0, result.output
+    profile = load_config().extra_fields["profiles"]["gemini-native"]
+    assert profile["protocol"] == "openai_compat"
+    assert profile["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert profile["default_model"] == "gemini-3.5-flash"
+    assert profile["web_search_adapter"] == "gemini_grounding"

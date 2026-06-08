@@ -7,6 +7,7 @@ import select
 import subprocess
 import threading
 import time
+import weakref
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -47,6 +48,7 @@ _STDOUT_RESPONSE_QUIESCENCE_WAIT_S = 0.1
 _STDOUT_RESPONSE_FOLLOW_UP_BUDGET_S = _STDOUT_RESPONSE_QUIESCENCE_WAIT_S * 2
 _STDERR_QUIESCENCE_WAIT_S = 0.75
 _FD_READY_POLL_INTERVAL_S = 0.01
+_READER_THREAD_JOIN_WAIT_S = 1.0
 _RETIRED_REQUEST_STATE_RETENTION_LIMIT = 1024
 _REQUEST_STATE_AWAITING_RESPONSE = "awaiting_response"
 _REQUEST_STATE_AWAITING_FOLLOW_UP = "awaiting_follow_up"
@@ -82,6 +84,7 @@ _CONSERVATIVE_ENV_KEYS = (
 )
 _INTERNAL_CLIENT_REQUEST_CODE = -32603
 _INVALID_STDOUT_UTF8_MESSAGE = "received invalid UTF-8 on stdio stdout"
+_LIVE_STDIO_TRANSPORTS: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
 class McpStdioTransportError(McpProcessError):
@@ -218,6 +221,33 @@ class McpStdioTransport:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def diagnostic_snapshot(self) -> dict[str, Any]:
+        process = self._process
+        return {
+            "transport_id": id(self),
+            "server_id": self.server.id,
+            "command": self.server.command,
+            "pid": process.pid if process is not None else None,
+            "returncode": process.poll() if process is not None else None,
+            "started": self._started,
+            "closed": self._closed,
+            "closing": self._closing,
+            "stdout_thread_alive": bool(
+                self._stdout_thread is not None and self._stdout_thread.is_alive()
+            ),
+            "stderr_thread_alive": bool(
+                self._stderr_thread is not None and self._stderr_thread.is_alive()
+            ),
+        }
+
+    def _has_live_process_or_threads(self) -> bool:
+        process = self._process
+        return bool(
+            (process is not None and process.poll() is None)
+            or (self._stdout_thread is not None and self._stdout_thread.is_alive())
+            or (self._stderr_thread is not None and self._stderr_thread.is_alive())
+        )
 
     def stderr_tail(self) -> str:
         with self._stderr_state_condition:
@@ -601,6 +631,7 @@ class McpStdioTransport:
         except Exception as exc:  # noqa: BLE001
             raise self._build_error(f"failed to launch process: {exc}") from exc
         self._started = True
+        _LIVE_STDIO_TRANSPORTS.add(self)
         self._stdout_thread = threading.Thread(
             target=self._stdout_reader,
             name=f"mcp-stdout-{self.server.id}",
@@ -1214,4 +1245,23 @@ class McpStdioTransport:
                     pass
             for thread in (self._stdout_thread, self._stderr_thread):
                 if thread is not None:
-                    thread.join(timeout=0.2)
+                    thread.join(timeout=_READER_THREAD_JOIN_WAIT_S)
+            if not self._has_live_process_or_threads():
+                _LIVE_STDIO_TRANSPORTS.discard(self)
+
+
+def live_stdio_transport_diagnostics() -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for transport in list(_LIVE_STDIO_TRANSPORTS):
+        snapshot = transport.diagnostic_snapshot()
+        if (
+            not snapshot["closed"]
+            or snapshot["returncode"] is None
+            or snapshot["stdout_thread_alive"]
+            or snapshot["stderr_thread_alive"]
+        ):
+            diagnostics.append(snapshot)
+        else:
+            _LIVE_STDIO_TRANSPORTS.discard(transport)
+    diagnostics.sort(key=lambda item: (str(item["server_id"]), int(item["transport_id"])))
+    return diagnostics

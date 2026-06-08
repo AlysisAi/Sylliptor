@@ -13,7 +13,7 @@ body:
     attributes:
       label: Summary
       description: A short, clear description of the bug.
-      placeholder: e.g. `sylliptor chat` crashes when the model returns no tool_calls.
+      placeholder: e.g. `sylliptor chat` exits after the provider returns an empty response.
     validations:
       required: true
   - type: textarea
@@ -22,9 +22,9 @@ body:
       label: Steps to reproduce
       description: Minimal, exact commands or actions that trigger the bug.
       placeholder: |
-        1. Run `sylliptor config set model gpt-4.1-mini`
-        2. Run `sylliptor run "..."`
-        3. Observe the error
+        1. Configure the provider/profile you are using.
+        2. Run the exact command or chat action that fails.
+        3. Paste the error or describe the incorrect behavior.
     validations:
       required: true
   - type: textarea
@@ -45,7 +45,7 @@ body:
     attributes:
       label: Sylliptor version
       description: Output of `sylliptor --version` (or commit SHA if running from source).
-      placeholder: 0.9.0b2
+      placeholder: 0.9.1
     validations:
       required: true
   - type: input

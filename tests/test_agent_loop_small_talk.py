@@ -14,6 +14,10 @@ from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.custom_tools.discovery import discover_custom_tools
 from sylliptor_agent_cli.custom_tools.trust import trust_project_tool
+from sylliptor_agent_cli.llm.metadata import (
+    GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY,
+    PROVIDER_METADATA_KEY,
+)
 from sylliptor_agent_cli.llm.openai_compat import LLMError, LLMResponse, ToolCall
 from sylliptor_agent_cli.request_estimation import estimate_message_tokens
 from sylliptor_agent_cli.runtime_kind import RuntimeKind
@@ -54,6 +58,7 @@ class _RouterStubClient:
         language: str = "",
         script: str = "",
         explicit_language_override: bool = False,
+        response_provider_metadata: dict[str, Any] | None = None,
     ) -> None:
         self.route = route
         self.route_reply = route_reply
@@ -64,6 +69,7 @@ class _RouterStubClient:
         self.language = language
         self.script = script
         self.explicit_language_override = explicit_language_override
+        self.response_provider_metadata = response_provider_metadata
         self.calls = 0
         self.route_calls = 0
         self.response_calls = 0
@@ -115,7 +121,12 @@ class _RouterStubClient:
 
         self.response_calls += 1
         self.last_response_temperature = temperature
-        return LLMResponse(content=self.response_reply, tool_calls=[], raw={})
+        return LLMResponse(
+            content=self.response_reply,
+            tool_calls=[],
+            raw={},
+            provider_metadata=self.response_provider_metadata,
+        )
 
 
 class _SequentialRouterClient:
@@ -556,6 +567,71 @@ def test_how_are_you_routes_to_chat_without_repo_agent_call(tmp_path: Path) -> N
     assert "repo" not in content.lower()
     assert "repository" not in content.lower()
     assert "workspace" not in content.lower()
+
+
+def test_non_repo_text_response_preserves_native_provider_metadata(tmp_path: Path) -> None:
+    metadata_payload = {
+        "response_id": "resp_non_repo_grounded",
+        "content": {
+            "role": "model",
+            "parts": [
+                {
+                    "text": "Gemini grounding answered the chat turn.",
+                    "thoughtSignature": "non-repo-thought",
+                }
+            ],
+        },
+        "groundingMetadata": {
+            "webSearchQueries": ["Sylliptor native providers"],
+        },
+    }
+    cfg = AppConfig(model="test-model", routing_mode="auto", chat_temperature=0.73)
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    session.client = _FailClient()  # type: ignore[assignment]
+    router = _RouterStubClient(
+        route="chat",
+        route_reply="",
+        response_reply="Gemini grounding answered the chat turn.",
+        language="English",
+        script="Latin",
+        response_provider_metadata={
+            GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY: metadata_payload,
+        },
+    )
+    session.router_client = router
+
+    try:
+        exit_code = session.run_turn("Can you answer from native search context?")
+        log_path = session.store.path
+        assistant_message = dict(session.messages[-1])
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert (
+        assistant_message[PROVIDER_METADATA_KEY][GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY]
+        == metadata_payload
+    )
+    assistant_events = [
+        dict(event.get("payload") or {})
+        for event in read_session_events(log_path)
+        if event.get("type") == "assistant_message"
+    ]
+    final_event = assistant_events[-1]
+    assert final_event["content"] == "Gemini grounding answered the chat turn."
+    assert (
+        final_event["message"][PROVIDER_METADATA_KEY][GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY]
+        == metadata_payload
+    )
 
 
 def test_non_repo_fast_path_uses_router_reply_without_second_llm_call(tmp_path: Path) -> None:

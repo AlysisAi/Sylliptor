@@ -29,6 +29,7 @@ from sylliptor_agent_cli.forge import (
     save_plan,
 )
 from sylliptor_agent_cli.git_ops import GitOpsError
+from sylliptor_agent_cli.mcp.transport_stdio import live_stdio_transport_diagnostics
 from sylliptor_agent_cli.mcp.untrusted_content import build_untrusted_mcp_text_block
 from sylliptor_agent_cli.merge_conflict_reviewer import ConflictReviewOutcome
 from sylliptor_agent_cli.review_gate import ReviewOutcome
@@ -89,7 +90,7 @@ def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def test_exec_fails_fast_when_same_run_is_already_locked(
+def test_exec_reports_structured_timeout_when_same_run_stays_locked(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -130,7 +131,7 @@ def test_exec_fails_fast_when_same_run_is_already_locked(
     result = runner.invoke(
         sylliptor_app,
         ["forge", "exec", "T01", "--path", os.fspath(repo)],
-        env=_env(tmp_path),
+        env={**_env(tmp_path), "SYLLIPTOR_FORGE_LOCK_WAIT_TIMEOUT_S": "0"},
     )
 
     assert result.exit_code == 2
@@ -511,6 +512,52 @@ def _write_mcp_stdio_config(
     )
 
 
+def _run_mcp_scoped_exec_case(
+    *,
+    case_tmp_path: Path,
+    monkeypatch,
+    fixture_payload: dict,
+    task_mcp_scope: dict[str, object],
+    fake_run_agent,
+    server_overrides: dict[str, object] | None = None,
+):
+    case_tmp_path.mkdir(parents=True, exist_ok=True)
+    runner = CliRunner()
+    repo = case_tmp_path / "repo"
+    repo.mkdir()
+    _write_mcp_stdio_config(
+        case_tmp_path,
+        fixture_payload,
+        server_overrides=server_overrides,
+    )
+    plan_path, plan = _prepare_run_with_tasks(runner, repo, case_tmp_path)
+    task = plan["tasks"][0]
+    task_id = task["id"]
+    task["estimated_files"] = ["src/in_scope.py"]
+    task["write_scope"] = ["src/in_scope.py"]
+    task["mcp_scope"] = task_mcp_scope
+    plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli_mod, "run_agent", fake_run_agent)
+    result = runner.invoke(
+        sylliptor_app,
+        [
+            "forge",
+            "exec",
+            task_id,
+            "--path",
+            os.fspath(repo),
+            "--model",
+            "test-model",
+            "--api-key",
+            "k",
+            "--no-log",
+        ],
+        env=_env(case_tmp_path),
+    )
+    return result, repo, task_id
+
+
 def test_execution_private_sessions_dir_stays_outside_workspace_when_session_log_dir_is_under_repo(
     tmp_path: Path,
 ) -> None:
@@ -790,7 +837,7 @@ def test_exec_reports_untracked_only_changes_in_patch_report_attempt_and_issue(
 
     patch_text = patch_path.read_text(encoding="utf-8")
     assert "diff --git a/src/generated.py b/src/generated.py" in patch_text
-    assert "new file mode 100644" in patch_text
+    assert any(f"new file mode {mode}" in patch_text for mode in ("100644", "100755"))
 
     report_text = report_path.read_text(encoding="utf-8")
     assert "`src/generated.py`" in report_text
@@ -1634,6 +1681,61 @@ def test_exec_enforces_dependencies(tmp_path: Path, monkeypatch) -> None:
     assert second_task["status"] == "planned"
 
 
+def test_exec_blocks_inferred_ordered_dependency_even_if_plan_lacks_metadata(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runner = CliRunner()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    result = runner.invoke(
+        sylliptor_app,
+        ["forge", "plan", "--path", os.fspath(repo)],
+        input=(
+            "/goal Dependency check\n"
+            "/task Update src/calc.py helper behavior\n"
+            "/task Update src/app.py caller after helper behavior\n"
+            "/done\n"
+        ),
+        env=_env(tmp_path),
+    )
+    assert result.exit_code == 0
+
+    pointer = _load_json(repo / ".sylliptor" / "current_run.json")
+    plan_path = repo / pointer["run_path"] / "plan" / "plan.json"
+    plan = _load_json(plan_path)
+    first_id = plan["tasks"][0]["id"]
+    second_id = plan["tasks"][1]["id"]
+    plan["tasks"][1]["dependencies"] = []
+    plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def fake_run_agent(**_kwargs) -> int:  # type: ignore[no-untyped-def]
+        raise AssertionError("run_agent should not be called when inferred dependency is blocked")
+
+    monkeypatch.setattr(cli_mod, "run_agent", fake_run_agent)
+
+    exec_result = runner.invoke(
+        sylliptor_app,
+        [
+            "forge",
+            "exec",
+            second_id,
+            "--path",
+            os.fspath(repo),
+            "--model",
+            "test-model",
+            "--api-key",
+            "k",
+            "--no-log",
+        ],
+        env=_env(tmp_path),
+    )
+
+    assert exec_result.exit_code == 2
+    assert f"{first_id} (planned, inferred)" in exec_result.output
+
+
 def test_exec_marks_failed_when_agent_returns_nonzero(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     repo = tmp_path / "repo"
@@ -2075,6 +2177,130 @@ def test_exec_rejects_successful_agent_run_without_material_changes_for_write_sc
     report_text = (run_dir / "execution" / "reports" / f"{task_id}.md").read_text(encoding="utf-8")
     assert "no material file changes were detected" in report_text
     assert not (repo / "reports" / "tool_error_result.txt").exists()
+
+
+def test_exec_accepts_analysis_only_task_without_material_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = CliRunner()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plan_path, plan = _prepare_run_with_tasks(runner, repo, tmp_path)
+    task = plan["tasks"][0]
+    task_id = task["id"]
+    task["title"] = "Investigate src/app.py and report findings only"
+    task["description"] = "Read-only analysis only; report findings."
+    task["acceptance_criteria"] = ["Findings documented."]
+    task["estimated_files"] = ["src/app.py"]
+    task["write_scope"] = ["src/app.py"]
+    task["analysis_only"] = True
+    plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli_mod, "run_agent", lambda **_kwargs: 0)
+
+    result = runner.invoke(
+        sylliptor_app,
+        [
+            "forge",
+            "exec",
+            task_id,
+            "--path",
+            os.fspath(repo),
+            "--model",
+            "test-model",
+            "--api-key",
+            "k",
+            "--no-log",
+            "--verify",
+            "off",
+        ],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 0
+    final_plan = _load_json(plan_path)
+    assert final_plan["tasks"][0]["status"] == "done"
+    pointer = _load_json(repo / ".sylliptor" / "current_run.json")
+    run_dir = repo / pointer["run_path"]
+    report_text = (run_dir / "execution" / "reports" / f"{task_id}.md").read_text(encoding="utf-8")
+    assert "- Result: success" in report_text
+    assert "- Result Kind: success_noop" in report_text
+    assert "- No-Op Reason: analysis_only" in report_text
+
+
+def test_exec_pr_accepts_analysis_only_task_without_material_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runner = CliRunner()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo_with_commit(repo)
+    base_branch = _git_run(
+        ["git", "-C", os.fspath(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    plan_path, plan = _prepare_run_with_tasks(runner, repo, tmp_path)
+    task = plan["tasks"][0]
+    task_id = task["id"]
+    task["title"] = "Investigate README.md and report findings only"
+    task["description"] = "Read-only analysis only; report findings."
+    task["acceptance_criteria"] = ["Findings documented."]
+    task["estimated_files"] = ["README.md"]
+    task["write_scope"] = ["README.md"]
+    task["analysis_only"] = True
+    task["branch"] = "feat/t01-analysis-only"
+    plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(cli_mod, "run_agent", lambda **_kwargs: 0)
+
+    result = runner.invoke(
+        sylliptor_app,
+        [
+            "forge",
+            "exec",
+            task_id,
+            "--path",
+            os.fspath(repo),
+            "--model",
+            "test-model",
+            "--api-key",
+            "k",
+            "--no-log",
+            "--pr",
+            "--verify",
+            "off",
+        ],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 0, result.output
+    final_plan = _load_json(plan_path)
+    assert final_plan["tasks"][0]["status"] == "done"
+    current_branch = _git_run(
+        ["git", "-C", os.fspath(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert current_branch == base_branch
+    deleted_branch = _git_run(
+        ["git", "-C", os.fspath(repo), "branch", "--list", "feat/t01-analysis-only"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert deleted_branch == ""
+    pointer = _load_json(repo / ".sylliptor" / "current_run.json")
+    run_dir = repo / pointer["run_path"]
+    report_text = (run_dir / "execution" / "reports" / f"{task_id}.md").read_text(encoding="utf-8")
+    assert "- Result: success" in report_text
+    assert "- Result Kind: success_noop" in report_text
+    assert "- No-Op Reason: analysis_only" in report_text
+    assert "- Commit: (none)" in report_text
+    assert "- Merge Commit: (none)" in report_text
+    assert "- Merge Result: no merge required (analysis-only no-op; branch deleted)" in report_text
 
 
 def test_exec_strict_scope_surfaces_task_local_reporting_inspection_failures(
@@ -2683,6 +2909,7 @@ def test_exec_task_mcp_scope_allowed_tools_exposes_only_exact_live_tools(
     captured: dict[str, object] = {}
 
     def fake_run_agent(*, root: Path, mcp_manager, **_kwargs):  # type: ignore[no-untyped-def]
+        captured["mcp_manager"] = mcp_manager
         bindings = list(mcp_manager.tool_bindings)
         captured["tool_aliases"] = [binding.tool_alias for binding in bindings]
         captured["tool_names"] = [binding.tool_name for binding in bindings]
@@ -2720,6 +2947,9 @@ def test_exec_task_mcp_scope_allowed_tools_exposes_only_exact_live_tools(
     assert tool_result["server_id"] == "alpha"
     assert tool_result["tool_name"] == "echo"
     assert tool_result["content_summary"] == "text(2 chars)"
+    assert captured["mcp_manager"].closed is True
+    assert not (load_current_run_paths(repo).run_dir / "active_execution.lock.json").exists()
+    assert live_stdio_transport_diagnostics() == []
 
 
 def test_exec_task_mcp_scope_unknown_tool_fails_clearly(tmp_path: Path, monkeypatch) -> None:
@@ -2783,6 +3013,130 @@ def test_exec_task_mcp_scope_unknown_tool_fails_clearly(tmp_path: Path, monkeypa
     )
     assert "Forge task mcp_scope references MCP tools" in report_text
     assert "missing_tool" in report_text
+    assert not (load_current_run_paths(repo).run_dir / "active_execution.lock.json").exists()
+    assert live_stdio_transport_diagnostics() == []
+
+
+def test_exec_task_mcp_scope_allowed_tool_then_resources_has_clean_mcp_lifecycle(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    first_captured: dict[str, object] = {}
+
+    def first_run_agent(*, root: Path, mcp_manager, **_kwargs):  # type: ignore[no-untyped-def]
+        first_captured["mcp_manager"] = mcp_manager
+        bindings = list(mcp_manager.tool_bindings)
+        first_captured["tool_names"] = [binding.tool_name for binding in bindings]
+        first_captured["tool_result"] = bindings[0].run({})
+        _write_material_change(root, rel_path="src/in_scope.py")
+        return 0
+
+    first_result, first_repo, _first_task_id = _run_mcp_scoped_exec_case(
+        case_tmp_path=tmp_path / "first",
+        monkeypatch=monkeypatch,
+        fixture_payload={
+            "capabilities": {"tools": {}, "resources": {}},
+            "tools_pages": [
+                [
+                    {
+                        "name": "echo",
+                        "description": "Echo tool",
+                        "inputSchema": {"type": "object", "properties": {}, "required": []},
+                    }
+                ]
+            ],
+            "tool_call_results": {
+                "echo": {
+                    "isError": False,
+                    "content": [{"type": "text", "text": "ok"}],
+                }
+            },
+            "resources_pages": [
+                [
+                    {
+                        "uri": "https://example.com/spec.json",
+                        "name": "spec",
+                    }
+                ]
+            ],
+        },
+        task_mcp_scope={"allowed_tools": [{"server_id": "alpha", "tool_name": "echo"}]},
+        fake_run_agent=first_run_agent,
+        server_overrides={"resources_mode": "listed_read_only"},
+    )
+
+    assert first_result.exit_code == 0
+    assert first_captured["tool_names"] == ["echo"]
+    assert first_captured["mcp_manager"].closed is True
+    assert not (load_current_run_paths(first_repo).run_dir / "active_execution.lock.json").exists()
+    assert live_stdio_transport_diagnostics() == []
+
+    second_captured: dict[str, object] = {}
+
+    def second_run_agent(*, root: Path, mcp_manager, **_kwargs):  # type: ignore[no-untyped-def]
+        bindings = {binding.tool_alias: binding for binding in mcp_manager.tool_bindings}
+        second_captured["tool_aliases"] = sorted(bindings)
+        second_captured["listed"] = bindings["mcp_resources_list"].run({"limit": 5})
+        second_captured["read"] = bindings["mcp_resource_read"].run(
+            {
+                "server_id": "alpha",
+                "uri": "https://example.com/spec.json",
+            }
+        )
+        _write_material_change(root, rel_path="src/in_scope.py")
+        return 0
+
+    second_result, second_repo, _second_task_id = _run_mcp_scoped_exec_case(
+        case_tmp_path=tmp_path / "second",
+        monkeypatch=monkeypatch,
+        fixture_payload={
+            "capabilities": {"tools": {}, "resources": {}},
+            "tools_pages": [
+                [
+                    {
+                        "name": "echo",
+                        "description": "Echo tool",
+                        "inputSchema": {"type": "object", "properties": {}, "required": []},
+                    }
+                ]
+            ],
+            "resources_pages": [
+                [
+                    {
+                        "uri": "https://example.com/spec.json",
+                        "name": "spec",
+                        "description": "Spec resource",
+                        "mimeType": "application/json",
+                    }
+                ]
+            ],
+            "resource_read_results": {
+                "https://example.com/spec.json": {
+                    "contents": [
+                        {
+                            "uri": "https://example.com/spec.json",
+                            "mimeType": "application/json",
+                            "text": '{"ok":true}',
+                        }
+                    ]
+                }
+            },
+        },
+        task_mcp_scope={"allow_resources": True},
+        fake_run_agent=second_run_agent,
+        server_overrides={"resources_mode": "listed_read_only"},
+    )
+
+    assert second_result.exit_code == 0
+    assert second_captured["tool_aliases"] == ["mcp_resource_read", "mcp_resources_list"]
+    listed = second_captured["listed"]
+    assert isinstance(listed, dict)
+    assert listed["returned_count"] == 1
+    read = second_captured["read"]
+    assert isinstance(read, dict)
+    assert '{"ok":true}' in read["text"]
+    assert not (load_current_run_paths(second_repo).run_dir / "active_execution.lock.json").exists()
+    assert live_stdio_transport_diagnostics() == []
 
 
 def test_exec_strict_scope_fails_on_out_of_scope_changes_in_plain_dir(
@@ -3029,7 +3383,8 @@ def test_exec_pr_success_autofills_branch_and_writes_pr_artifacts(
 
     assert patch_path.exists()
     assert report_path.exists()
-    assert "new file mode 100644" in patch_path.read_text(encoding="utf-8")
+    patch_text = patch_path.read_text(encoding="utf-8")
+    assert any(f"new file mode {mode}" in patch_text for mode in ("100644", "100755"))
 
     report = report_path.read_text(encoding="utf-8")
     assert "Base Branch: main" in report

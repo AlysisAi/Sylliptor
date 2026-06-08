@@ -102,7 +102,7 @@ def test_setup_wizard_saves_config(monkeypatch, tmp_path: Path) -> None:
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\npersisted-key\n4\ngpt-5-nano\n{tmp_path}\n",
+        input=f"\n1\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
@@ -119,19 +119,19 @@ def test_setup_wizard_can_persist_api_key(monkeypatch, tmp_path: Path) -> None:
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\npersisted-key\n4\ngpt-5-nano\n{tmp_path}\n",
+        input=f"\n1\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
 
     credentials = json.loads((tmp_path / "cfg" / "credentials.json").read_text(encoding="utf-8"))
-    assert credentials["profile_keys"]["openai"] == "persisted-key"
+    assert credentials["profile_keys"]["openai-responses"] == "persisted-key"
 
     show = runner.invoke(sylliptor_app, ["config", "show"], env=_env(tmp_path))
     assert show.exit_code == 0
     payload = json.loads(show.output)
     assert payload["api_key_set"] is True
-    assert payload["api_key_source"] == "stored:profile=openai"
+    assert payload["api_key_source"] == "stored:profile=openai-responses"
 
 
 def test_config_commands_can_set_and_clear_persisted_api_key(tmp_path: Path) -> None:
@@ -1409,7 +1409,7 @@ def test_setup_wizard_can_pick_first_suggested_model(monkeypatch, tmp_path: Path
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\npersisted-key\n1\n{tmp_path}\n",
+        input=f"\n1\npersisted-key\n1\n1\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
@@ -1426,7 +1426,7 @@ def test_setup_wizard_reprompts_invalid_workspace(monkeypatch, tmp_path: Path) -
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\npersisted-key\n4\ngpt-5-nano\n/does/not/exist\n{tmp_path}\n",
+        input=f"\n1\npersisted-key\n6\ngpt-5-nano\n1\n/does/not/exist\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0

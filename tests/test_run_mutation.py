@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 import socket
+import threading
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,9 @@ from sylliptor_agent_cli.run_lock import (
     RunMutationConflictError,
     acquire_run_mutation_guard,
     inspect_run_mutation_lock,
+    lock_diagnostic,
+    normalize_workspace_identity_path,
+    workspace_mutation_run_id,
     write_run_mutation_lock_metadata,
 )
 from sylliptor_agent_cli.swarm_orchestrator import (
@@ -268,6 +272,170 @@ def test_run_swarm_setup_failure_preserves_caller_owned_lock(tmp_path: Path, mon
 
     guard.release()
     assert not (paths.run_dir / "active_execution.lock.json").exists()
+
+
+def test_run_mutation_guard_writes_structured_lock_metadata(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+
+    with acquire_run_mutation_guard(
+        run_id="run-1",
+        mode="forge_swarm",
+        run_dir=run_dir,
+        workspace_root=tmp_path,
+        owner_session_id="session-123",
+    ) as guard:
+        metadata = inspect_run_mutation_lock(run_dir)
+        assert metadata is not None
+        assert metadata["owner_id"] == "session-123"
+        assert metadata["owner_session_id"] == "session-123"
+        assert metadata["started_at"]
+        assert metadata["last_heartbeat_at"]
+        assert metadata["workspace_identity"] == normalize_workspace_identity_path(tmp_path)
+        assert metadata["stale_policy"]
+        diagnostic = lock_diagnostic(metadata, run_id="run-1", mode="forge_swarm")
+        assert diagnostic["reason_code"] == "blocked_by_active_workspace_execution"
+        assert "Forge execution" in diagnostic["diagnostic"]
+        assert "owner_token" not in diagnostic["blocked_by"]
+
+        guard.refresh_heartbeat()
+        refreshed = inspect_run_mutation_lock(run_dir)
+        assert refreshed is not None
+        assert refreshed["last_heartbeat_at"]
+
+
+def test_run_mutation_guard_waits_for_active_lock_and_records_queue(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    active_guard = acquire_run_mutation_guard(
+        run_id="run-1",
+        mode="forge_swarm:first",
+        run_dir=run_dir,
+        workspace_root=tmp_path,
+    )
+    queued_started = threading.Event()
+    queued_result: dict[str, object] = {}
+
+    def acquire_queued() -> None:
+        try:
+            queued_guard = acquire_run_mutation_guard(
+                run_id="run-1",
+                mode="forge_swarm:second",
+                run_dir=run_dir,
+                workspace_root=tmp_path,
+                wait=True,
+                wait_timeout_s=5,
+                poll_interval_s=0.05,
+                on_wait=lambda _info: queued_started.set(),
+            )
+            queued_result["guard"] = queued_guard
+        except BaseException as exc:  # noqa: BLE001
+            queued_result["exc"] = exc
+
+    thread = threading.Thread(target=acquire_queued, daemon=True)
+    thread.start()
+    assert queued_started.wait(timeout=2)
+    assert inspect_run_mutation_lock(run_dir)["owner_token"] == active_guard.owner_token
+
+    active_guard.release()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert "exc" not in queued_result
+    queued_guard = queued_result["guard"]
+    assert queued_guard.acquired_after_wait is True
+    assert queued_guard.wait_started_at
+    assert queued_guard.wait_finished_at
+    queued_guard.release()
+    events_path = run_dir / "active_execution.events.jsonl"
+    events = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [event["event"] for event in events] == [
+        "queued_wait_started",
+        "queued_wait_finished",
+    ]
+
+
+def test_run_mutation_guard_wait_timeout_has_structured_reason(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+
+    with acquire_run_mutation_guard(
+        run_id="run-1",
+        mode="forge_swarm:first",
+        run_dir=run_dir,
+        workspace_root=tmp_path,
+    ):
+        with pytest.raises(RunMutationConflictError) as excinfo:
+            acquire_run_mutation_guard(
+                run_id="run-1",
+                mode="forge_swarm:second",
+                run_dir=run_dir,
+                workspace_root=tmp_path,
+                wait=True,
+                wait_timeout_s=0,
+                poll_interval_s=0.05,
+            )
+
+    assert excinfo.value.reason_code == "active_execution_wait_timeout"
+    assert excinfo.value.metadata is not None
+    assert "owner_token" not in excinfo.value.metadata
+
+
+def test_workspace_lock_identity_normalizes_cross_platform_path_forms(tmp_path: Path) -> None:
+    assert normalize_workspace_identity_path("C:\\Users\\Public\\Repo\\") == (
+        normalize_workspace_identity_path("c:/users/public/repo")
+    )
+    assert normalize_workspace_identity_path("/mnt/c/Users/Public/Repo/") == (
+        normalize_workspace_identity_path("C:/Users/Public/Repo")
+    )
+    assert workspace_mutation_run_id("C:\\Users\\Public\\Repo").startswith(
+        "workspace:c:/users/public/repo"
+    )
+    resolved_tmp_path = os.fspath(tmp_path.resolve()).replace("\\", "/")
+    expected_tmp_identity = resolved_tmp_path
+    if resolved_tmp_path.startswith("/mnt/") and len(resolved_tmp_path) > 6:
+        expected_tmp_identity = f"{resolved_tmp_path[5]}:{resolved_tmp_path[6:]}".lower()
+    assert normalize_workspace_identity_path(tmp_path) == expected_tmp_identity
+
+
+def test_swarm_mutation_guard_serializes_different_runs_in_same_workspace(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    first_paths = create_plan_run(repo)
+    second_paths = create_plan_run(repo)
+    first_guard = acquire_swarm_mutation_guard(first_paths, mode="forge_swarm:first")
+    queued_started = threading.Event()
+    queued_result: dict[str, object] = {}
+
+    def acquire_second() -> None:
+        try:
+            queued_result["guard"] = acquire_swarm_mutation_guard(
+                second_paths,
+                mode="forge_swarm:second",
+                wait=True,
+                wait_timeout_s=5,
+                poll_interval_s=0.05,
+                on_wait=lambda _info: queued_started.set(),
+            )
+        except BaseException as exc:  # noqa: BLE001
+            queued_result["exc"] = exc
+
+    thread = threading.Thread(target=acquire_second, daemon=True)
+    thread.start()
+    assert queued_started.wait(timeout=2)
+    assert not queued_result
+
+    first_guard.release()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert "exc" not in queued_result
+    second_guard = queued_result["guard"]
+    assert second_guard.acquired_after_wait is True
+    second_guard.release()
 
 
 def test_run_mutation_guard_recovers_definitely_stale_lock(tmp_path: Path) -> None:

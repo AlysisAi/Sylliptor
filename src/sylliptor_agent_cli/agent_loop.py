@@ -507,6 +507,7 @@ def run_agent(
     authoritative_verification_commands: list[str] | None = None,
     verify_cmd: list[str] | None = None,
     subagents_enabled: bool | None = None,
+    enforce_explicit_subagent_requests: bool = True,
     workspace_binding: WorkspaceBinding | None = None,
     runtime_kind: RuntimeKind | str | None = None,
     mcp_manager: McpManager | ForgeTaskScopedMcpManager | None = None,
@@ -542,6 +543,7 @@ def run_agent(
         authoritative_verification_commands=authoritative_verification_commands,
         verify_cmd=verify_cmd,
         subagents_enabled=subagents_enabled,
+        enforce_explicit_subagent_requests=enforce_explicit_subagent_requests,
         workspace_binding=workspace_binding,
         mcp_manager=mcp_manager,
     )

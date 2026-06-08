@@ -205,6 +205,12 @@ def hooks_list(
     for row in entries:
         table.add_row(*row)
     console.print(table)
+    for row in entries:
+        if row[5] != "-":
+            console.print(
+                f"[dim]hook:[/dim] event={row[3]} id={row[5]} "
+                f"runtime_kinds={row[8]} session_source={row[9]}"
+            )
     console.print(f"[dim]Workspace root:[/dim] {workspace_root.as_posix()}")
 
 
@@ -370,6 +376,7 @@ def hooks_test(
         return
 
     table = _Table(title=f"Hooks Test ({canonical_event})")
+    detail_rows: list[tuple[str, str, str, str]] = []
     table.add_column("scope")
     table.add_column("trust")
     table.add_column("matcher")
@@ -401,7 +408,14 @@ def hooks_test(
                 reason,
                 hook.command,
             )
+            detail_rows.append((hook.id or "-", "yes" if matched else "no", reason, hook.command))
     console.print(table)
+    for hook_id, matched, reason, command in detail_rows:
+        if hook_id != "-":
+            console.print(
+                f"[dim]hook_test:[/dim] id={hook_id} match={matched} "
+                f"reason={reason} command={command}"
+            )
     if resolved.untrusted_project_paths:
         console.print(
             "[yellow]Ignored untrusted project hook configs:[/yellow] "

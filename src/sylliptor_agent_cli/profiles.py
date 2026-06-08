@@ -5,12 +5,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+from .llm.protocols import OPENAI_COMPAT_PROTOCOL, SUPPORTED_LLM_PROTOCOLS
 from .web_search_adapters import normalize_web_search_adapter
 
 if TYPE_CHECKING:
     from .config import AppConfig
 
-SUPPORTED_PROTOCOLS: frozenset[str] = frozenset({"openai_compat"})
+SUPPORTED_PROTOCOLS: frozenset[str] = SUPPORTED_LLM_PROTOCOLS
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 _PROFILE_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
@@ -18,7 +19,7 @@ _PROFILE_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 @dataclass(frozen=True)
 class ProfileSpec:
     name: str
-    protocol: str = "openai_compat"
+    protocol: str = OPENAI_COMPAT_PROTOCOL
     base_url: str = ""
     api_key_env: str | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
@@ -54,7 +55,7 @@ class ProfileSpec:
             _raise_config_error(f"Profile {name!r} must be a JSON object.")
         return cls(
             name=name,
-            protocol=str(data.get("protocol") or "openai_compat").strip(),
+            protocol=str(data.get("protocol") or OPENAI_COMPAT_PROTOCOL).strip(),
             base_url=str(data.get("base_url") or "").strip(),
             api_key_env=_optional_string(data.get("api_key_env")),
             extra_headers=_coerce_headers(data.get("extra_headers")),
@@ -256,7 +257,7 @@ def migrate_legacy_to_profiles(cfg: AppConfig) -> bool:
         api_key_env = None
     profile = ProfileSpec(
         name="default",
-        protocol="openai_compat",
+        protocol=OPENAI_COMPAT_PROTOCOL,
         base_url=base_url,
         api_key_env=api_key_env,
         default_model=str(getattr(cfg, "model", "") or "").strip(),

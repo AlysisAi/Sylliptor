@@ -103,6 +103,10 @@ _USE_INSTEAD_RE = re.compile(
     r"\b(?:use|using)\s+(?P<new>.+?)\s+instead\b",
     re.IGNORECASE | re.DOTALL,
 )
+_NEGATED_DROP_PREFIX_RE = re.compile(
+    r"(?:^|[\s.;:,])(?:do\s+not|don't|dont|never|must\s+not|should\s+not|without|not)\s+$",
+    re.IGNORECASE,
+)
 
 
 def _dedupe_keep_order(values: list[str]) -> tuple[str, ...]:
@@ -189,6 +193,8 @@ def detect_direction_change(text: str) -> DirectionChange | None:
     reasons: list[str] = []
     for reason, pattern in _DIRECTION_PATTERNS:
         for match in pattern.finditer(raw_text):
+            if reason == "drop" and _match_has_negated_drop_prefix(raw_text, match.start()):
+                continue
             old = _clean_term(match.groupdict().get("old", ""))
             if not old:
                 continue
@@ -208,6 +214,11 @@ def detect_direction_change(text: str) -> DirectionChange | None:
         reason=", ".join(_dedupe_keep_order(reasons)) or "direction_change",
         raw_text=raw_text,
     )
+
+
+def _match_has_negated_drop_prefix(text: str, start: int) -> bool:
+    prefix = str(text or "")[: max(0, start)]
+    return _NEGATED_DROP_PREFIX_RE.search(prefix[-40:]) is not None
 
 
 def direction_change_to_record(change: DirectionChange) -> dict[str, Any]:

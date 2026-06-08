@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from sylliptor_agent_cli.config import AppConfig, ConfigError, load_config, save_config
+from sylliptor_agent_cli.llm.protocols import SUPPORTED_LLM_PROTOCOLS
+from sylliptor_agent_cli.profile_presets import get_preset, make_profile_from_preset
 from sylliptor_agent_cli.profiles import (
     ProfileSpec,
     add_profile,
@@ -41,6 +43,73 @@ def test_profile_name_validation_rejects_invalid_chars() -> None:
 def test_protocol_validation_rejects_unknown() -> None:
     with pytest.raises(ConfigError):
         ProfileSpec(name="test", protocol="anthropic_native", base_url="https://example.com/v1")
+
+
+@pytest.mark.parametrize("protocol", sorted(SUPPORTED_LLM_PROTOCOLS))
+def test_profile_spec_accepts_supported_llm_protocols(protocol: str) -> None:
+    profile = ProfileSpec(name="test", protocol=protocol, base_url="https://example.com/v1")
+
+    assert profile.protocol == protocol
+
+
+def test_profile_from_dict_defaults_missing_protocol_to_openai_compat() -> None:
+    profile = ProfileSpec.from_dict(
+        "legacy",
+        {
+            "base_url": "https://example.com/v1",
+            "default_model": "model",
+        },
+    )
+
+    assert profile.protocol == "openai_compat"
+
+
+def test_openai_responses_preset_uses_native_protocol_without_changing_openai_default() -> None:
+    compat = get_preset("openai")
+    native = get_preset("openai-responses")
+
+    assert compat is not None
+    assert compat.protocol == "openai_compat"
+    assert native is not None
+    assert native.protocol == "openai_responses"
+
+    profile = make_profile_from_preset(native)
+    assert profile.name == "openai-responses"
+    assert profile.protocol == "openai_responses"
+    assert profile.base_url == "https://api.openai.com/v1"
+    assert profile.web_search_adapter == "openai_responses"
+
+
+def test_anthropic_preset_uses_messages_protocol_by_default() -> None:
+    native = get_preset("anthropic")
+    compat = get_preset("anthropic-compat")
+
+    assert compat is not None
+    assert compat.protocol == "openai_compat"
+    assert native is not None
+    assert native.protocol == "anthropic_messages"
+
+    profile = make_profile_from_preset(native)
+    assert profile.name == "anthropic"
+    assert profile.protocol == "anthropic_messages"
+    assert profile.base_url == "https://api.anthropic.com/v1"
+    assert profile.web_search_adapter == "anthropic_messages"
+
+
+def test_gemini_preset_uses_generate_content_protocol_by_default() -> None:
+    native = get_preset("gemini")
+    compat = get_preset("gemini-compat")
+
+    assert compat is not None
+    assert compat.protocol == "openai_compat"
+    assert native is not None
+    assert native.protocol == "gemini_generate_content"
+
+    profile = make_profile_from_preset(native)
+    assert profile.name == "gemini"
+    assert profile.protocol == "gemini_generate_content"
+    assert profile.base_url == "https://generativelanguage.googleapis.com/v1beta"
+    assert profile.web_search_adapter == "gemini_grounding"
 
 
 def test_base_url_validation_rejects_malformed_url() -> None:

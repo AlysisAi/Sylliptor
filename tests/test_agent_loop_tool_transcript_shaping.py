@@ -4,9 +4,18 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
-from sylliptor_agent_cli.llm.openai_compat import PROVIDER_METADATA_KEY, LLMResponse, ToolCall
+from sylliptor_agent_cli.llm.metadata import (
+    ANTHROPIC_MESSAGES_PROVIDER_METADATA_KEY,
+    GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY,
+    OPENAI_RESPONSES_PROVIDER_METADATA_KEY,
+    PROVIDER_METADATA_KEY,
+    strip_provider_metadata_from_message,
+)
+from sylliptor_agent_cli.llm.types import LLMResponse, ToolCall
 from sylliptor_agent_cli.session_store import read_session_events
 
 
@@ -142,6 +151,10 @@ def test_run_turn_shapes_medium_tool_output_but_keeps_tool_transcript_valid(
     assert tool_result_events
     assert tool_result_events[-1]["name"] == "fs_read"
     assert len(str((tool_result_events[-1]["result"] or {}).get("content") or "")) == 1800
+    logged_content = json.loads(str(tool_result_events[-1].get("content") or "{}"))
+    assert logged_content["transcript_shaped"] is True
+    assert logged_content["tool_call_id"] == "tc-read"
+    assert "A" * 800 not in str(tool_result_events[-1].get("content") or "")
 
 
 def test_run_turn_preserves_deepseek_reasoning_metadata_for_tool_followup(
@@ -199,3 +212,277 @@ def test_run_turn_preserves_deepseek_reasoning_metadata_for_tool_followup(
         "deepseek": {"reasoning_content": "hidden reasoning state"}
     }
     assert "reasoning_content" not in assistant_call
+
+
+@pytest.mark.parametrize(
+    ("provider_key", "metadata_payload", "final_text"),
+    [
+        (
+            OPENAI_RESPONSES_PROVIDER_METADATA_KEY,
+            {
+                "response_id": "resp_web_text",
+                "output_items": [
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "status": "completed",
+                        "action": {"type": "search", "query": "Sylliptor metadata"},
+                    },
+                    {
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Hosted search found the release notes.",
+                            }
+                        ],
+                    },
+                ],
+                "web_search_calls": [
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "status": "completed",
+                    }
+                ],
+            },
+            "Hosted search found the release notes.",
+        ),
+        (
+            ANTHROPIC_MESSAGES_PROVIDER_METADATA_KEY,
+            {
+                "message_id": "msg_search_text",
+                "content_blocks": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {"query": "Sylliptor metadata"},
+                    },
+                    {
+                        "type": "text",
+                        "text": "Anthropic search found the release notes.",
+                        "citations": [
+                            {
+                                "type": "web_search_result_location",
+                                "url": "https://example.test/release",
+                                "title": "Release notes",
+                            }
+                        ],
+                    },
+                ],
+                "server_tool_uses": [
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                    }
+                ],
+                "citations": [
+                    {
+                        "type": "web_search_result_location",
+                        "url": "https://example.test/release",
+                        "title": "Release notes",
+                    }
+                ],
+            },
+            "Anthropic search found the release notes.",
+        ),
+        (
+            GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY,
+            {
+                "response_id": "resp_grounded_text",
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "text": "Gemini grounding found the release notes.",
+                            "thoughtSignature": "thought-text-only",
+                        }
+                    ],
+                },
+                "groundingMetadata": {
+                    "webSearchQueries": ["Sylliptor metadata"],
+                    "groundingChunks": [
+                        {
+                            "web": {
+                                "uri": "https://example.test/release",
+                                "title": "Release notes",
+                            }
+                        }
+                    ],
+                },
+                "search_queries": ["Sylliptor metadata"],
+            },
+            "Gemini grounding found the release notes.",
+        ),
+    ],
+)
+def test_run_turn_preserves_text_only_native_provider_metadata_for_followup(
+    tmp_path: Path,
+    provider_key: str,
+    metadata_payload: dict[str, Any],
+    final_text: str,
+) -> None:
+    session = create_session(
+        cfg=_cfg(),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+        session_id_override=f"text-only-{provider_key}",
+        enable_compaction=False,
+        enable_tool_output_offload=True,
+        enable_conversation_summarization=False,
+    )
+    client = _ScriptedClient(
+        responses=[
+            LLMResponse(
+                content=final_text,
+                tool_calls=[],
+                raw={},
+                provider_metadata={provider_key: metadata_payload},
+            ),
+            LLMResponse(content="Follow-up complete.", tool_calls=[], raw={}),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        assert session.run_turn("Use native hosted search and answer.") == 0
+        messages_after_first_turn = list(session.messages)
+        assert session.run_turn("Use the same provider context.") == 0
+        log_path = session.store.path
+    finally:
+        session.close()
+
+    assistant_message = next(
+        message
+        for message in reversed(messages_after_first_turn)
+        if str(message.get("role")) == "assistant" and message.get("content") == final_text
+    )
+    assert assistant_message[PROVIDER_METADATA_KEY][provider_key] == metadata_payload
+    assert strip_provider_metadata_from_message(assistant_message) == {
+        "role": "assistant",
+        "content": final_text,
+    }
+
+    followup_messages = client.calls[1]["messages"]
+    followup_assistant = next(
+        message
+        for message in followup_messages
+        if str(message.get("role")) == "assistant" and message.get("content") == final_text
+    )
+    assert followup_assistant[PROVIDER_METADATA_KEY][provider_key] == metadata_payload
+
+    assistant_events = [
+        dict(event.get("payload") or {})
+        for event in read_session_events(log_path)
+        if event.get("type") == "assistant_message"
+    ]
+    first_event = next(
+        payload for payload in assistant_events if payload.get("content") == final_text
+    )
+    assert first_event["message"][PROVIDER_METADATA_KEY][provider_key] == metadata_payload
+    assert PROVIDER_METADATA_KEY not in str(first_event.get("content") or "")
+
+
+def test_run_turn_persists_duplicate_final_text_native_provider_metadata(
+    tmp_path: Path,
+) -> None:
+    sample = tmp_path / "sample.txt"
+    sample.write_text("release notes", encoding="utf-8")
+    repeated_text = "I found the release notes."
+    metadata_payload = {
+        "response_id": "resp_duplicate_final_text",
+        "output_items": [
+            {
+                "type": "web_search_call",
+                "id": "ws_duplicate_final",
+                "status": "completed",
+                "action": {"type": "search", "query": "Sylliptor release notes"},
+            },
+            {
+                "type": "message",
+                "id": "msg_duplicate_final",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": repeated_text}],
+            },
+        ],
+    }
+    session = create_session(
+        cfg=_cfg(),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+        session_id_override="duplicate-final-native-metadata",
+        enable_compaction=False,
+        enable_tool_output_offload=True,
+        enable_conversation_summarization=False,
+    )
+    client = _ScriptedClient(
+        responses=[
+            LLMResponse(
+                content=repeated_text,
+                tool_calls=[
+                    ToolCall(
+                        id="tc-read",
+                        name="fs_read",
+                        arguments={"path": "sample.txt"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content=repeated_text,
+                tool_calls=[],
+                raw={},
+                provider_metadata={OPENAI_RESPONSES_PROVIDER_METADATA_KEY: metadata_payload},
+            ),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Read the file and answer with hosted search context.")
+        log_path = session.store.path
+        persisted_messages = list(session.messages)
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    final_assistant_message = persisted_messages[-1]
+    assert final_assistant_message["content"] == repeated_text
+    assert (
+        final_assistant_message[PROVIDER_METADATA_KEY][OPENAI_RESPONSES_PROVIDER_METADATA_KEY]
+        == metadata_payload
+    )
+
+    assistant_events = [
+        dict(event.get("payload") or {})
+        for event in read_session_events(log_path)
+        if event.get("type") == "assistant_message"
+    ]
+    final_metadata_event = next(
+        payload
+        for payload in assistant_events
+        if (
+            isinstance(payload.get("message"), dict)
+            and payload["message"]
+            .get(PROVIDER_METADATA_KEY, {})
+            .get(OPENAI_RESPONSES_PROVIDER_METADATA_KEY, {})
+            .get("response_id")
+            == "resp_duplicate_final_text"
+        )
+    )
+    assert final_metadata_event["content"] == repeated_text
+    assert "web_search_call" not in final_metadata_event["content"]

@@ -5,12 +5,23 @@ import json
 import httpx
 import pytest
 
+from sylliptor_agent_cli.llm import types as shared_types
 from sylliptor_agent_cli.llm.openai_compat import (
     PROVIDER_METADATA_KEY,
     LLMError,
+    LLMResponse,
+    LLMUsage,
     OpenAICompatClient,
+    ToolCall,
     attach_provider_metadata_to_assistant_message,
 )
+
+
+def test_openai_compat_reexports_shared_llm_types() -> None:
+    assert LLMError is shared_types.LLMError
+    assert ToolCall is shared_types.ToolCall
+    assert LLMUsage is shared_types.LLMUsage
+    assert LLMResponse is shared_types.LLMResponse
 
 
 def _surrogate_escaped_text(text: str) -> str:

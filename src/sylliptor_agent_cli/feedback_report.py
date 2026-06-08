@@ -1091,7 +1091,7 @@ def _render_feedback_markdown(
     workspace_root: Path,
 ) -> str:
     lines = [
-        "# Beta Feedback",
+        "# Feedback",
         "",
         f"- Created At: {_now_iso(created_at)}",
         f"- Session ID: {session_id or '(none)'}",

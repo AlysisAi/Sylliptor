@@ -21,7 +21,9 @@ from .repo_scan import (
     scan_workspace,
 )
 from .serialized_paths import safe_serialized_path
+from .task_dependencies import infer_ordered_predecessor_dependency
 from .task_readiness import (
+    TASK_KIND_ANALYSIS_ONLY,
     has_runnable_local_file_scope,
     manual_task_scope_error_message,
     normalize_task_file_fields,
@@ -351,10 +353,18 @@ def add_task(
         "branch": branch,
         "status": status,
         "attempts": attempts,
+        "task_kind": scope.task_kind,
+        "task_kind_reason": scope.task_kind_reason,
     }
     if isinstance(mcp_scope, dict):
         task["mcp_scope"] = dict(mcp_scope)
+    if scope.task_kind == TASK_KIND_ANALYSIS_ONLY:
+        task["analysis_only"] = True
     tasks.append(task)
+    if not dependencies:
+        inferred_dependency = infer_ordered_predecessor_dependency(tasks=tasks, task=task)
+        if inferred_dependency is not None:
+            task["dependencies"] = [inferred_dependency.depends_on]
     plan["updated_at"] = now_iso()
     return task
 
@@ -433,6 +443,13 @@ def _default_plan_json(run_id: str) -> dict[str, Any]:
         "summary": "",
         "requirements": [],
         "tasks": [],
+        "planning_constraints": {
+            "schema_version": 1,
+            "target_roots": [],
+            "forbidden_roots": [],
+            "decoy_roots": [],
+            "unrelated_roots": [],
+        },
         "assets": [],
     }
 
@@ -725,6 +742,25 @@ def render_plan_markdown(plan: dict[str, Any], *, asset_index: Any | None = None
                 continue
             suffix = f" ({reason})" if reason else ""
             lines.append(f"- {text}{suffix}")
+
+    planning_constraints = plan.get("planning_constraints")
+    if isinstance(planning_constraints, dict):
+        constraint_lines: list[str] = []
+        for label, key in (
+            ("Target roots", "target_roots"),
+            ("Forbidden roots", "forbidden_roots"),
+            ("Decoy roots", "decoy_roots"),
+            ("Unrelated roots", "unrelated_roots"),
+        ):
+            entries = [
+                str(entry.get("path") or "").strip()
+                for entry in planning_constraints.get(key) or []
+                if isinstance(entry, dict) and str(entry.get("path") or "").strip()
+            ]
+            if entries:
+                constraint_lines.append(f"- {label}: " + ", ".join(f"`{path}`" for path in entries))
+        if constraint_lines:
+            lines.extend(["", "## Planning Constraints", "", *constraint_lines])
 
     def _md_cell(value: Any) -> str:
         text = str(value or "").strip()
@@ -1516,6 +1552,8 @@ def write_task_report(
     salvaged_agent_exception: bool = False,
     agent_exception_summary: str | None = None,
     noop_reason: str | None = None,
+    task_kind: str | None = None,
+    task_lifecycle_reason: str | None = None,
     remote_lines: list[str] | None = None,
 ) -> Path:
     ensure_execution_dirs(paths)
@@ -1531,6 +1569,8 @@ def write_task_report(
         f"- Finished At: {finished_at}",
         f"- Result: {result}",
         f"- Result Kind: {result_kind or '(n/a)'}",
+        f"- Task Kind: {task_kind or str(task.get('task_kind') or '(n/a)')}",
+        f"- Task Lifecycle Reason: {task_lifecycle_reason or str(task.get('task_kind_reason') or '(n/a)')}",
         f"- Salvaged Non-Zero Exit: {'yes' if salvaged_nonzero_exit else 'no'}",
         f"- Salvaged Agent Exception: {'yes' if salvaged_agent_exception else 'no'}",
         f"- Agent Exception Summary: {clean_agent_exception_summary or '(none)'}",

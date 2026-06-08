@@ -96,6 +96,35 @@ def test_review_mode_shell_run_requires_approval(tmp_path: Path) -> None:
         tools["shell_run"].run({"cmd": "echo hi"})
 
 
+def test_review_mode_non_interactive_can_use_host_managed_approval(tmp_path: Path) -> None:
+    class HostApprovalSurface(NoopSurface):
+        host_managed_approvals = True
+
+        def __init__(self) -> None:
+            self.requests: list[ApprovalRequest] = []
+
+        def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
+            self.requests.append(request)
+            return ApprovalDecision(allow=True)
+
+    surface = HostApprovalSurface()
+    tools = build_tools(
+        root=tmp_path,
+        console=Console(file=io.StringIO()),
+        surface=surface,
+        store=_store(tmp_path),
+        mode="review",
+        yes=False,
+        non_interactive=True,
+    )
+
+    tools["fs_write"].run({"path": "allowed.txt", "content": "x"})
+
+    assert (tmp_path / "allowed.txt").read_text(encoding="utf-8") == "x"
+    assert len(surface.requests) == 1
+    assert surface.requests[0].kind == "fs_write"
+
+
 def test_review_mode_fs_write_escape_path_rejected_before_approval(tmp_path: Path) -> None:
     class RecordingSurface(NoopSurface):
         def __init__(self) -> None:

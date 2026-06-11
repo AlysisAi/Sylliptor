@@ -683,3 +683,68 @@ def tools() -> None:
     console.print(
         "[dim]Custom tools are managed separately via `sylliptor tool list|info|trust|untrust`.[/dim]"
     )
+
+
+@app.command()
+def login() -> None:
+    """Connect your Sylliptor account and unlock the free MiMo trial."""
+    from ... import account_login
+
+    console = _console()
+    cfg = _patchable("load_config", load_config)()
+    try:
+        result = account_login.login(
+            cfg, output_write=lambda message: console.print(message, highlight=False)
+        )
+    except (account_login.SylliptorLoginError, ConfigError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    who = f" as [bold]{result.email}[/bold]" if result.email else ""
+    console.print(f"[green]Logged in{who}.[/green] Your free MiMo trial is ready.")
+    console.print(
+        f"Active profile: [bold]{result.profile_name}[/bold] · default model: "
+        f"[bold]{result.model}[/bold]"
+    )
+    console.print(
+        "[dim]Run `sylliptor chat` to start. Use `sylliptor logout` to disconnect.[/dim]"
+    )
+
+
+@app.command()
+def logout() -> None:
+    """Disconnect your Sylliptor account (forgets the stored access key)."""
+    from ... import account_login
+
+    console = _console()
+    cfg = _patchable("load_config", load_config)()
+    if account_login.logout(cfg):
+        console.print("[green]Logged out.[/green] Your stored MiMo access key was removed.")
+    else:
+        console.print("You're not logged in to a Sylliptor account.")
+
+
+@app.command()
+def whoami() -> None:
+    """Show your Sylliptor login status."""
+    from ... import account_login
+
+    console = _console()
+    cfg = _patchable("load_config", load_config)()
+    status = account_login.login_status(cfg)
+    if not status.logged_in:
+        console.print("Not logged in. Run `sylliptor login` to start your free MiMo trial.")
+        return
+    active = "active" if status.active else "not active"
+    console.print("[green]Logged in[/green] to the Sylliptor MiMo trial.")
+    console.print(
+        f"Profile: [bold]{status.profile_name}[/bold] ({active}) · key {status.key_preview}"
+    )
+    console.print(f"Proxy: {status.base_url}")
+    trial = account_login.fetch_trial_status(cfg)
+    if trial is not None:
+        line = account_login.format_trial_status_line(trial)
+        if line:
+            console.print(line)
+    else:
+        console.print("[dim](Could not reach the trial service for live status.)[/dim]")

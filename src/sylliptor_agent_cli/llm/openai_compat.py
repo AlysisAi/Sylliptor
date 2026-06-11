@@ -680,6 +680,60 @@ def _json_error_payload(body: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+# Friendly, user-facing copy for the Sylliptor MiMo trial proxy's error codes.
+# The proxy (Supabase Edge Function) returns an OpenAI-shaped envelope
+# {"error": {"message": ..., "type": ..., "code": "<reason>"}} with these string
+# codes; upstream/other-provider errors use different codes and fall through.
+_SYLLIPTOR_PROXY_ERROR_MESSAGES: dict[str, str] = {
+    "invalid_key": (
+        "Your Sylliptor session is invalid or has been reset. "
+        "Run `sylliptor login` to reconnect your account."
+    ),
+    "trial_expired": (
+        "Your 10-day free MiMo trial has ended. "
+        "See your options at https://sylliptor.alysisai.com/account"
+    ),
+    "quota_exhausted": (
+        "You've used all of your free MiMo trial tokens. "
+        "See your options at https://sylliptor.alysisai.com/account"
+    ),
+    "email_not_verified": (
+        "Please confirm your email to use the MiMo trial — "
+        "check your inbox for the verification link."
+    ),
+    "plan_inactive": (
+        "Your Sylliptor plan is not active. "
+        "Visit https://sylliptor.alysisai.com/account to continue."
+    ),
+    "rate_limit_exceeded": (
+        "You're sending requests too quickly. Please wait a moment and try again."
+    ),
+    "global_budget_exceeded": (
+        "The free MiMo trial is at capacity right now. Please try again shortly."
+    ),
+    "proxy_unconfigured": (
+        "The MiMo service is temporarily unavailable. Please try again later."
+    ),
+}
+
+
+def sylliptor_trial_error_message(err: LLMError) -> str | None:
+    """Friendly message for a Sylliptor MiMo proxy error, or None if not ours.
+
+    Maps the proxy's known error ``code`` (trial_expired, quota_exhausted, ...) to
+    human copy so a user whose trial ended sees a clear next step instead of a raw
+    ``LLM error 402: {...}`` dump. Returns None for any other failure (including
+    upstream OpenRouter errors, which use numeric codes), so non-proxy errors
+    render unchanged.
+    """
+    payload = _json_error_payload(_llm_error_body(err))
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = str(error.get("code") or "").strip()
+    return _SYLLIPTOR_PROXY_ERROR_MESSAGES.get(code)
+
+
 def _temperature_error_fields(err: LLMError) -> tuple[str, str, str] | None:
     status_code = _llm_error_status_code(err)
     if status_code not in _TEMPERATURE_UNSUPPORTED_STATUS_CODES:

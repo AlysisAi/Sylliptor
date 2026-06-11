@@ -31,6 +31,20 @@
 
 ---
 
+## ⚡ Free Xiaomi MiMo trial
+
+Run Sylliptor on **[Xiaomi MiMo](https://openrouter.ai/xiaomi)** — **free for 10 days**, no API key, no card. MiMo is the default model.
+
+```bash
+pipx install sylliptor-agent-cli
+sylliptor login      # connect your Sylliptor account in the browser
+sylliptor chat       # start building — MiMo is ready
+```
+
+Create your account at **[sylliptor.alysisai.com](https://sylliptor.alysisai.com)**, then `sylliptor login` links the CLI to your trial. Usage is metered server-side and the upstream model key never touches your machine.
+
+---
+
 ## Why Sylliptor
 
 - **Forge** — Plan, dispatch parallel workers, verify each task, ship.

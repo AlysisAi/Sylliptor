@@ -816,20 +816,36 @@ def _chat_llm_error_panel(*, message: str) -> Panel:
     return _Panel("\n".join(body_lines), title=display.title, border_style="red")
 
 
+def _humanized_chat_llm_error_message(error: Exception) -> str:
+    """Prefer Sylliptor MiMo trial friendly copy; fall back to the raw error.
+
+    Turns the proxy's ``LLM error 402: {...trial_expired...}`` into a clear,
+    actionable line. Any non-proxy error (or import hiccup) renders unchanged.
+    """
+    try:
+        from ...llm.openai_compat import sylliptor_trial_error_message
+
+        friendly = sylliptor_trial_error_message(error)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001
+        friendly = None
+    return friendly or str(error)
+
+
 def _render_chat_llm_error(*, session: Any, console: Console, error: Exception) -> None:
+    message = _humanized_chat_llm_error_message(error)
     surface = getattr(session, "surface", None)
     on_error = getattr(surface, "on_error", None)
     if callable(on_error):
         try:
-            on_error(str(error))
+            on_error(message)
         except Exception:  # noqa: BLE001
             console.print("")
-            console.print(_chat_llm_error_panel(message=str(error)))
+            console.print(_chat_llm_error_panel(message=message))
             return
         if bool(getattr(surface, "renders_error_panel", False)):
             return
     console.print("")
-    console.print(_chat_llm_error_panel(message=str(error)))
+    console.print(_chat_llm_error_panel(message=message))
 
 
 def _plan_mode_action_rows() -> list[tuple[str, str, str]]:

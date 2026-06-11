@@ -14,6 +14,7 @@ from sylliptor_agent_cli.llm.openai_compat import (
     OpenAICompatClient,
     ToolCall,
     attach_provider_metadata_to_assistant_message,
+    sylliptor_trial_error_message,
 )
 
 
@@ -22,6 +23,50 @@ def test_openai_compat_reexports_shared_llm_types() -> None:
     assert ToolCall is shared_types.ToolCall
     assert LLMUsage is shared_types.LLMUsage
     assert LLMResponse is shared_types.LLMResponse
+
+
+def test_sylliptor_trial_error_message_maps_known_codes() -> None:
+    err = LLMError(
+        "LLM error 402: "
+        + json.dumps({"error": {"message": "Trial window passed.", "code": "trial_expired"}})
+    )
+    msg = sylliptor_trial_error_message(err)
+    assert msg is not None
+    assert "trial has ended" in msg
+    assert "sylliptor.alysisai.com/account" in msg
+
+
+def test_sylliptor_trial_error_message_handles_each_proxy_code() -> None:
+    cases = {
+        "invalid_key": "sylliptor login",
+        "quota_exhausted": "trial tokens",
+        "email_not_verified": "confirm your email",
+        "plan_inactive": "not active",
+        "rate_limit_exceeded": "wait a moment",
+        "global_budget_exceeded": "at capacity",
+        "proxy_unconfigured": "temporarily unavailable",
+    }
+    for code, needle in cases.items():
+        err = LLMError("LLM error 400: " + json.dumps({"error": {"code": code}}))
+        msg = sylliptor_trial_error_message(err)
+        assert msg is not None, code
+        assert needle in msg, code
+
+
+def test_sylliptor_trial_error_message_ignores_non_proxy_errors() -> None:
+    # Upstream OpenRouter error: numeric code, not one of ours.
+    upstream = LLMError(
+        "LLM error 401: " + json.dumps({"error": {"message": "User not found.", "code": 401}})
+    )
+    assert sylliptor_trial_error_message(upstream) is None
+
+    # Unknown string code.
+    unknown = LLMError("LLM error 500: " + json.dumps({"error": {"code": "kaboom"}}))
+    assert sylliptor_trial_error_message(unknown) is None
+
+    # Non-JSON body (e.g. a plain-text 500 from an edge/CDN layer).
+    plain = LLMError("LLM error 500: Internal Server Error")
+    assert sylliptor_trial_error_message(plain) is None
 
 
 def _surrogate_escaped_text(text: str) -> str:

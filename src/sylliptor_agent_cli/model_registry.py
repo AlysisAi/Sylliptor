@@ -63,6 +63,19 @@ _BUILT_IN_MODEL_METADATA: dict[str, dict[str, Any]] = {
         "input_cost_per_token": 0.000000435,
         "output_cost_per_token": 0.00000087,
     },
+    # Hosted Xiaomi MiMo trial: the CLI sends the friendly id "mimo" (the proxy
+    # pins it to the real upstream id server-side). Without an entry here the id
+    # resolves nowhere and falls back to 8192/2048 — emitting a metadata warning
+    # on every run and silently collapsing the usable context window ~32x.
+    # Values mirror the bundled `openrouter/xiaomi/mimo-v2-flash` catalog entry
+    # (262144 input / 16384 output); costs use the mimo-v2.5-pro list price.
+    "mimo": {
+        "context_window_tokens": 262_144,
+        "max_output_tokens": 16_384,
+        "supports_vision": False,
+        "input_cost_per_token": 0.000000435,
+        "output_cost_per_token": 0.00000087,
+    },
 }
 
 

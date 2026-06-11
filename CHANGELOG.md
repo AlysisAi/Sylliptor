@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-06-11
+
+### Added
+
+- Hosted **Xiaomi MiMo** free-trial provider: `sylliptor login` / `logout` / `whoami` connect the CLI to your Sylliptor account over a localhost browser handshake and unlock the 10-day MiMo trial — no API key, usage metered server-side, and the upstream model key never exposed to the client.
+- `sylliptor` provider preset (selectable in setup) routing to the hosted MiMo proxy with `mimo` as the default model, plus a one-step "connect now" offer at the end of setup and `/login` `/logout` chat commands.
+- `mimo` built-in model metadata (262144 context / 16384 output) so the trial model uses its full context window instead of the 8192/2048 fallback.
+- Friendly CLI messages for trial-state proxy errors (trial expired, quota exhausted, rate limited, …) in both interactive chat and one-shot `run`.
+
+### Fixed
+
+- Force UTF-8 stdout/stderr at startup so the rich UI no longer crashes on non-UTF-8 consoles (e.g. Windows Greek cp1253).
+
 ## [0.9.1] - 2026-06-08
 
 ### Added

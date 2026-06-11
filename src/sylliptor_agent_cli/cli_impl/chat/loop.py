@@ -1614,8 +1614,17 @@ def run(
         console.print(f"[red]Workspace error:[/red] {e}")
         raise typer.Exit(code=1) from e
     except Exception as e:  # noqa: BLE001
+        # Prefer friendly Sylliptor MiMo trial copy (trial_expired, rate-limit, ...)
+        # over a raw ``LLM error 402: {...}`` dump; any other error renders as-is.
+        message = str(e)
         try:
-            console.print(f"[red]Error:[/red] {e}")
+            from ...llm.openai_compat import sylliptor_trial_error_message
+
+            message = sylliptor_trial_error_message(e) or message
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            console.print(f"[red]Error:[/red] {message}")
         except Exception as render_exc:  # noqa: BLE001 - CLI error rendering must not double-crash.
             safe_plain_error(
                 stream=getattr(console, "file", None),

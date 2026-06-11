@@ -711,9 +711,7 @@ _SYLLIPTOR_PROXY_ERROR_MESSAGES: dict[str, str] = {
     "global_budget_exceeded": (
         "The free MiMo trial is at capacity right now. Please try again shortly."
     ),
-    "proxy_unconfigured": (
-        "The MiMo service is temporarily unavailable. Please try again later."
-    ),
+    "proxy_unconfigured": ("The MiMo service is temporarily unavailable. Please try again later."),
 }
 
 

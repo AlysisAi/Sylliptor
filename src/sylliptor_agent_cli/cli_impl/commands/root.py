@@ -706,9 +706,7 @@ def login() -> None:
         f"Active profile: [bold]{result.profile_name}[/bold] · default model: "
         f"[bold]{result.model}[/bold]"
     )
-    console.print(
-        "[dim]Run `sylliptor chat` to start. Use `sylliptor logout` to disconnect.[/dim]"
-    )
+    console.print("[dim]Run `sylliptor chat` to start. Use `sylliptor logout` to disconnect.[/dim]")
 
 
 @app.command()

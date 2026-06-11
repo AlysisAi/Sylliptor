@@ -124,7 +124,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         body = (
             '<!doctype html><html><head><meta charset="utf-8">'
             "<title>Sylliptor CLI login</title></head>"
-            f"<body style=\"font-family:system-ui;padding:2rem\"><p>{html.escape(message)}</p>"
+            f'<body style="font-family:system-ui;padding:2rem"><p>{html.escape(message)}</p>'
             "</body></html>"
         ).encode()
         self.send_response(200)
@@ -356,6 +356,8 @@ def _format_token_usage(used: int | None, total: int | None) -> str | None:
     if total:
         return f"{used or 0:,} / {total:,} tokens used"
     return f"{used or 0:,} tokens used"
+
+
 def _exchange_code(code: str) -> tuple[str, str | None]:
     """Swap a one-time code for (access_key, email) via the cli-auth function."""
     request = urllib.request.Request(

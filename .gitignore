@@ -28,8 +28,10 @@ sylliptor-feedback/
 reports/
 qa_reports/
 
-# Claude Code local config
-.claude/
+# Local tool config
+.claude/*
+!.claude/
+!.claude/settings.json
 
 # OS / IDE
 .DS_Store

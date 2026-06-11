@@ -1395,3 +1395,73 @@ def test_setup_typer_command_runs_wizard(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert called == [True]
+
+
+def _mimo_login_preset() -> ProfilePreset:
+    from sylliptor_agent_cli.sylliptor_cloud import PROFILE_KEY
+
+    # The hosted MiMo trial is an OpenAI-compatible gateway preset, so it lives in
+    # the advanced/gateway picker rather than the primary native-provider screen.
+    return next(
+        p for p in setup_wizard_mod.advanced_provider_selection_presets() if p.key == PROFILE_KEY
+    )
+
+
+def _profile_step_for(preset: ProfilePreset) -> Any:
+    profile = make_profile_from_preset(preset)
+    return setup_wizard_mod._ProfileStepResult(profile=profile, label=preset.label, preset=preset)
+
+
+def test_setup_offers_login_for_mimo_preset(monkeypatch) -> None:
+    import sylliptor_agent_cli.account_login as account_login_mod
+
+    console = Console(file=io.StringIO())
+    monkeypatch.setattr(setup_wizard_mod, "_prompt_yes_no", lambda *a, **k: True)
+    calls: list[bool] = []
+
+    def fake_login(cfg: Any, *, output_write: Any = None) -> Any:
+        calls.append(True)
+        return Mock(email="user@example.com")
+
+    monkeypatch.setattr(account_login_mod, "login", fake_login)
+
+    setup_wizard_mod._maybe_offer_sylliptor_login(
+        console, profile_result=_profile_step_for(_mimo_login_preset()), cfg=Mock()
+    )
+
+    assert calls == [True]
+
+
+def test_setup_skips_login_offer_for_other_presets(monkeypatch) -> None:
+    import sylliptor_agent_cli.account_login as account_login_mod
+
+    console = Console(file=io.StringIO())
+    other = next(
+        p
+        for p in setup_wizard_mod.provider_selection_presets()
+        if p.key != _mimo_login_preset().key
+    )
+    calls: list[bool] = []
+    monkeypatch.setattr(setup_wizard_mod, "_prompt_yes_no", lambda *a, **k: True)
+    monkeypatch.setattr(account_login_mod, "login", lambda *a, **k: calls.append(True))
+
+    setup_wizard_mod._maybe_offer_sylliptor_login(
+        console, profile_result=_profile_step_for(other), cfg=Mock()
+    )
+
+    assert calls == []  # never prompts or logs in for non-MiMo providers
+
+
+def test_setup_login_offer_declined_does_not_log_in(monkeypatch) -> None:
+    import sylliptor_agent_cli.account_login as account_login_mod
+
+    console = Console(file=io.StringIO())
+    calls: list[bool] = []
+    monkeypatch.setattr(setup_wizard_mod, "_prompt_yes_no", lambda *a, **k: False)
+    monkeypatch.setattr(account_login_mod, "login", lambda *a, **k: calls.append(True))
+
+    setup_wizard_mod._maybe_offer_sylliptor_login(
+        console, profile_result=_profile_step_for(_mimo_login_preset()), cfg=Mock()
+    )
+
+    assert calls == []

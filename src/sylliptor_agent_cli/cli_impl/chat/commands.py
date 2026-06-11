@@ -1162,6 +1162,47 @@ def _handle_chat_command(
             session.cfg.stream = stream_value
         console.print(f"Streaming set for this session: {'on' if stream_value else 'off'}")
         return "handled"
+    if cmd in {"/login"}:
+        from ...account_login import SylliptorLoginError
+        from ...account_login import login as _sylliptor_login
+
+        cfg = getattr(session, "cfg", None)
+        if cfg is None:
+            console.print("[red]No active config; run `sylliptor login` from the shell.[/red]")
+            return "handled"
+        try:
+            result = _sylliptor_login(
+                cfg, output_write=lambda message: console.print(message, highlight=False)
+            )
+        except SylliptorLoginError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return "handled"
+        who = f" as [bold]{result.email}[/bold]" if result.email else ""
+        console.print(f"[green]Logged in{who}.[/green] Your free MiMo trial is ready.")
+        try:
+            from ...config import load_config
+            from .loop import _apply_config_menu_changes_to_session
+
+            _apply_config_menu_changes_to_session(session=session, cfg=load_config())
+            console.print(
+                f"Profile [bold]{result.profile_name}[/bold] (model "
+                f"[bold]{result.model}[/bold]) is now active for this session."
+            )
+        except Exception:  # noqa: BLE001 - fall back to restart guidance
+            console.print(
+                f"Profile [bold]{result.profile_name}[/bold] is set. "
+                "Restart chat to use it for this session."
+            )
+        return "handled"
+    if cmd in {"/logout"}:
+        from ...account_login import logout as _sylliptor_logout
+
+        cfg = getattr(session, "cfg", None)
+        if cfg is not None and _sylliptor_logout(cfg):
+            console.print("[green]Logged out.[/green] Your stored MiMo access key was removed.")
+        else:
+            console.print("You're not logged in to a Sylliptor account.")
+        return "handled"
 
     if cmd[:1] in "/:":
         suggestion = _suggest_chat_command(parts[0], ui_mode=forge_state.ui_mode)

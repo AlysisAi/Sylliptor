@@ -242,6 +242,7 @@ def run_setup_wizard() -> bool:
             workspace_result=workspace_result,
             sandbox_result=sandbox_result,
         )
+        _maybe_offer_sylliptor_login(console, profile_result=profile_result, cfg=cfg)
         return True
     except _SetupCancelled:
         console.print()
@@ -256,6 +257,49 @@ def run_setup_wizard() -> bool:
         if log_path is not None:
             console.print(f"[dim]Details saved to: {log_path}[/dim]")
         return False
+
+
+def _maybe_offer_sylliptor_login(
+    console: Console, *, profile_result: _ProfileStepResult, cfg: AppConfig
+) -> None:
+    """If the user chose the hosted MiMo (login-based) preset, offer to connect now.
+
+    That preset needs no API key — it unlocks the free trial via `sylliptor login`.
+    Running the handshake here saves a separate step; declining is harmless (the
+    profile is already configured and `sylliptor login` can be run any time).
+    """
+    from ..sylliptor_cloud import PROFILE_KEY
+
+    preset = profile_result.preset
+    if preset is None or preset.key != PROFILE_KEY:
+        return
+
+    console.print()
+    try:
+        connect = _prompt_yes_no(
+            "Connect your Sylliptor account now to unlock the free MiMo trial? [Y/n]",
+            default=True,
+        )
+    except _GoBack:
+        connect = False
+
+    if not connect:
+        console.print("[dim]Run `sylliptor login` whenever you're ready to connect.[/dim]")
+        return
+
+    from .. import account_login
+
+    try:
+        result = account_login.login(
+            cfg, output_write=lambda message: console.print(message, highlight=False)
+        )
+    except (account_login.SylliptorLoginError, ConfigError) as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
+        console.print("[dim]You can finish this later with `sylliptor login`.[/dim]")
+        return
+
+    who = f" as [bold]{result.email}[/bold]" if result.email else ""
+    console.print(f"[green]Logged in{who}.[/green] Your free MiMo trial is ready.")
 
 
 def _resolve_console() -> Console:

@@ -125,6 +125,7 @@ def test_openai_preset_preserves_legacy_nano_alias_without_hiding_current_nano()
 
 def test_provider_presets_use_current_openai_compatible_base_urls() -> None:
     expected_base_urls = {
+        "sylliptor": "https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1",
         "openai": "https://api.openai.com/v1",
         "openai-responses": "https://api.openai.com/v1",
         "anthropic": "https://api.anthropic.com/v1",

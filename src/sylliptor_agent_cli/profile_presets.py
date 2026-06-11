@@ -143,6 +143,28 @@ def advanced_provider_selection_presets() -> list[ProfilePreset]:
 
 PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ProfilePreset(
+        key="sylliptor",
+        label="Sylliptor MiMo (Xiaomi) — free trial",
+        protocol="openai_compat",
+        # The hosted proxy. It authenticates the user's access_key, enforces the
+        # free-trial window, and forwards to OpenRouter with the Xiaomi BYOK key
+        # server-side. The login flow overrides this from sylliptor_cloud at
+        # runtime (env-configurable), so this literal is just the default.
+        base_url="https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1",
+        api_key_env=None,
+        suggested_models=("mimo",),
+        suggested_model_descriptions={
+            "mimo": "default - Xiaomi MiMo via your free Sylliptor trial",
+        },
+        validation_model="mimo",
+        web_search_adapter=OPENROUTER_WEB_ADAPTER,
+        setup_warning=(
+            "No API key needed — run `sylliptor login` to connect your Sylliptor "
+            "account and unlock the free MiMo trial."
+        ),
+        notes="Hosted MiMo trial. Authenticate with `sylliptor login`.",
+    ),
+    ProfilePreset(
         key="openai",
         label="OpenAI",
         protocol="openai_compat",

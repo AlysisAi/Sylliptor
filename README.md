@@ -31,6 +31,10 @@
 
 ---
 
+<p align="center">
+  <img src="docs/assets/xiaomi-mimo-logo.svg" alt="Xiaomi MiMo" width="320">
+</p>
+
 ## ⚡ Free Xiaomi MiMo trial
 
 Run Sylliptor on **[Xiaomi MiMo](https://openrouter.ai/xiaomi)** — **free for 10 days**, no API key, no card. MiMo is the default model.

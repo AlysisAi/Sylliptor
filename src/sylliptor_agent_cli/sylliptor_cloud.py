@@ -19,9 +19,11 @@ _DEFAULT_SITE_URL = "https://sylliptor.alysisai.com"
 # The profile/preset key used for the hosted MiMo provider.
 PROFILE_KEY = "sylliptor"
 
-# Friendly model id the CLI sends. The proxy pins/forwards it to the real MiMo
-# OpenRouter model server-side, so the CLI never needs the exact upstream id.
-SYLLIPTOR_MIMO_MODEL = "mimo"
+# Default model the CLI selects on first login — Xiaomi's flagship reasoning/
+# coding/agent model. The proxy honours any model in its server-side allowlist
+# (MIMO_ALLOWED_MODELS) and otherwise pins to its canonical MiMo model, so this is
+# just the first-connect default; the user can switch in /config or via /model.
+SYLLIPTOR_MIMO_MODEL = "mimo-v2.5-pro"
 
 # Default proxy base URL (kept in sync with the `sylliptor` profile preset).
 DEFAULT_PROXY_BASE_URL = f"{_DEFAULT_SUPABASE_URL}/functions/v1/llm/v1"
@@ -92,3 +94,13 @@ def token_exchange_url() -> str:
 def status_url() -> str:
     """Read-only endpoint returning the caller's trial status (days + tokens)."""
     return f"{proxy_base_url()}/status"
+
+
+def models_url() -> str:
+    """OpenAI-style discovery endpoint listing the model ids the proxy will serve.
+
+    The proxy returns ``{"object": "list", "data": [{"id": ...}, ...]}`` reflecting
+    its server-side allowlist, so the CLI can offer the trial's real models instead
+    of guessing. Public (no access_key required).
+    """
+    return f"{proxy_base_url()}/models"

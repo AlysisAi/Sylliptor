@@ -84,13 +84,20 @@ def _callback_browser(code: str, state_override: str | None = None):
     return _open
 
 
-def test_sylliptor_preset_defaults_to_mimo() -> None:
+def test_sylliptor_preset_offers_mimo_models() -> None:
     preset = get_preset("sylliptor")
     assert preset is not None
     assert preset.api_key_env is None
-    assert preset.suggested_models[0] == "mimo"
+    # Flagship is the default; flash + omni are the other two trial models.
+    assert preset.suggested_models[0] == "mimo-v2.5-pro"
+    assert set(preset.suggested_models) == {"mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2.5"}
     profile = make_profile_from_preset(preset, name="sylliptor")
-    assert profile.default_model == "mimo"
+    assert profile.default_model == "mimo-v2.5-pro"
+    # The legacy bare "mimo" id canonicalizes to the flagship via the preset alias,
+    # so old sessions stop showing a "current model" that no model matches.
+    from sylliptor_agent_cli.profile_presets import canonical_model_alias_for_preset
+
+    assert canonical_model_alias_for_preset(preset, "mimo") == "mimo-v2.5-pro"
 
 
 def test_login_status_defaults_to_logged_out(tmp_path: Path, monkeypatch) -> None:
@@ -123,7 +130,7 @@ def test_login_full_flow_wires_access_key_as_bearer(tmp_path: Path, monkeypatch)
         # Result reflects an active sylliptor profile with MiMo as default.
         assert result.email == "u@example.com"
         assert result.profile_name == "sylliptor"
-        assert result.model == "mimo"
+        assert result.model == "mimo-v2.5-pro"
 
         # The access_key is persisted as the sylliptor profile key.
         assert load_persisted_profile_keys()["sylliptor"] == _ACCESS_KEY
@@ -131,7 +138,7 @@ def test_login_full_flow_wires_access_key_as_bearer(tmp_path: Path, monkeypatch)
         # Reloaded config has sylliptor active with MiMo as the default model.
         reloaded = load_config()
         assert reloaded.extra_fields["active_profile"] == "sylliptor"
-        assert reloaded.model == "mimo"
+        assert reloaded.model == "mimo-v2.5-pro"
 
         # The crucial wiring: resolve_api_key returns the access_key as the
         # Bearer for the sylliptor profile (so requests hit the proxy authed).
@@ -273,3 +280,116 @@ def test_format_trial_status_line_expired() -> None:
 def test_format_trial_status_line_empty_returns_none() -> None:
     status = account_login.TrialStatus(None, None, None, None, None, None)
     assert account_login.format_trial_status_line(status) is None
+
+
+class _StubModelsServer:
+    """Stands in for the proxy's GET .../llm/v1/models discovery route."""
+
+    def __init__(self, model_ids: list[str], *, status_code: int = 200) -> None:
+        body = json.dumps(
+            {"object": "list", "data": [{"id": mid, "object": "model"} for mid in model_ids]}
+        ).encode()
+
+        class _Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args: object) -> None:  # noqa: A002
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                if not self.path.endswith("/llm/v1/models"):
+                    self.send_error(404)
+                    return
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._server.server_address
+        return f"http://{host}:{port}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
+def test_list_trial_models_parses_proxy_allowlist(tmp_path: Path, monkeypatch) -> None:
+    _config_env(tmp_path, monkeypatch)
+    stub = _StubModelsServer(["mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2.5"])
+    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
+    try:
+        models = account_login.list_trial_models(load_config())
+        assert models == ["mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2.5"]
+    finally:
+        stub.close()
+
+
+def test_list_trial_models_empty_when_unreachable(tmp_path: Path, monkeypatch) -> None:
+    _config_env(tmp_path, monkeypatch)
+    stub = _StubModelsServer(["mimo"])
+    base_url = stub.base_url
+    stub.close()  # nothing is listening now -> connection refused
+    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", base_url)
+    assert account_login.list_trial_models(load_config()) == []
+
+
+def test_login_preserves_user_chosen_model_across_relogin(tmp_path: Path, monkeypatch) -> None:
+    from dataclasses import replace
+
+    from sylliptor_agent_cli.config import save_config
+    from sylliptor_agent_cli.profiles import add_profile, get_profile
+
+    _config_env(tmp_path, monkeypatch)
+    stub = _StubExchangeServer(access_key=_ACCESS_KEY, email=None)
+    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
+    try:
+        # First connect: no profile yet, so it defaults to the flagship MiMo.
+        first = account_login.login(
+            load_config(), browser_opener=_callback_browser("code"), timeout_s=10
+        )
+        assert first.model == "mimo-v2.5-pro"
+
+        # Simulate the user picking another model in `/config`.
+        cfg = load_config()
+        add_profile(cfg, replace(get_profile(cfg, "sylliptor"), default_model="mimo-pro"))
+        save_config(cfg)
+
+        # Re-login must keep that choice instead of clobbering it back to MiMo.
+        second = account_login.login(
+            load_config(), browser_opener=_callback_browser("code"), timeout_s=10
+        )
+        assert second.model == "mimo-pro"
+        assert load_config().model == "mimo-pro"
+    finally:
+        stub.close()
+
+
+def test_login_migrates_legacy_bare_mimo_model(tmp_path: Path, monkeypatch) -> None:
+    from dataclasses import replace
+
+    from sylliptor_agent_cli.config import save_config
+    from sylliptor_agent_cli.profiles import add_profile, get_profile
+
+    _config_env(tmp_path, monkeypatch)
+    stub = _StubExchangeServer(access_key=_ACCESS_KEY, email=None)
+    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
+    try:
+        # Seed a profile that still carries the legacy bare "mimo" placeholder.
+        account_login.login(load_config(), browser_opener=_callback_browser("code"), timeout_s=10)
+        cfg = load_config()
+        add_profile(cfg, replace(get_profile(cfg, "sylliptor"), default_model="mimo"))
+        save_config(cfg)
+
+        # Re-login migrates that placeholder up to the named flagship (not "mimo").
+        again = account_login.login(
+            load_config(), browser_opener=_callback_browser("code"), timeout_s=10
+        )
+        assert again.model == "mimo-v2.5-pro"
+    finally:
+        stub.close()

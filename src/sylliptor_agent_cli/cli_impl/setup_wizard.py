@@ -300,6 +300,10 @@ def _maybe_offer_sylliptor_login(
 
     who = f" as [bold]{result.email}[/bold]" if result.email else ""
     console.print(f"[green]Logged in{who}.[/green] Your free MiMo trial is ready.")
+    console.print(
+        f"[dim]Default model: [/dim][bold]{result.model}[/bold][dim] · "
+        "switch with /model in chat or `sylliptor config`.[/dim]"
+    )
 
 
 def _resolve_console() -> Console:

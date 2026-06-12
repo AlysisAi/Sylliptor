@@ -212,6 +212,63 @@ def test_default_model_rows_include_active_profile_preset_suggestions() -> None:
     assert "deepseek-coder" not in model_values
 
 
+def test_default_model_rows_include_discovered_sylliptor_trial_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sylliptor_agent_cli.profile_presets import get_preset, make_profile_from_preset
+
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "config"))
+    monkeypatch.setenv("SYLLIPTOR_DATA_DIR", os.fspath(tmp_path / "data"))
+    # Live proxy advertises a provider-prefixed variant of a curated model, plus a
+    # genuinely new one.
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.account_login.list_trial_models",
+        lambda _cfg: ["xiaomi/mimo-v2.5-pro", "mimo-next"],
+    )
+
+    cfg = AppConfig(model="mimo-v2.5-pro")
+    add_profile(cfg, make_profile_from_preset(get_preset("sylliptor"), name="sylliptor"))
+    set_active_profile(cfg, "sylliptor")
+    state = ConfigMenuState.from_cfg(cfg)
+
+    model_values = [
+        value for value, _label, _description in config_menu_mod._default_model_rows(state)
+    ]
+    # Curated clean names present...
+    assert "mimo-v2.5-pro" in model_values
+    assert "mimo-v2-flash" in model_values
+    assert "mimo-v2.5" in model_values
+    # ...the provider-prefixed duplicate of a curated model is suppressed...
+    assert "xiaomi/mimo-v2.5-pro" not in model_values
+    # ...but a genuinely new discovered model still shows.
+    assert "mimo-next" in model_values
+
+
+def test_default_model_rows_survive_sylliptor_discovery_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sylliptor_agent_cli.profile_presets import get_preset, make_profile_from_preset
+
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "config"))
+    monkeypatch.setenv("SYLLIPTOR_DATA_DIR", os.fspath(tmp_path / "data"))
+
+    def _boom(_cfg: object) -> list[str]:
+        raise RuntimeError("proxy down")
+
+    monkeypatch.setattr("sylliptor_agent_cli.account_login.list_trial_models", _boom)
+
+    cfg = AppConfig(model="mimo-v2.5-pro")
+    add_profile(cfg, make_profile_from_preset(get_preset("sylliptor"), name="sylliptor"))
+    set_active_profile(cfg, "sylliptor")
+    state = ConfigMenuState.from_cfg(cfg)
+
+    # Discovery blew up, but the static preset rows must still render the menu.
+    model_values = [
+        value for value, _label, _description in config_menu_mod._default_model_rows(state)
+    ]
+    assert "mimo-v2.5-pro" in model_values
+
+
 def test_default_model_rows_fallback_to_base_url_provider() -> None:
     cfg = AppConfig(model="deepseek-v4-pro")
     add_profile(

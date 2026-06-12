@@ -63,6 +63,30 @@ _BUILT_IN_MODEL_METADATA: dict[str, dict[str, Any]] = {
         "input_cost_per_token": 0.000000435,
         "output_cost_per_token": 0.00000087,
     },
+    # Hosted Xiaomi MiMo trial models. The proxy serves these ids when allowlisted,
+    # and falls back server-side to its canonical MiMo model otherwise.
+    "mimo-v2.5-pro": {
+        "context_window_tokens": 1_048_576,
+        "max_output_tokens": 131_072,
+        "supports_vision": False,
+        "input_cost_per_token": 0.000001,
+        "output_cost_per_token": 0.000003,
+    },
+    "mimo-v2-flash": {
+        "context_window_tokens": 262_144,
+        "max_output_tokens": 65_536,
+        "supports_vision": False,
+        "input_cost_per_token": 0.0000001,
+        "output_cost_per_token": 0.0000003,
+    },
+    "mimo-v2.5": {
+        "context_window_tokens": 1_048_576,
+        "max_output_tokens": 131_072,
+        "supports_vision": True,
+        "input_cost_per_token": 0.0000004,
+        "output_cost_per_token": 0.000002,
+    },
+    # Legacy friendly id kept for sessions that logged in before model choice.
     # Hosted Xiaomi MiMo trial: the CLI sends the friendly id "mimo" (the proxy
     # pins it to the real upstream id server-side). Without an entry here the id
     # resolves nowhere and falls back to 8192/2048 — emitting a metadata warning

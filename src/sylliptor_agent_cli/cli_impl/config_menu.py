@@ -1561,6 +1561,44 @@ def _default_model_picker_subtitle(state: ConfigMenuState) -> str:
     return f"Pick a supported model for {preset.label}."
 
 
+def _preset_model_option_rows(preset: ProfilePreset) -> list[tuple[str, str, str]]:
+    """Model picker rows for a preset, widened with live trial models for Sylliptor.
+
+    Other providers expose a fixed ``suggested_models`` list. For the hosted MiMo
+    trial we also discover the proxy's live allowlist via ``/v1/models`` and append
+    any genuinely new models. A discovered id that only differs from a curated id by
+    a provider prefix (e.g. ``xiaomi/mimo-v2.5-pro`` vs ``mimo-v2.5-pro``) is the
+    same model and is not shown twice. Best-effort and offline-safe: on any failure
+    the static preset rows still render.
+    """
+    rows = list(model_options_for_preset(preset))
+
+    from ..sylliptor_cloud import PROFILE_KEY
+
+    if preset.key != PROFILE_KEY:
+        return rows
+
+    try:
+        from .. import account_login
+        from ..config import load_config
+
+        discovered = account_login.list_trial_models(load_config())
+    except Exception:  # noqa: BLE001 - discovery must never break the picker
+        discovered = []
+
+    def _same_model(a: str, b: str) -> bool:
+        # Equal, or one is just the provider-prefixed form of the other.
+        return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+    known = [value for value, _label, _description in rows]
+    for model_id in discovered:
+        if any(_same_model(model_id, existing) for existing in known):
+            continue
+        known.append(model_id)
+        rows.append((model_id, model_id, "available on your Sylliptor trial"))
+    return rows
+
+
 def _default_model_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
     rows: list[tuple[str, str, str]] = []
     seen: set[str] = set()
@@ -1572,7 +1610,7 @@ def _default_model_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
 
     preset = _active_preset(state)
     if preset is not None:
-        for value, label, description in model_options_for_preset(preset):
+        for value, label, description in _preset_model_option_rows(preset):
             if value in seen:
                 continue
             seen.add(value)
@@ -1653,7 +1691,7 @@ def _router_model_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
 
     preset = _active_preset(state)
     if preset is not None:
-        for value, label, description in model_options_for_preset(preset):
+        for value, label, description in _preset_model_option_rows(preset):
             if value in seen:
                 continue
             seen.add(value)

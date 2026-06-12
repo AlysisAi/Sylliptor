@@ -27,6 +27,36 @@ _TERMINALS_USAGE_LINES = (
 )
 
 
+def _print_sylliptor_trial_models(console: Console, session: Any, *, current: str) -> None:
+    """List the models the hosted Sylliptor trial serves, when on that profile.
+
+    Best-effort and silent otherwise: only runs when the active profile is the
+    hosted `sylliptor` trial, discovers the live allowlist via the proxy, and
+    never raises into the chat loop.
+    """
+    cfg = getattr(session, "cfg", None)
+    if cfg is None:
+        return
+    try:
+        from ...sylliptor_cloud import PROFILE_KEY
+
+        active = str((getattr(cfg, "extra_fields", {}) or {}).get("active_profile") or "").strip()
+        if active != PROFILE_KEY:
+            return
+        from ... import account_login
+
+        models = account_login.list_trial_models(cfg)
+    except Exception:  # noqa: BLE001 - listing is best-effort
+        return
+    if not models:
+        return
+    console.print("Models on your Sylliptor trial:")
+    for model_id in models:
+        marker = "  (current)" if model_id == current else ""
+        console.print(f"  • {model_id}{marker}")
+    console.print("[dim]Switch with: /model <name>[/dim]")
+
+
 def _print_forge_lock_wait_notice(console: Console, info: dict[str, Any]) -> None:
     diagnostic = str(info.get("diagnostic") or "").strip()
     warnings = ["Another Forge execution is mutating this workspace; queued and waiting."]
@@ -1140,6 +1170,7 @@ def _handle_chat_command(
         if not arg:
             model = getattr(getattr(session, "client", None), "model", "")
             console.print(f"Current model: {model}")
+            _print_sylliptor_trial_models(console, session, current=str(model))
             return "handled"
         if hasattr(session, "client"):
             session.client.model = arg
@@ -1188,6 +1219,7 @@ def _handle_chat_command(
                 f"Profile [bold]{result.profile_name}[/bold] (model "
                 f"[bold]{result.model}[/bold]) is now active for this session."
             )
+            console.print("[dim]Tip: switch model anytime with /model.[/dim]")
         except Exception:  # noqa: BLE001 - fall back to restart guidance
             console.print(
                 f"Profile [bold]{result.profile_name}[/bold] is set. "

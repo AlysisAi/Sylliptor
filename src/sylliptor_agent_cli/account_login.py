@@ -41,6 +41,9 @@ _CALLBACK_PATH = "/callback"
 _DEFAULT_TIMEOUT_S = 180.0
 _EXCHANGE_TIMEOUT_S = 15.0
 _STATUS_TIMEOUT_S = 10.0
+# Kept short: model discovery runs inline while rendering the interactive `/config`
+# model picker, so an offline/slow proxy must not stall the menu for long.
+_MODELS_TIMEOUT_S = 6.0
 
 
 class SylliptorLoginError(Exception):
@@ -297,6 +300,44 @@ def fetch_trial_status(cfg: AppConfig) -> TrialStatus | None:
     )
 
 
+def list_trial_models(cfg: AppConfig) -> list[str]:
+    """List the model ids the hosted proxy currently allows, via ``/v1/models``.
+
+    The proxy serves a server-side allowlist (just MiMo by default, but the deploy
+    can widen it), and exposes it as an OpenAI-shaped ``{"data": [{"id": ...}]}``.
+    Surfacing it lets `/config` show the trial's real models instead of pinning a
+    single hard-coded id. Best-effort: returns ``[]`` on any failure (offline,
+    non-200, malformed) so callers fall back to the static preset model. The
+    endpoint is public; the access_key is sent only when present (harmless and
+    forward-compatible) and never required.
+    """
+    try:
+        url = cloud.models_url()
+    except cloud.SylliptorCloudConfigError:
+        return []
+    headers = {}
+    access_key = load_persisted_profile_keys().get(cloud.PROFILE_KEY)
+    if access_key:
+        headers["Authorization"] = f"Bearer {access_key}"
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=_MODELS_TIMEOUT_S) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, UnicodeDecodeError):
+        return []
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        return []
+    models: list[str] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if model_id and model_id not in models:
+            models.append(model_id)
+    return models
+
+
 def format_trial_status_line(status: TrialStatus) -> str | None:
     """A one-line trial summary for `whoami`, or None if there's nothing to show."""
     parts: list[str] = []
@@ -399,21 +440,37 @@ def _exchange_error_message(exc: urllib.error.HTTPError) -> str:
 
 
 def _activate_sylliptor_profile(cfg: AppConfig, *, email: str | None) -> LoginResult:
-    """Create + activate the `sylliptor` profile with MiMo as the default model."""
+    """Create + activate the `sylliptor` profile, keeping any model the user chose.
+
+    On the first connect there is no `sylliptor` profile yet, so the default model
+    is MiMo. On later logins we preserve whatever model the user has since selected
+    in `/config` (e.g. another model the proxy serves) instead of clobbering it back
+    to MiMo — otherwise re-logging in would silently undo their choice.
+    """
     preset = get_preset(cloud.PROFILE_KEY)
     if preset is not None:
         profile = make_profile_from_preset(preset, name=cloud.PROFILE_KEY)
     else:  # pragma: no cover - preset is always present
         profile = ProfileSpec(name=cloud.PROFILE_KEY, protocol="openai_compat")
 
-    # Always pin to the live proxy URL + MiMo default (env-overridable for tests).
+    existing = get_profile(cfg, cloud.PROFILE_KEY)
+    existing_model = str(getattr(existing, "default_model", "") or "").strip() if existing else ""
+    # The legacy bare "mimo" placeholder is not a real model id; migrate sessions
+    # that still carry it (logged in before the named models existed) up to the
+    # flagship default instead of preserving a name no model actually has.
+    if existing_model.casefold() == "mimo":
+        existing_model = ""
+    chosen_model = existing_model or cloud.SYLLIPTOR_MIMO_MODEL
+
+    # Always pin to the live proxy URL (env-overridable for tests); keep the user's
+    # chosen model, defaulting to MiMo only when none has been set yet.
     profile = ProfileSpec(
         name=profile.name,
         protocol=profile.protocol,
         base_url=cloud.proxy_base_url(),
         api_key_env=None,
         extra_headers=dict(profile.extra_headers),
-        default_model=cloud.SYLLIPTOR_MIMO_MODEL,
+        default_model=chosen_model,
         web_search_adapter=profile.web_search_adapter,
         web_search_model=profile.web_search_model,
         notes=profile.notes,

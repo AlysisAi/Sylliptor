@@ -15,6 +15,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `mimo` built-in model metadata (262144 context / 16384 output) so the trial model uses its full context window instead of the 8192/2048 fallback.
 - Friendly CLI messages for trial-state proxy errors (trial expired, quota exhausted, rate limited, …) in both interactive chat and one-shot `run`.
 
+- Hosted trial model choice: `mimo-v2.5-pro` is now the default, with `mimo-v2-flash`
+  and `mimo-v2.5` available in `/config` and `/model`; live `/v1/models` discovery,
+  login model preservation, and legacy `mimo` alias migration keep existing installs
+  working while exposing the full trial model set.
+
 ### Fixed
 
 - Force UTF-8 stdout/stderr at startup so the rich UI no longer crashes on non-UTF-8 consoles (e.g. Windows Greek cp1253).

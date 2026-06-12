@@ -152,11 +152,18 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         # runtime (env-configurable), so this literal is just the default.
         base_url="https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1",
         api_key_env=None,
-        suggested_models=("mimo",),
+        # The models the trial offers. Live availability is discovered from the
+        # proxy's /v1/models allowlist at runtime; this static list is the offline
+        # fallback and the menu shown before a model is chosen.
+        suggested_models=("mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2.5"),
         suggested_model_descriptions={
-            "mimo": "default - Xiaomi MiMo via your free Sylliptor trial",
+            "mimo-v2.5-pro": "default - flagship reasoning, coding & agents (1M context)",
+            "mimo-v2-flash": "faster & lighter on trial tokens (256K context)",
+            "mimo-v2.5": "omni - text + image understanding (1M context)",
         },
-        validation_model="mimo",
+        validation_model="mimo-v2.5-pro",
+        # Migrate the legacy bare "mimo" placeholder up to the flagship model.
+        model_aliases={"mimo": "mimo-v2.5-pro"},
         web_search_adapter=OPENROUTER_WEB_ADAPTER,
         setup_warning=(
             "No API key needed — run `sylliptor login` to connect your Sylliptor "

@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-06-12
+
+### Added
+
+- Hosted trial model choice: `mimo-v2.5-pro` is now the default, with `mimo-v2-flash`
+  and `mimo-v2.5` available in `/config` and `/model`; live `/v1/models` discovery,
+  login model preservation, and legacy `mimo` alias migration keep existing installs
+  working while exposing the full trial model set.
+- Xiaomi MiMo logo in the README trial section.
+
+### Fixed
+
+- Removed the duplicate Xiaomi trial section from the README.
+
 ## [0.9.2] - 2026-06-11
 
 ### Added
@@ -14,11 +28,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `sylliptor` provider preset (selectable in setup) routing to the hosted MiMo proxy with `mimo` as the default model, plus a one-step "connect now" offer at the end of setup and `/login` `/logout` chat commands.
 - `mimo` built-in model metadata (262144 context / 16384 output) so the trial model uses its full context window instead of the 8192/2048 fallback.
 - Friendly CLI messages for trial-state proxy errors (trial expired, quota exhausted, rate limited, …) in both interactive chat and one-shot `run`.
-
-- Hosted trial model choice: `mimo-v2.5-pro` is now the default, with `mimo-v2-flash`
-  and `mimo-v2.5` available in `/config` and `/model`; live `/v1/models` discovery,
-  login model preservation, and legacy `mimo` alias migration keep existing installs
-  working while exposing the full trial model set.
 
 ### Fixed
 

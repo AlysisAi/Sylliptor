@@ -64,8 +64,69 @@ def _forge_help_panel() -> Panel:
     return _chat_commands_panel(ui_mode="forge")
 
 
+def _forge_plan_readiness_line(*, console: Console, plan: dict[str, Any]) -> Any:
+    """A one-line go/no-go readiness chip derived from the current plan state."""
+    from rich.text import Text
+
+    use_unicode = _forge_supports_unicode_glyphs(console)
+    filled = "●" if use_unicode else "*"
+    hollow = "○" if use_unicode else "o"
+    tasks = plan.get("tasks") or []
+    has_tasks = isinstance(tasks, list) and len(tasks) > 0
+    if not has_tasks:
+        if _forge_plan_has_requirement(plan):
+            req_count = sum(
+                1
+                for req in (plan.get("requirements") or [])
+                if str(requirement_text(req)).strip()
+            )
+            req_word = "requirement" if req_count == 1 else "requirements"
+            text = f"{req_count} {req_word}, 0 tasks — describe the work or /task to add tasks"
+        else:
+            text = "no tasks yet · add /goal then /task to start planning"
+        return Text.assemble(
+            ("│ ", STYLE_CHROME), (f"{hollow} ", STYLE_DIM), (text, STYLE_DIM)
+        )
+    done, failed, remaining = _forge_task_status_counts(plan)
+    total = done + failed + remaining
+    if failed > 0:
+        task_word = "task" if failed == 1 else "tasks"
+        text = f"needs attention · {failed} {task_word} blocked — see status column"
+        glyph_style = STYLE_WARN
+    elif remaining == 0 and total > 0:
+        task_word = "task" if total == 1 else "tasks"
+        text = f"all tasks done · {done} of {total} {task_word} finished"
+        glyph_style = STYLE_SUCCESS
+    else:
+        task_word = "task" if total == 1 else "tasks"
+        text = f"ready to execute · {total} {task_word} · 0 blocked"
+        glyph_style = STYLE_SUCCESS
+    return Text.assemble(
+        ("│ ", STYLE_CHROME), (f"{filled} ", glyph_style), (text, STYLE_DIM)
+    )
+
+
+def _forge_next_step_line(*, console: Console, plan: dict[str, Any]) -> Any:
+    """A state-aware ``Next`` hint naming the single best next command."""
+    from rich.text import Text
+
+    _ = console
+    hint = {
+        "empty": "paste your goal, or /goal then /task to start planning",
+        "planning": "/show to review, then /execute plan when ready",
+        "ready": "/execute plan to start the run",
+        "done": "run complete · /done to save, or /back to chat",
+    }.get(_forge_plan_state(plan), "/help for commands")
+    return Text.assemble(
+        ("│ ", STYLE_CHROME),
+        ("Next · ", STYLE_ACCENT),
+        (hint, STYLE_DIM),
+    )
+
+
 def _forge_enter_panel(
     *,
+    console: Console,
     paths: RunPaths,
     plan: dict[str, Any],
     entry_kind: str,
@@ -91,6 +152,8 @@ def _forge_enter_panel(
             text="/show for summary · /execute plan when ready · /help for commands",
             style="dim",
         ),
+        _forge_plan_readiness_line(console=console, plan=plan),
+        _forge_next_step_line(console=console, plan=plan),
     )
 
 
@@ -270,6 +333,7 @@ def _show_forge_plan_summary(*, console: Console, paths: RunPaths, plan: dict[st
         message=f"Run {paths.run_id} · {task_count} tasks · {asset_count} assets",
         style=STYLE_EMPHASIS,
     )
+    console.print(_forge_plan_readiness_line(console=console, plan=plan), highlight=False)
     _print_forge_meta(console=console, message=f"Goal · {goal}", style=STYLE_CONTENT)
     _print_forge_meta(console=console, message=f"Summary · {summary}", style=STYLE_CONTENT)
     requirements = plan.get("requirements") or []
@@ -289,6 +353,18 @@ def _show_forge_plan_summary(*, console: Console, paths: RunPaths, plan: dict[st
                 message=f"... ({req_count - 8} more requirements)",
                 style="dim",
             )
+
+    if not _forge_has_usable_plan_input(plan):
+        _print_forge_meta(
+            console=console, message="This plan is empty.", style=STYLE_EMPHASIS
+        )
+        _print_forge_meta(
+            console=console,
+            message="Add work two ways: paste a goal/spec, or use /goal then /task.",
+            style=STYLE_CONTENT,
+        )
+        console.print(_forge_next_step_line(console=console, plan=plan), highlight=False)
+        return
 
     table = _forge_task_table()
     table.add_column("id", style="dim", no_wrap=True, ratio=1)
@@ -311,6 +387,7 @@ def _show_forge_plan_summary(*, console: Console, paths: RunPaths, plan: dict[st
         table.add_row("-", "-", "(no tasks yet)", "-", "off")
     console.print(table)
     _print_forge_meta(console=console, message=f"Assets · {asset_count}", style="dim")
+    console.print(_forge_next_step_line(console=console, plan=plan), highlight=False)
 
 
 def _show_forge_plan_markdown(
@@ -1012,6 +1089,7 @@ def _enter_forge_mode(
     )
     console.print(
         _forge_enter_panel(
+            console=console,
             paths=paths,
             plan=plan,
             entry_kind=entry_selection.entry_kind,

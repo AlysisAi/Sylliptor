@@ -285,6 +285,32 @@ def _progress_message_completes_activity(message: str) -> bool:
     return any(clean.startswith(prefix) for prefix in _TERMINAL_PROGRESS_PREFIXES)
 
 
+_SWARM_TRACE_SUCCESS_KEYWORDS = (
+    "merged successfully",
+    "applied successfully",
+    "accepted verified",
+    "review approved",
+    "verification passed",
+    "verified no-op",
+    "completed successfully",
+)
+
+
+def _swarm_trace_severity(phase: str, message: str) -> str:
+    """Classify a swarm trace line into error/warning/success/neutral."""
+    normalized_phase = str(phase or "").strip().lower()
+    normalized_message = str(message or "").strip().lower()
+    if normalized_phase.endswith(".error"):
+        return "error"
+    if normalized_phase.endswith(".warning") or normalized_message.startswith("warning"):
+        return "warning"
+    if "warning:" in normalized_message:
+        return "warning"
+    if any(keyword in normalized_message for keyword in _SWARM_TRACE_SUCCESS_KEYWORDS):
+        return "success"
+    return "neutral"
+
+
 class _ThinkingSpinnerRenderable:
     def __init__(self, surface: RichSurface) -> None:
         self._surface = surface
@@ -630,6 +656,61 @@ class RichSurface:
             return
         if not self._assistant_stream_open and not self._tool_start_info:
             self._start_thinking_spinner(label="Thinking...")
+
+    def _supports_unicode_glyphs(self) -> bool:
+        encoding = str(getattr(self.console, "encoding", "") or "")
+        if not encoding:
+            return True
+        try:
+            "✓✗".encode(encoding)
+        except (LookupError, UnicodeError):
+            return False
+        return True
+
+    def _swarm_severity_glyph(self, severity: str) -> tuple[str, str]:
+        use_unicode = self._supports_unicode_glyphs()
+        if severity == "error":
+            return (("✗" if use_unicode else "x"), _STYLE_FAILURE)
+        if severity == "success":
+            return (("✓" if use_unicode else "v"), _STYLE_SUCCESS)
+        if severity == "warning":
+            return ("!", _STYLE_WARNING)
+        return ("•", _STYLE_CHROME)
+
+    def on_swarm_trace(
+        self,
+        message: str,
+        *,
+        phase: str = "",
+        task_id: str | None = None,
+    ) -> None:
+        """Render a live swarm trace line, colorizing verify/review/merge outcomes."""
+        _ = task_id
+        if self._trace_level == "off":
+            return
+        severity = _swarm_trace_severity(phase, message)
+        if severity == "neutral":
+            self.on_progress_update(message)
+            return
+        self._stop_thinking_spinner()
+        clean = _redact(str(message or "").strip())
+        if not clean:
+            return
+        glyph, glyph_style = self._swarm_severity_glyph(severity)
+        line_key = f"swarm-trace:{severity}\0{clean}"
+        if line_key == self._last_trace_line_key:
+            return
+        self._last_trace_line_key = line_key
+        self._thinking_open = True
+        self.console.print(
+            Text.assemble((f"{glyph} ", glyph_style), (clean, _STYLE_META)),
+            highlight=False,
+        )
+        if _progress_message_completes_activity(message):
+            self._stop_thinking_spinner()
+            return
+        if not self._assistant_stream_open and not self._tool_start_info:
+            self._start_thinking_spinner(label="Reasoning...")
 
     def on_subagent_start(self, event: SubagentStartEvent) -> None:
         if self._trace_level == "off":

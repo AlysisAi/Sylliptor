@@ -217,6 +217,13 @@ class SerializedSwarmTraceSink:
                 )
             except Exception:
                 pass
+        trace_handler = getattr(self.surface, "on_swarm_trace", None)
+        if callable(trace_handler):
+            try:
+                trace_handler(message, phase=event.phase, task_id=event.task_id)
+                return
+            except Exception:
+                pass
         handler = getattr(self.surface, "on_progress_update", None)
         if callable(handler):
             try:

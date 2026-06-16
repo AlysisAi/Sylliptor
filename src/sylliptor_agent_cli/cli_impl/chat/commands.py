@@ -11,7 +11,12 @@ import typer
 from rich.text import Text
 
 from ...plan_validation import PlannerFailedError, raise_for_execution_ready_plan
-from ...surface.styles import STYLE_EMPHASIS
+from ...surface.styles import (
+    STYLE_CHROME,
+    STYLE_EMPHASIS,
+    STYLE_SUCCESS,
+    STYLE_WARN,
+)
 from ...swarm_orchestrator import acquire_swarm_mutation_guard
 from .state import _ChatExecutionRequest, _ChatPlanModeState, _ForgeChatState
 
@@ -1953,7 +1958,25 @@ def _handle_forge_chat_command(
                     f"Execution finished with issues · {failed_tasks} failed · "
                     f"{remaining_tasks} remaining."
                 )
-            _print_forge_meta(console=console, message=headline, style=STYLE_EMPHASIS)
+            done_ok = (
+                total_tasks > 0
+                and failed_tasks == 0
+                and remaining_tasks == 0
+                and code == 0
+            )
+            console.print(
+                _forge_phase_rule(console=console, label="DONE"),
+                highlight=False,
+            )
+            dot = "●" if _forge_supports_unicode_glyphs(console) else "*"
+            console.print(
+                Text.assemble(
+                    ("│ ", STYLE_CHROME),
+                    (f"{dot} ", STYLE_SUCCESS if done_ok else STYLE_WARN),
+                    (headline, STYLE_EMPHASIS),
+                ),
+                highlight=False,
+            )
             _print_forge_meta(
                 console=console,
                 message=(

@@ -337,6 +337,7 @@ def forge_plan(
         console.print(line)
     console.print("Planning loop started. Type /help for commands. Type /done to finish.")
     assistant_enabled = False
+    planning_suggested: set[str] = set()
     planner_state = _ForgePlannerSessionState(
         workspace_context=(
             _workspace_context_payload_for_paths(paths=paths) or workspace_scan.to_dict()
@@ -460,6 +461,12 @@ def forge_plan(
                 plan["summary"] = goal
             save_plan(paths, plan)
             console.print("Project goal updated.")
+            if "goal" not in planning_suggested:
+                planning_suggested.add("goal")
+                console.print(
+                    "[dim]Next: add tasks with /task <title>, or describe the work and "
+                    "let the planner draft them.[/dim]"
+                )
             append_transcript_note(paths, role="system", message="Updated project goal.")
             continue
         if cmd == "/task":
@@ -484,6 +491,11 @@ def forge_plan(
                 continue
             save_plan(paths, plan)
             console.print(f"Added task: {task['id']} - {task['title']}")
+            if "task" not in planning_suggested:
+                planning_suggested.add("task")
+                console.print(
+                    "[dim]Next: add more tasks, or /done to save and validate the plan.[/dim]"
+                )
             append_transcript_note(paths, role="system", message=f"Added task {task['id']}.")
             continue
 

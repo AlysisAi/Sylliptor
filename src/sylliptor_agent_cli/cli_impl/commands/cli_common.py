@@ -160,6 +160,7 @@ from ...extensions.state import (
 )
 from ...extensions.workspace_trust import is_workspace_trusted
 from ...surface.styles import (
+    STYLE_ACCENT,
     STYLE_CHROME,
     STYLE_CONTENT,
     STYLE_DESELECTED_DESC,
@@ -625,6 +626,81 @@ def _print_forge_error(*, console: Console, message: str) -> None:
         ),
         highlight=False,
     )
+
+
+def _forge_supports_unicode_glyphs(console: Console) -> bool:
+    """Whether the console encoding can render the status/box glyphs we add."""
+    encoding = str(getattr(console, "encoding", "") or "")
+    if not encoding:
+        return True
+    try:
+        "●○─→✓✗".encode(encoding)
+    except (LookupError, UnicodeError):
+        return False
+    return True
+
+
+def _forge_phase_rule(*, console: Console, label: str, style: str = STYLE_EMPHASIS) -> Any:
+    """A quiet ``│ -- LABEL --...`` separator sized to the terminal width."""
+    from rich.text import Text
+
+    clean_label = str(label or "").strip()
+    dash = "─" if _forge_supports_unicode_glyphs(console) else "-"
+    try:
+        width = int(getattr(console, "width", 0) or 0)
+    except (TypeError, ValueError):
+        width = 0
+    width = max(width, _MIN_TERMINAL_COLUMNS)
+    lead = dash * 2
+    if not clean_label:
+        body = max(3, width - 2)
+        return Text.assemble(("│ ", STYLE_CHROME), (dash * body, STYLE_CHROME))
+    used = 2 + len(lead) + 1 + len(clean_label) + 1
+    tail = max(3, width - used)
+    return Text.assemble(
+        ("│ ", STYLE_CHROME),
+        (f"{lead} ", STYLE_CHROME),
+        (clean_label, style),
+        (" ", STYLE_CHROME),
+        (dash * tail, STYLE_CHROME),
+    )
+
+
+def _print_forge_suggestion(*, console: Console, message: str) -> None:
+    """Print a dim ``│ -> ...`` next-step nudge under a Forge command result."""
+    from rich.text import Text
+
+    arrow = "→" if _forge_supports_unicode_glyphs(console) else "->"
+    console.print(
+        Text.assemble(
+            ("│ ", STYLE_CHROME),
+            (f"{arrow} ", STYLE_ACCENT),
+            (str(message or ""), STYLE_DIM),
+        ),
+        highlight=False,
+    )
+
+
+def _forge_plan_has_requirement(plan: dict[str, Any]) -> bool:
+    requirements = plan.get("requirements") if isinstance(plan, dict) else None
+    if not isinstance(requirements, list):
+        return False
+    return any(bool(str(requirement_text(req)).strip()) for req in requirements)
+
+
+def _forge_plan_state(plan: dict[str, Any]) -> str:
+    """Classify a Forge plan into empty/planning/ready/done for UI guidance."""
+    if not isinstance(plan, dict):
+        return "empty"
+    tasks = plan.get("tasks") or []
+    has_tasks = isinstance(tasks, list) and len(tasks) > 0
+    if not has_tasks:
+        return "planning" if _forge_plan_has_requirement(plan) else "empty"
+    done, failed, remaining = _forge_task_status_counts(plan)
+    total = done + failed + remaining
+    if total > 0 and failed == 0 and remaining == 0:
+        return "done"
+    return "ready"
 
 
 def _forge_task_status_counts(plan: dict[str, Any]) -> tuple[int, int, int]:

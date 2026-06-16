@@ -922,6 +922,7 @@ class AgentSession:
         routing_mode_override: str | None = None,
         ephemeral_system_messages: list[str] | tuple[str, ...] | None = None,
         ephemeral_user_messages: list[str] | tuple[str, ...] | None = None,
+        cancellation_token: Any | None = None,
     ) -> int:
         return _run_turn(
             self,
@@ -930,6 +931,7 @@ class AgentSession:
             routing_mode_override=routing_mode_override,
             ephemeral_system_messages=ephemeral_system_messages,
             ephemeral_user_messages=ephemeral_user_messages,
+            cancellation_token=cancellation_token,
         )
 
 

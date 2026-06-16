@@ -436,7 +436,18 @@ def run_turn(
     routing_mode_override: str | None = None,
     ephemeral_system_messages: list[str] | tuple[str, ...] | None = None,
     ephemeral_user_messages: list[str] | tuple[str, ...] | None = None,
+    cancellation_token: Any | None = None,
 ) -> int:
+    def _throw_if_cancelled() -> None:
+        if cancellation_token is None:
+            return
+        throw_if_cancelled = getattr(cancellation_token, "throw_if_cancelled", None)
+        if callable(throw_if_cancelled):
+            throw_if_cancelled("cancelled_by_user")
+            return
+        if bool(getattr(cancellation_token, "is_cancelled", False)):
+            raise RuntimeError("cancelled_by_user")
+
     def _phase_update(message: str) -> None:
         clean = message.strip()
         if not clean:
@@ -450,6 +461,7 @@ def run_turn(
     image_paths = list(image_paths or [])
     assistant_message_emitted = False
     steps_attempted = 0
+    _throw_if_cancelled()
 
     def _finish_turn(code: int, *, reason: str, final_text: str = "") -> int:
         if self.hook_dispatcher is not None:
@@ -1069,6 +1081,7 @@ def run_turn(
     last_edit_stagnation_payload: dict[str, Any] | None = None
 
     for step in range(1, turn_max_steps + 1):
+        _throw_if_cancelled()
         steps_attempted = step
         stream_used = self.stream
         step_ephemeral_suffix_system_messages: list[str] = []

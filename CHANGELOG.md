@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-06-16
+
+### Fixed
+
+- Refreshed the sandbox image base digest so release image vulnerability scans use the
+  current Python 3.12 slim base.
+
 ## [0.9.4] - 2026-06-16
 
 ### Added

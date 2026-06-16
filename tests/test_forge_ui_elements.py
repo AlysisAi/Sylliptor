@@ -114,9 +114,7 @@ def test_forge_next_step_line_states() -> None:
     empty = _render_line(cli_mod._forge_next_step_line, {}, console=console)
     assert "Next ·" in empty and "/goal" in empty
 
-    planning = _render_line(
-        cli_mod._forge_next_step_line, {"requirements": ["x"]}, console=console
-    )
+    planning = _render_line(cli_mod._forge_next_step_line, {"requirements": ["x"]}, console=console)
     assert "/show" in planning
 
     ready = _render_line(
@@ -199,9 +197,7 @@ def test_show_forge_plan_summary_ready_state() -> None:
 
 def test_swarm_trace_severity_classification() -> None:
     assert _swarm_trace_severity("verify.error", "verification did not run") == "error"
-    assert (
-        _swarm_trace_severity("review.error", "Changes requested by review gate.") == "error"
-    )
+    assert _swarm_trace_severity("review.error", "Changes requested by review gate.") == "error"
     assert _swarm_trace_severity("worker.lifecycle", "Merged successfully (abc).") == "success"
     assert _swarm_trace_severity("worker.lifecycle", "Applied successfully (def).") == "success"
     assert _swarm_trace_severity("swarm.startup", "Heads up warning: be careful") == "warning"
@@ -235,9 +231,7 @@ def test_serialized_swarm_trace_sink_routes_to_on_swarm_trace(tmp_path) -> None:
         surface=_CapSurface(),
     )
     sink.emit(
-        build_swarm_trace_event(
-            run_id="r1", phase="verify.error", message="boom", task_id="T01"
-        )
+        build_swarm_trace_event(run_id="r1", phase="verify.error", message="boom", task_id="T01")
     )
     sink.close()
     assert calls

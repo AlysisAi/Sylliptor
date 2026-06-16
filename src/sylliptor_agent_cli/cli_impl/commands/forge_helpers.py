@@ -76,17 +76,13 @@ def _forge_plan_readiness_line(*, console: Console, plan: dict[str, Any]) -> Any
     if not has_tasks:
         if _forge_plan_has_requirement(plan):
             req_count = sum(
-                1
-                for req in (plan.get("requirements") or [])
-                if str(requirement_text(req)).strip()
+                1 for req in (plan.get("requirements") or []) if str(requirement_text(req)).strip()
             )
             req_word = "requirement" if req_count == 1 else "requirements"
             text = f"{req_count} {req_word}, 0 tasks — describe the work or /task to add tasks"
         else:
             text = "no tasks yet · add /goal then /task to start planning"
-        return Text.assemble(
-            ("│ ", STYLE_CHROME), (f"{hollow} ", STYLE_DIM), (text, STYLE_DIM)
-        )
+        return Text.assemble(("│ ", STYLE_CHROME), (f"{hollow} ", STYLE_DIM), (text, STYLE_DIM))
     done, failed, remaining = _forge_task_status_counts(plan)
     total = done + failed + remaining
     if failed > 0:
@@ -101,9 +97,7 @@ def _forge_plan_readiness_line(*, console: Console, plan: dict[str, Any]) -> Any
         task_word = "task" if total == 1 else "tasks"
         text = f"ready to execute · {total} {task_word} · 0 blocked"
         glyph_style = STYLE_SUCCESS
-    return Text.assemble(
-        ("│ ", STYLE_CHROME), (f"{filled} ", glyph_style), (text, STYLE_DIM)
-    )
+    return Text.assemble(("│ ", STYLE_CHROME), (f"{filled} ", glyph_style), (text, STYLE_DIM))
 
 
 def _forge_next_step_line(*, console: Console, plan: dict[str, Any]) -> Any:
@@ -355,9 +349,7 @@ def _show_forge_plan_summary(*, console: Console, paths: RunPaths, plan: dict[st
             )
 
     if not _forge_has_usable_plan_input(plan):
-        _print_forge_meta(
-            console=console, message="This plan is empty.", style=STYLE_EMPHASIS
-        )
+        _print_forge_meta(console=console, message="This plan is empty.", style=STYLE_EMPHASIS)
         _print_forge_meta(
             console=console,
             message="Add work two ways: paste a goal/spec, or use /goal then /task.",

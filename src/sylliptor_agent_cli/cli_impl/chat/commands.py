@@ -1958,12 +1958,7 @@ def _handle_forge_chat_command(
                     f"Execution finished with issues · {failed_tasks} failed · "
                     f"{remaining_tasks} remaining."
                 )
-            done_ok = (
-                total_tasks > 0
-                and failed_tasks == 0
-                and remaining_tasks == 0
-                and code == 0
-            )
+            done_ok = total_tasks > 0 and failed_tasks == 0 and remaining_tasks == 0 and code == 0
             console.print(
                 _forge_phase_rule(console=console, label="DONE"),
                 highlight=False,

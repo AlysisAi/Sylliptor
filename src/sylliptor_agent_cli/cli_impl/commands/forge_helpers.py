@@ -349,6 +349,8 @@ def _show_forge_plan_summary(*, console: Console, paths: RunPaths, plan: dict[st
             )
 
     if not _forge_has_usable_plan_input(plan):
+        if asset_count:
+            _print_forge_meta(console=console, message=f"Assets · {asset_count}", style="dim")
         _print_forge_meta(console=console, message="This plan is empty.", style=STYLE_EMPHASIS)
         _print_forge_meta(
             console=console,

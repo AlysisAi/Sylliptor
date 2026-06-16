@@ -942,6 +942,34 @@ def test_print_welcome_banner_keeps_compact_owl_left_at_80_columns(monkeypatch) 
     assert any("▝▜██▅▅▅▅▅▅▅██▛▘" in line for line in plain_lines)
 
 
+def test_print_welcome_banner_keeps_dark_panel_owl_left_at_80_columns(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_mod.shutil,
+        "get_terminal_size",
+        lambda fallback=(80, 20): os.terminal_size((80, 20)),
+    )
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("OWL_THEME", raising=False)
+    monkeypatch.setenv("COLORFGBG", "15;0")
+
+    banner = cli_mod.printWelcome(
+        workspace=Path.home() / "myproject",
+        model="anthropic/opus-4.7",
+        version="0.8.2",
+    )
+    plain_lines = [cli_mod.stripAnsi(line) for line in banner.splitlines()]
+    plain = "\n".join(plain_lines)
+
+    assert "\x1b[48;5;231m" in banner
+    assert all(len(line) < 80 for line in plain_lines)
+    assert "..." not in plain
+    assert "model opus-4.7   version 0.8.2" in plain
+    assert any("\u2588" in line and "Sylliptor" in line for line in plain_lines)
+    assert any("\u2588" in line and "workspace ~/myproject" in line for line in plain_lines)
+
+
 def test_print_welcome_banner_keeps_long_context_off_terminal_edge_at_80_columns(
     monkeypatch,
 ) -> None:

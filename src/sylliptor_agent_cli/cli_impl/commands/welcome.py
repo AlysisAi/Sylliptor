@@ -451,42 +451,52 @@ def printWelcome(
             ]
 
         if owl_frames:
-            right_width = max(
-                safe_line_width - visibleLength(indent) - logo_width - visibleLength(gap),
-                1,
-            )
-            detail_lines = welcome_detail_lines(right_width)
-            required_side_by_side_width = visibleLength(indent) + logo_width + visibleLength(gap)
-            required_side_by_side_width += max(
-                (visibleLength(line) for line in detail_lines),
-                default=0,
-            )
-            if safe_line_width >= required_side_by_side_width:
+            side_by_side_layouts = [(indent, gap)]
+            if indent or visibleLength(gap) > 1:
+                side_by_side_layouts.append(("", " "))
+            for left_indent, middle_gap in side_by_side_layouts:
+                right_width = max(
+                    safe_line_width
+                    - visibleLength(left_indent)
+                    - logo_width
+                    - visibleLength(middle_gap),
+                    1,
+                )
+                detail_lines = welcome_detail_lines(right_width)
+                required_side_by_side_width = (
+                    visibleLength(left_indent) + logo_width + visibleLength(middle_gap)
+                )
+                required_side_by_side_width += max(
+                    (visibleLength(line) for line in detail_lines),
+                    default=0,
+                )
+                if safe_line_width < required_side_by_side_width:
+                    continue
                 right_start = max((len(logo_frame) - len(detail_lines)) // 2, 0)
                 rendered_lines = []
                 total_rows = max(len(logo_frame), right_start + len(detail_lines))
                 for row_index in range(total_rows):
                     row = logo_frame[row_index] if row_index < len(logo_frame) else ""
-                    line = f"{indent}{padLine(row, logo_width)}"
+                    line = f"{left_indent}{padLine(row, logo_width)}"
                     right_index = row_index - right_start
                     if 0 <= right_index < len(detail_lines):
-                        line = f"{line}{gap}{detail_lines[right_index]}"
+                        line = f"{line}{middle_gap}{detail_lines[right_index]}"
                     rendered_lines.append(_clip_visible_line(line.rstrip(), safe_line_width))
                 return rendered_lines
-            else:
-                rendered_lines = []
-                rendered_lines.extend(
-                    _clip_visible_line(f"{indent}{row.rstrip()}".rstrip(), safe_line_width)
-                    for row in logo_frame
-                )
-                rendered_lines.append("")
-                full_detail_width = max(safe_line_width - visibleLength(indent), 1)
-                full_detail_lines = welcome_detail_lines(full_detail_width)
-                rendered_lines.extend(
-                    _clip_visible_line(f"{indent}{line}".rstrip(), safe_line_width)
-                    for line in full_detail_lines
-                )
-                return rendered_lines
+
+            rendered_lines = []
+            rendered_lines.extend(
+                _clip_visible_line(f"{indent}{row.rstrip()}".rstrip(), safe_line_width)
+                for row in logo_frame
+            )
+            rendered_lines.append("")
+            full_detail_width = max(safe_line_width - visibleLength(indent), 1)
+            full_detail_lines = welcome_detail_lines(full_detail_width)
+            rendered_lines.extend(
+                _clip_visible_line(f"{indent}{line}".rstrip(), safe_line_width)
+                for line in full_detail_lines
+            )
+            return rendered_lines
 
         context_line = _welcome_context_line(
             workspace=workspace,

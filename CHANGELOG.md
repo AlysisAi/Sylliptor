@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-06-16
+
+### Added
+
+- Polished Forge CLI planning and execution feedback with clearer readiness, next-step,
+  completion, and swarm trace status lines.
+
+### Fixed
+
+- Kept the welcome banner side-by-side at 80 columns when dark terminal themes add the
+  light owl panel.
+- Restored the Forge asset count line for empty plans that already have indexed assets.
+
 ## [0.9.3] - 2026-06-12
 
 ### Added

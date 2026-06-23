@@ -30,6 +30,8 @@ from sylliptor_agent_cli.config import (
 from sylliptor_agent_cli.profile_presets import ProfilePreset, make_profile_from_preset
 from sylliptor_agent_cli.profiles import ProfileSpec
 from sylliptor_agent_cli.sandbox_doctor import (
+    BubblewrapInstallPlan,
+    BubblewrapInstallResult,
     SandboxCheck,
     SandboxDiagnostic,
     SandboxImagePullResult,
@@ -220,6 +222,72 @@ def test_setup_wizard_persists_explicit_router_model_and_validates_it(
     assert setup_wizard_mod.run_setup_wizard() is True
     assert load_config().extra_fields["role_models"]["router"] == "gpt-5.4-mini"
     assert validated_models == [None, "gpt-5", "gpt-5.4-mini"]
+
+
+def test_setup_wizard_no_backend_disable_writes_off_to_both_gates(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    output = _patch_console(monkeypatch)
+    monkeypatch.setattr(
+        setup_wizard_mod,
+        "diagnose_sandbox",
+        lambda _cfg, *, include_smoke=False: _sandbox_diagnostic(ready=False, can_pull=False),
+    )
+    monkeypatch.setattr(setup_wizard_mod, "detect_bubblewrap_install_plan", lambda: None)
+    picker = PickerScript(["openai", "gpt-5", "disable"])
+    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
+    monkeypatch.setattr(
+        setup_wizard_mod.typer, "prompt", PromptScript(["", "sk-test-1234", os.fspath(tmp_path)])
+    )
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+    cfg = load_config()
+    assert cfg.extra_fields["shell_sandbox"]["mode"] == "off"
+    assert cfg.extra_fields["verify_sandbox"]["mode"] == "off"
+    assert "Sandbox disabled" in output.getvalue()
+
+
+def test_setup_wizard_no_backend_install_bwrap_then_ready(monkeypatch, tmp_path: Path) -> None:
+    _config_env(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    diagnose_calls = {"count": 0}
+
+    def fake_diagnose(_cfg, *, include_smoke=False):
+        diagnose_calls["count"] += 1
+        if diagnose_calls["count"] == 1:
+            return _sandbox_diagnostic(ready=False, can_pull=False)
+        return _sandbox_diagnostic(ready=True)
+
+    plan = BubblewrapInstallPlan(
+        manager="apt-get",
+        command=("sudo", "apt-get", "install", "-y", "bubblewrap"),
+        display="sudo apt-get install -y bubblewrap",
+    )
+    install_calls: list[BubblewrapInstallPlan | None] = []
+
+    def fake_install(*, plan=None):
+        install_calls.append(plan)
+        return BubblewrapInstallResult(ok=True, command=plan.display, detail="ok")
+
+    monkeypatch.setattr(setup_wizard_mod, "diagnose_sandbox", fake_diagnose)
+    monkeypatch.setattr(setup_wizard_mod, "detect_bubblewrap_install_plan", lambda: plan)
+    monkeypatch.setattr(setup_wizard_mod, "install_bubblewrap", fake_install)
+    picker = PickerScript(["openai", "gpt-5", "install_bwrap"])
+    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
+    monkeypatch.setattr(
+        setup_wizard_mod.typer, "prompt", PromptScript(["", "sk-test-1234", os.fspath(tmp_path)])
+    )
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+    assert install_calls == [plan]
+    assert diagnose_calls["count"] >= 2
+    cfg = load_config()
+    # Bubblewrap installed and re-check passed: the secure default is untouched.
+    assert (
+        "shell_sandbox" not in cfg.extra_fields
+        or cfg.extra_fields.get("shell_sandbox", {}).get("mode") != "off"
+    )
 
 
 def test_setup_wizard_abort_on_api_key_writes_nothing(monkeypatch, tmp_path: Path) -> None:
@@ -1395,6 +1463,94 @@ def test_setup_typer_command_runs_wizard(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert called == [True]
+
+
+def test_setup_command_launches_chat_after_interactive_tui(monkeypatch) -> None:
+    chat_calls: list[bool] = []
+    monkeypatch.setattr(cli_mod, "_try_setup_tui", lambda **_k: True)  # TUI saved
+    monkeypatch.setattr(cli_mod, "_run_chat_after_setup", lambda: chat_calls.append(True))
+
+    result = CliRunner().invoke(sylliptor_app, ["setup"])
+
+    assert result.exit_code == 0
+    assert chat_calls == [True]  # flows straight into chat
+
+
+def test_setup_command_tui_cancel_does_not_launch_chat(monkeypatch) -> None:
+    chat_calls: list[bool] = []
+    monkeypatch.setattr(cli_mod, "_try_setup_tui", lambda **_k: False)  # cancelled
+    monkeypatch.setattr(cli_mod, "_run_chat_after_setup", lambda: chat_calls.append(True))
+
+    result = CliRunner().invoke(sylliptor_app, ["setup"])
+
+    assert result.exit_code == 0
+    assert chat_calls == []
+
+
+def test_run_chat_after_setup_uses_configured_workspace(monkeypatch, tmp_path) -> None:
+    """After setup, chat launches in the saved workspace with broad consent so the
+    guard does not re-ask about the folder the user just chose."""
+    from sylliptor_agent_cli.cli_impl.commands import startup as startup_mod
+
+    ws = tmp_path / "myproject"
+    ws.mkdir()
+    monkeypatch.setattr(
+        startup_mod,
+        "_configured_default_workspace",
+        lambda: ws,
+    )
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        startup_mod,
+        "_run_default_chat_action",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    startup_mod._run_chat_after_setup()
+
+    assert captured["path"] == ws
+    assert captured["allow_broad_workspace"] is True
+
+
+def test_run_default_chat_action_forwards_posture_flags(monkeypatch) -> None:
+    """A relaunch (e.g. /config → switch project) must preserve the session's
+    execution-posture flags instead of silently resetting auto-approve/mode/logging."""
+    from sylliptor_agent_cli.cli_impl.commands import startup as startup_mod
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli_mod, "chat", lambda **kw: captured.update(kw))
+
+    startup_mod._run_default_chat_action(
+        path=Path("/tmp/proj"),
+        allow_broad_workspace=True,
+        mode="auto",
+        model="m1",
+        yes=True,
+        no_log=True,
+        verify_cmd=["pytest"],
+    )
+
+    assert captured["allow_broad_workspace"] is True
+    assert captured["mode"] == "auto"
+    assert captured["model"] == "m1"
+    assert captured["yes"] is True
+    assert captured["no_log"] is True
+    assert captured["verify_cmd"] == ["pytest"]
+
+
+def test_run_default_chat_action_defaults_unchanged(monkeypatch) -> None:
+    """Plain launches (no forwarded flags) still get the default posture."""
+    from sylliptor_agent_cli.cli_impl.commands import startup as startup_mod
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli_mod, "chat", lambda **kw: captured.update(kw))
+
+    startup_mod._run_default_chat_action()
+
+    assert captured["yes"] is False
+    assert captured["mode"] is None
+    assert captured["no_log"] is False
+    assert captured["verify_cmd"] is None
 
 
 def _mimo_login_preset() -> ProfilePreset:

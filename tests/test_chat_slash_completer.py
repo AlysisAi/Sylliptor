@@ -42,7 +42,6 @@ def test_get_chat_specs_match_curated_visible_surface() -> None:
         "compact",
         "clear",
         "resume",
-        "stream",
         "trace",
         "config",
         "toolbar",
@@ -50,7 +49,6 @@ def test_get_chat_specs_match_curated_visible_surface() -> None:
         "image",
         "subagent",
         "forge",
-        "history",
         "report",
         "feedback",
         "plan",
@@ -93,7 +91,7 @@ def test_forge_completions_include_general_chat_and_forge_commands() -> None:
     completer = ChatSlashCompleter(mode_provider=lambda: "forge")
 
     assert _completion_names(completer, "/go") == ["goal"]
-    assert _completion_names(completer, "/st") == ["status", "stream"]
+    assert _completion_names(completer, "/st") == ["status"]
     assert _completion_names(completer, "/ta") == ["task"]
 
 

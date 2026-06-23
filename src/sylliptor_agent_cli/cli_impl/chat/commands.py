@@ -1,6 +1,7 @@
 # ruff: noqa: F821
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -135,11 +136,25 @@ def _handle_chat_command(
         except Exception as e:  # noqa: BLE001
             console.print(f"[red]Failed to enter Forge:[/red] {e}")
             return "handled"
-        _enter_forge_mode(
-            root=forge_root,
-            console=console,
-            forge_state=forge_state,
+        forge_model = getattr(getattr(session, "client", None), "model", None)
+        forge_mode = getattr(session, "mode", None)
+        enter_kwargs: dict[str, Any] = {
+            "root": forge_root,
+            "console": console,
+            "forge_state": forge_state,
+        }
+        try:
+            enter_params = inspect.signature(_enter_forge_mode).parameters
+        except (TypeError, ValueError):
+            enter_params = {}
+        accepts_extra = any(
+            param.kind is inspect.Parameter.VAR_KEYWORD for param in enter_params.values()
         )
+        if accepts_extra or "model" in enter_params:
+            enter_kwargs["model"] = str(forge_model) if forge_model else None
+        if accepts_extra or "mode" in enter_params:
+            enter_kwargs["mode"] = str(forge_mode) if forge_mode else None
+        _enter_forge_mode(**enter_kwargs)
         return "handled"
     if cmd == "/":
         console.print(_chat_quick_commands_panel(ui_mode=forge_state.ui_mode))
@@ -513,65 +528,6 @@ def _handle_chat_command(
         )
     if cmd in {"/context", "/ctx"}:
         _print_chat_context(console=console, session=session)
-        return "handled"
-    if cmd in {"/history"}:
-        if _is_forge_ui_mode(forge_state.ui_mode):
-            console.print("History search is disabled in Forge.")
-            return "handled"
-        pattern = arg.strip()
-        if not pattern:
-            console.print("[yellow]Usage:[/yellow] /history <regex-pattern>")
-            return "handled"
-        root_dir = Path(getattr(session, "root", Path(".")))
-        store_obj = getattr(session, "store", None)
-        session_id = str(getattr(store_obj, "session_id", "") or "")
-        if not session_id:
-            console.print("No session artifacts found yet.")
-            return "handled"
-        history_session_dir = root_dir / ".sylliptor" / "sessions" / _safe_component(session_id)
-        tool_output_session_dir = getattr(store_obj, "session_artifact_root", None)
-        if not history_session_dir.exists() and (
-            not isinstance(tool_output_session_dir, Path) or not tool_output_session_dir.exists()
-        ):
-            console.print("No session artifacts found yet.")
-            return "handled"
-        try:
-            result = history_search(
-                root=root_dir,
-                session_id=session_id,
-                session_artifact_root=(
-                    tool_output_session_dir if isinstance(tool_output_session_dir, Path) else None
-                ),
-                pattern=pattern,
-            )
-        except HistorySearchError as exc:
-            console.print(f"[red]History search failed:[/red] {exc}")
-            return "handled"
-        matches = result.get("matches", [])
-        if not isinstance(matches, list) or not matches:
-            console.print("No history matches found.")
-            return "handled"
-        table = _Table(title=f"History Matches ({len(matches)})")
-        table.add_column("kind", no_wrap=True)
-        table.add_column("path")
-        table.add_column("line", justify="right", no_wrap=True)
-        table.add_column("snippet")
-        for row in matches:
-            if not isinstance(row, dict):
-                continue
-            table.add_row(
-                str(row.get("kind", "-")),
-                str(row.get("path", "-")),
-                str(row.get("line", "-")),
-                str(row.get("text", "")),
-            )
-        console.print(table)
-        if bool(result.get("truncated")):
-            console.print("[yellow]Results truncated at max_results.[/yellow]")
-        console.print(
-            "Inspect the reported artifact path when it is workspace-readable; "
-            "otherwise rerun with narrower bounds for more detail."
-        )
         return "handled"
     if cmd in {"/report", "/feedback"}:
         cfg = (
@@ -972,9 +928,16 @@ def _handle_chat_command(
             if not plan_task:
                 try:
                     plan_task = typer.prompt("Plan task", default="").strip()
-                except (EOFError, KeyboardInterrupt):
+                except KeyboardInterrupt:
                     console.print("")
                     return "handled"
+                except (EOFError, typer.Abort):
+                    # No interactive stdin available (the TUI feeds an empty/EOF
+                    # stdin so interactive prompts cancel cleanly). typer.prompt
+                    # raises click.Abort here, whose str() is empty -- if it
+                    # escaped it surfaced as a bare "Command error:" with no
+                    # detail. Fall through to the usage hint below instead.
+                    plan_task = ""
             if not plan_task:
                 for line in _chat_plan_usage_lines():
                     console.print(line)
@@ -1183,20 +1146,6 @@ def _handle_chat_command(
             session.cfg.model = arg
         _refresh_chat_hud_context_cache(session)
         console.print(f"Model set for this session: {arg}")
-        return "handled"
-    if cmd in {"/stream"}:
-        if not arg:
-            stream = bool(getattr(session, "stream", False))
-            console.print(f"Streaming is {'on' if stream else 'off'}. Use /stream on|off")
-            return "handled"
-        stream_value = _parse_bool_text(arg)
-        if stream_value is None:
-            console.print("[red]Invalid stream value.[/red] Try: /stream on or /stream off.")
-            return "handled"
-        session.stream = stream_value
-        if hasattr(session, "cfg"):
-            session.cfg.stream = stream_value
-        console.print(f"Streaming set for this session: {'on' if stream_value else 'off'}")
         return "handled"
     if cmd in {"/login"}:
         from ...account_login import SylliptorLoginError

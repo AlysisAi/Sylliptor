@@ -1091,6 +1091,69 @@ def test_build_tools_web_fetch_blocks_guessed_public_url(
     assert called is False
     assert result["error_code"] == "web_fetch_provenance_required"
     assert "user or one returned by web_search" in result["error"]
+    # Nothing has been searched/provided, so there is nothing to offer.
+    assert "fetchable_urls" not in result
+    assert "Run web_search first" in result["guidance"]
+
+
+def test_build_tools_web_fetch_rejection_lists_fetchable_search_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Reproduces the reported incident: web_search returned real sources, but the
+    # model then tried to fetch a URL it invented from memory. The gate must still
+    # reject the invented URL, yet now hand back the genuinely fetchable sources so
+    # the model can retry against one instead of dead-ending.
+    called = False
+
+    def fake_web_fetch(
+        *, url: str, max_chars: object, transport: object | None = None
+    ) -> dict[str, object]:
+        nonlocal called
+        called = True
+        return {"url": url, "final_url": url, "status_code": 200}
+
+    monkeypatch.setattr(agent_loop_mod, "web_fetch", fake_web_fetch)
+    store = _store(tmp_path)
+    store.append(
+        "tool_result",
+        {
+            "name": "web_search",
+            "step": 1,
+            "result": {
+                "query": "world cup news",
+                "backend": "openrouter_web",
+                "sources": [
+                    {"title": "FIFA", "url": "https://www.fifa.com/worldcup/news"},
+                    {"title": "UEFA", "url": "https://www.uefa.com/news"},
+                ],
+            },
+        },
+    )
+    tools = build_tools(
+        root=tmp_path,
+        console=Console(file=io.StringIO()),
+        store=store,
+        mode="auto",
+        yes=True,
+        non_interactive=True,
+        verification_enabled=True,
+        subagents_enabled=True,
+        subagent_registry={},
+    )
+
+    invented_url = "https://www.fifa.com/fifaplus/en/tournaments/mens/worldcup/canadamexicousa2026"
+    result = tools["web_fetch"].run({"url": invented_url})
+
+    assert called is False
+    assert result["error_code"] == "web_fetch_provenance_required"
+    assert result["fetchable_urls"], "rejection should list the real search sources"
+    assert result["fetchable_urls"][0] == "https://www.fifa.com/worldcup/news"
+    assert "fetchable_urls" in result["guidance"]
+    # Retrying with a listed URL (verbatim) is authorized and actually fetches.
+    ok = tools["web_fetch"].run({"url": result["fetchable_urls"][0]})
+    assert ok["status_code"] == 200
+    assert called is True
 
 
 def test_build_tools_web_fetch_allows_previously_valid_url_after_store_reopen(

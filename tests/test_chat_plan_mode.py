@@ -444,6 +444,52 @@ def test_plan_command_without_inline_task_prompts_then_starts_draft_flow(
     assert captured["approved_messages"] == ["implement feature"]
 
 
+@pytest.mark.parametrize("raised", [EOFError(), chat_impl_mod.typer.Abort()])
+def test_bare_plan_without_interactive_stdin_shows_usage_not_command_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raised: BaseException,
+) -> None:
+    # In the TUI the command runs with an EOF stdin, so typer.prompt raises
+    # click.Abort (whose str() is empty). Bare /plan must fall through to the
+    # usage hint instead of letting the Abort escape as a bare "Command error:".
+    called: dict[str, int] = {"approval_loops": 0}
+
+    def fake_prompt(_label: str, **_kwargs: Any) -> str:
+        raise raised
+
+    session = SimpleNamespace(
+        mode="review",
+        stream=False,
+        client=SimpleNamespace(model="test-model", temperature=1.0),
+        cfg=AppConfig(model="test-model", default_mode="review"),
+    )
+    monkeypatch.setattr(chat_impl_mod.typer, "prompt", fake_prompt)
+    monkeypatch.setattr(
+        chat_impl_mod,
+        "_run_plan_mode_approval_loop",
+        lambda **_kwargs: called.__setitem__("approval_loops", called["approval_loops"] + 1),
+    )
+    chat_impl_mod._sync_cli_globals(cli_mod)
+    buffer = io.StringIO()
+
+    result = chat_impl_mod._handle_chat_command(
+        input_text="/plan",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=buffer, force_terminal=False, width=120),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert called["approval_loops"] == 0
+    rendered = buffer.getvalue()
+    assert "Usage:" in rendered
+    assert "/plan <task>" in rendered
+
+
 def test_plan_mode_on_rebuilds_to_narrow_readonly_tool_surface(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

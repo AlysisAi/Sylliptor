@@ -45,12 +45,16 @@ from ..profile_presets import (
 from ..profiles import ProfileSpec, add_profile, set_active_profile, update_profile
 from ..provider_diagnostics import provider_diagnostic_warning_lines
 from ..sandbox_doctor import (
+    BubblewrapInstallPlan,
     SandboxDiagnostic,
     SandboxPullResult,
+    detect_bubblewrap_install_plan,
     diagnose_sandbox,
     format_sandbox_problem_message,
+    install_bubblewrap,
     pull_sandbox_images,
 )
+from ..sandbox_settings import apply_sandbox_mode_to_config
 from ..surface.console import make_console
 from ..workspace_binding import WorkspaceBindingError, resolve_workspace_binding
 
@@ -1242,7 +1246,113 @@ def _prompt_and_check_sandbox(console: Console, cfg: AppConfig) -> _SandboxStepR
                     "[yellow]Sandbox skipped. You can finish this later with `sylliptor sandbox setup`.[/yellow]"
                 )
                 return _SandboxStepResult(ready=False, status="skipped")
+        console.print("[yellow]You can finish this later with `sylliptor sandbox setup`.[/yellow]")
+        return _SandboxStepResult(ready=False, status="not ready")
 
+    return _offer_sandbox_choice(console, cfg, result)
+
+
+def _offer_sandbox_choice(
+    console: Console, cfg: AppConfig, result: SandboxDiagnostic
+) -> _SandboxStepResult:
+    """No usable backend was found: let the user install one, opt out, or defer.
+
+    The secure default stays strict; this only surfaces an explicit, discoverable
+    opt-out so a brand-new user is not silently blocked on their first task.
+    """
+    del result  # diagnosis already printed; we only need the decision now
+    plan = detect_bubblewrap_install_plan()
+    rows: list[tuple[str, str, str]] = []
+    if plan is not None:
+        rows.append(
+            (
+                "install_bwrap",
+                "Install bubblewrap now (keeps sandbox on)",
+                f"Runs: {plan.display}",
+            )
+        )
+    rows.append(
+        (
+            "disable",
+            "Run without sandbox for now (less safe)",
+            "Commands run on the host shell. Re-enable anytime in /config.",
+        )
+    )
+    rows.append(
+        (
+            "later",
+            "Decide later",
+            "Finish with `sylliptor sandbox setup`.",
+        )
+    )
+    try:
+        selected = _run_wizard_picker(
+            console=console,
+            title="Sandbox",
+            subtitle=(
+                "No sandbox backend (bubblewrap or Docker) was found. How do you want to proceed?"
+            ),
+            rows=rows,
+            current_value=rows[0][0],
+            cancel_hint="skip",
+        )
+    except (KeyboardInterrupt, Abort, EOFError):
+        console.print(
+            "[yellow]Sandbox skipped. You can finish this later with `sylliptor sandbox setup`.[/yellow]"
+        )
+        return _SandboxStepResult(ready=False, status="skipped")
+
+    if selected == "install_bwrap":
+        return _install_bwrap_and_recheck(console, cfg, plan)
+    if selected == "disable":
+        return _disable_sandbox(console, cfg)
+    console.print("[yellow]You can finish this later with `sylliptor sandbox setup`.[/yellow]")
+    return _SandboxStepResult(ready=False, status="not ready")
+
+
+def _disable_sandbox(console: Console, cfg: AppConfig) -> _SandboxStepResult:
+    apply_sandbox_mode_to_config(cfg, "off")
+    try:
+        save_config(cfg)
+    except (ConfigError, OSError) as exc:
+        console.print(f"[yellow]Could not save the sandbox setting:[/yellow] {exc}")
+        return _SandboxStepResult(ready=False, status="not ready")
+    console.print(
+        "[yellow]Sandbox disabled - Sylliptor will run commands directly on the host shell. "
+        "Re-enable anytime with /config -> Sandbox.[/yellow]"
+    )
+    return _SandboxStepResult(ready=False, status="disabled")
+
+
+def _install_bwrap_and_recheck(
+    console: Console, cfg: AppConfig, plan: BubblewrapInstallPlan | None
+) -> _SandboxStepResult:
+    display = plan.display if plan is not None else "auto"
+    console.print(f"[dim]Installing bubblewrap ({display})...[/dim]")
+    console.print("[dim]You may be prompted for your sudo password.[/dim]")
+    install_result = install_bubblewrap(plan=plan)
+    if not install_result.ok:
+        console.print(
+            f"[yellow]Bubblewrap install did not complete:[/yellow] {install_result.detail}"
+        )
+        console.print(
+            "[yellow]You can finish this later with `sylliptor sandbox setup`, "
+            "or choose to run without sandbox in /config.[/yellow]"
+        )
+        return _SandboxStepResult(ready=False, status="not ready")
+    console.print("[green]Bubblewrap installed.[/green]")
+    try:
+        recheck = diagnose_sandbox(cfg, include_smoke=True)
+    except Exception as exc:  # noqa: BLE001 - sandbox backends fail in environment-specific ways
+        console.print(
+            f"[yellow]Sandbox check failed after install:[/yellow] {exc}. "
+            "Re-run with `sylliptor sandbox doctor`."
+        )
+        return _SandboxStepResult(ready=False, status="check failed")
+    _print_sandbox_status(console, recheck)
+    if recheck.ready:
+        return _SandboxStepResult(ready=True, status=recheck.selected_backend or recheck.status)
+    console.print(Panel(_sandbox_problem_text(recheck), title="Sandbox", border_style="yellow"))
     console.print("[yellow]You can finish this later with `sylliptor sandbox setup`.[/yellow]")
     return _SandboxStepResult(ready=False, status="not ready")
 
@@ -1374,6 +1484,8 @@ def _api_key_summary_label(api_key_result: _ApiKeyStepResult) -> Text:
 def _sandbox_summary_label(sandbox_result: _SandboxStepResult) -> Text:
     if sandbox_result.ready:
         return Text(f"ready ({sandbox_result.status})", style="green")
+    if sandbox_result.status == "disabled":
+        return Text("off - host execution (less safe); re-enable via /config", style="yellow")
     if sandbox_result.status == "skipped":
         return Text("skipped - run `sylliptor sandbox setup` to finish", style="yellow")
     return Text(

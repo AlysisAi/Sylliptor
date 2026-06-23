@@ -1,0 +1,2530 @@
+"""The full-screen TUI shell + agent host.
+
+A prompt_toolkit ``Application`` (alt-screen) that reproduces the launch
+screenshot: a centered white owl animation, the "What can I do for you?"
+heading, a dim hint line, a larger bordered multi-line input box, and a pinned
+2-line footer (brand · model · context/tokens/cost; user · workspace · branch ·
+auto-approve). Enter submits, Ctrl+J / Alt+Enter insert a newline, Shift+Tab
+toggles auto-approve.
+
+Phase 2 wires the agent: when a ``session_builder`` is supplied, the welcome body
+swaps for a scrollable transcript and each submission runs ``session.run_turn``
+on a worker thread. A :class:`TuiSurface` streams the agent's tokens, tool trace
+and errors into the transcript; Ctrl+C interrupts the running turn (and exits
+when idle). Without a ``session_builder`` the shell keeps the Phase 1 stub reply.
+"""
+
+from __future__ import annotations
+
+import textwrap
+import threading
+import time
+from collections.abc import Callable
+from typing import Any
+
+from prompt_toolkit.application import Application
+from prompt_toolkit.application.current import get_app
+from prompt_toolkit.cursor_shapes import CursorShape
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.filters import Condition, has_focus
+from prompt_toolkit.formatted_text import FormattedText, to_formatted_text
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout, WindowAlign
+from prompt_toolkit.layout.containers import (
+    ConditionalContainer,
+    Float,
+    FloatContainer,
+    HSplit,
+    ScrollOffsets,
+    VSplit,
+    Window,
+)
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import D
+from prompt_toolkit.layout.margins import ScrollbarMargin
+from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.layout.processors import BeforeInput, Processor, Transformation
+from prompt_toolkit.mouse_events import MouseEventType
+from prompt_toolkit.styles import Style, merge_styles
+from prompt_toolkit.widgets import Frame, TextArea
+
+from ...surface.types import ApprovalDecision
+from . import content as _content
+from .footer import footer_fragments
+from .markdown import render_markdown_rows
+from .owl import load_owl_animation
+from .state import TuiState
+from .surface import TuiSurface, set_active_cancellation
+from .transcript import TuiTranscript
+
+_EXIT_WORDS = {"/exit", "/quit", ":q", "exit", "quit"}
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+# Single accent colour for the input frame, the "> " prompt, the user band and
+# the assistant marker — a green shade. ``_BAND_BG`` is the subtle full-width
+# highlight behind the user's own message.
+_ACCENT = "#3fb950"
+_BAND_BG = "#21262d"
+# Marker drawn in front of every assistant reply so it reads as the agent's.
+_ASSIST_MARK = "✦"
+# The model's "thinking" (reasoning) aside, tucked just under the question:
+# a chevron header (``▾`` open / ``▸`` collapsed) above a dim left rail ``│``.
+_THINK_OPEN = "▾"
+_THINK_CLOSED = "▸"
+_THINK_RAIL = "│"
+
+_STYLE = Style.from_dict(
+    {
+        "tui.heading": "bold",
+        "tui.credit": "#7a7a7a",
+        "tui.hint": "italic #8a8a8a",
+        "tui.placeholder": "#6c6c6c",
+        "tui.input": "",
+        "tui.prompt": f"bold {_ACCENT}",
+        # Accent-coloured border highlights the input box.
+        "frame.border": _ACCENT,
+        "tui.footer.mark": "#56b6c2",
+        "tui.footer.brand": "bold",
+        "tui.footer.model": "#d0d0d0",
+        "tui.footer.value": "#8a8a8a",
+        "tui.footer.dim": "#6c6c6c",
+        "tui.footer.user": "#8a8a8a",
+        "tui.footer.workspace": "#8a8a8a",
+        "tui.footer.branch": "#56b6c2",
+        "tui.footer.context": "#8a8a8a",
+        "tui.footer.autoapprove.on": "#3fb950",
+        "tui.footer.autoapprove.off": "#6c6c6c",
+        # Forge-session badge: a distinct bold violet chip so the planning mode is
+        # unmistakable (green stays the chat accent, cyan the brand/branch).
+        "tui.footer.forge": "bold #bc8cff",
+        # User's own message: a full-width highlighted band (the "> " in accent).
+        "tui.transcript.userband": f"bold bg:{_BAND_BG}",
+        "tui.transcript.userprompt": f"bold {_ACCENT} bg:{_BAND_BG}",
+        # Assistant reply: plain text behind an accent marker.
+        "tui.transcript.assistantmark": f"bold {_ACCENT}",
+        "tui.transcript.assistant": "",
+        # Model reasoning ("thinking"): muted + italic so it reads as background
+        # process, not the answer.
+        "tui.transcript.reasoning": "italic #8b949e",
+        "tui.transcript.reasoningmark": "#6e7681",
+        "tui.transcript.system": "#8a8a8a",
+        "tui.transcript.trace": "#6c6c6c",
+        "tui.transcript.error": "#e06c75",
+        "tui.transcript.warn": "#d19a66",
+        "tui.status": "#8a8a8a",
+        # Working line turns amber once a turn has run long (>=30s).
+        "tui.status.warn": "#d29922",
+        # Right-hand scrollbar. The margin paints spaces, so the colour must be a
+        # BACKGROUND (a foreground does nothing on a blank cell, leaving the ugly
+        # default light-grey bar). Faint near-black track + accent-green thumb.
+        "scrollbar.background": "bg:#1a1a1a",
+        "scrollbar.button": f"bg:{_ACCENT}",
+        "scrollbar.start": "nounderline",
+        "scrollbar.end": "nounderline",
+        # Centered /help popup: an opaque dark panel (so the transcript behind it
+        # does not bleed through), green commands on the left, dim descriptions on
+        # the right, amber section headers, a dim footer hint.
+        "tui.help": "bg:#0d1117",
+        "tui.help.cmd": f"bold {_ACCENT} bg:#0d1117",
+        "tui.help.desc": "#c9d1d9 bg:#0d1117",
+        # Section headers: bold + bright neutral (no colour clash with the green
+        # commands) so the green stays the only accent.
+        "tui.help.section": "bold #e6edf3 bg:#0d1117",
+        "tui.help.hint": "italic #6e7681 bg:#0d1117",
+        "tui.help.frame": "bg:#0d1117",
+        "tui.help.frame frame.border": _ACCENT,
+        # Key/value panels (e.g. /status) reuse the same opaque /help chrome. Keys
+        # read as dim labels; values are toned by health: accent green = on/healthy,
+        # plain = neutral/degraded, amber = caution, red = error. Green stays the
+        # single accent — degraded states are plain, never a second accent.
+        "tui.help.key": "#8a8a8a bg:#0d1117",
+        "tui.help.accent": f"bold {_ACCENT} bg:#0d1117",
+        "tui.help.warn": "#d19a66 bg:#0d1117",
+        "tui.help.err": "#e06c75 bg:#0d1117",
+        # Slash-command dropdown (shown while typing "/…"): same dark panel as the
+        # popups; the highlighted row uses the band bg + accent green so it reads
+        # like the panels. Green stays the only accent.
+        "completion-menu": "bg:#0d1117",
+        "completion-menu.completion": "bg:#0d1117 #c9d1d9",
+        "completion-menu.completion.current": f"bg:{_BAND_BG} bold {_ACCENT}",
+        "completion-menu.meta.completion": "bg:#0d1117 #6e7681",
+        "completion-menu.meta.completion.current": f"bg:{_BAND_BG} #c9d1d9",
+        # Selectable picker (e.g. /mode): same dark panel; the focused row gets the
+        # band bg + accent caret/label so it stands out. Green is the only accent.
+        "tui.picker": "bg:#0d1117",
+        "tui.picker.num": "#8a8a8a bg:#0d1117",
+        "tui.picker.label": "#c9d1d9 bg:#0d1117",
+        "tui.picker.desc": "#8a8a8a bg:#0d1117",
+        "tui.picker.tag": f"{_ACCENT} bg:#0d1117",
+        "tui.picker.hint": "italic #6e7681 bg:#0d1117",
+        "tui.picker.sel": f"bg:{_BAND_BG}",
+        "tui.picker.selcaret": f"bold {_ACCENT} bg:{_BAND_BG}",
+        "tui.picker.selnum": f"bold {_ACCENT} bg:{_BAND_BG}",
+        "tui.picker.sellabel": f"bold {_ACCENT} bg:{_BAND_BG}",
+        "tui.picker.seldesc": f"#c9d1d9 bg:{_BAND_BG}",
+        "tui.picker.seltag": f"{_ACCENT} bg:{_BAND_BG}",
+        # Execution-mode badge in the footer: accent green normally, amber when in
+        # the unguarded fullaccess mode so the danger state is glanceable.
+        "tui.footer.mode": f"bold {_ACCENT}",
+        "tui.footer.mode.warn": "bold #d19a66",
+        # Live Forge execution view (the task table + phase line shown while
+        # /execute plan runs). Violet ties it to the FORGE badge; done=green,
+        # failed=red so task outcomes are glanceable.
+        "tui.forge.head": "bold #bc8cff",
+        "tui.forge.rule": "#6e7681",
+        "tui.forge.done": f"bold {_ACCENT}",
+        "tui.forge.fail": "bold #e06c75",
+        "tui.forge.run": "bold #bc8cff",
+        "tui.forge.idle": "#6c6c6c",
+        "tui.forge.id": "#8a8a8a",
+        "tui.forge.title": "#c9d1d9",
+        # In-TUI editor float (e.g. /plan edit): dark panel + a status bar that
+        # turns red when a save is rejected (invalid JSON / shape).
+        "tui.editor": "bg:#0d1117 #c9d1d9",
+        "tui.editor.statusbar": "bg:#161b22",
+        "tui.editor.hint": "italic #6e7681 bg:#161b22",
+        "tui.editor.err": "bold #e06c75 bg:#161b22",
+        # Approval modal: an amber-bordered popup (red-bordered when destructive) so
+        # the question grabs attention; colour-coded keys (y green / a cyan / n red).
+        "tui.approve": "bg:#0d1117",
+        "tui.approve.head": "bold #d19a66 bg:#0d1117",
+        "tui.approve.head.danger": "bold #e06c75 bg:#0d1117",
+        "tui.approve.target": "bold #e6edf3 bg:#0d1117",
+        "tui.approve.reason": "italic #8a8a8a bg:#0d1117",
+        "tui.approve.optlabel": "#c9d1d9 bg:#0d1117",
+        "tui.approve.key.yes": f"bold {_ACCENT} bg:#0d1117",
+        "tui.approve.key.always": "bold #56b6c2 bg:#0d1117",
+        "tui.approve.key.no": "bold #e06c75 bg:#0d1117",
+        "tui.approve.frame": "bg:#0d1117",
+        "tui.approve.frame frame.border": "#d19a66",
+    }
+)
+
+# Stub reply used only when no agent session is wired (Phase 1 / tests).
+_PREVIEW_REPLY = "TUI preview - no agent session attached."
+
+
+def _user_band_rows(text: str, width: int) -> list[list[tuple[str, str]]]:
+    """Render the user's own message as a full-width highlighted band (one blank
+    band row above and below the text) so their question stands out from the
+    agent's reply. Wrap-aware; every row is padded to ``width``.
+
+    Returns a list of rows, each a list of ``(style, text)`` fragments.
+    """
+    width = max(8, int(width))
+    inner = max(1, width - 2)  # room for the "› " / "  " prefix
+    wrapped: list[str] = []
+    for line in text.split("\n") or [""]:
+        if line:
+            wrapped.extend(textwrap.wrap(line, inner) or [""])
+        else:
+            wrapped.append("")
+    if not wrapped:
+        wrapped = [""]
+    band = "class:tui.transcript.userband"
+    prompt = "class:tui.transcript.userprompt"
+    blank_row: list[tuple[str, str]] = [(band, " " * width)]
+    rows: list[list[tuple[str, str]]] = [blank_row]
+    for index, line in enumerate(wrapped):
+        prefix = "› " if index == 0 else "  "
+        rows.append([(prompt, prefix), (band, line.ljust(width - len(prefix)))])
+    rows.append([(band, " " * width)])
+    return rows
+
+
+# Rows scrolled per mouse-wheel notch (small = smooth).
+_WHEEL_STEP_ROWS = 2
+
+
+class _ScrollableControl(FormattedTextControl):
+    """FormattedTextControl that routes mouse-wheel events to ``on_scroll`` so the
+    wheel drives our follow/scroll state. Returning ``None`` marks the event
+    handled, stopping the Window's own ``vertical_scroll`` (which the cursor-pin
+    would otherwise override); other events fall through unchanged.
+    """
+
+    def __init__(self, *args: Any, on_scroll: Callable[[int], None], **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._on_scroll = on_scroll
+
+    def mouse_handler(self, mouse_event: Any) -> Any:
+        event_type = mouse_event.event_type
+        if event_type == MouseEventType.SCROLL_UP:
+            self._on_scroll(-1)
+            return None
+        if event_type == MouseEventType.SCROLL_DOWN:
+            self._on_scroll(1)
+            return None
+        return NotImplemented
+
+
+def _scroll_target(current_row: int, last_row: int, delta: int) -> tuple[int, bool]:
+    """Clamp a scroll move and report whether we landed at the live tail.
+
+    Returns ``(new_row, follow)`` — ``follow`` is True when ``new_row`` reaches the
+    last row, so new content keeps auto-scrolling.
+    """
+    last = max(0, last_row)
+    target = max(0, min(current_row + delta, last))
+    return target, target >= last
+
+
+def _wrap_line(line: str, width: int) -> list[str]:
+    """Wrap one logical line to ``<= width`` columns, preserving blank lines.
+
+    The transcript window renders with ``wrap_lines=True``, so any emitted row
+    WIDER than the content width is silently re-wrapped into extra *screen* rows
+    that the follow/scroll math (which counts logical rows) never accounts for.
+    That undercount makes auto-follow undershoot, pushing the live "thinking"
+    line below the fold so it reads as hidden behind the footer. Pre-wrapping
+    every emitted row keeps logical rows == screen rows so follow lands on the
+    true last line. ``break_long_words`` guarantees even a single long token
+    (e.g. a URL) is hard-broken to ``<= width``.
+    """
+    width = max(1, int(width))
+    if not line:
+        return [""]
+    return textwrap.wrap(line, width, break_long_words=True, break_on_hyphens=False) or [""]
+
+
+def _plain_role_rows(style: str, text: str, width: int) -> list[list[tuple[str, str]]]:
+    """Render a non-streamed line (trace/error/warn/system/info) wrapped to width."""
+    rows: list[list[tuple[str, str]]] = []
+    for sub in text.split("\n") or [""]:
+        for chunk in _wrap_line(sub, width):
+            rows.append([(style, chunk)])
+    return rows
+
+
+def _assistant_rows(
+    text: str, width: int = 80, *, markdown: bool = True
+) -> list[list[tuple[str, str]]]:
+    """Render an assistant reply behind the accent marker, with continuation
+    lines indented to align under the first line's text.
+
+    When ``markdown`` is on (the reply is complete) and the text carries
+    block-level markdown, it is rendered through Rich into styled rows — headings,
+    lists, tables and syntax-highlighted code blocks. The marker lands on the
+    first non-blank row; everything else is indented two columns to match. While
+    a reply is still streaming the caller passes ``markdown=False`` so partial
+    output (a half-open code fence) renders as plain text and never flickers.
+    """
+    mark = "class:tui.transcript.assistantmark"
+    body = "class:tui.transcript.assistant"
+    if markdown:
+        md_rows = render_markdown_rows(text, max(1, int(width) - 2))
+        if md_rows is not None:
+            marker_at = next(
+                (i for i, row in enumerate(md_rows) if "".join(t for _s, t in row).strip()),
+                0,
+            )
+            rows: list[list[tuple[str, str]]] = []
+            for index, row in enumerate(md_rows):
+                prefix = (mark, f"{_ASSIST_MARK} ") if index == marker_at else (body, "  ")
+                rows.append([prefix, *row])
+            return rows
+    # Plain fallback (streaming or non-markdown). Wrap to the content width minus
+    # the 2-col marker/indent so logical rows match screen rows (see _wrap_line).
+    inner = max(1, int(width) - 2)
+    rows = []
+    first = True
+    for line in text.split("\n") or [""]:
+        for chunk in _wrap_line(line, inner):
+            if first:
+                rows.append([(mark, f"{_ASSIST_MARK} "), (body, chunk)])
+                first = False
+            else:
+                rows.append([(body, f"  {chunk}")])
+    return rows
+
+
+def _reasoning_rows(
+    text: str,
+    width: int,
+    *,
+    live: bool,
+    secs: int,
+    expanded: bool,
+    spinner: str = "",
+    elapsed: int = 0,
+) -> list[list[tuple[str, str]]]:
+    """Render the model's reasoning ("thinking") as a dim aside under the question.
+
+    A header sits flush left, directly beneath the user's message: while ``live``
+    it animates as ``⠋ thinking… Ns`` (the ``spinner`` char + ``elapsed`` seconds);
+    once closed it collapses to ``▸ thought for Ns`` (``▾`` when expanded). The body
+    is hung off a dim left rail ``│`` and shown while live, or when expanded with
+    Ctrl+R, so the reasoning never crowds out the reply.
+    """
+    rail = "class:tui.transcript.reasoningmark"
+    body = "class:tui.transcript.reasoning"
+    show_body = live or expanded
+    if live:
+        lead = spinner or _THINK_OPEN
+        header = f"thinking… {elapsed}s" if elapsed else "thinking…"
+    else:
+        lead = _THINK_OPEN if expanded else _THINK_CLOSED
+        header = f"thought for {secs}s" if secs else "thought"
+    rows: list[list[tuple[str, str]]] = [[(rail, f"{lead} "), (body, header)]]
+    if not show_body:
+        return rows
+    inner = max(1, int(width) - 2)  # room for the "│ " rail
+    for line in text.split("\n"):
+        for chunk in (textwrap.wrap(line, inner) if line else [""]) or [""]:
+            rows.append([(rail, f"{_THINK_RAIL} "), (body, chunk)])
+    return rows
+
+
+def _activity_rows(spinner: str, label: str, elapsed: int) -> list[list[tuple[str, str]]]:
+    """The single live activity line shown under the content while a turn runs —
+    ``⠋ thinking… Ns`` or ``⠋ Search Web… Ns``. Matches the live reasoning header
+    so the indicator and a streaming thought flow into each other seamlessly."""
+    rail = "class:tui.transcript.reasoningmark"
+    body = "class:tui.transcript.reasoning"
+    clock = f" {elapsed}s" if elapsed else ""
+    return [[(rail, f"{spinner} "), (body, f"{label}{clock}")]]
+
+
+# --------------------------------------------------------- live Forge view
+# These buckets MUST mirror cli_common._forge_task_status_counts (the authority for
+# the "N done · N failed · N remaining" summary) so a task's glyph never contradicts
+# the count: done = exactly "done", failure = the same 7 states, obsolete = the same
+# 2. Everything else (planned/in_progress/…) is "remaining".
+_FORGE_DONE_STATES = {"done"}
+_FORGE_FAIL_STATES = {
+    "failed",
+    "verify_failed",
+    "candidate_rejected",
+    "changes_requested",
+    "merge_conflict",
+    "blocked_integration",
+    "blocked",
+}
+_FORGE_OBSOLETE_STATES = {"superseded", "invalidated"}
+_FORGE_RUNNING_STATES = {"in_progress", "running", "executing", "active"}
+
+
+def _forge_task_visual(status: str, active: bool, spinner: str) -> tuple[str, str]:
+    """Return ``(glyph, style_class)`` for one forge task row given its status and
+    whether the swarm is currently working it. Done=✓ green, failed=✗ red, the
+    in-flight task spins (violet), everything else is a dim ``○``."""
+    s = (status or "").strip().lower()
+    done = s in _FORGE_DONE_STATES
+    failed = s in _FORGE_FAIL_STATES
+    if active and not done and not failed:
+        return spinner or "◐", "class:tui.forge.run"
+    if done:
+        return "✓", "class:tui.forge.done"
+    if failed:
+        return "✗", "class:tui.forge.fail"
+    if s in _FORGE_OBSOLETE_STATES:
+        return "·", "class:tui.forge.idle"
+    if s in _FORGE_RUNNING_STATES:
+        return spinner or "◐", "class:tui.forge.run"
+    return "○", "class:tui.forge.idle"
+
+
+def _forge_view_rows(
+    view: dict[str, Any], width: int, spinner: str, elapsed: int
+) -> list[list[tuple[str, str]]]:
+    """Render the live Forge execution block: a violet header rule, a per-task
+    status table (glyph · id · status · title) and a phase/spinner line. Every row
+    is ``<= width`` so the transcript's cursor-pin scroll math stays exact."""
+    width = max(20, int(width))
+    rows: list[list[tuple[str, str]]] = []
+    run_id = str(view.get("run_id") or "")
+    done = bool(view.get("done"))
+    tasks = list(view.get("tasks") or [])
+    active = view.get("active")
+
+    # Header rule: "FORGE · run-xxx ──────────". No leading glyph: a wide emoji
+    # renders 2 columns but counts as 1 char, so the row would overflow the content
+    # width, wrap, and break the cursor-pin scroll math (scrolling would stick).
+    head_label = f"FORGE · {run_id}" if run_id else "FORGE"
+    head_label = head_label[: max(0, width - 1)]
+    head = f"{head_label} "
+    dashes = max(0, width - len(head))
+    rows.append([("class:tui.forge.head", head), ("class:tui.forge.rule", "─" * dashes)])
+
+    # Task table — aligned id + status columns, title fills the rest. The id/status
+    # column widths are capped RELATIVE to the width so the fixed prefix can never
+    # exceed the panel (which would silently wrap the row and break the scroll math).
+    if tasks:
+        id_w = min(
+            max((len(str(t.get("id", ""))) for t in tasks), default=2), 8, max(2, width // 6)
+        )
+        status_w = min(
+            max((len(str(t.get("status", ""))) for t in tasks), default=7), 16, max(4, width // 4)
+        )
+        prefix = 2 + 2 + id_w + 2 + status_w + 2  # indent+glyph+id+gap+status+gap
+        title_w = max(0, width - prefix)  # 0 → no room for a title on an ultra-narrow panel
+        for task in tasks:
+            tid = str(task.get("id", ""))
+            status = str(task.get("status", "") or "planned")
+            title = str(task.get("title", "") or "")
+            is_active = active is not None and tid == active
+            glyph, gstyle = _forge_task_visual(status, is_active, spinner)
+            id_cell = tid[:id_w].ljust(id_w)
+            status_cell = status[:status_w].ljust(status_w)
+            title_cell = title[:title_w]
+            rows.append(
+                [
+                    ("class:tui.forge.idle", "  "),
+                    (gstyle, f"{glyph} "),
+                    ("class:tui.forge.id", f"{id_cell}  "),
+                    (gstyle, f"{status_cell}  "),
+                    ("class:tui.forge.title", title_cell),
+                ]
+            )
+    else:
+        rows.append([("class:tui.forge.idle", "  (no execution-ready tasks)"[: max(0, width)])])
+
+    # Phase / spinner status line.
+    message = str(view.get("message") or "")
+    if done:
+        # Colour the summary by the run outcome so a green ✓ never sits next to a
+        # failed task: green ✓ on a clean run, red ✗ when anything failed/remains.
+        ok = bool(view.get("ok", True))
+        glyph = "✓" if ok else "✗"
+        gstyle = "class:tui.forge.done" if ok else "class:tui.forge.fail"
+        line = (message or ("Done." if ok else "Finished with issues."))[: max(0, width - 2)]
+        rows.append([(gstyle, f"{glyph} "), ("class:tui.transcript.system", line)])
+    else:
+        phase = str(view.get("phase") or "execute")
+        text = phase if not message else f"{phase} · {message}"
+        if elapsed:
+            text = f"{text} · {elapsed}s"
+        text = text[: max(0, width - 2)]
+        rows.append(
+            [("class:tui.forge.run", f"{spinner} "), ("class:tui.transcript.reasoning", text)]
+        )
+    return rows
+
+
+# ----------------------------------------------------------------- /help popup
+HelpSection = tuple[str, list[tuple[str, str]]]
+
+_HELP_HINT = "↑↓ / wheel scroll · End bottom · Esc close"
+
+
+def _help_inner_width(cols: int) -> int:
+    """Content width of the centered help panel (inside the frame border).
+
+    Leaves a wide margin on both sides so the panel clearly floats over the app
+    rather than filling the screen.
+    """
+    return max(36, min(int(cols) - 16, 84))
+
+
+def _fallback_help_sections() -> list[HelpSection]:
+    """Static command list used if the canonical grouped help can't be imported."""
+    try:
+        from ..chat_slash_completer import get_chat_specs
+
+        return [("Commands", [(spec.usage, spec.description) for spec in get_chat_specs()])]
+    except Exception:
+        return [
+            ("Commands", [("/help", "Show available commands"), ("/exit", "Exit chat")]),
+        ]
+
+
+def _help_rows_for_sections(sections: list[HelpSection], width: int) -> list[list[tuple[str, str]]]:
+    """Render help ``sections`` into padded fragment rows for the popup.
+
+    Each command-row is ``<green command>  <dim description>`` with the commands
+    left-aligned in a shared column so they line up and read easily; long
+    descriptions wrap with a hanging indent under the description column. Every
+    row is padded to ``width`` so the panel background fills as a solid block.
+    """
+    width = max(20, int(width))
+    pad = "class:tui.help"
+    cmd_style = "class:tui.help.cmd"
+    desc_style = "class:tui.help.desc"
+    sec_style = "class:tui.help.section"
+    hint_style = "class:tui.help.hint"
+
+    all_cmds = [cmd for _name, rows in sections for cmd, _desc in rows]
+    cmd_w = min(max((len(c) for c in all_cmds), default=0), 30)
+    gap = 2
+    desc_w = max(10, width - cmd_w - gap)
+
+    def _pad(fragments: list[tuple[str, str]], used: int) -> list[tuple[str, str]]:
+        return [*fragments, (pad, " " * max(0, width - used))]
+
+    out: list[list[tuple[str, str]]] = []
+    for index, (name, rows) in enumerate(sections):
+        if index > 0:
+            out.append([(pad, " " * width)])  # blank row between sections
+        out.append(_pad([(sec_style, name)], len(name)))
+        for cmd, desc in rows:
+            chunks = _wrap_line(desc, desc_w)
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    out.append(
+                        _pad(
+                            [
+                                (cmd_style, cmd.ljust(cmd_w)),
+                                (pad, " " * gap),
+                                (desc_style, chunk),
+                            ],
+                            cmd_w + gap + len(chunk),
+                        )
+                    )
+                else:
+                    out.append(
+                        _pad(
+                            [(pad, " " * (cmd_w + gap)), (desc_style, chunk)],
+                            cmd_w + gap + len(chunk),
+                        )
+                    )
+    out.append([(pad, " " * width)])
+    out.append(_pad([(hint_style, _HELP_HINT)], len(_HELP_HINT)))
+    return out
+
+
+# A key/value panel section: a header plus ``(key, value, tone)`` rows. ``tone``
+# selects the value colour: "accent" (on/healthy, green), "plain" (neutral),
+# "warn" (amber), "err" (red), "dim" (muted). Anything else falls back to plain.
+PanelSection = tuple[str, list[tuple[str, str, str]]]
+
+_PANEL_TONE_STYLE = {
+    "accent": "class:tui.help.accent",
+    "plain": "class:tui.help.desc",
+    "warn": "class:tui.help.warn",
+    "err": "class:tui.help.err",
+    "dim": "class:tui.help.key",
+}
+
+
+def _render_kv_panel_rows(
+    sections: list[PanelSection], width: int, hint: str = _HELP_HINT
+) -> list[list[tuple[str, str]]]:
+    """Render key/value ``sections`` into padded fragment rows for a popup panel.
+
+    Each row is ``<dim key>  <toned value>`` with the keys left-aligned in a shared
+    column so they line up; long values wrap with a hanging indent under the value
+    column. Section headers use the same bright style as /help, a blank row sits
+    between sections, and a dim hint closes the panel. Every row is padded to
+    ``width`` so the panel background fills as a solid block — exactly like
+    :func:`_help_rows_for_sections`, so both feed the one reusable panel overlay.
+    """
+    width = max(20, int(width))
+    pad = "class:tui.help"
+    key_style = "class:tui.help.key"
+    sec_style = "class:tui.help.section"
+    hint_style = "class:tui.help.hint"
+    indent = 2
+
+    all_keys = [key for _name, rows in sections for key, _val, _tone in rows]
+    key_w = min(max((len(key) for key in all_keys), default=0), 22)
+    gap = 2
+    val_w = max(10, width - indent - key_w - gap)
+
+    def _pad(fragments: list[tuple[str, str]], used: int) -> list[tuple[str, str]]:
+        return [*fragments, (pad, " " * max(0, width - used))]
+
+    def _clip(text: str, limit: int) -> str:
+        # Guarantee the layout contract: every emitted row must be exactly
+        # ``width`` columns (the cursor-pin scroll math relies on it), so a key or
+        # header longer than its column is hard-clipped with an ellipsis. Values
+        # never need this — they wrap to ``val_w``.
+        limit = max(0, limit)
+        if len(text) <= limit:
+            return text
+        if limit <= 1:
+            return text[:limit]
+        return text[: limit - 1] + "…"
+
+    header_w = max(0, width - indent)
+    out: list[list[tuple[str, str]]] = []
+    for index, (name, rows) in enumerate(sections):
+        if index > 0:
+            out.append([(pad, " " * width)])  # blank row between sections
+        header = _clip(name, header_w)
+        out.append(_pad([(pad, " " * indent), (sec_style, header)], indent + len(header)))
+        for key, value, tone in rows:
+            val_style = _PANEL_TONE_STYLE.get(tone, "class:tui.help.desc")
+            key_cell = _clip(key, key_w).ljust(key_w)
+            chunks = _wrap_line(str(value), val_w)
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    out.append(
+                        _pad(
+                            [
+                                (pad, " " * indent),
+                                (key_style, key_cell),
+                                (pad, " " * gap),
+                                (val_style, chunk),
+                            ],
+                            indent + key_w + gap + len(chunk),
+                        )
+                    )
+                else:
+                    out.append(
+                        _pad(
+                            [(pad, " " * (indent + key_w + gap)), (val_style, chunk)],
+                            indent + key_w + gap + len(chunk),
+                        )
+                    )
+    out.append([(pad, " " * width)])
+    if hint:
+        # Honour explicit line breaks, then wrap (never clip) so a long hint is
+        # never cut off at the right edge.
+        for segment in str(hint).split("\n"):
+            for hline in _wrap_line(segment, width):
+                out.append(_pad([(hint_style, hline)], len(hline)))
+    return out
+
+
+def _render_doc_panel_rows(
+    text: str, width: int, hint: str = _HELP_HINT
+) -> list[list[tuple[str, str]]]:
+    """Render freeform document text into rows for the centered popup panel.
+
+    Markdown text (PLAN.md, a README preview, …) is rendered through the same Rich
+    pipeline as assistant replies — headings, lists, tables, syntax-highlighted
+    code — so ``/plan markdown`` reads like a real document instead of a pager
+    dump. Non-markdown text falls back to plain wrapped lines. Every row is
+    ``<= width`` so the cursor-pin scroll math (which counts logical rows) stays
+    exact; the popup window's dark background fills the rest of each row.
+    """
+    width = max(20, int(width))
+    pad = "class:tui.help"
+    body_style = "class:tui.help.desc"
+    hint_style = "class:tui.help.hint"
+    out: list[list[tuple[str, str]]] = []
+    md_rows = render_markdown_rows(text, width)
+    if md_rows is not None:
+        out.extend(md_rows)
+    else:
+        for line in text.split("\n") or [""]:
+            for chunk in _wrap_line(line, width):
+                out.append([(body_style, chunk)])
+    if not out:
+        out.append([(body_style, "(empty)")])
+    out.append([(pad, " " * width)])
+    if hint:
+        for segment in str(hint).split("\n"):
+            for hline in _wrap_line(segment, width):
+                out.append([(hint_style, hline)])
+    return out
+
+
+# A picker row: a selectable option with a label, a one-line description, the
+# value passed to the select callback, and whether it is the current setting.
+PickerRow = dict[str, Any]
+
+_PICKER_HINT = "↑↓ move · 1-9 pick · Enter select · Esc cancel"
+
+
+# Most lines a single picker option's description may wrap to before it is capped
+# with an ellipsis (so a long blurb takes a few lines, never ten).
+_PICKER_MAX_DESC_LINES = 3
+
+
+def _render_picker_rows(
+    rows: list[PickerRow], index: int, width: int, hint: str = _PICKER_HINT
+) -> list[list[tuple[str, str]]]:
+    """Render a numbered, selectable option list for the picker popup.
+
+    Each option is ``› N. label   description`` with the descriptions aligned in a
+    shared column; a description that does not fit on one line **wraps** onto
+    continuation lines (indented under the column), capped at
+    :data:`_PICKER_MAX_DESC_LINES` so it never grows unbounded. The focused row
+    (``index``) is painted with the band background and an accent caret/label
+    across all its lines, and the active setting is tagged "(current)". Every row
+    is padded to ``width`` so the highlight band stays aligned.
+    """
+    width = max(20, int(width))
+    gap = 2
+    num_w = max((len(f"{i + 1}. ") for i in range(len(rows))), default=3)
+    label_w = max((len(str(r.get("label", ""))) for r in rows), default=0)
+    # Aligned description column = caret + number + widest label + gap, capped so a
+    # very long label / narrow panel still leaves room for the description.
+    desc_col = min(2 + num_w + label_w + gap, max(12, width - 12))
+    desc_w = max(6, width - desc_col)
+    label_room = max(1, desc_col - 2 - num_w - gap)
+
+    out: list[list[tuple[str, str]]] = []
+    for i, row in enumerate(rows):
+        sel = i == index
+        base = "class:tui.picker.sel" if sel else "class:tui.picker"
+        caret_style = "class:tui.picker.selcaret" if sel else "class:tui.picker.num"
+        num_style = "class:tui.picker.selnum" if sel else "class:tui.picker.num"
+        label_style = "class:tui.picker.sellabel" if sel else "class:tui.picker.label"
+        desc_style = "class:tui.picker.seldesc" if sel else "class:tui.picker.desc"
+        tag_style = "class:tui.picker.seltag" if sel else "class:tui.picker.tag"
+
+        num = f"{i + 1}. "
+        label = str(row.get("label", ""))
+        if len(label) > label_room:  # only trips on a very narrow panel
+            label = label[: max(1, label_room - 1)] + "…"
+        desc = str(row.get("description", "") or "")
+        tag = " (current)" if row.get("current") else ""
+
+        desc_lines = _wrap_line(desc, desc_w) if desc else [""]
+        if len(desc_lines) > _PICKER_MAX_DESC_LINES:
+            desc_lines = desc_lines[:_PICKER_MAX_DESC_LINES]
+            last = desc_lines[-1][: max(1, desc_w - 1)].rstrip()
+            desc_lines[-1] = last + "…"
+        # The "(current)" tag rides the last description line when it fits, else a
+        # line of its own — so it never pushes a row past the panel width.
+        tag_line = -1
+        if tag:
+            if len(desc_lines[-1]) + len(tag) <= desc_w:
+                tag_line = len(desc_lines) - 1
+            else:
+                desc_lines.append("")
+                tag_line = len(desc_lines) - 1
+
+        for li, dline in enumerate(desc_lines):
+            frags: list[tuple[str, str]] = []
+            if li == 0:
+                pad_label = " " * max(0, desc_col - (2 + len(num) + len(label)))
+                frags.append((caret_style, "› " if sel else "  "))
+                frags.append((num_style, num))
+                frags.append((label_style, label))
+                frags.append((base, pad_label))
+            else:
+                frags.append((base, " " * desc_col))
+            used = desc_col
+            if dline:
+                frags.append((desc_style, dline))
+                used += len(dline)
+            if li == tag_line and tag:
+                frags.append((tag_style, tag))
+                used += len(tag)
+            if used < width:
+                frags.append((base, " " * (width - used)))
+            out.append(frags)
+
+    out.append([("class:tui.picker", " " * width)])
+    if hint:
+        # Honour explicit line breaks, then wrap (never clip) so a long hint — e.g.
+        # the "auto-delegate off" note — is never cut off at the right edge.
+        for segment in str(hint).split("\n"):
+            for hline in _wrap_line(segment, width):
+                out.append(
+                    [
+                        ("class:tui.picker.hint", hline),
+                        ("class:tui.picker", " " * max(0, width - len(hline))),
+                    ]
+                )
+    return out
+
+
+# ------------------------------------------------------------- approval modal
+_APPROVE_ACTION_LABELS = {
+    "shell_run": "Run command",
+    "fs_write": "Write files",
+    "fs_delete": "Delete files",
+}
+
+
+def _approval_action_label(kind: str) -> str:
+    if kind.startswith("custom_tool_run:"):
+        return "Run custom tool"
+    return _APPROVE_ACTION_LABELS.get(kind, f"Approve {kind}")
+
+
+def _approval_is_destructive(kind: str, command: str) -> bool:
+    if kind == "fs_delete":
+        return True
+    lowered = f" {command.lower()} "
+    return any(token in lowered for token in (" rm ", "rm -", "force", "delete"))
+
+
+def _render_approval_rows(request: Any, width: int) -> list[list[tuple[str, str]]]:
+    """Render the approval modal body: a headline (amber, red if destructive), the
+    target command/files (bright), the reason (dim), and the colour-coded keys."""
+    width = max(20, int(width))
+    kind = str(getattr(request, "kind", "") or "")
+    command = str(getattr(request, "command", "") or "")
+    files = list(getattr(request, "files", []) or [])
+    reason = str(getattr(request, "reason", "") or "")
+    target = command or (", ".join(files) if files else kind)
+    danger = _approval_is_destructive(kind, command)
+
+    base = "class:tui.approve"
+    head_style = "class:tui.approve.head.danger" if danger else "class:tui.approve.head"
+    indent = 2
+    inner = max(8, width - indent * 2)
+
+    def _pad(fragments: list[tuple[str, str]], used: int) -> list[tuple[str, str]]:
+        return [*fragments, (base, " " * max(0, width - used))]
+
+    out: list[list[tuple[str, str]]] = [[(base, " " * width)]]
+    head = f"⚠ {_approval_action_label(kind)}"
+    out.append(_pad([(base, " " * indent), (head_style, head)], indent + len(head)))
+    out.append([(base, " " * width)])
+    for chunk in _wrap_line(target, inner):
+        out.append(
+            _pad([(base, " " * indent), ("class:tui.approve.target", chunk)], indent + len(chunk))
+        )
+    if reason:
+        for chunk in _wrap_line(reason, inner):
+            out.append(
+                _pad(
+                    [(base, " " * indent), ("class:tui.approve.reason", chunk)], indent + len(chunk)
+                )
+            )
+    out.append([(base, " " * width)])
+    opts: list[tuple[str, str]] = [
+        (base, " " * indent),
+        ("class:tui.approve.key.yes", "[y]"),
+        ("class:tui.approve.optlabel", " yes   "),
+        ("class:tui.approve.key.always", "[a]"),
+        ("class:tui.approve.optlabel", " always   "),
+        ("class:tui.approve.key.no", "[n]"),
+        ("class:tui.approve.optlabel", " no"),
+    ]
+    used = indent + len("[y] yes   [a] always   [n] no")
+    out.append(_pad(opts, used))
+    out.append([(base, " " * width)])
+    return out
+
+
+class _Cancellation:
+    """Minimal cancellation token understood by ``run_turn``.
+
+    ``run_turn`` calls ``throw_if_cancelled`` between steps and per streamed token;
+    raising ``KeyboardInterrupt`` mirrors the classic loop's interrupt semantics.
+
+    For the *initial* think-wait (the model has sent no tokens yet, so no callback
+    fires) an optional abort callback lets the LLM client register its live HTTP
+    response's ``close`` — :meth:`cancel` then closes the stream so the blocked
+    read unwinds promptly instead of waiting for the first byte.
+    """
+
+    def __init__(self) -> None:
+        self._cancelled = False
+        self._abort: Callable[[], None] | None = None
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        abort = self._abort
+        if abort is not None:
+            try:
+                abort()
+            except Exception:
+                pass
+
+    def set_abort_callback(self, fn: Callable[[], None] | None) -> None:
+        self._abort = fn
+
+    def clear_abort_callback(self) -> None:
+        self._abort = None
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+    def throw_if_cancelled(self, reason: str = "cancelled_by_user") -> None:
+        if self._cancelled:
+            raise KeyboardInterrupt(reason)
+
+
+class _PlaceholderProcessor(Processor):
+    """Show dim placeholder text while the input buffer is empty.
+
+    ``text`` may be a string or a zero-arg callable resolved at render time (so
+    the placeholder can change once a conversation is underway). The text carries
+    a leading space so the cursor rests on a blank cell in front of it.
+    """
+
+    def __init__(
+        self,
+        text: str | Callable[[], str],
+        style: str = "class:tui.placeholder",
+    ) -> None:
+        self._text = text
+        self._style = style
+
+    def _resolve(self) -> str:
+        if callable(self._text):
+            try:
+                return self._text()
+            except Exception:
+                return ""
+        return self._text
+
+    def apply_transformation(self, ti: Any) -> Transformation:
+        if ti.lineno == 0 and not ti.document.text:
+            return Transformation([(self._style, self._resolve())])
+        return Transformation(ti.fragments)
+
+
+def _has_conversation(entries: list[tuple[str, str]]) -> bool:
+    """True once a real turn exists in the transcript.
+
+    Drives the welcome-landing ↔ chat split: the owl/wordmark landing stays up
+    until the first *user/assistant* turn. Startup notices (the streaming-disabled
+    warning, ``system``/``trace`` lines) are appended to the transcript at launch
+    but must not count as a conversation, otherwise they would instantly dismiss
+    the landing the moment the app opens.
+    """
+    return any(role in ("user", "assistant") for role, _ in entries)
+
+
+def run_tui(
+    state: TuiState,
+    *,
+    owl_color: bool = True,
+    input: Any | None = None,
+    output: Any | None = None,
+    session_builder: Callable[[TuiSurface], Any] | None = None,
+    on_turn_complete: Callable[[], None] | None = None,
+    on_hud_refresh: Callable[[], None] | None = None,
+    command_runner: Callable[[Any, str, int], tuple[str, str, str | None, dict[str, Any] | None]]
+    | None = None,
+    background_turns: bool = True,
+    help_sections: list[HelpSection] | None = None,
+    panel_providers: dict[str, Callable[[], dict[str, Any] | None]] | None = None,
+    picker_providers: dict[str, Callable[[], dict[str, Any] | None]] | None = None,
+    completer: Any | None = None,
+    config_flow_factory: Callable[[], Any] | None = None,
+    on_config_saved: Callable[[], bool | None] | None = None,
+) -> tuple[Any, list[tuple[str, str]]]:
+    """Run the full-screen TUI shell, optionally hosting a real agent session.
+
+    Returns ``(result, transcript)`` where ``result`` is the value passed to
+    ``app.exit`` (an exit word, or ``None`` for Ctrl-C/Ctrl-D) and ``transcript``
+    is the list of ``(role, text)`` entries shown in the pane.
+
+    ``session_builder`` receives the :class:`TuiSurface` and returns an object
+    exposing ``run_turn(text, *, cancellation_token=...)`` (an ``AgentSession``).
+    When omitted, submissions show a static stub reply (Phase 1 behaviour).
+
+    ``on_turn_complete`` is invoked (worker thread) once after each turn so the
+    caller can refresh live HUD fields (tokens/cost/context) on ``state``.
+    ``on_hud_refresh`` (optional) is the same idea but called *during* a turn at
+    safe points (tool-end / message-done, throttled) so a long multi-step turn's
+    footer numbers advance instead of staying frozen until the turn finishes; pass
+    the same refresher used for ``on_turn_complete``.
+
+    ``command_runner(session, text, width)`` routes a submission through the chat
+    command handler and returns ``(action, output, instruction, run_kwargs)``:
+    ``action`` is ``"exit"`` | ``"handled"`` | ``"run"``; ``output`` is captured
+    text to show in the transcript; for ``"run"`` the turn uses ``instruction``
+    (defaulting to ``text``) and ``run_kwargs``. When omitted, slash commands are
+    sent to the agent as plain messages.
+
+    ``input``/``output`` are injectable so tests can drive the application with a
+    pipe input and a dummy output. ``background_turns=False`` runs turns inline
+    (used by tests for deterministic ordering).
+
+    ``panel_providers`` maps a command name (e.g. ``"/status"``) to a callable
+    ``provider(arg)`` returning a panel spec ``{"title", "hint"?, "sections"}``
+    where ``sections`` is a list of :data:`PanelSection`, or ``None`` to decline.
+    ``arg`` is the text after the command word. When a spec is returned the command
+    is TUI-native (like ``/help``): it opens the centered popup over the
+    FloatContainer instead of routing through ``command_runner`` and never echoes
+    into the transcript. When the provider returns ``None`` (e.g. ``/usage hud on``,
+    ``/config set …``) the submission falls through to ``picker_providers`` / the
+    command runner so the typed form still applies.
+    """
+    owl = load_owl_animation(color_enabled=owl_color)
+    transcript = TuiTranscript()
+
+    # ---- turn/run state (mutated across threads; guarded by simple flags) ----
+    running: dict[str, bool] = {"on": False}
+    spinner: dict[str, int] = {"i": 0}
+    cancel_box: dict[str, _Cancellation | None] = {"token": None}
+    approval_box: dict[str, Any] = {"event": None, "decision": None, "request": None}
+    worker_box: dict[str, threading.Thread | None] = {"thread": None}
+    # Scroll state: ``follow`` pins to the latest line; once the user scrolls up
+    # it sticks at ``offset`` (top visible row) until they return to the bottom
+    # (or send a message).
+    scroll: dict[str, Any] = {"follow": True, "offset": 0}
+    # ``started`` stamps the running turn so the status line can show elapsed
+    # time; ``reasoning_expanded`` toggles full vs collapsed thinking (Ctrl+R).
+    run_box: dict[str, float] = {"started": 0.0}
+    view: dict[str, bool] = {"reasoning_expanded": False}
+    # Centered popup panel (the reusable /help recipe): ``on`` toggles the Float;
+    # ``offset`` is the top visible row (driven through the same cursor-pin trick as
+    # the transcript so a set scroll position sticks); ``title`` retitles the Frame;
+    # ``builder`` is the active row-builder (``width -> rows``) so /help, /status and
+    # every future panel share one overlay. ``n`` caches the rendered row count.
+    # ``confirm`` (when set) is a command string a panel runs on Enter — the popup
+    # then acts as a confirm dialog (e.g. the /forge intro: Enter enters Forge, Esc
+    # cancels). It is None for ordinary read-only panels, where Enter just closes.
+    help_box: dict[str, Any] = {
+        "on": False,
+        "offset": 0,
+        "title": "Commands",
+        "builder": None,
+        "confirm": None,
+    }
+    help_rows: dict[str, int] = {"n": 0}
+    # Selectable picker popup (e.g. /mode): ``on`` toggles the Float, ``index`` is
+    # the focused row, ``rows`` the option list, ``on_select`` the apply callback
+    # (value -> list[(role, text)] messages to echo). Shares the dark popup chrome.
+    picker_box: dict[str, Any] = {
+        "on": False,
+        "index": 0,
+        "title": "Select",
+        "hint": _PICKER_HINT,
+        "rows": [],
+        "on_select": None,
+    }
+    # In-TUI editor float (e.g. /plan edit on plan.json): ``on`` toggles the Float,
+    # ``on_save`` validates+persists the buffer (returns ``(ok, message)``), and
+    # ``status`` shows the last save error inline so the user can fix and re-save.
+    editor_box: dict[str, Any] = {"on": False, "title": "Edit", "on_save": None, "status": ""}
+
+    def _safe_invalidate() -> None:
+        try:
+            get_app().invalidate()
+        except Exception:
+            pass
+
+    transcript.set_invalidate(_safe_invalidate)
+
+    def _app_running() -> bool:
+        try:
+            return bool(getattr(get_app(), "is_running", False))
+        except Exception:
+            return False
+
+    # ---- approval (centered modal popup; only reached when auto-approve is off) ----
+    def _approval_ui(request: Any) -> Any:
+        if not _app_running():
+            return ApprovalDecision(allow=False)
+        event = threading.Event()
+        approval_box["event"] = event
+        approval_box["decision"] = None
+        approval_box["request"] = request  # drives the approval Float
+        _safe_invalidate()
+        # Bounded wait so the worker leaves event.wait() if the app is torn down
+        # (EOF/exception) before the user (or the exit hook) resolves it.
+        while not event.wait(timeout=0.2):
+            if not _app_running():
+                approval_box["event"] = None
+                approval_box["decision"] = None
+                approval_box["request"] = None
+                return ApprovalDecision(allow=False)
+        decision = approval_box.get("decision") or ApprovalDecision(allow=False)
+        approval_box["event"] = None
+        approval_box["decision"] = None
+        approval_box["request"] = None
+        _safe_invalidate()
+        return decision
+
+    def _resolve_approval(*, allow: bool, always: bool = False) -> None:
+        event = approval_box.get("event")
+        if event is None:
+            return
+        approval_box["decision"] = ApprovalDecision(allow=allow, allow_for_session=always)
+        verdict = "allowed" if allow else "denied"
+        transcript.append("trace", f"· approval {verdict}")
+        event.set()
+        _safe_invalidate()
+
+    _approval_pending = Condition(lambda: approval_box.get("event") is not None)
+
+    # ---- build the agent surface + session (eager; failure → caller falls back) ----
+    surface: TuiSurface | None = None
+    session: Any | None = None
+    if session_builder is not None:
+        surface = TuiSurface(
+            transcript,
+            auto_approve=lambda: bool(state.auto_approve),
+            request_approval_ui=_approval_ui,
+            # Mid-turn HUD refresher (throttled, worker-thread) so the footer's
+            # context/tokens/cost advance while a long multi-step turn runs, not just
+            # once it ends. Distinct from on_turn_complete so the end-of-turn hook
+            # keeps its fire-once-per-turn contract.
+            on_hud_refresh=on_hud_refresh,
+        )
+        session = session_builder(surface)
+        # Seed the footer HUD from the freshly built session so the bottom-right
+        # context/tokens/cost read accurately on the first paint, instead of a flat
+        # "context 100%" until the first turn completes.
+        if on_hud_refresh is not None:
+            try:
+                on_hud_refresh()
+            except Exception:
+                pass
+
+    # ---- welcome body (owl + wordmark + hint), shown until first message ----
+    def _welcome_text() -> FormattedText:
+        fragments: list[tuple[str, str]] = [("", "\n")]
+        owl_ansi = owl.current_ansi()
+        if owl_ansi is not None:
+            fragments.extend(to_formatted_text(owl_ansi))
+            fragments.append(("", "\n\n"))
+        fragments.append(("class:tui.heading", _content.HEADING_TEXT))
+        fragments.append(("class:tui.credit", "  ·  " + _content.CREDIT_TEXT))
+        fragments.append(("", "\n\n"))
+        fragments.append(("class:tui.hint", _content.HINT_TEXT))
+        return FormattedText(fragments)
+
+    welcome_window = Window(
+        FormattedTextControl(_welcome_text, focusable=False),
+        align=WindowAlign.CENTER,
+    )
+
+    # ---- transcript pane (pull-based; the worker only mutates the model) ----
+    def _run_elapsed() -> int:
+        started = run_box["started"]
+        return max(0, int(time.monotonic() - started)) if started else 0
+
+    _row_count = {"n": 0}
+    _role_styles = {
+        "system": "class:tui.transcript.system",
+        "trace": "class:tui.transcript.trace",
+        "error": "class:tui.transcript.error",
+        "warn": "class:tui.transcript.warn",
+        "info": "class:tui.transcript.system",
+    }
+
+    def _transcript_fragments() -> FormattedText:
+        entries, status, streaming_index = transcript.snapshot()
+        reasoning_index, reasoning_secs = transcript.reasoning_snapshot()
+        # Content width EXCLUDING the right scrollbar margin, so the full-width
+        # user bands never overflow into a wrapped extra row.
+        info = transcript_window.render_info
+        if info is not None:
+            width = info.window_width
+        else:
+            try:
+                width = max(1, get_app().output.get_size().columns - 1)
+            except Exception:
+                width = 80
+        fragments: list[tuple[str, str]] = []
+        rows = 0
+        for index, (role, text) in enumerate(entries):
+            if role == "user":
+                block = _user_band_rows(text, width)  # full-width highlighted band
+            elif role == "assistant":
+                # Markdown-render once the block is complete; keep the still-
+                # streaming block plain so a half-open code fence never flickers.
+                done = streaming_index != index
+                block = _assistant_rows(text, width, markdown=done)
+            elif role == "reasoning":
+                is_live = reasoning_index == index
+                block = _reasoning_rows(
+                    text,
+                    width,
+                    live=is_live,
+                    secs=reasoning_secs.get(index, 0),
+                    expanded=view["reasoning_expanded"],
+                    spinner=_SPINNER_FRAMES[spinner["i"] % len(_SPINNER_FRAMES)] if is_live else "",
+                    elapsed=_run_elapsed() if is_live else 0,
+                )
+            else:
+                style = _role_styles.get(role, "")
+                block = _plain_role_rows(style, text, width)
+            for row in block:
+                fragments.extend(row)
+                fragments.append(("", "\n"))
+                rows += 1
+            # Blank spacer between blocks for readability (so the thinking aside
+            # is not glued to the highlighted question box above it).
+            if index != len(entries) - 1:
+                fragments.append(("", "\n"))
+                rows += 1
+        # Live Forge execution view (the task table + phase/spinner line) while
+        # /execute plan runs the swarm — and it stays frozen as the final table once
+        # the run completes (until the next submission clears it). It replaces the
+        # generic activity indicator for the duration of a forge run.
+        forge_view = transcript.forge_snapshot()
+        if forge_view is not None:
+            frame = _SPINNER_FRAMES[spinner["i"] % len(_SPINNER_FRAMES)]
+            try:
+                forge_elapsed = int(max(0, time.monotonic() - float(forge_view["started"])))
+            except Exception:
+                forge_elapsed = 0
+            if entries:
+                fragments.append(("", "\n"))
+                rows += 1
+            for row in _forge_view_rows(forge_view, width, frame, forge_elapsed):
+                fragments.extend(row)
+                fragments.append(("", "\n"))
+                rows += 1
+        # Single live activity indicator under the content while the turn runs:
+        # the model's current step — "thinking…" or the running tool name — with a
+        # spinner + elapsed. Hidden while a reasoning block is itself live (it
+        # carries its own header), while the answer streams, or while the forge view
+        # is showing (it carries its own spinner). A blank line above gives it room.
+        elif running["on"] and reasoning_index is None and streaming_index is None:
+            frame = _SPINNER_FRAMES[spinner["i"] % len(_SPINNER_FRAMES)]
+            label = status or "thinking…"
+            if entries:
+                fragments.append(("", "\n"))
+                rows += 1
+            for row in _activity_rows(frame, label, _run_elapsed()):
+                fragments.extend(row)
+                fragments.append(("", "\n"))
+                rows += 1
+        _row_count["n"] = rows
+        return FormattedText(fragments)
+
+    def _last_row() -> int:
+        return max(0, _row_count["n"] - 1)
+
+    def _win_height() -> int:
+        info = transcript_window.render_info
+        return info.window_height if info is not None else 0
+
+    def _follow_top() -> int:
+        # Top visible row when pinned to the bottom (so the last screen shows).
+        return max(0, _last_row() - max(0, _win_height() - 1))
+
+    def _cursor_row() -> int:
+        # We pin the Window's "cursor" to the TOP of the viewport (via the huge
+        # bottom scroll-offset below), so vertical_scroll == this row. Following →
+        # the bottom screen; otherwise the user's scroll position.
+        if scroll["follow"]:
+            return _follow_top()
+        return max(0, min(int(scroll["offset"]), _last_row()))
+
+    def _scroll_move(delta: int) -> None:
+        current = _follow_top() if scroll["follow"] else int(scroll["offset"])
+        scroll["offset"], scroll["follow"] = _scroll_target(current, _follow_top(), delta)
+
+    def _wheel_scroll(direction: int) -> None:
+        _scroll_move(direction * _WHEEL_STEP_ROWS)
+        _safe_invalidate()
+
+    transcript_window = Window(
+        _ScrollableControl(
+            _transcript_fragments,
+            focusable=False,
+            show_cursor=False,
+            get_cursor_position=lambda: Point(x=0, y=_cursor_row()),
+            on_scroll=_wheel_scroll,
+        ),
+        wrap_lines=True,
+        # Huge bottom scroll-offset pins our "cursor" (the top visible row) to the
+        # top of the viewport, so vertical_scroll tracks it 1:1 → exact, smooth
+        # scrolling (no cursor-visibility snap) and a correct scrollbar position.
+        scroll_offsets=ScrollOffsets(bottom=10**6),
+        right_margins=[ScrollbarMargin(display_arrows=False)],
+    )
+
+    def _scroll_page_rows() -> int:
+        height = _win_height()
+        return max(1, height - 1) if height > 0 else 10
+
+    # The welcome landing (owl + wordmark) stays up until the *conversation*
+    # actually starts — the first user/assistant turn. Startup notices (the
+    # streaming-disabled warning, system/trace lines) get appended to the
+    # transcript too, but they must NOT dismiss the landing, so the welcome/chat
+    # split keys on real turns rather than "any transcript entry". The notices
+    # are still there and surface as soon as the first message is sent.
+    def _conversation_started() -> bool:
+        return _has_conversation(transcript.entries)
+
+    has_messages = Condition(_conversation_started)
+    no_messages = Condition(lambda: not _conversation_started())
+
+    # ---- status / working line (between transcript and input) ----
+    def _status_text() -> FormattedText:
+        # All "agent is working" feedback (thinking + running tool, with the one
+        # timer) now lives in the transcript under the question via the live
+        # activity indicator. The footer only carries the scrolled-up hint and an
+        # interrupt reminder while busy, so there is never a second timer here.
+        if running["on"]:
+            return FormattedText([("class:tui.status", "  Esc or Ctrl+C to interrupt")])
+        if state.mouse_capture:
+            # Scroll mode (opt-in): the app owns the mouse, so native text
+            # selection is off — remind the user how to get it back for copying.
+            return FormattedText(
+                [("class:tui.status", "  wheel-scroll on · F2 to select & copy text")]
+            )
+        if not scroll["follow"] and transcript.entries:
+            return FormattedText([("class:tui.status", "  ↓ scrolled up — Ctrl+End for latest")])
+        return FormattedText([("", "")])
+
+    status_window = Window(FormattedTextControl(_status_text, focusable=False), height=1)
+
+    # ---- input box (multiline; Enter submits, Ctrl+J / Alt+Enter add a line) ----
+    # Grows from one row up to a few as the user adds lines (so a pasted/multi-line
+    # prompt stays visible); empty it is one row, keeping the welcome centering.
+    def _placeholder_text() -> str:
+        # Inside a Forge session the input is a plan editor — nudge the verbs.
+        if getattr(state, "forge_mode", False):
+            return " " + _content.INPUT_PLACEHOLDER_FORGE
+        # Long greeting on the welcome screen; short follow-up once chatting.
+        if _conversation_started():
+            return " " + _content.INPUT_PLACEHOLDER_FOLLOWUP
+        return " " + _content.INPUT_PLACEHOLDER
+
+    input_area = TextArea(
+        height=D(min=1, max=8),
+        multiline=True,
+        wrap_lines=True,
+        style="class:tui.input",
+        completer=completer,
+        complete_while_typing=True,
+        input_processors=[
+            _PlaceholderProcessor(_placeholder_text),
+            BeforeInput("> ", style="class:tui.prompt"),
+        ],
+    )
+
+    # ---- turn execution ----
+    def _current_width() -> int:
+        try:
+            return get_app().output.get_size().columns
+        except Exception:
+            return 80
+
+    def _run_turn_blocking(instruction: str, run_kwargs: dict[str, Any]) -> None:
+        my_token = cancel_box["token"]
+        # Tag this worker thread so the surface can drop its output if it gets
+        # soft-interrupted (and keeps blocking on a slow model in the background).
+        set_active_cancellation(my_token)
+        cancelled = my_token is not None and getattr(my_token, "is_cancelled", False)
+        # A forge /execute plan run carries a callable that runs the swarm (with the
+        # live forge view) on this worker thread instead of a normal agent turn.
+        # POP it (not get) so it never leaks into session.run_turn(**run_kwargs).
+        forge_execute = run_kwargs.pop("_forge_execute", None) if run_kwargs else None
+        try:
+            if callable(forge_execute):
+                forge_execute(my_token)
+            else:
+                session.run_turn(instruction, cancellation_token=my_token, **run_kwargs)
+        except KeyboardInterrupt:
+            cancelled = True
+            # A soft-interrupt already printed "Interrupted." from the key handler.
+            if not (my_token is not None and my_token.is_cancelled):
+                transcript.append("warn", "Interrupted.")
+        except BaseException as exc:  # noqa: BLE001 - surface any failure inline
+            cancelled = my_token is not None and my_token.is_cancelled
+            if not cancelled:
+                transcript.append("error", f"{type(exc).__name__}: {exc}")
+        finally:
+            # Only reset shared run state if we are still the active turn — a
+            # soft-interrupt (or a newer turn) may have moved on while we were
+            # blocked, and we must not stomp on its state when we finally unwind.
+            if cancel_box.get("token") is my_token:
+                transcript.set_status(None)
+                if on_turn_complete is not None:
+                    try:
+                        on_turn_complete()
+                    except Exception:
+                        pass
+                # Flip run state OFF only AFTER the post-turn HUD refresh: while
+                # running["on"] is True _submit is blocked, so a UI-thread /resume
+                # (which swaps session.__dict__ in place) cannot race this refresh's
+                # reads of the same session object. Closes the post-turn window.
+                running["on"] = False
+                cancel_box["token"] = None
+            _safe_invalidate()
+
+    def _begin_run(instruction: str, run_kwargs: dict[str, Any]) -> None:
+        running["on"] = True
+        cancel_box["token"] = _Cancellation()
+        run_box["started"] = time.monotonic()
+        # No "Thinking…" footer status — the transient thinking indicator now
+        # renders under the question (see _transcript_fragments).
+        transcript.set_status(None)
+        _safe_invalidate()
+        if background_turns:
+            worker = threading.Thread(
+                target=_run_turn_blocking, args=(instruction, run_kwargs), daemon=True
+            )
+            worker_box["thread"] = worker
+            worker.start()
+        else:
+            _run_turn_blocking(instruction, run_kwargs)
+
+    def _soft_interrupt() -> None:
+        # Respond to Ctrl+C / Esc *immediately*: free the UI and show "Interrupted."
+        # now, without waiting for the (possibly still-blocked) worker to unwind.
+        # The cancel flips the token — the surface then drops that worker's output,
+        # it closes any live HTTP stream, and the worker exits at its next checkpoint
+        # (its finally no-ops since the active token has changed).
+        token = cancel_box.get("token")
+        if token is None and not running["on"]:
+            return
+        if token is not None:
+            token.cancel()
+        pending = approval_box.get("event")
+        if pending is not None:
+            approval_box["decision"] = ApprovalDecision(allow=False)
+            pending.set()
+        transcript.append("warn", "Interrupted.")
+        running["on"] = False
+        cancel_box["token"] = None
+        transcript.set_status(None)
+        scroll["follow"] = True
+        _safe_invalidate()
+
+    def _dispatch_command(text: str) -> None:
+        """Route ``text`` straight through the chat command runner.
+
+        This is the real path of :func:`_submit` (echo the user line, run the
+        command handler, then exit / begin a turn / show captured output). It is
+        factored out so a confirm popup can run its command on Enter — bypassing
+        the /help, panel and picker interceptions — e.g. the /forge intro popup
+        whose Enter enters the Forge session. No-ops without a session + runner.
+        """
+        if session is None or command_runner is None:
+            return
+        scroll["follow"] = True
+        buff = input_area.buffer
+        buff.reset()
+        transcript.append_user(text)  # echo what the user typed
+        try:
+            action, output, instruction, run_kwargs = command_runner(
+                session, text, _current_width()
+            )
+        except Exception as exc:  # noqa: BLE001 - never crash the UI on a command
+            transcript.append("error", f"Command failed: {exc}")
+            _safe_invalidate()
+            return
+        if output:
+            transcript.append("system", output)
+        if action == "exit":
+            get_app().exit(result=text.strip())
+            return
+        if action == "run":
+            _begin_run(instruction if instruction is not None else text, run_kwargs or {})
+            return
+        _safe_invalidate()  # "handled" — output already shown
+
+    def _submit() -> None:
+        # Ignore submissions while a turn runs or an approval is pending — the
+        # user interrupts with Ctrl+C first. (Also prevents an exit word from
+        # tearing the app down mid-turn.)
+        if running["on"] or approval_box.get("event") is not None:
+            return
+        buff = input_area.buffer
+        text = buff.text
+        stripped = text.strip()
+        if not stripped:
+            return
+        # Returning to the live tail whenever the user sends something.
+        scroll["follow"] = True
+
+        # /help is TUI-native: open the centered command popup instead of routing
+        # it anywhere (works with or without a session).
+        if stripped.lower() == "/help":
+            buff.reset()
+            _open_help()
+            return
+
+        # /clear is TUI-native (the classic command clears the console screen).
+        if session is not None and stripped.lower() == "/clear":
+            transcript.clear()
+            scroll["offset"] = 0
+            buff.reset()
+            _safe_invalidate()
+            return
+
+        # /config is TUI-native: bare `/config` opens the full configuration menu
+        # overlay (the classic interactive menu can't run in the alt-screen). The
+        # argument forms (`/config show|list|set|clear|…`) fall through to the panel
+        # provider / command runner so the typed forms still apply.
+        if config_overlay is not None and stripped.lower() == "/config":
+            buff.reset()
+            config_overlay.open()
+            return
+
+        # Panel commands (e.g. /status, /usage) are TUI-native too: the first token
+        # names a provider, called with the remaining argument, that returns a
+        # {title, hint?, sections} spec to open the centered popup instead of routing
+        # to the command runner (no transcript echo). Returning None means "this
+        # invocation isn't a panel" (e.g. "/usage hud on", "/config set …") — we fall
+        # through to the picker / command runner so the typed form still applies.
+        if panel_providers:
+            parts = stripped.split(maxsplit=1)
+            name = parts[0].lower()
+            provider = panel_providers.get(name)
+            if provider is not None:
+                cmd_arg = parts[1].strip() if len(parts) > 1 else ""
+                try:
+                    spec = provider(cmd_arg)
+                except Exception as exc:  # noqa: BLE001 - never crash the UI on a panel
+                    buff.reset()
+                    transcript.append("error", f"{name} failed: {exc}")
+                    _safe_invalidate()
+                    return
+                if spec is not None:
+                    buff.reset()
+                    hint = spec.get("hint") or _HELP_HINT
+                    title = spec.get("title") or name
+                    editor_spec = spec.get("editor")
+                    body = spec.get("body")
+                    # An optional confirm command turns the panel into a confirm
+                    # dialog: Enter runs it (e.g. the /forge intro enters Forge),
+                    # Esc/q cancels. None for ordinary read-only panels.
+                    confirm = spec.get("confirm")
+                    if editor_spec is not None:
+                        # An editable document (e.g. /plan edit) opens the editor
+                        # float instead of a read-only panel.
+                        _open_editor(editor_spec)
+                        return
+                    if body is not None:
+                        # A document panel (e.g. /plan markdown → PLAN.md): render the
+                        # raw text (markdown-aware) instead of key/value sections.
+                        _open_panel(
+                            title,
+                            lambda width, _b=body, _h=hint: _render_doc_panel_rows(_b, width, _h),
+                            confirm=confirm,
+                        )
+                    else:
+                        sections = spec.get("sections") or []
+                        _open_panel(
+                            title,
+                            lambda width, _s=sections, _h=hint: _render_kv_panel_rows(
+                                _s, width, _h
+                            ),
+                            confirm=confirm,
+                        )
+                    return
+                # spec is None → not a panel for this argument; fall through below.
+
+        # Picker commands (e.g. bare /mode) open the selectable popup. Only the
+        # no-arg form opens the picker; "/mode fast" falls through to the command
+        # runner so an explicit choice still applies inline.
+        if picker_providers:
+            parts = stripped.split()
+            name = parts[0].lower()
+            if len(parts) == 1 and name in picker_providers:
+                try:
+                    spec = picker_providers[name]()
+                except Exception as exc:  # noqa: BLE001 - never crash the UI on a picker
+                    buff.reset()
+                    transcript.append("error", f"{name} failed: {exc}")
+                    _safe_invalidate()
+                    return
+                if spec and spec.get("rows"):
+                    buff.reset()
+                    _open_picker(spec)
+                    return
+                # Nothing to pick (e.g. no subagents registered) → fall through to
+                # the command runner so it can explain/guide instead of silently
+                # swallowing the command.
+
+        # Real path with slash-command support: route every submission through
+        # the chat command handler (it returns "run" for plain messages).
+        if session is not None and command_runner is not None:
+            _dispatch_command(text)
+            return
+
+        # No command runner (Phase 2 fake session / tests): exit words + run.
+        if stripped.lower() in _EXIT_WORDS:
+            get_app().exit(result=stripped)
+            return
+        if session is not None:
+            buff.reset()
+            transcript.append_user(text)
+            _begin_run(text, {})
+            return
+
+        # Stub path (no agent session): echo + canned reply.
+        transcript.append_user(text)
+        transcript.append("system", _PREVIEW_REPLY)
+        buff.reset()
+        _safe_invalidate()
+
+    # ---- footer ----
+    def _footer_text() -> FormattedText:
+        try:
+            width = get_app().output.get_size().columns
+        except Exception:
+            width = 80
+        return footer_fragments(state, width=width)
+
+    footer_window = Window(FormattedTextControl(_footer_text, focusable=False), height=2)
+
+    body = HSplit(
+        [
+            ConditionalContainer(welcome_window, filter=no_messages),
+            ConditionalContainer(transcript_window, filter=has_messages),
+        ]
+    )
+
+    # Welcome state: blank rows above/below the input line so the text sits
+    # vertically centered in the box. Conversation state: blanks collapse.
+    input_inner = HSplit(
+        [
+            ConditionalContainer(Window(height=1), filter=no_messages),
+            input_area,
+            ConditionalContainer(Window(height=1), filter=no_messages),
+        ]
+    )
+    input_frame = Frame(input_inner)
+
+    def _side_width() -> Any:
+        if _conversation_started():
+            return D.exact(0)
+        try:
+            cols = get_app().output.get_size().columns
+        except Exception:
+            cols = 80
+        box = min(64, max(28, cols - 10))
+        return D.exact(max(0, (cols - box) // 2))
+
+    def _box_height() -> int:
+        return 5 if not _conversation_started() else 3
+
+    input_row = VSplit(
+        [
+            Window(width=_side_width, height=_box_height),
+            input_frame,
+            Window(width=_side_width, height=_box_height),
+        ]
+    )
+
+    root = HSplit(
+        [
+            body,
+            # Working/status line only appears once a conversation is underway, so
+            # the welcome screen keeps its Phase 1 spacing exactly.
+            ConditionalContainer(status_window, filter=has_messages),
+            input_row,
+            Window(height=1),
+            footer_window,
+        ]
+    )
+
+    # ---- /help popup (centered Float over the root; opaque command panel) ----
+    _help_open = Condition(lambda: help_box["on"])
+
+    def _resolve_help_sections() -> list[HelpSection]:
+        if help_sections is not None:
+            return help_sections
+        try:
+            from ..commands.welcome import _chat_command_sections
+
+            sections = _chat_command_sections(ui_mode="chat")
+            if sections:
+                return sections
+        except Exception:
+            pass
+        return _fallback_help_sections()
+
+    def _help_fragments() -> FormattedText:
+        # Read the panel's ACTUAL content width from render_info (exactly like the
+        # transcript) so the padded rows match the window and never re-wrap.
+        info = help_window.render_info
+        if info is not None:
+            width = info.window_width
+        else:
+            width = _help_inner_width(_current_width())
+        builder = help_box.get("builder")
+        if builder is None:
+            rows = _help_rows_for_sections(_resolve_help_sections(), max(20, width))
+        else:
+            rows = builder(max(20, width))
+        help_rows["n"] = len(rows)
+        fragments: list[tuple[str, str]] = []
+        for index, row in enumerate(rows):
+            if index:
+                fragments.append(("", "\n"))
+            fragments.extend(row)
+        return FormattedText(fragments)
+
+    # Scroll math: the cursor is pinned to the TOP of the viewport via the huge
+    # bottom scroll-offset, so vertical_scroll tracks the offset 1:1. The max scroll
+    # (follow-top) is taken STRAIGHT from render_info — `content_height -
+    # window_height` is the exact value the ScrollbarMargin treats as fully
+    # scrolled, so the clamp and the scrollbar agree and the thumb reaches the end.
+    def _help_win_height() -> int:
+        info = help_window.render_info
+        return info.window_height if info is not None else 0
+
+    def _help_follow_top() -> int:
+        info = help_window.render_info
+        if info is None:
+            return max(0, help_rows["n"] - 1)
+        return max(0, info.content_height - info.window_height)
+
+    def _help_cursor_row() -> int:
+        return max(0, min(int(help_box["offset"]), _help_follow_top()))
+
+    def _help_panel_width() -> int:
+        try:
+            cols = get_app().output.get_size().columns
+        except Exception:
+            cols = 80
+        # Outer frame width; wide side margins so it floats, capped so it is never
+        # absurdly wide and never exceeds the screen.
+        return max(38, min(cols - 8, 86))
+
+    def _help_panel_height() -> int:
+        try:
+            rows = get_app().output.get_size().rows
+        except Exception:
+            rows = 24
+        # Outer frame height; leave a clear top/bottom margin and never overflow
+        # the screen, so render_info is exact and scrolling can reach the bottom.
+        return max(6, rows - 6)
+
+    help_window = Window(
+        _ScrollableControl(
+            _help_fragments,
+            focusable=True,
+            show_cursor=False,
+            get_cursor_position=lambda: Point(x=0, y=_help_cursor_row()),
+            on_scroll=lambda direction: _help_scroll(direction * _WHEEL_STEP_ROWS),
+        ),
+        # MUST be True: the cursor-pin scroll trick only works on prompt_toolkit's
+        # line-wrapping scroll path (_scroll_when_linewrapping). With wrap_lines
+        # False the offset never moved vertical_scroll, so the scrollbar thumb
+        # could not reach the bottom. Rows are pre-padded to the content width, so
+        # nothing actually wraps.
+        wrap_lines=True,
+        style="class:tui.help",
+        scroll_offsets=ScrollOffsets(bottom=10**6),
+        right_margins=[ScrollbarMargin(display_arrows=False)],
+    )
+    help_frame = Frame(help_window, title="Commands", style="class:tui.help.frame")
+    help_float = Float(
+        content=ConditionalContainer(help_frame, filter=_help_open),
+        width=_help_panel_width,
+        height=_help_panel_height,
+    )
+
+    def _open_panel(
+        title: str,
+        builder: Callable[[int], list[list[tuple[str, str]]]],
+        *,
+        confirm: str | None = None,
+    ) -> None:
+        # Open the centered popup with an arbitrary title + row-builder. /help and
+        # every panel command (/status, …) route through here so there is one
+        # overlay, one set of scroll/close keys, one Float. ``confirm`` (when set)
+        # makes Enter run that command instead of merely closing (confirm dialog).
+        help_box["on"] = True
+        help_box["offset"] = 0
+        help_box["title"] = title
+        help_box["builder"] = builder
+        help_box["confirm"] = confirm
+        try:
+            help_frame.title = title
+        except Exception:
+            pass
+        try:
+            get_app().layout.focus(help_window)
+        except Exception:
+            pass
+        _safe_invalidate()
+
+    def _open_help() -> None:
+        _open_panel(
+            "Commands",
+            lambda width: _help_rows_for_sections(_resolve_help_sections(), width),
+        )
+
+    def _close_help() -> None:
+        if not help_box["on"]:
+            return
+        help_box["on"] = False
+        help_box["confirm"] = None
+        try:
+            get_app().layout.focus(input_area)
+        except Exception:
+            pass
+        _safe_invalidate()
+
+    def _help_page_rows() -> int:
+        return max(1, _help_win_height() - 1)
+
+    def _help_scroll(delta: int) -> None:
+        new_offset, _follow = _scroll_target(int(help_box["offset"]), _help_follow_top(), delta)
+        help_box["offset"] = new_offset
+        _safe_invalidate()
+
+    # ---- picker popup (centered Float; selectable option list, e.g. /mode) ----
+    _picker_open = Condition(lambda: picker_box["on"])
+
+    def _picker_fragments() -> FormattedText:
+        info = picker_window.render_info
+        width = info.window_width if info is not None else _help_inner_width(_current_width())
+        rows = _render_picker_rows(
+            picker_box["rows"], int(picker_box["index"]), max(20, width), picker_box["hint"]
+        )
+        fragments: list[tuple[str, str]] = []
+        for index, row in enumerate(rows):
+            if index:
+                fragments.append(("", "\n"))
+            fragments.extend(row)
+        return FormattedText(fragments)
+
+    def _picker_width() -> int:
+        try:
+            cols = get_app().output.get_size().columns
+        except Exception:
+            cols = 80
+        return max(40, min(cols - 8, 76))
+
+    def _picker_height() -> int:
+        try:
+            rows = get_app().output.get_size().rows
+        except Exception:
+            rows = 24
+        # Descriptions may wrap to a few lines, so size from the ACTUAL rendered
+        # line count (independent of which row is selected) at the panel's inner
+        # width; plus the 2-row frame border, capped to the screen.
+        inner = max(20, _picker_width() - 2)
+        content = len(
+            _render_picker_rows(
+                picker_box["rows"], int(picker_box["index"]), inner, picker_box["hint"]
+            )
+        )
+        return max(5, min(content + 2, rows - 4))
+
+    def _picker_cursor_position() -> Point:
+        # Report the cursor at the selected entry's first line so the Window scrolls
+        # to keep the highlighted option visible — essential when a long list (e.g.
+        # /resume with many sessions) is taller than the popup. The selected entry's
+        # first line is the only one carrying the accent caret style, so find it in
+        # the freshly rendered rows (at the panel's real content width).
+        info = picker_window.render_info
+        width = info.window_width if info is not None else _help_inner_width(_current_width())
+        rows = _render_picker_rows(
+            picker_box["rows"], int(picker_box["index"]), max(20, width), picker_box["hint"]
+        )
+        for line_no, line in enumerate(rows):
+            if any(style == "class:tui.picker.selcaret" for style, _text in line):
+                return Point(0, line_no)
+        return Point(0, 0)
+
+    picker_window = Window(
+        FormattedTextControl(
+            _picker_fragments,
+            focusable=True,
+            show_cursor=False,
+            get_cursor_position=_picker_cursor_position,
+        ),
+        wrap_lines=True,
+        style="class:tui.picker",
+    )
+    picker_frame = Frame(picker_window, title="Select", style="class:tui.help.frame")
+    picker_float = Float(
+        content=ConditionalContainer(picker_frame, filter=_picker_open),
+        width=_picker_width,
+        height=_picker_height,
+    )
+
+    def _close_picker() -> None:
+        if not picker_box["on"]:
+            return
+        picker_box["on"] = False
+        try:
+            get_app().layout.focus(input_area)
+        except Exception:
+            pass
+        _safe_invalidate()
+
+    def _open_picker(spec: dict[str, Any]) -> None:
+        rows = list(spec.get("rows") or [])
+        picker_box["on"] = True
+        picker_box["rows"] = rows
+        picker_box["title"] = spec.get("title") or "Select"
+        picker_box["hint"] = spec.get("hint") or _PICKER_HINT
+        picker_box["on_select"] = spec.get("on_select")
+        # Pre-select the row flagged as current (else the first option).
+        picker_box["index"] = next((i for i, r in enumerate(rows) if r.get("current")), 0)
+        try:
+            picker_frame.title = picker_box["title"]
+        except Exception:
+            pass
+        try:
+            get_app().layout.focus(picker_window)
+        except Exception:
+            pass
+        _safe_invalidate()
+
+    def _picker_move(delta: int) -> None:
+        count = len(picker_box["rows"])
+        if count:
+            picker_box["index"] = max(0, min(int(picker_box["index"]) + delta, count - 1))
+        _safe_invalidate()
+
+    def _picker_choose(idx: int) -> None:
+        rows = picker_box["rows"]
+        if not rows or idx < 0 or idx >= len(rows):
+            return
+        value = rows[idx].get("value")
+        on_select = picker_box["on_select"]
+        _close_picker()
+        if on_select is None or value is None:
+            return
+        try:
+            result = on_select(value)
+        except Exception as exc:  # noqa: BLE001 - never crash the UI on a selection
+            transcript.append("error", f"selection failed: {exc}")
+            result = None
+        # on_select returns either a list of (role, text) messages to echo, or a
+        # dict {"messages"?: [...], "prefill"?: str, "submit"?: str}.
+        #   · ``prefill`` drops text into the input box (cursor at end, focused) so a
+        #     picked option can be finished by typing — e.g. choosing a subagent
+        #     prefills "/subagent <name> " ready for the task.
+        #   · ``submit`` runs text straight through the submit pipeline as if typed —
+        #     e.g. a forge /plan option immediately opens its panel (no extra Enter).
+        messages = result
+        prefill: str | None = None
+        submit: str | None = None
+        if isinstance(result, dict):
+            messages = result.get("messages")
+            prefill = result.get("prefill")
+            submit = result.get("submit")
+        for role, text in messages or []:
+            transcript.append(role, text)
+        if submit is not None:
+            try:
+                input_area.text = str(submit)
+                input_area.buffer.cursor_position = len(input_area.text)
+                get_app().layout.focus(input_area)
+                _submit()
+            except Exception:  # noqa: BLE001 - submit is best-effort
+                pass
+            scroll["follow"] = True
+            _safe_invalidate()
+            return
+        if prefill is not None:
+            try:
+                prefill_text = str(prefill)
+                input_area.text = prefill_text
+                input_area.buffer.cursor_position = len(prefill_text)
+                get_app().layout.focus(input_area)
+            except Exception:  # noqa: BLE001 - prefill is best-effort
+                pass
+        scroll["follow"] = True
+        _safe_invalidate()
+
+    # ---- in-TUI editor (centered Float; e.g. /plan edit on plan.json) ----
+    _editor_open = Condition(lambda: editor_box["on"])
+
+    editor_area = TextArea(
+        multiline=True,
+        wrap_lines=False,
+        scrollbar=True,
+        line_numbers=True,
+        focusable=True,
+        style="class:tui.editor",
+    )
+
+    def _editor_status_bar() -> FormattedText:
+        status = str(editor_box.get("status") or "")
+        hint = "Ctrl+S save · Esc cancel"
+        if status:
+            return FormattedText(
+                [("class:tui.editor.err", f" {status}  "), ("class:tui.editor.hint", hint)]
+            )
+        return FormattedText([("class:tui.editor.hint", f" {hint}")])
+
+    def _editor_width() -> int:
+        try:
+            cols = get_app().output.get_size().columns
+        except Exception:
+            cols = 80
+        return max(40, min(cols - 6, 100))
+
+    def _editor_height() -> int:
+        try:
+            rows = get_app().output.get_size().rows
+        except Exception:
+            rows = 24
+        return max(8, rows - 4)
+
+    editor_body = HSplit(
+        [
+            editor_area,
+            Window(
+                FormattedTextControl(_editor_status_bar, focusable=False),
+                height=1,
+                style="class:tui.editor.statusbar",
+            ),
+        ]
+    )
+    editor_frame = Frame(editor_body, title="Edit", style="class:tui.help.frame")
+    editor_float = Float(
+        content=ConditionalContainer(editor_frame, filter=_editor_open),
+        width=_editor_width,
+        height=_editor_height,
+    )
+
+    def _open_editor(spec: dict[str, Any]) -> None:
+        editor_box["on"] = True
+        editor_box["title"] = spec.get("title") or "Edit"
+        editor_box["on_save"] = spec.get("on_save")
+        editor_box["status"] = ""
+        editor_area.text = str(spec.get("text") or "")
+        editor_area.buffer.cursor_position = 0
+        try:
+            editor_frame.title = editor_box["title"]
+        except Exception:
+            pass
+        try:
+            get_app().layout.focus(editor_area)
+        except Exception:
+            pass
+        _safe_invalidate()
+
+    def _close_editor() -> None:
+        if not editor_box["on"]:
+            return
+        editor_box["on"] = False
+        editor_box["on_save"] = None
+        try:
+            get_app().layout.focus(input_area)
+        except Exception:
+            pass
+        _safe_invalidate()
+
+    def _editor_save() -> None:
+        on_save = editor_box.get("on_save")
+        if not callable(on_save):
+            _close_editor()
+            return
+        try:
+            ok, message = on_save(editor_area.text)
+        except Exception as exc:  # noqa: BLE001 - never crash the UI on a save
+            ok, message = False, f"Save failed: {exc}"
+        if ok:
+            _close_editor()
+            if message:
+                transcript.append("system", str(message))
+            scroll["follow"] = True
+        else:
+            # Keep editing so the user can fix the error (shown in the status bar).
+            editor_box["status"] = str(message or "Invalid input.")
+        _safe_invalidate()
+
+    # ---- approval modal (centered Float; shown while an approval is pending) ----
+    def _approval_fragments() -> FormattedText:
+        request = approval_box.get("request")
+        if request is None:
+            return FormattedText([])
+        info = approval_window.render_info
+        width = info.window_width if info is not None else _approval_width() - 2
+        rows = _render_approval_rows(request, max(20, width))
+        fragments: list[tuple[str, str]] = []
+        for index, row in enumerate(rows):
+            if index:
+                fragments.append(("", "\n"))
+            fragments.extend(row)
+        return FormattedText(fragments)
+
+    def _approval_width() -> int:
+        try:
+            cols = get_app().output.get_size().columns
+        except Exception:
+            cols = 80
+        return max(40, min(cols - 8, 72))
+
+    def _approval_height() -> int:
+        request = approval_box.get("request")
+        if request is None:
+            return 6
+        try:
+            rows = get_app().output.get_size().rows
+        except Exception:
+            rows = 24
+        content = len(_render_approval_rows(request, max(20, _approval_width() - 2)))
+        return max(6, min(content + 2, rows - 4))
+
+    approval_window = Window(
+        FormattedTextControl(_approval_fragments, focusable=False, show_cursor=False),
+        wrap_lines=True,
+        style="class:tui.approve",
+    )
+    # Static amber border (Frame.style must be a string); destructive actions are
+    # signalled by the red headline + red [n] key inside the body instead.
+    approval_frame = Frame(
+        approval_window, title="Approval required", style="class:tui.approve.frame"
+    )
+    approval_float = Float(
+        content=ConditionalContainer(approval_frame, filter=_approval_pending),
+        width=_approval_width,
+        height=_approval_height,
+    )
+
+    # ---- /config overlay (full-screen modal driven by ConfigFlow) ----
+    # Built only when the host wires a flow factory. It hosts the whole interactive
+    # configuration menu inside this same Application (the chat transcript/session
+    # survive), so bare `/config` no longer drops to a read-only panel.
+    config_overlay = None
+    if config_flow_factory is not None:
+        from .config_overlay import ConfigOverlay
+
+        def _on_config_overlay_saved(count: int) -> None:
+            # Reload the live session FIRST, then report — so a reload failure is
+            # surfaced instead of falsely promising the new settings apply next turn
+            # (mirrors the classic chat /config error handling).
+            reload_ok = True
+            if on_config_saved is not None:
+                try:
+                    reload_ok = on_config_saved() is not False
+                except Exception:  # noqa: BLE001 - treat any reload error as a failure
+                    reload_ok = False
+            if not reload_ok:
+                transcript.append(
+                    "error",
+                    "Configuration saved to disk, but the running session could not be "
+                    "reloaded — restart Sylliptor for the new settings to take effect.",
+                )
+            elif count > 0:
+                word = "change" if count == 1 else "changes"
+                transcript.append(
+                    "system",
+                    f"Configuration saved ({count} {word}). New settings apply on the next turn.",
+                )
+            else:
+                transcript.append("system", "Configuration saved (no changes).")
+            _safe_invalidate()
+
+        def _on_config_switch_workspace(path: str) -> None:
+            # Exit the TUI with a sentinel result; the chat loop relaunches a fresh
+            # session bound to this folder (the live workspace root can't change in
+            # place). The transcript/session of the current project end here.
+            try:
+                get_app().exit(result=("switch_workspace", str(path)))
+            except Exception:  # noqa: BLE001 - never crash on teardown
+                pass
+
+        config_overlay = ConfigOverlay(
+            flow_factory=config_flow_factory,
+            on_saved=_on_config_overlay_saved,
+            on_error=lambda msg: (transcript.append("error", msg), _safe_invalidate()),
+            on_switch_workspace=_on_config_switch_workspace,
+            focus_chat=lambda: get_app().layout.focus(input_area),
+        )
+    _config_open = (
+        config_overlay.open_condition if config_overlay is not None else Condition(lambda: False)
+    )
+    _config_floats = [config_overlay.float] if config_overlay is not None else []
+
+    root_container = FloatContainer(
+        content=root,
+        floats=[
+            # Slash-command dropdown, anchored at the cursor. The FloatContainer
+            # flips it above the input automatically when there is no room below
+            # (the input sits near the bottom), so it reads as a command palette.
+            Float(
+                xcursor=True,
+                ycursor=True,
+                content=CompletionsMenu(max_height=12, scroll_offset=1),
+            ),
+            help_float,
+            picker_float,
+            editor_float,
+            # The /config overlay covers the whole screen while open.
+            *_config_floats,
+            # Approval modal sits on top — it interrupts a running turn for a y/a/n.
+            approval_float,
+        ],
+    )
+
+    # ---- key bindings ----
+    kb = KeyBindings()
+    _input_focused = has_focus(input_area)
+    # True while the slash-command dropdown is showing for the input buffer.
+    _completing = Condition(lambda: input_area.buffer.complete_state is not None)
+    # A turn (or its pending approval) is in flight — Esc / Ctrl+C interrupt it.
+    _turn_active = Condition(lambda: running["on"] or approval_box.get("event") is not None)
+
+    @kb.add("c-c")
+    @kb.add("c-d")
+    def _interrupt_or_exit(event: Any) -> None:
+        if config_overlay is not None and config_overlay.is_open():
+            config_overlay.request_cancel()
+            return
+        if help_box["on"]:
+            _close_help()
+            return
+        if picker_box["on"]:
+            _close_picker()
+            return
+        if editor_box["on"]:
+            _close_editor()
+            return
+        if running["on"] or approval_box.get("event") is not None:
+            _soft_interrupt()
+            return
+        event.app.exit(result=None)
+
+    # ---- in-TUI editor keys (only while the editor float is open) ----
+    @kb.add("c-s", filter=_editor_open)
+    def _editor_save_key(event: Any) -> None:
+        _editor_save()
+
+    @kb.add("escape", filter=_editor_open)  # non-eager so arrow ESC-sequences parse
+    def _editor_cancel_key(event: Any) -> None:
+        _close_editor()
+
+    @kb.add(
+        "escape",
+        filter=_turn_active
+        & ~_help_open
+        & ~_picker_open
+        & ~_editor_open
+        & ~_completing
+        & ~_config_open,
+        eager=True,
+    )
+    def _escape_interrupt(event: Any) -> None:
+        # Esc interrupts a running turn immediately (never exits the app). Gated to a
+        # live turn so it doesn't shadow Esc's other roles (cancel completion, close
+        # help/picker, Alt+Enter newline).
+        _soft_interrupt()
+
+    @kb.add(
+        "enter",
+        filter=_input_focused & ~_approval_pending & ~_help_open & ~_config_open,
+        eager=True,
+    )
+    def _submit_key(event: Any) -> None:
+        # When the slash dropdown has a highlighted row, Enter accepts it instead
+        # of submitting (so you can pick a command, then edit args / submit). With
+        # the menu merely open but nothing highlighted, Enter submits as normal.
+        buff = input_area.buffer
+        state = buff.complete_state
+        if state is not None and state.current_completion is not None:
+            buff.apply_completion(state.current_completion)
+            return
+        _submit()
+
+    @kb.add("c-j", filter=_input_focused & ~_help_open & ~_config_open)
+    @kb.add("escape", "enter", filter=_input_focused & ~_help_open & ~_config_open)
+    def _newline(event: Any) -> None:
+        input_area.buffer.insert_text("\n")
+
+    # ---- slash-command dropdown (only while the input is focused) ----
+    @kb.add(
+        "tab",
+        filter=_input_focused & ~_help_open & ~_approval_pending & ~_config_open,
+        eager=True,
+    )
+    def _complete_tab(event: Any) -> None:
+        # Tab opens the dropdown for a "/…" line (selecting the first row) and
+        # cycles through it on repeats.
+        buff = input_area.buffer
+        if buff.complete_state is not None:
+            buff.complete_next()
+        elif buff.document.text_before_cursor.lstrip().startswith("/"):
+            buff.start_completion(select_first=True)
+
+    @kb.add("down", filter=_input_focused & _completing, eager=True)
+    def _complete_down(event: Any) -> None:
+        input_area.buffer.complete_next()
+
+    @kb.add("up", filter=_input_focused & _completing, eager=True)
+    def _complete_up(event: Any) -> None:
+        input_area.buffer.complete_previous()
+
+    @kb.add("escape", filter=_input_focused & _completing, eager=True)
+    def _complete_cancel(event: Any) -> None:
+        input_area.buffer.cancel_completion()
+
+    # ---- /help popup keys (only while the popup is open) ----
+    @kb.add("escape", filter=_help_open)
+    def _help_escape(event: Any) -> None:
+        _close_help()
+
+    @kb.add("enter", filter=_help_open, eager=True)
+    def _help_confirm(event: Any) -> None:
+        # Enter closes the panel; for a confirm panel (e.g. the /forge intro) it
+        # also runs the stored command, so the popup reads as a begin/cancel dialog.
+        confirm = help_box.get("confirm")
+        _close_help()
+        if confirm:
+            _dispatch_command(str(confirm))
+
+    @kb.add("q", filter=_help_open, eager=True)
+    def _help_dismiss(event: Any) -> None:
+        # q is always a plain dismiss — i.e. cancel for a confirm panel.
+        _close_help()
+
+    @kb.add("up", filter=_help_open, eager=True)
+    @kb.add("k", filter=_help_open, eager=True)
+    def _help_scroll_up(event: Any) -> None:
+        _help_scroll(-1)
+
+    @kb.add("down", filter=_help_open, eager=True)
+    @kb.add("j", filter=_help_open, eager=True)
+    def _help_scroll_down(event: Any) -> None:
+        _help_scroll(1)
+
+    @kb.add("home", filter=_help_open, eager=True)
+    def _help_to_top(event: Any) -> None:
+        help_box["offset"] = 0
+        _safe_invalidate()
+
+    @kb.add("end", filter=_help_open, eager=True)
+    def _help_to_bottom(event: Any) -> None:
+        help_box["offset"] = _help_follow_top()
+        _safe_invalidate()
+
+    # ---- picker popup keys (only while a picker is open) ----
+    @kb.add("escape", filter=_picker_open, eager=True)
+    @kb.add("q", filter=_picker_open, eager=True)
+    def _picker_cancel(event: Any) -> None:
+        _close_picker()
+
+    @kb.add("up", filter=_picker_open, eager=True)
+    @kb.add("k", filter=_picker_open, eager=True)
+    def _picker_up(event: Any) -> None:
+        _picker_move(-1)
+
+    @kb.add("down", filter=_picker_open, eager=True)
+    @kb.add("j", filter=_picker_open, eager=True)
+    def _picker_down(event: Any) -> None:
+        _picker_move(1)
+
+    @kb.add("enter", filter=_picker_open, eager=True)
+    def _picker_enter(event: Any) -> None:
+        _picker_choose(int(picker_box["index"]))
+
+    # Number keys pick (and apply) the matching option directly.
+    @kb.add("1", filter=_picker_open, eager=True)
+    @kb.add("2", filter=_picker_open, eager=True)
+    @kb.add("3", filter=_picker_open, eager=True)
+    @kb.add("4", filter=_picker_open, eager=True)
+    @kb.add("5", filter=_picker_open, eager=True)
+    @kb.add("6", filter=_picker_open, eager=True)
+    @kb.add("7", filter=_picker_open, eager=True)
+    @kb.add("8", filter=_picker_open, eager=True)
+    @kb.add("9", filter=_picker_open, eager=True)
+    def _picker_digit(event: Any) -> None:
+        try:
+            _picker_choose(int(event.data) - 1)
+        except (TypeError, ValueError):
+            pass
+
+    @kb.add("s-tab", filter=~_config_open, eager=True)
+    def _toggle_auto_approve(event: Any) -> None:
+        state.toggle_auto_approve()
+        event.app.invalidate()
+
+    @kb.add("f2", filter=~_config_open, eager=True)
+    def _toggle_mouse_capture(event: Any) -> None:
+        # Release/recapture the mouse so the user can natively select + copy
+        # transcript text (mouse off) or scroll with the wheel (mouse on).
+        state.toggle_mouse_capture()
+        event.app.invalidate()
+
+    @kb.add("y", filter=_approval_pending, eager=True)
+    def _approve_yes(event: Any) -> None:
+        _resolve_approval(allow=True)
+
+    @kb.add("a", filter=_approval_pending, eager=True)
+    def _approve_always(event: Any) -> None:
+        _resolve_approval(allow=True, always=True)
+
+    @kb.add("n", filter=_approval_pending, eager=True)
+    def _approve_no(event: Any) -> None:
+        _resolve_approval(allow=False)
+
+    @kb.add("c-p", filter=~_config_open, eager=True)
+    def _command_menu(event: Any) -> None:
+        # Command menu placeholder (Phase 3).
+        event.app.invalidate()
+
+    @kb.add("c-r", filter=~_config_open, eager=True)
+    def _toggle_reasoning(event: Any) -> None:
+        # Expand/collapse the model's reasoning ("thinking") blocks.
+        view["reasoning_expanded"] = not view["reasoning_expanded"]
+        event.app.invalidate()
+
+    # ---- scrollback (works while the input keeps focus) ----
+    @kb.add("pageup", filter=_help_open, eager=True)
+    def _help_pageup(event: Any) -> None:
+        _help_scroll(-_help_page_rows())
+
+    @kb.add("pagedown", filter=_help_open, eager=True)
+    def _help_pagedown(event: Any) -> None:
+        _help_scroll(_help_page_rows())
+
+    @kb.add(
+        "pageup", filter=~_help_open & ~_picker_open & ~_editor_open & ~_config_open, eager=True
+    )
+    def _scroll_up(event: Any) -> None:
+        _scroll_move(-_scroll_page_rows())
+        event.app.invalidate()
+
+    @kb.add(
+        "pagedown", filter=~_help_open & ~_picker_open & ~_editor_open & ~_config_open, eager=True
+    )
+    def _scroll_down(event: Any) -> None:
+        _scroll_move(_scroll_page_rows())
+        event.app.invalidate()
+
+    @kb.add(
+        "c-home", filter=~_help_open & ~_picker_open & ~_editor_open & ~_config_open, eager=True
+    )
+    def _scroll_top(event: Any) -> None:
+        scroll["follow"] = False
+        scroll["offset"] = 0
+        event.app.invalidate()
+
+    @kb.add("c-end", filter=~_help_open & ~_picker_open & ~_editor_open & ~_config_open, eager=True)
+    def _scroll_bottom(event: Any) -> None:
+        scroll["follow"] = True
+        event.app.invalidate()
+
+    # The /config overlay adds its own key bindings (gated on its open state) and
+    # needs the setup wizard's style classes merged in for its panels to render.
+    _app_style = _STYLE
+    if config_overlay is not None:
+        from .setup_app import _SETUP_STYLE
+
+        config_overlay.register(kb)
+        _app_style = merge_styles([_STYLE, _SETUP_STYLE])
+
+    app: Application = Application(
+        layout=Layout(root_container, focused_element=input_area),
+        key_bindings=kb,
+        style=_app_style,
+        full_screen=True,
+        # Dynamic: the app captures the mouse for wheel-scroll by default, but F2
+        # releases it so the terminal's native click-drag selection (and copy)
+        # works. Re-evaluated every render, so toggling takes effect live.
+        mouse_support=Condition(lambda: bool(state.mouse_capture)),
+        cursor=CursorShape.BEAM,
+        input=input,
+        output=output,
+    )
+
+    # ---- animation driver: owl while idle, spinner while a turn runs ----
+    def _pre_run() -> None:
+        def _spin() -> None:
+            while getattr(app, "is_running", False):
+                time.sleep(0.1)
+                animated = False
+                if owl.available and not _conversation_started():
+                    owl.advance()
+                    animated = True
+                if running["on"] or transcript.status:
+                    spinner["i"] = (spinner["i"] + 1) % len(_SPINNER_FRAMES)
+                    animated = True
+                if config_overlay is not None and config_overlay.is_busy():
+                    config_overlay.tick_spinner()
+                    animated = True
+                if animated:
+                    try:
+                        app.invalidate()
+                    except Exception:
+                        break
+
+        threading.Thread(target=_spin, daemon=True).start()
+
+    result = app.run(pre_run=_pre_run)
+
+    # Unwind any in-flight turn before returning so the caller can close the
+    # session safely (no teardown racing a live worker). Cancel the turn, release
+    # a parked approval wait, then join with a bounded timeout (the worker is a
+    # daemon, so a stuck long-running tool cannot block process exit).
+    token = cancel_box.get("token")
+    if token is not None:
+        token.cancel()
+    pending = approval_box.get("event")
+    if pending is not None:
+        approval_box["decision"] = ApprovalDecision(allow=False)
+        pending.set()
+    worker = worker_box.get("thread")
+    if worker is not None and worker.is_alive():
+        worker.join(timeout=5.0)
+
+    return result, transcript.entries
+
+
+__all__ = ["run_tui"]

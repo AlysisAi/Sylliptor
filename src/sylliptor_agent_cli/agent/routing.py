@@ -994,7 +994,17 @@ def _is_fatal_non_repo_llm_error(err: LLMError) -> bool:
         "permission denied",
         "access denied",
     )
-    return any(marker in msg for marker in markers)
+    if any(marker in msg for marker in markers):
+        return True
+
+    # Recognized Sylliptor MiMo trial proxy errors (trial_expired,
+    # quota_exhausted, rate_limit_exceeded, ...) must propagate so the REPL's
+    # friendly-error renderer shows an actionable message, instead of being
+    # swallowed into the generic "Could you clarify..." fallback. Lazy import
+    # avoids an llm -> agent import cycle.
+    from ..llm.openai_compat import sylliptor_trial_error_message
+
+    return sylliptor_trial_error_message(err) is not None
 
 
 def _router_chat(*, client: Any, messages: list[dict[str, Any]]) -> Any:
@@ -1061,23 +1071,35 @@ def _main_agent_chat(
     tools: list[dict[str, Any]] | None,
     stream: bool,
     on_text_delta: Callable[[str], None] | None,
+    on_reasoning_delta: Callable[[str], None] | None = None,
     temperature: float | None = None,
+    cancellation_token: Any | None = None,
 ) -> Any:
+    base: dict[str, Any] = {
+        "messages": messages,
+        "tools": tools,
+        "stream": stream,
+        "on_text_delta": on_text_delta,
+    }
+    extra: dict[str, Any] = {
+        "on_reasoning_delta": on_reasoning_delta,
+        "temperature": temperature,
+    }
+    # Pass the token only when present so older/test clients keep working via the
+    # TypeError fallbacks below; clients that accept it can abort an in-flight
+    # request the instant the user interrupts (even before the first token).
+    if cancellation_token is not None:
+        extra["cancellation_token"] = cancellation_token
     try:
-        return client.chat(
-            messages=messages,
-            tools=tools,
-            stream=stream,
-            on_text_delta=on_text_delta,
-            temperature=temperature,
-        )
+        return client.chat(**base, **extra)
     except TypeError:
-        return client.chat(
-            messages=messages,
-            tools=tools,
-            stream=stream,
-            on_text_delta=on_text_delta,
-        )
+        pass
+    # Narrower client without the reasoning sink: keep temperature (older 2-tier
+    # behaviour) before falling back to the minimal signature.
+    try:
+        return client.chat(**base, temperature=temperature)
+    except TypeError:
+        return client.chat(**base)
 
 
 def _non_repo_chat(
@@ -1088,29 +1110,26 @@ def _non_repo_chat(
     tools: list[dict[str, Any]] | None = None,
     stream: bool = False,
     on_text_delta: Callable[[str], None] | None = None,
+    on_reasoning_delta: Callable[[str], None] | None = None,
 ) -> Any:
+    base: dict[str, Any] = {"messages": messages, "tools": tools, "stream": stream}
     try:
         return client.chat(
-            messages=messages,
-            tools=tools,
-            stream=stream,
+            **base,
             on_text_delta=on_text_delta,
+            on_reasoning_delta=on_reasoning_delta,
             temperature=temperature,
         )
     except TypeError:
-        try:
-            return client.chat(
-                messages=messages,
-                tools=tools,
-                stream=stream,
-                temperature=temperature,
-            )
-        except TypeError:
-            return client.chat(
-                messages=messages,
-                tools=tools,
-                stream=stream,
-            )
+        pass
+    try:
+        return client.chat(**base, on_text_delta=on_text_delta, temperature=temperature)
+    except TypeError:
+        pass
+    try:
+        return client.chat(**base, temperature=temperature)
+    except TypeError:
+        return client.chat(**base)
 
 
 def _route_reply_matches_turn_language_policy(
@@ -1173,6 +1192,7 @@ def _respond_non_repo_turn(
     store: SessionStore | None = None,
     stream: bool = False,
     on_text_delta: Callable[[str], None] | None = None,
+    on_reasoning_delta: Callable[[str], None] | None = None,
 ) -> str:
     route_label = "chat" if route == "chat" else ("tool" if route == "tool" else "general")
     active_tool_defs = dict(tool_defs or {})
@@ -1207,6 +1227,7 @@ def _respond_non_repo_turn(
                 tools=active_tool_list if tool_enabled else None,
                 stream=(stream and not tool_enabled),
                 on_text_delta=on_text_delta if not tool_enabled else None,
+                on_reasoning_delta=on_reasoning_delta if not tool_enabled else None,
             )
         except LLMError as err:
             if _is_fatal_non_repo_llm_error(err):
@@ -1218,6 +1239,15 @@ def _respond_non_repo_turn(
         tool_calls = list(getattr(response, "tool_calls", []) or [])
         if not tool_calls:
             content = str(getattr(response, "content", "") or "").strip()
+            if not content and store is not None:
+                # A successful (non-error) response with empty content degrades
+                # this turn to the generic clarification fallback. Leave a
+                # breadcrumb so the otherwise-invisible empty completion is
+                # diagnosable from the session log.
+                store.append(
+                    "warning",
+                    {"warning": "non_repo_empty_completion", "route": route, "step": step},
+                )
             return _NonRepoResponseText(
                 content,
                 assistant_message=(

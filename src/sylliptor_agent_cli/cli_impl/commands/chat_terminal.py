@@ -518,6 +518,36 @@ def _resolve_startup_workspace_binding(
     source: str = "explicit_path",
     action: str = WorkspaceAction.CHAT,
 ) -> WorkspaceBinding:
+    select_action = _patchable(
+        "_select_guarded_workspace_action_interactive",
+        _select_guarded_workspace_action_interactive,
+    )
+    select_candidate = _patchable(
+        "_select_workspace_candidate_interactive",
+        _select_workspace_candidate_interactive,
+    )
+    prompt = _patchable("_guarded_workspace_prompt_text", _guarded_workspace_prompt_text)
+    # When the full-screen TUI is active, render the guarded-workspace steps with
+    # the TUI's own picker/prompt chrome instead of the classic inline ones, so the
+    # startup screen matches the rest of the experience. The binding *logic* is
+    # unchanged — only these display callbacks swap. Any import/terminal failure
+    # falls back to the classic selectors above.
+    if interactive:
+        try:
+            from ..tui import is_tui_enabled as _tui_enabled
+
+            if _tui_enabled():
+                from ..tui.workspace_guard import (
+                    select_guarded_workspace_action as _tui_select_action,
+                    select_workspace_candidate as _tui_select_candidate,
+                    workspace_guard_prompt_text as _tui_prompt,
+                )
+
+                select_action = _tui_select_action
+                select_candidate = _tui_select_candidate
+                prompt = _tui_prompt
+        except Exception:
+            pass
     return _resolve_startup_workspace_binding_impl(
         requested_path=requested_path,
         interactive=interactive,
@@ -526,15 +556,9 @@ def _resolve_startup_workspace_binding(
         source=source,
         action=action,
         console=console,
-        select_action_interactive=_patchable(
-            "_select_guarded_workspace_action_interactive",
-            _select_guarded_workspace_action_interactive,
-        ),
-        select_candidate_interactive=_patchable(
-            "_select_workspace_candidate_interactive",
-            _select_workspace_candidate_interactive,
-        ),
-        prompt_text=_patchable("_guarded_workspace_prompt_text", _guarded_workspace_prompt_text),
+        select_action_interactive=select_action,
+        select_candidate_interactive=select_candidate,
+        prompt_text=prompt,
     )
 
 

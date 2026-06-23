@@ -165,6 +165,14 @@ def _apply_interactive_chat_step_budget_floor(
         effective.max_steps = default_chat_max_steps
 
 
+def _parameter_value_was_provided(value: Any, source: Any) -> bool:
+    if value is None:
+        return False
+    if source is None:
+        return True
+    return source is not ParameterSource.DEFAULT
+
+
 def _chat_plan_mode_latest_task(plan_mode_state: Any) -> str | None:
     task = getattr(plan_mode_state, "latest_task", None)
     clean = str(task or "").strip()
@@ -1139,6 +1147,7 @@ def chat(
         "--yes",
         help="In auto mode, skip confirmations for sensitive commands.",
     ),
+    cli_ctx: Any = None,
 ) -> None:
     from ...llm.types import LLMError
 
@@ -1152,7 +1161,7 @@ def chat(
         effective.model = model
     if temperature is not None:
         _apply_temperature_override(effective, temperature)
-    current_ctx = get_current_context(silent=True)
+    current_ctx = cli_ctx if cli_ctx is not None else get_current_context(silent=True)
     non_interactive = _is_non_interactive_terminal()
     stream_source = current_ctx.get_parameter_source("stream") if current_ctx is not None else None
     path_source = current_ctx.get_parameter_source("path") if current_ctx is not None else None
@@ -1163,9 +1172,7 @@ def chat(
     max_steps_provided = max_steps is not None
     if current_ctx is not None:
         stream_provided = stream_source is not None and stream_source is not ParameterSource.DEFAULT
-        max_steps_provided = (
-            max_steps_source is not None and max_steps_source is not ParameterSource.DEFAULT
-        )
+        max_steps_provided = _parameter_value_was_provided(max_steps, max_steps_source)
     if stream_provided and stream is not None:
         effective.stream = stream
     else:
@@ -1202,6 +1209,883 @@ def chat(
         )
         session_root = workspace_binding.workspace_context.workspace_root
         focus_path = workspace_binding.workspace_context.focus_path
+        # Full-screen TUI is the default interactive chat surface. Users can
+        # set SYLLIPTOR_TUI=0 to fall back to the classic prompt loop below.
+        if not non_interactive:
+            from ..tui import is_tui_enabled as _tui_enabled
+
+            if _tui_enabled():
+                import getpass as _getpass
+
+                from ...git_ops import current_branch as _current_branch
+                from ..commands.welcome import _welcome_workspace_value
+                from ..tui import TuiState as _TuiState
+                from ..tui import run_tui as _run_tui
+
+                try:
+                    _username = _getpass.getuser()
+                except Exception:
+                    _username = ""
+                _ws_path = focus_path if focus_path != session_root else session_root
+                try:
+                    _workspace = _welcome_workspace_value(_ws_path)
+                except Exception:
+                    _workspace = ""
+                try:
+                    _branch = _current_branch(session_root)
+                except Exception:
+                    _branch = ""
+                _tui_state = _TuiState(
+                    model_name=str(effective.model or ""),
+                    username=_username,
+                    workspace=_workspace,
+                    branch=_branch,
+                    exec_mode=str(effective_mode or "").strip(),
+                    # Approval gate must default OFF (= classic behaviour): otherwise
+                    # TuiSurface.request_approval auto-approves everything and the
+                    # execution mode (safe/review prompts) is silently bypassed.
+                    # --yes opts into approve-everything; Shift+Tab toggles it live.
+                    auto_approve=bool(yes),
+                )
+                _tui_box: dict[str, Any] = {"session": None}
+
+                def _tui_session_builder(surface: Any) -> Any:
+                    built = create_session(
+                        cfg=effective,
+                        root=session_root,
+                        mode=effective_mode,
+                        runtime_kind=RuntimeKind.INTERACTIVE_CHAT,
+                        yes=yes,
+                        max_steps=effective.max_steps,
+                        no_log=no_log,
+                        api_key_override=api_key_override,
+                        console=None,
+                        surface=surface,
+                        non_interactive=non_interactive,
+                        enable_chat_turn_step_budget=True,
+                        chat_turn_fixed_override=(
+                            effective.max_steps if max_steps_provided else None
+                        ),
+                        verify_cmd=verify_cmd,
+                        subagents_enabled=effective.subagents_enabled,
+                        workspace_binding=workspace_binding,
+                    )
+                    _set_chat_usage_hud_enabled(built, _resolve_usage_hud_default(effective))
+                    _refresh_chat_hud_context_cache(built)
+                    _tui_box["session"] = built
+                    return built
+
+                def _tui_on_turn_complete() -> None:
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return
+                    from ..commands.startup import (
+                        _chat_context_percent_value,
+                        _known_cost_value,
+                    )
+
+                    try:
+                        _refresh_chat_hud_context_cache(built)
+                        pct = _chat_context_percent_value(built)
+                        if pct is not None:
+                            _tui_state.context_pct = float(pct)
+                    except Exception:
+                        pass
+                    try:
+                        summary = getattr(built, "usage_summary", None)
+                        if summary is not None:
+                            totals = summary.totals()
+                            _tui_state.tokens = int(totals.get("total_tokens") or 0)
+                            cost = _known_cost_value(totals)
+                            if cost is not None:
+                                _tui_state.cost_usd = float(cost)
+                    except Exception:
+                        pass
+
+                def _tui_config_flow_factory() -> Any:
+                    # Built fresh each time bare /config opens, so it always reflects
+                    # the on-disk config (and any edits applied since launch). The live
+                    # session root is passed for display + so "switch project" knows
+                    # what it's leaving.
+                    from ..tui.config_flow import ConfigFlow
+
+                    built = _tui_box.get("session")
+                    root = str(getattr(built, "root", "") or "") if built is not None else ""
+                    return ConfigFlow(current_workspace=root)
+
+                def _tui_on_config_saved() -> bool:
+                    # After the overlay saves, reload the live session from disk so the
+                    # new model/keys/limits apply on the next turn (same reload the
+                    # classic /config uses), and refresh the footer's model badge.
+                    # Returns False if the reload failed so the overlay can warn the
+                    # user the running session was NOT updated (parity with classic).
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return True
+                    try:
+                        reloaded = load_config()
+                        _apply_config_menu_changes_to_session(session=built, cfg=reloaded)
+                        _tui_state.model_name = str(getattr(reloaded, "model", "") or "")
+                        new_mode = str(getattr(built, "mode", "") or "").strip()
+                        if new_mode:
+                            _tui_state.exec_mode = new_mode
+                    except Exception:
+                        return False
+                    try:
+                        _refresh_chat_hud_context_cache(built)
+                    except Exception:
+                        pass
+                    return True
+
+                _tui_forge_state = _ForgeChatState()
+                _tui_plan_state = _ChatPlanModeState()
+
+                def _tui_make_forge_execute(command_text: str):
+                    # Build the callable the worker thread runs for "/execute plan":
+                    # it opens the live forge view, runs the swarm (whose events
+                    # stream into that view via TuiSurface.on_swarm_event), and
+                    # surfaces the handler's captured warnings/summary at the end.
+                    def _run(token: Any) -> None:
+                        import io as _io
+
+                        from rich.console import Console as _RichConsole
+
+                        built = _tui_box.get("session")
+                        if built is None:
+                            return
+                        surface = getattr(built, "surface", None)
+                        paths = getattr(_tui_forge_state, "paths", None)
+                        buf = _io.StringIO()
+                        cap = _RichConsole(
+                            file=buf,
+                            force_terminal=False,
+                            no_color=True,
+                            highlight=False,
+                            width=100,
+                        )
+                        if surface is not None and paths is not None:
+                            try:
+                                # Pass the worker token so the trace sink's own thread
+                                # can drop events after a soft-interrupt.
+                                surface.begin_forge(paths, token)
+                            except Exception:
+                                pass
+                        try:
+                            _handle_chat_command(
+                                input_text=command_text,
+                                root=focus_path,
+                                session=built,
+                                pending_images=[],
+                                console=cap,
+                                forge_state=_tui_forge_state,
+                                plan_mode_state=_tui_plan_state,
+                                plan_mode_escape_supported=False,
+                            )
+                        except Exception as _exec_exc:  # noqa: BLE001
+                            if surface is not None:
+                                try:
+                                    surface.append_system(f"Forge execution failed: {_exec_exc}")
+                                except Exception:
+                                    pass
+                        finally:
+                            cancelled = bool(getattr(token, "is_cancelled", False))
+                            if surface is not None:
+                                out = buf.getvalue().rstrip("\n")
+                                if out and not cancelled:
+                                    try:
+                                        surface.append_system(out)
+                                    except Exception:
+                                        pass
+                                try:
+                                    surface.end_forge()
+                                except Exception:
+                                    pass
+
+                    return _run
+
+                def _tui_command_runner(
+                    sess: Any, text: str, width: int
+                ) -> tuple[str, str, str | None, dict[str, Any] | None]:
+                    # "/execute plan" inside Forge runs the swarm — defer it to the
+                    # worker thread (not the synchronous runner, which would freeze
+                    # the UI) with a live forge view instead of a flat captured dump.
+                    _exec_parts = text.strip().lower().split()
+                    if (
+                        _tui_forge_state.ui_mode == "forge"
+                        and len(_exec_parts) >= 2
+                        and _exec_parts[0] == "/execute"
+                        and _exec_parts[1] == "plan"
+                    ):
+                        return (
+                            "run",
+                            "",
+                            text.strip(),
+                            {"_forge_execute": _tui_make_forge_execute(text.strip())},
+                        )
+                    # Route a submission through the chat command handler with a
+                    # capture console so its output renders into the TUI transcript
+                    # instead of corrupting the alt-screen. stdin is swapped to EOF
+                    # so any interactive command (e.g. /resume) cancels cleanly.
+                    import io as _io
+                    import sys as _sys
+
+                    from rich.console import Console as _RichConsole
+
+                    buf = _io.StringIO()
+                    cap = _RichConsole(
+                        file=buf,
+                        force_terminal=False,
+                        no_color=True,
+                        highlight=False,
+                        width=max(20, min(int(width or 100), 120)),
+                    )
+                    saved_stdin = _sys.stdin
+                    try:
+                        _sys.stdin = _io.StringIO("")
+                        result = _handle_chat_command(
+                            input_text=text,
+                            root=focus_path,
+                            session=sess,
+                            pending_images=[],
+                            console=cap,
+                            forge_state=_tui_forge_state,
+                            plan_mode_state=_tui_plan_state,
+                            plan_mode_escape_supported=False,
+                        )
+                    except Exception as _cmd_exc:  # noqa: BLE001
+                        return ("handled", f"Command error: {_cmd_exc}", None, None)
+                    finally:
+                        _sys.stdin = saved_stdin
+                    output = buf.getvalue().rstrip("\n")
+                    # Keep the footer mode badge in sync after any command that may
+                    # have changed it (e.g. "/mode fast" applied inline).
+                    _tui_state.exec_mode = str(getattr(sess, "mode", "") or "").strip()
+                    # The forge state machine flips ui_mode inside _enter_forge_mode
+                    # (and back to "chat" on /back / /done); this single sync drives
+                    # the FORGE footer badge + the forge-specific input placeholder.
+                    _tui_state.forge_mode = _tui_forge_state.ui_mode == "forge"
+                    if _tui_state.forge_mode:
+                        _forge_paths = getattr(_tui_forge_state, "paths", None)
+                        _run_id = str(getattr(_forge_paths, "run_id", "") or "")
+                        _tui_state.forge_run_id = (
+                            _run_id if len(_run_id) <= 12 else _run_id[:11] + "…"
+                        )
+                    else:
+                        _tui_state.forge_run_id = ""
+                    if result == "exit":
+                        return ("exit", output, None, None)
+                    if result == "send":
+                        return ("run", output, text, {})
+                    if isinstance(result, _ChatExecutionRequest):
+                        run_kwargs: dict[str, Any] = {}
+                        if result.routing_mode_override:
+                            run_kwargs["routing_mode_override"] = result.routing_mode_override
+                        if result.ephemeral_system_messages:
+                            run_kwargs["ephemeral_system_messages"] = list(
+                                result.ephemeral_system_messages
+                            )
+                        if result.ephemeral_user_messages:
+                            run_kwargs["ephemeral_user_messages"] = list(
+                                result.ephemeral_user_messages
+                            )
+                        return ("run", output, result.instruction, run_kwargs)
+                    return ("handled", output, None, None)
+
+                from ..commands.chat_status import _chat_status_panel_spec
+                from ..commands.chat_tui_panels import (
+                    _chat_asset_detail_panel_spec,
+                    _chat_assets_picker_spec,
+                    _chat_config_panel_spec,
+                    _chat_context_panel_spec,
+                    _chat_forge_intro_panel_spec,
+                    _chat_forge_markdown_panel_spec,
+                    _chat_forge_plan_panel_spec,
+                    _chat_model_info_panel_spec,
+                    _chat_skill_listing_panel_spec,
+                    _chat_terminals_panel_spec,
+                    _chat_toolbar_panel_spec,
+                    _chat_usage_panel_spec,
+                    _short_subagent_desc,
+                )
+
+                def _tui_status_panel(arg: str = "") -> dict[str, Any] | None:
+                    # TUI-native /status: render the live session snapshot as a
+                    # centered popup instead of a flat gray table dump.
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    try:
+                        return _chat_status_panel_spec(session=built, pending_images=[])
+                    except Exception:  # noqa: BLE001 - never crash the UI
+                        return None
+
+                def _tui_usage_panel(arg: str = "") -> dict[str, Any] | None:
+                    # Bare /usage opens the panel; "/usage hud …" falls through to
+                    # the command runner so the HUD toggle still applies.
+                    if arg.strip():
+                        return None
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    try:
+                        return _chat_usage_panel_spec(session=built)
+                    except Exception:  # noqa: BLE001
+                        return None
+
+                def _tui_context_panel(arg: str = "") -> dict[str, Any] | None:
+                    if arg.strip():
+                        return None
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    try:
+                        return _chat_context_panel_spec(session=built)
+                    except Exception:  # noqa: BLE001
+                        return None
+
+                def _tui_model_info_panel(arg: str = "") -> dict[str, Any] | None:
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    try:
+                        return _chat_model_info_panel_spec(session=built, model_ref=arg)
+                    except Exception:  # noqa: BLE001
+                        return None
+
+                def _tui_config_panel(arg: str = "") -> dict[str, Any] | None:
+                    # Bare /config now opens the full interactive menu overlay (handled
+                    # in app._submit before this provider). This read-only model panel
+                    # serves /config show|list|help (the tracked-model view) and acts as
+                    # the fallback when the overlay is unavailable; set|clear|rm|delete
+                    # fall through to the command runner so edits still apply.
+                    normalized = arg.strip().lower()
+                    if normalized and normalized not in {"show", "list", "help"}:
+                        return None
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    try:
+                        return _chat_config_panel_spec(session=built)
+                    except Exception:  # noqa: BLE001
+                        return None
+
+                def _tui_toolbar_panel(arg: str = "") -> dict[str, Any] | None:
+                    if arg.strip():
+                        return None
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    try:
+                        return _chat_toolbar_panel_spec(session=built)
+                    except Exception:  # noqa: BLE001
+                        return None
+
+                def _tui_terminals_panel(arg: str = "") -> dict[str, Any] | None:
+                    # Bare /terminals (or "list") opens the panel; show|kill|help fall
+                    # through to the command runner.
+                    normalized = arg.strip().lower()
+                    if normalized and normalized != "list":
+                        return None
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    try:
+                        return _chat_terminals_panel_spec(session=built)
+                    except Exception:  # noqa: BLE001
+                        return None
+
+                def _tui_skill_panel(arg: str = "") -> dict[str, Any] | None:
+                    # Bare /skill lists skills; "/skill <name>" and "/skill <name>
+                    # <task>" fall through to the runner (info text / attach turn).
+                    if arg.strip():
+                        return None
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    try:
+                        return _chat_skill_listing_panel_spec(session=built)
+                    except Exception:  # noqa: BLE001
+                        return None
+
+                def _tui_forge_intro_panel(arg: str = "") -> dict[str, Any] | None:
+                    # Plain /forge opens a guidance popup explaining how Forge works;
+                    # its Enter (confirm) routes "/forge" to the command runner to enter
+                    # the planning session, Esc cancels. "/forge resume" and re-entry
+                    # while already in Forge return None so they fall through to the
+                    # runner and resume directly (no intro).
+                    if arg.strip():
+                        return None
+                    if _tui_forge_state.ui_mode == "forge":
+                        return None
+                    try:
+                        return _chat_forge_intro_panel_spec()
+                    except Exception:  # noqa: BLE001 - never crash the UI on a panel
+                        return None
+
+                # --- Forge read-only panels (only fire inside a Forge session) ---
+                def _tui_forge_plan_and_paths() -> tuple[Any, Any] | None:
+                    if _tui_forge_state.ui_mode != "forge":
+                        return None  # chat-mode /plan, /show handled elsewhere
+                    plan = getattr(_tui_forge_state, "plan", None)
+                    paths = getattr(_tui_forge_state, "paths", None)
+                    if not isinstance(plan, dict) or paths is None:
+                        return None
+                    return plan, paths
+
+                def _tui_forge_show_panel(arg: str = "") -> dict[str, Any] | None:
+                    # Forge /show → the plan summary panel.
+                    pair = _tui_forge_plan_and_paths()
+                    if pair is None:
+                        return None
+                    plan, paths = pair
+                    try:
+                        return _chat_forge_plan_panel_spec(paths=paths, plan=plan)
+                    except Exception:  # noqa: BLE001 - never crash the UI on a panel
+                        return None
+
+                def _tui_forge_plan_edit_spec(plan: Any, paths: Any) -> dict[str, Any]:
+                    # /plan edit → open plan.json in the in-TUI editor; on save,
+                    # validate the JSON shape, persist it, and reload the in-memory
+                    # plan (no $EDITOR, which can't run under the alt-screen).
+                    import json as _json
+
+                    from ...forge import save_plan as _save_plan
+
+                    try:
+                        _save_plan(paths, plan)  # PLAN.md/json reflect the live plan
+                    except Exception:
+                        pass
+                    try:
+                        text = paths.plan_json_path.read_text(encoding="utf-8")
+                    except Exception:
+                        text = _json.dumps(plan, indent=2, ensure_ascii=False)
+
+                    def _on_save(new_text: str) -> tuple[bool, str]:
+                        try:
+                            candidate = _json.loads(new_text)
+                        except _json.JSONDecodeError as exc:
+                            return (False, f"Invalid JSON: {exc}")
+                        from ..commands.forge_helpers import _validate_forge_plan_shape
+
+                        shape_error = _validate_forge_plan_shape(candidate)
+                        if shape_error:
+                            return (False, shape_error)
+                        try:
+                            _save_plan(paths, candidate)
+                        except Exception as exc:  # noqa: BLE001
+                            return (False, f"Failed to save plan: {exc}")
+                        _tui_forge_state.plan = candidate
+                        suffix = ""
+                        try:
+                            from ..commands.forge_helpers import (
+                                _validate_forge_plan_for_paths,
+                            )
+
+                            warnings = _validate_forge_plan_for_paths(paths, candidate)
+                            if warnings:
+                                suffix = f" · {len(warnings)} validation warning(s)"
+                        except Exception:
+                            pass
+                        return (True, f"Plan saved and reloaded.{suffix}")
+
+                    return {
+                        "editor": {
+                            "title": f"Edit plan.json · {getattr(paths, 'run_id', '')}".rstrip(
+                                " ·"
+                            ),
+                            "text": text,
+                            "on_save": _on_save,
+                        }
+                    }
+
+                def _tui_forge_plan_panel(arg: str = "") -> dict[str, Any] | None:
+                    # Forge /plan: tasks|table|view → plan panel; markdown|md → PLAN.md
+                    # doc panel; edit → in-TUI JSON editor. Bare /plan returns None so
+                    # it falls through to the forge /plan picker.
+                    pair = _tui_forge_plan_and_paths()
+                    if pair is None:
+                        return None
+                    plan, paths = pair
+                    sub = arg.strip().lower()
+                    try:
+                        if sub in {"tasks", "table", "view"}:
+                            return _chat_forge_plan_panel_spec(paths=paths, plan=plan)
+                        if sub in {"markdown", "md"}:
+                            return _chat_forge_markdown_panel_spec(paths=paths, plan=plan)
+                        if sub in {"edit", "edit-json"}:
+                            return _tui_forge_plan_edit_spec(plan, paths)
+                    except Exception:  # noqa: BLE001
+                        return None
+                    return None
+
+                # --- Forge assets (picker + detail panel; replaces the stdin modal) ---
+                def _tui_asset_context() -> tuple[Any, Any] | None:
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    cfg = getattr(built, "cfg", None)
+                    if not isinstance(cfg, AppConfig):
+                        cfg = effective if isinstance(effective, AppConfig) else None
+                    asset_paths = getattr(_tui_forge_state, "paths", None)
+                    if asset_paths is None:
+                        # Outside a Forge session, resolve the workspace's current run.
+                        try:
+                            from ...agent.prompt_context import (
+                                resolve_session_active_workdir_path,
+                            )
+                            from ...forge import load_current_run_paths
+
+                            asset_paths = load_current_run_paths(
+                                Path(resolve_session_active_workdir_path(built))
+                            )
+                        except Exception:
+                            asset_paths = None
+                    if cfg is None or asset_paths is None:
+                        return None
+                    return cfg, asset_paths
+
+                def _tui_assets_panel(arg: str = "") -> dict[str, Any] | None:
+                    ctx = _tui_asset_context()
+                    if ctx is None:
+                        return None
+                    cfg_obj, asset_paths = ctx
+                    asset_id = arg.strip()
+                    if asset_id:
+                        try:
+                            return _chat_asset_detail_panel_spec(
+                                cfg=cfg_obj, paths=asset_paths, asset_id=asset_id
+                            )
+                        except Exception:  # noqa: BLE001
+                            return None
+                    # Bare /assets: show a small panel only when there is nothing to
+                    # pick; otherwise fall through to the selectable picker below.
+                    try:
+                        from ...assets.surface import build_asset_surface
+
+                        count = len(
+                            build_asset_surface(cfg=cfg_obj, run_paths=asset_paths).list_assets()
+                        )
+                    except Exception:  # noqa: BLE001
+                        return None
+                    if count == 0:
+                        return {
+                            "title": "Assets",
+                            "sections": [
+                                (
+                                    "Assets",
+                                    [("status", "No assets attached to this run yet.", "plain")],
+                                )
+                            ],
+                            "hint": "Esc close",
+                        }
+                    return None
+
+                def _tui_assets_picker() -> dict[str, Any] | None:
+                    ctx = _tui_asset_context()
+                    if ctx is None:
+                        return None
+                    cfg_obj, asset_paths = ctx
+                    try:
+                        return _chat_assets_picker_spec(cfg=cfg_obj, paths=asset_paths)
+                    except Exception:  # noqa: BLE001
+                        return None
+
+                _tui_panel_providers = {
+                    "/status": _tui_status_panel,
+                    "/usage": _tui_usage_panel,
+                    "/ctx": _tui_context_panel,
+                    "/context": _tui_context_panel,
+                    "/model-info": _tui_model_info_panel,
+                    "/config": _tui_config_panel,
+                    "/toolbar": _tui_toolbar_panel,
+                    "/terminals": _tui_terminals_panel,
+                    "/skill": _tui_skill_panel,
+                    "/forge": _tui_forge_intro_panel,
+                    "/show": _tui_forge_show_panel,
+                    "/plan": _tui_forge_plan_panel,
+                    "/assets": _tui_assets_panel,
+                }
+
+                # Slash-command dropdown: same completer the classic prompt uses, so
+                # typing "/" lists commands (and /subagent|/skill complete names).
+                from ..chat_slash_completer import ChatSlashCompleter
+
+                def _tui_subagent_names() -> list[str]:
+                    built = _tui_box.get("session")
+                    return sorted(str(n) for n in (getattr(built, "subagent_registry", {}) or {}))
+
+                def _tui_skill_names() -> list[str]:
+                    built = _tui_box.get("session")
+                    return sorted(str(n) for n in (getattr(built, "skill_registry", {}) or {}))
+
+                _tui_completer = ChatSlashCompleter(
+                    mode_provider=lambda: _tui_forge_state.ui_mode,
+                    subagent_names_provider=_tui_subagent_names,
+                    skill_names_provider=_tui_skill_names,
+                )
+
+                # TUI-native /mode picker: bare /mode opens a selectable popup;
+                # "/mode <name>" still applies inline via the command runner.
+                from ..commands.chat_terminal import (
+                    _chat_mode_display,
+                    _chat_mode_rows,
+                    _chat_trace_rows,
+                )
+                from ..commands.startup import _chat_trace_level, _set_chat_trace_level
+
+                _FULLACCESS_WARNING = (
+                    "full (fullaccess) disables write/shell safety guards and approval prompts."
+                )
+
+                def _tui_mode_select(value: str) -> list[tuple[str, str]] | None:
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    current = str(getattr(built, "mode", "review") or "review").strip().lower()
+                    if _chat_plan_mode_enabled(_tui_plan_state):
+                        if value == "readonly":
+                            return [("system", "Mode already set: Read-Only (Plan Mode is on)")]
+                        return [
+                            (
+                                "warn",
+                                "Cannot change execution mode while Plan Mode is on. "
+                                "Use /plan off first.",
+                            )
+                        ]
+                    if value == current:
+                        msgs = [("system", f"Mode already set: {_chat_mode_display(value)}")]
+                        if value == "fullaccess":
+                            msgs.append(("warn", _FULLACCESS_WARNING))
+                        return msgs
+                    try:
+                        _apply_chat_effective_mode(
+                            session=built, next_mode=value, persist_default_mode=True
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        return [("error", f"Failed to change mode: {exc}")]
+                    _tui_state.exec_mode = value
+                    msgs = [("system", f"Mode → {_chat_mode_display(value)}")]
+                    if value == "fullaccess":
+                        msgs.append(("warn", _FULLACCESS_WARNING))
+                    return msgs
+
+                def _tui_mode_picker() -> dict[str, Any] | None:
+                    built = _tui_box.get("session")
+                    current = str(getattr(built, "mode", "review") or "review").strip().lower()
+                    rows: list[dict[str, Any]] = []
+                    for value, label, desc in _chat_mode_rows():
+                        clean = label.split(") ", 1)[-1] if ") " in label else label
+                        rows.append(
+                            {
+                                "label": clean,
+                                "description": desc,
+                                "value": value,
+                                "current": value == current,
+                            }
+                        )
+                    return {"title": "Mode", "rows": rows, "on_select": _tui_mode_select}
+
+                # TUI-native /trace picker: bare /trace opens a selectable popup;
+                # "/trace <level>" still applies inline via the command runner.
+                def _tui_trace_select(value: str) -> list[tuple[str, str]] | None:
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    current = _chat_trace_level(built)
+                    if value == current:
+                        return [("system", f"Reasoning trace already set: {value}")]
+                    try:
+                        applied = _set_chat_trace_level(session=built, level=value)
+                    except Exception as exc:  # noqa: BLE001
+                        return [("error", f"Failed to set trace level: {exc}")]
+                    return [("system", f"Reasoning trace → {applied}")]
+
+                def _tui_trace_picker() -> dict[str, Any] | None:
+                    built = _tui_box.get("session")
+                    current = _chat_trace_level(built) if built is not None else "compact"
+                    rows: list[dict[str, Any]] = []
+                    for value, label, desc in _chat_trace_rows():
+                        clean = label.split(") ", 1)[-1] if ") " in label else label
+                        rows.append(
+                            {
+                                "label": clean,
+                                "description": desc,
+                                "value": value,
+                                "current": value == current,
+                            }
+                        )
+                    return {
+                        "title": "Reasoning Trace",
+                        "rows": rows,
+                        "on_select": _tui_trace_select,
+                    }
+
+                # TUI-native /subagent picker: bare /subagent opens a selectable
+                # list of subagents to spawn; choosing one prefills the input with
+                # "/subagent <name> " so the user types the task and Enter spawns it
+                # (explicit "/subagent <name> <task>" routes to the runner). The
+                # on|off|status toggles and the explicit form still go to the runner.
+                def _tui_subagent_select(value: str) -> dict[str, Any]:
+                    return {"prefill": f"/subagent {value} "}
+
+                def _tui_subagent_picker() -> dict[str, Any] | None:
+                    built = _tui_box.get("session")
+                    registry_obj = (
+                        getattr(built, "subagent_registry", None) if built is not None else None
+                    )
+                    registry = registry_obj if isinstance(registry_obj, dict) else {}
+                    if not registry:
+                        return None  # nothing to pick → runner prints guidance
+                    rows: list[dict[str, Any]] = []
+                    for value, _label, desc in _chat_subagent_rows(registry=registry):
+                        rows.append(
+                            {
+                                "label": str(value),
+                                # Full first-clause summary — the picker wraps it to
+                                # a couple of lines rather than clipping on the right.
+                                "description": _short_subagent_desc(desc, limit=120),
+                                "value": str(value),
+                                "current": False,
+                            }
+                        )
+                    enabled = bool(getattr(built, "subagents_enabled", False))
+                    hint = "↑↓ select · Enter to spawn · Esc cancel"
+                    if not enabled:
+                        # Own line so it never crowds / clips the keybinding hint.
+                        hint += "\nauto-delegate off · enable with /subagent on"
+                    return {
+                        "title": "Spawn Subagent",
+                        "rows": rows,
+                        "on_select": _tui_subagent_select,
+                        "hint": hint,
+                    }
+
+                # TUI-native forge pickers: bare /plan opens a tasks/markdown/edit
+                # chooser; bare /assistant toggles the planner assistant. Each row's
+                # on_select SUBMITS the explicit form (e.g. "/plan tasks") so the
+                # panel/runner path applies with no extra Enter. They fire only in a
+                # Forge session; in chat mode they return None and fall through.
+                def _tui_forge_plan_picker() -> dict[str, Any] | None:
+                    if _tui_forge_state.ui_mode != "forge":
+                        return None
+                    rows = [
+                        {
+                            "label": "tasks",
+                            "description": "Show the plan summary — goal, requirements, task table.",
+                            "value": "tasks",
+                            "current": False,
+                        },
+                        {
+                            "label": "markdown",
+                            "description": "Preview PLAN.md for the current run.",
+                            "value": "markdown",
+                            "current": False,
+                        },
+                        {
+                            "label": "edit",
+                            "description": "Edit plan.json in an in-TUI editor, then reload.",
+                            "value": "edit",
+                            "current": False,
+                        },
+                    ]
+                    return {
+                        "title": "Plan",
+                        "rows": rows,
+                        "on_select": lambda value: {"submit": f"/plan {value}"},
+                        "hint": "↑↓ select · Enter · Esc cancel",
+                    }
+
+                def _tui_forge_assistant_picker() -> dict[str, Any] | None:
+                    if _tui_forge_state.ui_mode != "forge":
+                        return None
+                    enabled = bool(getattr(_tui_forge_state, "assistant_enabled", False))
+                    rows = [
+                        {
+                            "label": "on",
+                            "description": "Planner assistant drafts and refines the plan with you.",
+                            "value": "on",
+                            "current": enabled,
+                        },
+                        {
+                            "label": "off",
+                            "description": "Manual planning only — you drive /goal, /task, /plan edit.",
+                            "value": "off",
+                            "current": not enabled,
+                        },
+                    ]
+                    return {
+                        "title": "Planner Assistant",
+                        "rows": rows,
+                        "on_select": lambda value: {"submit": f"/assistant {value}"},
+                        "hint": "↑↓ select · Enter · Esc cancel",
+                    }
+
+                _tui_picker_providers = {
+                    "/mode": _tui_mode_picker,
+                    "/trace": _tui_trace_picker,
+                    "/subagent": _tui_subagent_picker,
+                    "/plan": _tui_forge_plan_picker,
+                    "/assistant": _tui_forge_assistant_picker,
+                    "/assets": _tui_assets_picker,
+                }
+
+                _tui_ok = False
+                _tui_result: Any = None
+                try:
+                    _tui_result, _ = _run_tui(
+                        _tui_state,
+                        session_builder=_tui_session_builder,
+                        on_turn_complete=_tui_on_turn_complete,
+                        on_hud_refresh=_tui_on_turn_complete,
+                        command_runner=_tui_command_runner,
+                        panel_providers=_tui_panel_providers,
+                        picker_providers=_tui_picker_providers,
+                        completer=_tui_completer,
+                        config_flow_factory=_tui_config_flow_factory,
+                        on_config_saved=_tui_on_config_saved,
+                    )
+                    _tui_ok = True
+                except Exception as _tui_exc:  # pragma: no cover - defensive fallback
+                    console.print(
+                        f"[yellow]TUI unavailable ({_tui_exc}); using classic chat.[/yellow]"
+                    )
+                finally:
+                    _tui_session = _tui_box.get("session")
+                    if _tui_session is not None:
+                        try:
+                            _tui_session.close()
+                        except Exception:
+                            pass
+                if _tui_ok:
+                    # "Switch project" from /config exits with this sentinel; relaunch a
+                    # fresh chat bound to the chosen folder (the old session is already
+                    # closed above). We forward this session's execution-posture flags
+                    # (mode/yes/no_log/verify_cmd/…) so switching project doesn't
+                    # silently reset auto-approve/mode/logging. NOTE: this re-enters
+                    # chat() (one frame per switch); switching is a deliberate,
+                    # heavyweight manual action so the depth is bounded in practice.
+                    if (
+                        isinstance(_tui_result, tuple)
+                        and len(_tui_result) == 2
+                        and _tui_result[0] == "switch_workspace"
+                    ):
+                        from ..commands.startup import _run_default_chat_action
+
+                        _run_default_chat_action(
+                            path=Path(str(_tui_result[1])),
+                            allow_broad_workspace=True,
+                            mode=mode,
+                            model=model,
+                            base_url=base_url,
+                            temperature=temperature,
+                            stream=stream,
+                            max_steps=max_steps,
+                            subagents=subagents,
+                            no_log=no_log,
+                            verify_cmd=verify_cmd,
+                            yes=yes,
+                        )
+                    return
         printWelcome(
             console=console,
             workspace=focus_path if focus_path != session_root else session_root,
@@ -1533,10 +2417,11 @@ def run(
         "--yes",
         help="In auto mode, skip confirmations for sensitive commands (hard blocks still apply).",
     ),
+    cli_ctx: Any = None,
 ) -> None:
     console = _console()
     cfg = load_config()
-    current_ctx = get_current_context(silent=True)
+    current_ctx = cli_ctx if cli_ctx is not None else get_current_context(silent=True)
     non_interactive = _is_non_interactive_terminal()
     path_source = current_ctx.get_parameter_source("path") if current_ctx is not None else None
     max_steps_source = (
@@ -1544,9 +2429,7 @@ def run(
     )
     max_steps_provided = max_steps is not None
     if current_ctx is not None:
-        max_steps_provided = (
-            max_steps_source is not None and max_steps_source is not ParameterSource.DEFAULT
-        )
+        max_steps_provided = _parameter_value_was_provided(max_steps, max_steps_source)
 
     effective = clone_cfg(cfg)
     if base_url is not None:

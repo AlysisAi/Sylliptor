@@ -35,6 +35,7 @@ forge_app = typer.Typer(add_completion=False, help="Forge commands.")
 
 @forge_app.command("plan")
 def forge_plan(
+    ctx: typer.Context = None,
     path: Path = typer.Option(
         Path("."),
         "--path",
@@ -53,7 +54,7 @@ def forge_plan(
 ) -> None:
     from ..forge import forge_plan_impl
 
-    return forge_plan_impl(_cli_module(), path, create_path, allow_broad_workspace)
+    return forge_plan_impl(_cli_module(), path, create_path, allow_broad_workspace, cli_ctx=ctx)
 
 
 @forge_app.command("attach")
@@ -249,6 +250,7 @@ def forge_review(
 
 @forge_app.command("swarm")
 def forge_swarm(
+    ctx: typer.Context = None,
     path: Path = typer.Option(
         Path("."),
         "--path",
@@ -412,6 +414,7 @@ def forge_swarm(
         api_key_stdin,
         api_key,
         yes,
+        cli_ctx=ctx,
     )
 
 

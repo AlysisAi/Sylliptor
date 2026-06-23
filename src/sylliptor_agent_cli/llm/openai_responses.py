@@ -35,6 +35,37 @@ _RESPONSES_JSON_SCHEMA_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SYLLIPTOR_WEB_SEARCH_FUNCTION_NAME = "web_search"
 _RESPONSES_HOSTED_WEB_SEARCH_TYPES = frozenset({"web_search", "web_search_preview"})
 
+# Some models (notably the GPT-5 reasoning family) reject a non-default
+# ``temperature`` on the Responses API with a 400/422 ("temperature is not
+# supported … only the default (1) value is supported"). Unlike the chat-compat
+# client, this one had no fallback, so such a model failed on every call — and on
+# setup-wizard key/model validation. We now detect that error once per
+# (base_url, model), drop ``temperature`` from the payload, retry the offending
+# call immediately, and omit it from every later call to the same model.
+_TEMPERATURE_UNSUPPORTED_STATUS_MARKERS = ("error 400", "error 422")
+_TEMPERATURE_UNSUPPORTED_TOKENS = (
+    "unsupported",
+    "not support",
+    "not allowed",
+    "only the default",
+    "out of range",
+    "deprecated",
+)
+_RESPONSES_OMIT_TEMPERATURE_MODELS: set[str] = set()
+
+
+def _responses_temperature_omit_key(base_url: str, model: str) -> str:
+    return f"{str(base_url).strip().rstrip('/')}\n{str(model).strip()}"
+
+
+def _responses_temperature_unsupported(err: Exception) -> bool:
+    text = str(err).casefold()
+    if "temperature" not in text:
+        return False
+    if not any(marker in text for marker in _TEMPERATURE_UNSUPPORTED_STATUS_MARKERS):
+        return False
+    return any(token in text for token in _TEMPERATURE_UNSUPPORTED_TOKENS)
+
 
 def _headers_with_default_accept_encoding(headers: dict[str, str]) -> dict[str, str]:
     request_headers = dict(headers)
@@ -1254,20 +1285,24 @@ class OpenAIResponsesClient:
         response_format: dict[str, Any] | None = None,
         stream: bool = False,
         on_text_delta: Callable[[str], None] | None = None,
+        on_reasoning_delta: Callable[[str], None] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
+        _ = on_reasoning_delta
         tool_mapping = _responses_tools(
             tools,
             mode=self.web_search_mode,
             adapter=self.web_search_adapter,
         )
         mapped_tools = tool_mapping.tools
+        temp_omit_key = _responses_temperature_omit_key(self.base_url, self.model)
         payload: dict[str, Any] = {
             "model": self.model,
             "input": _responses_input_from_messages(messages),
-            "temperature": self.temperature if temperature is None else float(temperature),
         }
+        if temp_omit_key not in _RESPONSES_OMIT_TEMPERATURE_MODELS:
+            payload["temperature"] = self.temperature if temperature is None else float(temperature)
         if self.prompt_cache_key:
             payload["prompt_cache_key"] = self.prompt_cache_key
         if self.prompt_cache_retention:
@@ -1323,32 +1358,49 @@ class OpenAIResponsesClient:
 
         def _send_request() -> LLMResponse:
             url = f"{self.base_url}/responses"
-            try:
-                with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
-                    if stream:
-                        with client.stream(
-                            "POST",
-                            url,
-                            headers=self._headers(),
-                            json=payload,
-                        ) as response:
-                            if response.status_code >= 400:
-                                response.read()
-                                raise self._llm_error_from_response(response)
-                            return self._parse_stream_response(
-                                response,
-                                on_text_delta=telemetry_on_text_delta,
-                            )
-                    response = client.post(url, headers=self._headers(), json=payload)
-            except httpx.DecodingError as e:
-                raise LLMError(f"OpenAI Responses decompression failed: {e}") from e
-            except Exception as e:  # noqa: BLE001
-                if isinstance(e, LLMError):
-                    raise
-                raise LLMError(f"OpenAI Responses request failed: {e}") from e
-            if response.status_code >= 400:
-                raise self._llm_error_from_response(response)
-            return self._parse_chat_response(response)
+            while True:
+                try:
+                    with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
+                        if stream:
+                            with client.stream(
+                                "POST",
+                                url,
+                                headers=self._headers(),
+                                json=payload,
+                            ) as response:
+                                if response.status_code >= 400:
+                                    response.read()
+                                    err = self._llm_error_from_response(response)
+                                    if (
+                                        "temperature" in payload
+                                        and _responses_temperature_unsupported(err)
+                                    ):
+                                        payload.pop("temperature", None)
+                                        _RESPONSES_OMIT_TEMPERATURE_MODELS.add(temp_omit_key)
+                                        continue
+                                    raise err
+                                return self._parse_stream_response(
+                                    response,
+                                    on_text_delta=telemetry_on_text_delta,
+                                )
+                        response = client.post(url, headers=self._headers(), json=payload)
+                except httpx.DecodingError as e:
+                    raise LLMError(f"OpenAI Responses decompression failed: {e}") from e
+                except Exception as e:  # noqa: BLE001
+                    if isinstance(e, LLMError):
+                        raise
+                    raise LLMError(f"OpenAI Responses request failed: {e}") from e
+                if response.status_code >= 400:
+                    err = self._llm_error_from_response(response)
+                    # The model rejected ``temperature``: drop it (and remember
+                    # that for this model) and retry once. Bounded — the second
+                    # attempt has no ``temperature`` so it can't loop here.
+                    if "temperature" in payload and _responses_temperature_unsupported(err):
+                        payload.pop("temperature", None)
+                        _RESPONSES_OMIT_TEMPERATURE_MODELS.add(temp_omit_key)
+                        continue
+                    raise err
+                return self._parse_chat_response(response)
 
         return telemetry.run(
             lambda: run_provider_limited_call(

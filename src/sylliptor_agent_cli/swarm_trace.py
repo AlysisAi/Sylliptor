@@ -217,6 +217,17 @@ class SerializedSwarmTraceSink:
                 )
             except Exception:
                 pass
+        # A surface that wants structured per-task progress (the TUI's live forge
+        # view) opts in with ``on_swarm_event``; it is preferred over the flat
+        # ``on_progress_update`` string hook. RichSurface defines neither beyond
+        # ``on_progress_update`` so the classic path is unchanged.
+        swarm_handler = getattr(self.surface, "on_swarm_event", None)
+        if callable(swarm_handler):
+            try:
+                swarm_handler(event)
+                return
+            except Exception:
+                pass
         trace_handler = getattr(self.surface, "on_swarm_trace", None)
         if callable(trace_handler):
             try:

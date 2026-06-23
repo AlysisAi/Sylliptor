@@ -126,6 +126,8 @@ def _forge_enter_panel(
     entry_kind: str,
     assistant_enabled: bool,
     workspace_summary_lines: list[str] | None = None,
+    model: str | None = None,
+    mode: str | None = None,
 ) -> Any:
     from rich.console import Group
 
@@ -133,22 +135,34 @@ def _forge_enter_panel(
     task_count = len(plan.get("tasks") or [])
     task_label = "task" if task_count == 1 else "tasks"
     assistant_label = "assistant on" if assistant_enabled else "assistant off"
-    return Group(
+    lines = [
         _forge_bar_text(
             text=f"Forge ready · run {paths.run_id} · {task_count} {task_label} · {assistant_label}",
             style=STYLE_EMPHASIS,
         ),
-        _forge_bar_text(
-            text=_forge_entry_status_text(entry_kind=entry_kind),
-            style="dim",
-        ),
-        _forge_bar_text(
-            text="/show for summary · /execute plan when ready · /help for commands",
-            style="dim",
-        ),
-        _forge_plan_readiness_line(console=console, plan=plan),
-        _forge_next_step_line(console=console, plan=plan),
+    ]
+    context_bits = []
+    if str(model or "").strip():
+        context_bits.append(f"model {str(model).strip()}")
+    if str(mode or "").strip():
+        context_bits.append(f"mode {str(mode).strip()}")
+    if context_bits:
+        lines.append(_forge_bar_text(text=" - ".join(context_bits), style="dim"))
+    lines.extend(
+        [
+            _forge_bar_text(
+                text=_forge_entry_status_text(entry_kind=entry_kind),
+                style="dim",
+            ),
+            _forge_bar_text(
+                text="/show for summary · /execute plan when ready · /help for commands",
+                style="dim",
+            ),
+            _forge_plan_readiness_line(console=console, plan=plan),
+            _forge_next_step_line(console=console, plan=plan),
+        ]
     )
+    return Group(*lines)
 
 
 def _forge_requirement_text(item: Any) -> str:
@@ -487,8 +501,10 @@ def _workspace_context_payload_for_paths(
         scan = ensure_workspace_context_artifacts(paths, refresh_if_stale=refresh_if_stale)
     except ForgeError:
         return None
+    payload = scan.to_dict()
+    payload["greenfield"] = bool(getattr(paths, "greenfield", False))
     return _augment_workspace_context_with_mcp_execution_context(
-        workspace_context=scan.to_dict(),
+        workspace_context=payload,
         workspace_root=paths.root,
     )
 
@@ -1019,6 +1035,8 @@ def _enter_forge_mode(
     root: Path,
     console: Console,
     forge_state: _ForgeChatState,
+    model: str | None = None,
+    mode: str | None = None,
 ) -> bool:
     forge_binding: WorkspaceBinding | None = None
     try:
@@ -1077,7 +1095,10 @@ def _enter_forge_mode(
     )(console=console)
     forge_state.planner_session = _ForgePlannerSessionState(
         workspace_context=_augment_workspace_context_with_mcp_execution_context(
-            workspace_context=workspace_scan.to_dict(),
+            workspace_context={
+                **workspace_scan.to_dict(),
+                "greenfield": bool(getattr(paths, "greenfield", False)),
+            },
             workspace_root=paths.root,
         )
     )
@@ -1089,6 +1110,8 @@ def _enter_forge_mode(
             entry_kind=entry_selection.entry_kind,
             assistant_enabled=forge_state.assistant_enabled,
             workspace_summary_lines=format_workspace_context_summary_lines(workspace_scan),
+            model=model,
+            mode=mode,
         )
     )
     if (

@@ -22,6 +22,8 @@ class ChatClient(Protocol):
         response_format: dict[str, Any] | None = None,
         stream: bool = False,
         on_text_delta: Callable[[str], None] | None = None,
+        on_reasoning_delta: Callable[[str], None] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        cancellation_token: Any | None = None,
     ) -> LLMResponse: ...

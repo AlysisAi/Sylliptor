@@ -904,9 +904,11 @@ class AnthropicMessagesClient:
         response_format: dict[str, Any] | None = None,
         stream: bool = False,
         on_text_delta: Callable[[str], None] | None = None,
+        on_reasoning_delta: Callable[[str], None] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
+        _ = on_reasoning_delta
         if response_format is not None:
             raise LLMError("Anthropic Messages does not support response_format")
         if self.reasoning_effort:

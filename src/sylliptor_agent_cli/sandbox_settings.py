@@ -364,3 +364,44 @@ def resolve_shell_sandbox_settings(cfg: AppConfig) -> ShellSandboxSettings:
         background_output_max_bytes=background_output_max_bytes,
         background_kill_timeout_s=background_kill_timeout_s,
     )
+
+
+def normalize_sandbox_mode(value: object, *, default: str = "strict") -> str:
+    """Return a valid sandbox mode, falling back to ``default`` for unknown input."""
+    text = str(value or "").strip().lower()
+    return text if text in _VALID_MODES else default
+
+
+def sandbox_mode_from_config(cfg: AppConfig) -> str:
+    """Read the persisted shell sandbox mode from config (``strict`` if unset).
+
+    This reports the configured value only; the runtime resolution in
+    :func:`resolve_shell_sandbox_settings` still lets the ``SYLLIPTOR_SHELL_SANDBOX_MODE``
+    environment variable override it.
+    """
+    extra = cfg.extra_fields if isinstance(cfg.extra_fields, dict) else {}
+    section = extra.get("shell_sandbox")
+    if isinstance(section, dict):
+        return normalize_sandbox_mode(section.get("mode"))
+    return "strict"
+
+
+def apply_sandbox_mode_to_config(cfg: AppConfig, mode: object) -> AppConfig:
+    """Persist ``mode`` into both ``shell_sandbox`` and ``verify_sandbox`` config sections.
+
+    Both sections must be written together: the verify/completion gate resolves its
+    sandbox mode independently from the shell sandbox, so writing only one would leave
+    the other defaulting to ``strict`` and still fail closed.
+    """
+    normalized = normalize_sandbox_mode(mode)
+    extra = cfg.extra_fields
+    if not isinstance(extra, dict):
+        extra = {}
+        cfg.extra_fields = extra
+    for key in ("shell_sandbox", "verify_sandbox"):
+        section = extra.get(key)
+        if not isinstance(section, dict):
+            section = {}
+        section["mode"] = normalized
+        extra[key] = section
+    return cfg

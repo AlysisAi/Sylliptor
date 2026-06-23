@@ -1360,3 +1360,72 @@ def test_web_search_rejects_unsupported_response_shape() -> None:
     client = _client(httpx.MockTransport(handler))
     with pytest.raises(ResponsesError, match="did not return sources"):
         client.web_search(query="httpx docs")
+
+
+def test_chat_drops_temperature_when_model_rejects_it() -> None:
+    """GPT-5-class models reject a non-default temperature; the client must omit
+    it and retry (and remember the model), so validation + chat both succeed."""
+    from sylliptor_agent_cli.llm.openai_responses import (
+        _RESPONSES_OMIT_TEMPERATURE_MODELS,
+        _responses_temperature_omit_key,
+    )
+
+    base_url = "https://api.openai.com/v1"
+    model = "gpt-5.5-omit-test"
+    _RESPONSES_OMIT_TEMPERATURE_MODELS.discard(_responses_temperature_omit_key(base_url, model))
+
+    calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if "temperature" in body:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": (
+                            "Unsupported parameter: 'temperature' is not supported with this "
+                            "model. Only the default (1) value is supported."
+                        ),
+                        "param": "temperature",
+                        "code": "unsupported_parameter",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_ok",
+                "model": model,
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIResponsesClient(
+        base_url=base_url,
+        api_key="test-key",
+        model=model,
+        temperature=0.4,
+        transport=httpx.MockTransport(handler),
+    )
+
+    resp = client.chat(messages=[{"role": "user", "content": "ping"}])
+    assert resp.content == "ok"
+    # First attempt carried temperature and 400'd; the retry dropped it and won.
+    assert len(calls) == 2
+    assert "temperature" in calls[0]
+    assert "temperature" not in calls[1]
+
+    # The model is now remembered: the next chat omits temperature up front (no
+    # wasted 400 round-trip).
+    resp2 = client.chat(messages=[{"role": "user", "content": "again"}])
+    assert resp2.content == "ok"
+    assert len(calls) == 3
+    assert "temperature" not in calls[2]

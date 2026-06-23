@@ -180,6 +180,9 @@ class SessionStore:
     def resolve_web_fetch_url(self, raw_url: Any) -> tuple[str | None, str | None]:
         return self._web_research.resolve_fetch_url(raw_url)
 
+    def fetchable_web_fetch_urls(self, *, limit: int = 10) -> list[str]:
+        return self._web_research.fetchable_urls(limit=limit)
+
     def web_research_artifact_payload(self) -> dict[str, Any]:
         return self._web_research.artifact_payload()
 

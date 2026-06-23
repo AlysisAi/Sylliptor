@@ -52,8 +52,8 @@ def _sync_cli_globals(cli_mod: Any) -> None:
         module_globals[name] = value
 
 
-def _path_binding_source() -> str:
-    current_ctx = get_current_context(silent=True)
+def _path_binding_source(ctx: Any = None) -> str:
+    current_ctx = ctx if ctx is not None else get_current_context(silent=True)
     path_source = current_ctx.get_parameter_source("path") if current_ctx is not None else None
     if path_source is not None and path_source is not ParameterSource.DEFAULT:
         return "explicit_path"
@@ -303,6 +303,7 @@ def forge_plan(
         "--allow-broad-workspace",
         help="Allow guarded broad workspaces instead of choosing a narrower project folder.",
     ),
+    cli_ctx: Any = None,
 ) -> None:
     console = _console()
     try:
@@ -312,7 +313,7 @@ def forge_plan(
             interactive=not _is_non_interactive_terminal(),
             create_if_missing=create_path,
             allow_broad_workspace=allow_broad_workspace,
-            source=_path_binding_source(),
+            source=_path_binding_source(cli_ctx),
             action=WorkspaceAction.FORGE_PLAN,
         )
         paths = create_plan_run(
@@ -340,7 +341,11 @@ def forge_plan(
     planning_suggested: set[str] = set()
     planner_state = _ForgePlannerSessionState(
         workspace_context=(
-            _workspace_context_payload_for_paths(paths=paths) or workspace_scan.to_dict()
+            _workspace_context_payload_for_paths(paths=paths)
+            or {
+                **workspace_scan.to_dict(),
+                "greenfield": bool(getattr(paths, "greenfield", False)),
+            }
         )
     )
 
@@ -669,6 +674,7 @@ def forge_swarm(
         "--yes",
         help="In auto mode, skip confirmations for sensitive commands (hard blocks still apply).",
     ),
+    cli_ctx: Any = None,
 ) -> None:
     console = _console()
     cfg = load_config()
@@ -714,7 +720,7 @@ def forge_swarm(
             path,
             create_if_missing=False,
             allow_broad_workspace=allow_broad_workspace,
-            source=_path_binding_source(),
+            source=_path_binding_source(cli_ctx),
         )
         ensure_workspace_policy(
             binding,

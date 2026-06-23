@@ -369,7 +369,6 @@ from ...task_scope import (
 )
 from ...token_budget import compute_input_budget, estimate_tokens
 from ...tools.availability import get_tool_availability, is_tool_unavailable_result
-from ...tools.history import HistorySearchError, history_search
 from ...tools.registry import (
     iter_builtin_tool_metadata,
     summarize_tool_output_chunk,
@@ -1088,7 +1087,6 @@ _CHAT_GLOBAL_VISIBLE_COMMANDS = [
     "/compact",
     "/clear",
     "/resume",
-    "/stream",
     "/trace",
     "/config",
     "/toolbar",
@@ -1096,7 +1094,6 @@ _CHAT_GLOBAL_VISIBLE_COMMANDS = [
     "/image",
     "/subagent",
     "/forge",
-    "/history",
     "/report",
     "/feedback",
     "/plan",
@@ -1130,14 +1127,12 @@ _FORGE_SHARED_CHAT_COMMANDS = [
     "/ctx",
     "/compact",
     "/resume",
-    "/stream",
     "/trace",
     "/config",
     "/toolbar",
     "/assets",
     "/image",
     "/subagent",
-    "/history",
     "/report",
     "/feedback",
     "/plan",

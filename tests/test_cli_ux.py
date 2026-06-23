@@ -407,8 +407,6 @@ def test_chat_help_panel_describes_plan_workflow_and_explicit_readonly_mode() ->
     assert "/plan mode" in rendered
     assert "/plan approve" in rendered
     assert "/pwd" in rendered
-    assert "go to packages/app" in rendered
-    assert "natural language" in rendered
     assert "secondary persistent readonly planning overlay" in rendered
     assert "does not execute by itself" in rendered
     assert "/plan draft" not in rendered
@@ -468,10 +466,10 @@ def test_chat_bottom_toolbar_shows_help_only_when_all_items_disabled() -> None:
 def test_chat_prompt_label_is_aesthetic_and_consistent() -> None:
     assert cli_mod._chat_prompt_label() == "> "
     assert cli_mod._chat_prompt_label(mode="safe") == "> "
-    assert cli_mod._chat_prompt_label(ui_mode="forge") == "Forge · "
+    assert cli_mod._chat_prompt_label(ui_mode="forge") == "forge > "
     assert cli_mod._chat_prompt_fallback_label() == ">"
     assert cli_mod._chat_prompt_fallback_label(mode="safe") == ">"
-    assert cli_mod._chat_prompt_fallback_label(ui_mode="forge", mode="safe") == "Forge"
+    assert cli_mod._chat_prompt_fallback_label(ui_mode="forge", mode="safe") == "forge"
 
 
 def test_chat_prompt_label_formatted_ignores_mode_tag_for_chat() -> None:
@@ -487,17 +485,17 @@ def test_chat_prompt_label_formatted_ignores_mode_tag_for_chat() -> None:
     assert ">" in text
 
 
-def test_chat_prompt_label_formatted_uses_middle_dot_in_forge_mode() -> None:
+def test_chat_prompt_label_formatted_uses_pointer_in_forge_mode() -> None:
     try:
         from prompt_toolkit.formatted_text import to_formatted_text
     except Exception:
-        assert cli_mod._chat_prompt_label_formatted(ui_mode="forge") == "Forge · "
+        assert cli_mod._chat_prompt_label_formatted(ui_mode="forge") == "forge > "
         return
 
     formatted = to_formatted_text(cli_mod._chat_prompt_label_formatted(ui_mode="forge"))
     text = "".join(str(fragment[1]) for fragment in formatted)
-    assert "Forge" in text
-    assert "·" in text
+    assert "forge" in text
+    assert "▸" in text
     assert "::" not in text
 
 
@@ -547,7 +545,6 @@ def test_chat_visible_command_lists_match_curated_surface() -> None:
         "/compact",
         "/clear",
         "/resume",
-        "/stream",
         "/trace",
         "/config",
         "/toolbar",
@@ -555,7 +552,6 @@ def test_chat_visible_command_lists_match_curated_surface() -> None:
         "/image",
         "/subagent",
         "/forge",
-        "/history",
         "/report",
         "/feedback",
         "/plan",
@@ -1679,7 +1675,7 @@ def test_chat_home_path_uses_guarded_binding_flow(tmp_path: Path, monkeypatch) -
         sylliptor_app,
         ["chat", "--path", os.fspath(home), "--model", "test-model", "--api-key", "k", "--no-log"],
         input="exit\n",
-        env=_env(tmp_path),
+        env={**_env(tmp_path), "SYLLIPTOR_TUI": "0"},
     )
 
     assert result.exit_code == 0
@@ -1744,7 +1740,7 @@ def test_chat_guarded_create_folder_flow_works_with_mocked_prompts(
         sylliptor_app,
         ["chat", "--path", os.fspath(home), "--model", "test-model", "--api-key", "k", "--no-log"],
         input="exit\n",
-        env=_env(tmp_path),
+        env={**_env(tmp_path), "SYLLIPTOR_TUI": "0"},
     )
 
     assert result.exit_code == 0

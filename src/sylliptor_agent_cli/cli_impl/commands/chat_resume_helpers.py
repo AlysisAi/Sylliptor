@@ -467,6 +467,36 @@ def _chat_resume_rows(*, sessions: list[SessionInfo]) -> list[tuple[str, str, st
     return rows
 
 
+def _chat_resume_picker_spec(*, sessions: list[SessionInfo]) -> dict[str, Any] | None:
+    """Build the TUI ``/resume`` picker spec, one selectable row per session.
+
+    Each row uses the relative time as the label (e.g. ``5 min ago``) and the
+    conversation preview (custom title / summary / first user message) as the
+    wrapping description; the row ``value`` is the session id passed to the
+    picker's ``on_select``. Returns ``None`` when there is nothing to resume so
+    the caller can fall through to a plain "no previous sessions" message instead
+    of opening an empty popup. ``on_select`` is attached by the caller (it needs
+    the live session to apply the swap)."""
+    rows: list[dict[str, Any]] = []
+    for item in _chat_resume_display_rows(sessions=sessions):
+        label = item.when_label or item.session_id[:8] or "session"
+        rows.append(
+            {
+                "label": label,
+                "description": item.preview,
+                "value": item.session_id,
+                "current": False,
+            }
+        )
+    if not rows:
+        return None
+    return {
+        "title": "Resume Session",
+        "rows": rows,
+        "hint": "↑↓ select · Enter to resume · Esc cancel",
+    }
+
+
 def _resume_visible_session_rows(*, has_status_message: bool) -> int:
     _cols, term_rows = _terminal_dimensions()
     reserved = 15

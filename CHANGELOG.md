@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-06-23
+
+### Added
+
+- Added the full-screen TUI chat surface as the default interactive chat experience,
+  with transcript panels, setup/config flows, markdown rendering, reasoning display,
+  and workspace guard support.
+
+### Fixed
+
+- Restored public build stability for the TUI update, including provider streaming
+  compatibility and CLI max-step override handling.
+
 ## [0.9.6] - 2026-06-16
 
 ### Fixed

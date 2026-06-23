@@ -1529,6 +1529,23 @@ def build_tools(
                 "url": requested_url,
                 "allowed_provenance": ["user_provided", "returned_by_web_search"],
             }
+            # Make the rejection self-correcting: tell the model exactly which URLs
+            # it MAY fetch (web_search sources + user-provided URLs) so it retries
+            # against a real source instead of a guessed/restated one — without
+            # widening what is authorized.
+            fetchable_urls = store.fetchable_web_fetch_urls()
+            if fetchable_urls:
+                result["fetchable_urls"] = fetchable_urls
+                result["guidance"] = (
+                    "Do not guess or restate URLs from memory. Retry web_fetch with one of "
+                    "fetchable_urls (these came from web_search results or the user), or run "
+                    "web_search again to find the page."
+                )
+            else:
+                result["guidance"] = (
+                    "No URLs are fetchable yet. Run web_search first, or ask the user for the "
+                    "exact URL. Do not guess URLs."
+                )
             if raw_requested_url and raw_requested_url != requested_url:
                 result["raw_input_url"] = raw_requested_url
             return result

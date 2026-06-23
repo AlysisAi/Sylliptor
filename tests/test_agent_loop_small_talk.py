@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from sylliptor_agent_cli import agent_loop as agent_loop_mod
+from sylliptor_agent_cli.agent.routing import _is_fatal_non_repo_llm_error
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.custom_tools.discovery import discover_custom_tools
@@ -309,6 +310,13 @@ def _invalid_api_key_error() -> LLMError:
     )
 
 
+def _trial_quota_exhausted_error() -> LLMError:
+    return LLMError(
+        'LLM error 402: {"error":{"message":"Free trial tokens used up.",'
+        '"type":"insufficient_quota","code":"quota_exhausted"}}'
+    )
+
+
 class _AuthRejectingClient:
     model = "test-model"
     temperature = 0.0
@@ -320,11 +328,13 @@ class _AuthRejectingClient:
         route_error: bool = False,
         response_error: bool = False,
         response_reply: str = "",
+        error_factory: Any = _invalid_api_key_error,
     ) -> None:
         self.route = route
         self.route_error = route_error
         self.response_error = response_error
         self.response_reply = response_reply
+        self.error_factory = error_factory
         self.calls = 0
         self.route_calls = 0
         self.response_calls = 0
@@ -349,7 +359,7 @@ class _AuthRejectingClient:
         if first_system == agent_loop_mod._ROUTER_SYSTEM_PROMPT:
             self.route_calls += 1
             if self.route_error:
-                raise _invalid_api_key_error()
+                raise self.error_factory()
             payload = {
                 "route": self.route,
                 "execution_posture": (
@@ -365,7 +375,7 @@ class _AuthRejectingClient:
 
         self.response_calls += 1
         if self.response_error:
-            raise _invalid_api_key_error()
+            raise self.error_factory()
         return LLMResponse(content=self.response_reply, tool_calls=[], raw={})
 
 
@@ -2885,8 +2895,15 @@ def test_repo_follow_up_continuity_override_keeps_ambiguous_follow_up_on_repo_pa
     assert router.route_calls == 2
     assert router.response_calls == 0
     assert client.calls == 3
+
+    # Tool results echo OS-native paths (e.g. "src\\widget.py" on Windows), so
+    # normalize separators before asserting the repo history carried into turn 2.
+    def _mentions_widget_path(content: object) -> bool:
+        text = str(content or "").replace("\\\\", "/").replace("\\", "/")
+        return "src/widget.py" in text
+
     assert any(
-        msg.get("role") == "tool" and "src/widget.py" in str(msg.get("content") or "")
+        msg.get("role") == "tool" and _mentions_widget_path(msg.get("content"))
         for msg in client.call_records[-1]["messages"]
     )
 
@@ -3318,6 +3335,88 @@ def test_gibberish_non_repo_turn_defaults_to_english_fallback(tmp_path: Path) ->
     assert router.response_calls == 1
     assert session.messages[-1]["role"] == "assistant"
     assert session.messages[-1]["content"] == "Could you clarify what you want me to help with?"
+
+
+def test_is_fatal_non_repo_llm_error_classifies_trial_proxy_errors() -> None:
+    for code in ("trial_expired", "quota_exhausted", "rate_limit_exceeded", "plan_inactive"):
+        err = LLMError("LLM error 402: " + json.dumps({"error": {"code": code}}))
+        assert _is_fatal_non_repo_llm_error(err) is True, code
+    # A generic upstream failure stays non-fatal (handled/retried as before).
+    assert _is_fatal_non_repo_llm_error(LLMError("LLM error 500: upstream boom")) is False
+
+
+def test_auto_mode_non_repo_trial_quota_error_is_not_masked_as_clarification_fallback(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(model="test-model", routing_mode="auto", chat_temperature=0.7)
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+    )
+    session.client = _FailClient()  # type: ignore[assignment]
+    router = _AuthRejectingClient(
+        route="chat",
+        response_error=True,
+        error_factory=_trial_quota_exhausted_error,
+    )
+    session.router_client = router
+    baseline_messages = copy.deepcopy(session.messages)
+
+    try:
+        with pytest.raises(LLMError, match="quota_exhausted"):
+            session.run_turn("How are you?")
+        assert router.route_calls == 1
+        assert router.response_calls == 1
+        assert session.messages == baseline_messages
+        error_payload = _session_event_payload(session.store.path, "error")
+        assert "quota_exhausted" in str(error_payload.get("error") or "")
+    finally:
+        session.close()
+
+
+def test_non_repo_empty_completion_logs_breadcrumb_before_fallback(tmp_path: Path) -> None:
+    cfg = AppConfig(model="test-model", routing_mode="auto", chat_temperature=0.5)
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+    )
+    session.client = _FailClient()  # type: ignore[assignment]
+    router = _RouterStubClient(
+        route="general",
+        route_reply="",
+        response_reply="",
+        language="English",
+        script="Latin",
+    )
+    session.router_client = router
+
+    try:
+        exit_code = session.run_turn("hello there")
+        log_path = session.store.path
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert router.response_calls == 1
+    # Legitimate fallback is still produced for an empty completion ...
+    assert session.messages[-1]["content"] == "Could you clarify what you want me to help with?"
+    # ... but it now leaves a diagnosable breadcrumb in the session log.
+    warnings = [
+        dict(event.get("payload") or {})
+        for event in read_session_events(log_path)
+        if event.get("type") == "warning"
+    ]
+    assert any(w.get("warning") == "non_repo_empty_completion" for w in warnings)
 
 
 def test_code_only_mode_does_not_inject_non_english_without_explicit_override(

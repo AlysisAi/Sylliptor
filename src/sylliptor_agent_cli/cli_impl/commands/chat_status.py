@@ -210,6 +210,155 @@ def _active_protocol_status(*, cfg: AppConfig | None, client: Any) -> tuple[str,
     return protocol, supported
 
 
+def _chat_status_panel_spec(*, session: Any, pending_images: list[str]) -> dict[str, Any]:
+    """Build the structured spec for the TUI ``/status`` popup.
+
+    Mirrors :func:`_print_chat_status` (same getters) but returns grouped
+    key/value sections with a health ``tone`` per value instead of a flat Rich
+    table, so the full-screen TUI can render it as a centered panel. ``tone`` is
+    one of "accent" (on/healthy, green), "plain", "warn", "err", "dim". Green is
+    the only accent; degraded states stay "plain", real failures use "err".
+    """
+
+    def tone(flag: bool, true_tone: str = "accent", false_tone: str = "plain") -> str:
+        return true_tone if flag else false_tone
+
+    model = getattr(getattr(session, "client", None), "model", "?")
+    temperature = getattr(getattr(session, "client", None), "temperature", "?")
+    stream = bool(getattr(session, "stream", False))
+    mode = str(getattr(session, "mode", "?"))
+    root = Path(getattr(session, "root", Path(".")))
+    branch = _current_branch_label(root)
+    dirty = _is_git_dirty(root)
+    subagents = bool(getattr(session, "subagents_enabled", False))
+    cfg_obj = getattr(session, "cfg", None)
+    resolved_cfg = cfg_obj if isinstance(cfg_obj, AppConfig) else None
+    session_api_key = (
+        str(getattr(getattr(session, "client", None), "api_key", "") or "").strip() or None
+    )
+    web = resolve_web_search_runtime_status(cfg=resolved_cfg, api_key=session_api_key)
+
+    def _attr(name: str, default: Any) -> Any:
+        return getattr(session, name, getattr(getattr(session, "cfg", None), name, default))
+
+    session_rows: list[tuple[str, str, str]] = [
+        ("mode", mode, "accent"),
+        ("model", str(model), "accent"),
+        ("trace", _chat_trace_level(session), "plain"),
+        ("session", str(getattr(getattr(session, "store", None), "session_id", "-")), "dim"),
+        ("branch", branch, "plain"),
+        ("dirty", "yes" if dirty else "no", tone(not dirty)),
+        ("update", _cached_update_status_summary(resolved_cfg), "plain"),
+    ]
+
+    model_rows: list[tuple[str, str, str]] = [
+        (
+            "api_key_source",
+            _api_key_source_label(str(getattr(session, "api_key_source", "missing") or "missing")),
+            "plain",
+        ),
+        ("temperature", str(temperature), "plain"),
+        ("stream", "on" if stream else "off", tone(stream)),
+        ("subagents", "on" if subagents else "off", tone(subagents)),
+        ("step_budget_policy", str(_attr("step_budget_policy", "adaptive")), "plain"),
+        ("chat_max_steps", str(getattr(session, "max_steps", DEFAULT_CHAT_MAX_STEPS)), "plain"),
+        ("task_max_steps", str(_attr("task_max_steps", 100)), "plain"),
+        ("subagent_max_steps", str(_attr("subagent_max_steps", 16)), "plain"),
+    ]
+    active_turn_budget = getattr(
+        getattr(session, "step_budget_runtime", None), "active_turn_budget", None
+    )
+    model_rows.append(
+        (
+            "active_turn_budget",
+            str(active_turn_budget if active_turn_budget is not None else "-"),
+            "plain",
+        )
+    )
+
+    active_workdir = Path(resolve_session_active_workdir_path(session))
+    focus_dir = Path(getattr(session, "focus_dir", root) or root)
+    workspace_rows: list[tuple[str, str, str]] = [
+        ("workspace_root", os.fspath(root), "plain"),
+        ("focus_dir", os.fspath(focus_dir), "plain"),
+        ("focus_relpath", str(getattr(session, "focus_relpath", ".") or "."), "plain"),
+        ("active_workdir", os.fspath(active_workdir), "accent"),
+        (
+            "active_workdir_relpath",
+            str(resolve_session_active_workdir_relpath(session) or "."),
+            "plain",
+        ),
+        ("queued_images", str(len(pending_images)), "plain"),
+    ]
+
+    web_unavailable = "unavailable" in str(web.availability_label or "").casefold()
+    web_rows: list[tuple[str, str, str]] = [
+        (
+            "status",
+            web.availability_label,
+            "err" if web_unavailable else tone(web.registration_ready),
+        ),
+        ("mode", web.mode, "plain"),
+        ("provider", web.provider or "(none)", "plain"),
+        ("registration", "yes" if web.registration_ready else "no", tone(web.registration_ready)),
+    ]
+    if web.provider not in {None, "tavily"}:
+        web_rows.append(("base_url", web.base_url or "(missing)", "plain"))
+        web_rows.append(("model", web.model or "(missing)", "plain"))
+    web_rows.append(
+        (
+            "api_key",
+            "available" if web.api_key_available else "missing",
+            tone(web.api_key_available),
+        )
+    )
+    web_rows.append(("note", web.summary, "plain"))
+    web_rows.append(("setup", web.setup_hint, "plain"))
+
+    sections: list[tuple[str, list[tuple[str, str, str]]]] = [
+        ("Session", session_rows),
+        ("Model", model_rows),
+        ("Workspace", workspace_rows),
+        ("Web search", web_rows),
+    ]
+
+    registry = getattr(session, "model_registry", None)
+    resolved_model_name = str(model).strip()
+    if registry is not None and resolved_model_name:
+        meta_rows: list[tuple[str, str, str]] = []
+        try:
+            meta = registry.get(resolved_model_name)
+        except Exception as e:  # noqa: BLE001
+            meta_rows.append(("source", "error", "err"))
+            meta_rows.append(("error", str(e), "err"))
+        else:
+            meta_rows.append(("source", str(getattr(meta, "source", "unknown")), "plain"))
+            last_error = str(getattr(registry, "last_error", None) or "-")
+            meta_rows.append(("error", last_error, "err" if last_error != "-" else "plain"))
+            warning = "; ".join(getattr(meta, "warnings", ())[:3]) or "-"
+            meta_rows.append(("warning", warning, "warn" if warning != "-" else "plain"))
+            field_sources = getattr(meta, "field_sources", {}) or {}
+            meta_rows.append(
+                (
+                    "context_window_source",
+                    str(field_sources.get("context_window_tokens", "unknown")),
+                    "plain",
+                )
+            )
+            meta_rows.append(
+                (
+                    "max_output_source",
+                    str(field_sources.get("max_output_tokens", "unknown")),
+                    "plain",
+                )
+            )
+            for key, value in _bundled_catalog_provenance_rows(meta=meta, registry=registry):
+                meta_rows.append((key, value, "dim"))
+        sections.append(("Model metadata", meta_rows))
+
+    return {"title": "Session Status", "sections": sections}
+
+
 def _print_chat_pwd(*, console: Console, session: Any) -> None:
     root = Path(getattr(session, "root", Path("."))).resolve()
     focus_dir = Path(getattr(session, "focus_dir", root) or root)
@@ -675,7 +824,9 @@ def _chat_bottom_toolbar(
 
 def _chat_prompt_label(*, ui_mode: str = "chat", mode: str = "") -> str:
     if _is_forge_ui_mode(ui_mode):
-        return "Forge \u00b7 "
+        # ASCII-safe fallback (used when prompt_toolkit HTML is unavailable);
+        # the interactive path uses the ``\u25b8`` form below.
+        return "forge > "
     _ = mode
     return _CHAT_PROMPT_TEXT
 
@@ -686,14 +837,14 @@ def _chat_prompt_label_formatted(*, ui_mode: str = "chat", mode: str = "") -> An
     except Exception:
         return _chat_prompt_label(ui_mode=ui_mode, mode=mode)
     if _is_forge_ui_mode(ui_mode):
-        return HTML("<b>Forge</b> <ansibrightblack>\u00b7</ansibrightblack> ")
+        return HTML("<b>forge</b> <ansicyan>\u25b8</ansicyan> ")
     _ = mode
     return HTML("<b>&gt;</b> ")
 
 
 def _chat_prompt_fallback_label(*, ui_mode: str = "chat", mode: str = "") -> str:
     if _is_forge_ui_mode(ui_mode):
-        return "Forge"
+        return "forge"
     _ = mode
     return _CHAT_PROMPT_FALLBACK_LABEL
 

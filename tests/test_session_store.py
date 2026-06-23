@@ -397,6 +397,52 @@ def test_session_store_reopen_preserves_user_provided_web_url_classification(
     assert reopened.classify_web_fetch_url("https://docs.example.com/spec") == "user_provided"
 
 
+def test_session_store_fetchable_urls_lists_search_sources_then_user_urls(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(
+        enabled=True,
+        artifact_persistence_enabled=True,
+        sessions_dir=tmp_path,
+        session_id="fetchable-urls",
+        cwd=".",
+        repo_root=".",
+    )
+    store.append(
+        "user_message",
+        {"content": "Check https://user.example.com/page later."},
+    )
+    store.append(
+        "tool_result",
+        {
+            "name": "web_search",
+            "step": 1,
+            "result": {
+                "query": "world cup news",
+                "backend": "openrouter_web",
+                "sources": [
+                    {"title": "FIFA", "url": "https://www.fifa.com/worldcup/news"},
+                    {"title": "UEFA", "url": "https://www.uefa.com/news"},
+                ],
+            },
+        },
+    )
+
+    fetchable = store.fetchable_web_fetch_urls()
+
+    # web_search sources first (in result order), then the user-provided URL.
+    assert fetchable == [
+        "https://www.fifa.com/worldcup/news",
+        "https://www.uefa.com/news",
+        "https://user.example.com/page",
+    ]
+    # Every listed URL is genuinely authorized for web_fetch.
+    for url in fetchable:
+        assert store.classify_web_fetch_url(url) is not None
+    # The bound is honored.
+    assert store.fetchable_web_fetch_urls(limit=1) == ["https://www.fifa.com/worldcup/news"]
+
+
 def test_session_store_reopen_preserves_search_returned_web_url_classification(
     tmp_path: Path,
 ) -> None:

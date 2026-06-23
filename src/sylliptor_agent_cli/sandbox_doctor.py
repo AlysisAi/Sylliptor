@@ -58,6 +58,30 @@ class SandboxPullResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class BubblewrapInstallPlan:
+    manager: str
+    command: tuple[str, ...]
+    display: str
+
+
+@dataclass(frozen=True)
+class BubblewrapInstallResult:
+    ok: bool
+    command: str
+    detail: str
+
+
+_BWRAP_INSTALL_MANAGERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("apt-get", ("apt-get", "install", "-y", "bubblewrap")),
+    ("dnf", ("dnf", "install", "-y", "bubblewrap")),
+    ("pacman", ("pacman", "-S", "--noconfirm", "bubblewrap")),
+    ("zypper", ("zypper", "--non-interactive", "install", "bubblewrap")),
+    ("apk", ("apk", "add", "bubblewrap")),
+)
+_BWRAP_INSTALL_TIMEOUT_S = 300
+
+
 def default_sandbox_images(*, include_server: bool = True) -> tuple[str, ...]:
     images = [default_sandbox_docker_image("dev")]
     if include_server:
@@ -290,6 +314,86 @@ def pull_sandbox_images(
             )
         )
     return SandboxPullResult(ok=all(item.ok for item in results), results=tuple(results))
+
+
+def _needs_sudo() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    if not callable(geteuid):
+        return True
+    try:
+        return geteuid() != 0
+    except OSError:
+        return True
+
+
+def detect_bubblewrap_install_plan() -> BubblewrapInstallPlan | None:
+    """Return how to install Bubblewrap on this host, or ``None`` if not applicable.
+
+    Returns ``None`` when not on Linux, when ``bwrap`` is already installed, when no
+    supported package manager is found, or when elevation is needed but ``sudo`` is
+    unavailable.
+    """
+    if not _is_linux() or shutil.which("bwrap"):
+        return None
+    needs_sudo = _needs_sudo()
+    sudo_path = shutil.which("sudo")
+    if needs_sudo and not sudo_path:
+        return None
+    for manager, base_cmd in _BWRAP_INSTALL_MANAGERS:
+        if not shutil.which(manager):
+            continue
+        command = ("sudo", *base_cmd) if needs_sudo else base_cmd
+        return BubblewrapInstallPlan(
+            manager=manager,
+            command=command,
+            display=" ".join(command),
+        )
+    return None
+
+
+def install_bubblewrap(
+    *,
+    plan: BubblewrapInstallPlan | None = None,
+    timeout_s: int = _BWRAP_INSTALL_TIMEOUT_S,
+) -> BubblewrapInstallResult:
+    """Install Bubblewrap via the host package manager.
+
+    The package manager runs with inherited stdio so an interactive ``sudo`` password
+    prompt and progress output reach the user directly.
+    """
+    plan = plan or detect_bubblewrap_install_plan()
+    if plan is None:
+        return BubblewrapInstallResult(
+            ok=False,
+            command="",
+            detail=(
+                "No supported Linux package manager was found to install Bubblewrap "
+                "automatically. Install `bubblewrap` manually, or use Docker."
+            ),
+        )
+    try:
+        proc = subprocess.run(list(plan.command), check=False, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return BubblewrapInstallResult(
+            ok=False,
+            command=plan.display,
+            detail=f"install timed out after {timeout_s}s",
+        )
+    except OSError as exc:
+        return BubblewrapInstallResult(ok=False, command=plan.display, detail=str(exc))
+    if proc.returncode != 0:
+        return BubblewrapInstallResult(
+            ok=False,
+            command=plan.display,
+            detail=f"package manager exited with code {proc.returncode}",
+        )
+    if not shutil.which("bwrap"):
+        return BubblewrapInstallResult(
+            ok=False,
+            command=plan.display,
+            detail="bubblewrap (`bwrap`) is still not on PATH after the install completed",
+        )
+    return BubblewrapInstallResult(ok=True, command=plan.display, detail="bubblewrap installed")
 
 
 def format_sandbox_problem_message(result: SandboxDiagnostic) -> str:

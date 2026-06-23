@@ -64,7 +64,8 @@ USER root
 ARG NODE_MAJOR=24
 # Keep npm ahead of the NodeSource package's bundled npm when scanner-actionable
 # transitive npm dependencies receive security fixes.
-ARG NPM_VERSION=11.13.0
+ARG NPM_VERSION=11.17.0
+ARG NPM_UNDICI_VERSION=6.27.0
 ARG TARGETARCH
 ARG GO_VERSION=1.26.4
 ARG GO_LINUX_AMD64_SHA256=1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f
@@ -105,6 +106,15 @@ RUN install -d -m 0755 /etc/apt/keyrings; \
     echo "APT pin: ${package}=${version}"; \
     apt-get install -y --no-install-recommends "${package}=${version}"; \
     npm install -g "npm@${NPM_VERSION}"; \
+    npm_root="$(npm root -g)"; \
+    undici_tgz="$(npm pack "undici@${NPM_UNDICI_VERSION}" --pack-destination /tmp --silent)"; \
+    undici_dir="${npm_root}/npm/node_modules/undici"; \
+    rm -rf "${undici_dir}"; \
+    install -d -m 0755 "${undici_dir}"; \
+    tar -xzf "/tmp/${undici_tgz}" -C "${undici_dir}" --strip-components=1; \
+    rm "/tmp/${undici_tgz}"; \
+    installed_undici="$(node -e "process.stdout.write(require('${undici_dir}/package.json').version)")"; \
+    test "${installed_undici}" = "${NPM_UNDICI_VERSION}"; \
     npm cache clean --force; \
     apt-mark manual "${package}"; \
     rm -rf /var/lib/apt/lists/*

@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
+from ..branding import env_get
 from ..config import (
     _ROLE_TEMPERATURE_FIELDS,
     AppConfig,
@@ -47,6 +48,11 @@ from ..profiles import (
     validate_base_url,
 )
 from ..provider_diagnostics import provider_diagnostic_warning_lines
+from ..sandbox_settings import (
+    apply_sandbox_mode_to_config,
+    normalize_sandbox_mode,
+    sandbox_mode_from_config,
+)
 from ..surface.console import make_console
 from ..surface.styles import STYLE_CONTENT, STYLE_DIM, STYLE_EMPHASIS
 from ..web_search_adapters import WEB_SEARCH_ADAPTER_CHOICES, normalize_web_search_adapter
@@ -68,7 +74,9 @@ SECTION_VALUES: tuple[tuple[str, str], ...] = (
     ("router", "Routing & Limits"),
     ("subagents", "Subagent model overrides"),
     ("forge", "Forge model overrides"),
+    ("sandbox", "Sandbox"),
 )
+SANDBOX_MODES: tuple[str, ...] = ("strict", "warn", "off")
 THINKING_LABELS: tuple[str, ...] = ("off", "minimal", "low", "medium", "high", "xhigh", "auto")
 ROUTING_MODES: tuple[str, ...] = ("auto", "code_only")
 STEP_BUDGET_POLICIES: tuple[str, ...] = ("adaptive", "fixed")
@@ -122,6 +130,7 @@ class ConfigMenuState:
     clear_stored_key_confirmed: bool = False
     clear_stored_key_profile: str | None = None
     config_warning: str | None = None
+    default_workspace_path: str = ""
     thinking_label_explicitly_set: bool = field(default=False, repr=False)
     _original: dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -143,6 +152,7 @@ class ConfigMenuState:
             thinking_label = "auto"
         profiles = {profile.name: profile.to_dict() for profile in list_profiles(cfg)}
         active_profile = str(cfg.extra_fields.get("active_profile") or "")
+        default_workspace_path = str(cfg.extra_fields.get("default_workspace_path") or "")
         role_models = _normalized_role_model_values(
             cfg.extra_fields.get("role_models") if isinstance(cfg.extra_fields, dict) else None
         )
@@ -182,6 +192,7 @@ class ConfigMenuState:
                 "web_search_adapter": str(getattr(cfg, "web_search_adapter", "auto") or "auto"),
                 "web_search_base_url": str(getattr(cfg, "web_search_base_url", "") or ""),
                 "web_search_model": str(getattr(cfg, "web_search_model", "") or ""),
+                "sandbox_mode": sandbox_mode_from_config(cfg),
             },
             thinking_label=thinking_label,
             role_models=role_models,
@@ -192,6 +203,7 @@ class ConfigMenuState:
             api_key_source=api_key_source,
             masked_api_key=masked_api_key,
             config_warning="; ".join(warnings) or None,
+            default_workspace_path=default_workspace_path,
         )
         state._original = state.snapshot()
         return state
@@ -215,6 +227,7 @@ class ConfigMenuState:
             },
             "profiles": {name: dict(data) for name, data in sorted(self.profiles.items())},
             "active_profile": self.active_profile,
+            "default_workspace_path": self.default_workspace_path,
             "new_api_key": self.new_api_key,
             "clear_stored_key_confirmed": self.clear_stored_key_confirmed,
             "clear_stored_key_profile": self.clear_stored_key_profile,
@@ -240,6 +253,7 @@ class ConfigMenuState:
             if isinstance(data, dict)
         }
         self.active_profile = str(self._original.get("active_profile") or "")
+        self.default_workspace_path = str(self._original.get("default_workspace_path") or "")
         self.new_api_key = str(self._original.get("new_api_key") or "")
         self.clear_stored_key_confirmed = bool(
             self._original.get("clear_stored_key_confirmed", False)
@@ -311,6 +325,9 @@ class ConfigMenuState:
         self.clear_stored_key_confirmed = True
         self.clear_stored_key_profile = self.active_profile or None
         self.new_api_key = ""
+
+    def set_default_workspace_path(self, path: str) -> None:
+        self.default_workspace_path = str(path or "").strip()
 
     def set_active_profile_name(self, name: str) -> None:
         profile_name = str(name or "").strip().lower()
@@ -413,6 +430,14 @@ class ConfigMenuState:
                 cfg.extra_fields.pop("active_profile", None)
             changes["active_profile"] = self.active_profile
 
+        original_workspace = str(self._original.get("default_workspace_path") or "")
+        if self.default_workspace_path != original_workspace:
+            if self.default_workspace_path:
+                cfg.extra_fields["default_workspace_path"] = self.default_workspace_path
+            else:
+                cfg.extra_fields.pop("default_workspace_path", None)
+            changes["default_workspace_path"] = self.default_workspace_path
+
         desired_base_url = str(self.fields.get("base_url", ""))
         if str(getattr(cfg, "base_url", "") or "") != desired_base_url:
             set_config_value(cfg, "base_url", desired_base_url)
@@ -513,6 +538,11 @@ class ConfigMenuState:
                 set_config_value(cfg, field_name, _format_number(desired_temperature))
                 changes[field_name] = desired_temperature
 
+        desired_sandbox_mode = normalize_sandbox_mode(self.fields.get("sandbox_mode", "strict"))
+        if sandbox_mode_from_config(cfg) != desired_sandbox_mode:
+            apply_sandbox_mode_to_config(cfg, desired_sandbox_mode)
+            changes["sandbox_mode"] = desired_sandbox_mode
+
         return ConfigMenuResult(
             saved=True,
             changes=changes,
@@ -596,6 +626,8 @@ def run_config_menu(
             _run_subagent_section(state, console)
         elif action == "forge":
             _run_forge_section(state, console)
+        elif action == "sandbox":
+            _run_sandbox_section(state, console)
         elif action == "save":
             result = _save_and_exit(state, effective_cfg, console)
             if result.saved or result.error is None:
@@ -668,11 +700,78 @@ def _top_level_menu_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
             "Forge model overrides",
             _override_summary_text(state.forge_role_models),
         ),
+        ("sandbox", "Sandbox", _sandbox_summary_text(state)),
     ]
+
+
+def _sandbox_summary_text(state: ConfigMenuState) -> str:
+    mode = normalize_sandbox_mode(state.fields.get("sandbox_mode", "strict"))
+    base = {
+        "strict": "strict · sandboxed (recommended)",
+        "warn": "warn · sandbox, fail-closed if missing",
+        "off": "off · host execution (less safe)",
+    }[mode]
+    if _sandbox_mode_env_override() is not None:
+        return f"{base} · overridden by env"
+    return base
+
+
+def _sandbox_mode_env_override() -> str | None:
+    for name in ("SYLLIPTOR_SHELL_SANDBOX_MODE", "SYLLIPTOR_VERIFY_SANDBOX_MODE"):
+        value = str(env_get(name) or "").strip()
+        if value:
+            return f"{name}={value}"
+    return None
 
 
 def _print_section_cancelled(console: Console, section_name: str) -> None:
     console.print(f'[dim]Section "{section_name}" cancelled.[/dim]')
+
+
+def _run_sandbox_section(state: ConfigMenuState, console: Console) -> None:
+    override = _sandbox_mode_env_override()
+    if override is not None:
+        console.print(
+            f"[yellow]Note: {override} is set in your environment and overrides "
+            "this config value at runtime.[/yellow]"
+        )
+    current = normalize_sandbox_mode(state.fields.get("sandbox_mode", "strict"))
+    rows = [
+        (
+            "strict",
+            "Strict (recommended)",
+            "Run shell & verification commands inside a sandbox (bubblewrap/Docker).",
+        ),
+        (
+            "warn",
+            "Warn",
+            "Try the sandbox; fail closed if no backend (no host fallback).",
+        ),
+        (
+            "off",
+            "Off (less safe)",
+            "Run commands directly on the host shell. No isolation.",
+        ),
+    ]
+    value = _run_config_picker(
+        console=console,
+        title="Sandbox",
+        subtitle="How Sylliptor isolates shell and verification commands.",
+        rows=rows,
+        current_value=current,
+    )
+    if value is None:
+        _print_section_cancelled(console, "Sandbox")
+        return
+    normalized = normalize_sandbox_mode(value)
+    state.fields["sandbox_mode"] = normalized
+    if normalized == "off":
+        console.print(
+            "[yellow]Sandbox set to off - commands will run on the host shell. "
+            "Save to apply.[/yellow]"
+        )
+    else:
+        console.print(f"[green]Sandbox mode: {normalized}.[/green] Save to apply.")
 
 
 def _summary_is_markup(summary: str) -> bool:
@@ -900,10 +999,11 @@ def _prompt_main_action_fallback(console: Console, state: ConfigMenuState) -> st
             )
             console.print(f"  {index}) [bold]{label}[/bold]  {summary_text}")
         console.print()
+        jump_hint = f"[1-{len(rows)}]"
         if state.dirty:
-            console.print("[dim][1-6] edit  [s] save  [q] cancel  [Enter] save & exit[/dim]")
+            console.print(f"[dim]{jump_hint} edit  [s] save  [q] cancel  [Enter] save & exit[/dim]")
         else:
-            console.print("[dim][1-6] edit  [s] save  [q] cancel  [Enter] cancel[/dim]")
+            console.print(f"[dim]{jump_hint} edit  [s] save  [q] cancel  [Enter] cancel[/dim]")
         try:
             raw = str(typer.prompt("Choice", default="", show_default=False)).strip()
         except (Abort, EOFError, KeyboardInterrupt):
@@ -2017,6 +2117,7 @@ def _pending_change_count(state: ConfigMenuState) -> int:
                 count += 1
     for key in (
         "active_profile",
+        "default_workspace_path",
         "thinking_label",
         "thinking_label_explicitly_set",
         "new_api_key",

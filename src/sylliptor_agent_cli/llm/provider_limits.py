@@ -161,7 +161,11 @@ def run_provider_limited_call(
             return call()
         except Exception as exc:
             retry_reason = _provider_retry_reason(exc)
-            if retry_reason is None or retries_used >= settings.max_retries:
+            if (
+                retry_reason is None
+                or _is_provider_call_non_retryable(exc)
+                or retries_used >= settings.max_retries
+            ):
                 raise
             wait_seconds = _retry_delay_seconds(settings, retries_used, jitter)
             if on_retry is not None:
@@ -191,6 +195,28 @@ def _provider_retry_reason(exc: Exception) -> str | None:
     if is_provider_unavailable_error(exc):
         return "provider_unavailable"
     return None
+
+
+PROVIDER_NON_RETRYABLE_ATTR = "_provider_call_non_retryable"
+
+
+def mark_provider_call_non_retryable(exc: BaseException) -> None:
+    """Tag an exception so :func:`run_provider_limited_call` will not retry it.
+
+    Some failures match the retryable heuristics by message (e.g. an httpx read
+    timeout contains "timed out") yet an immediate retry with the same budget is
+    pointless — it will fail the same way and only double the dead air. A caller
+    that knows a failure is not worth retrying marks it here so the retry loop
+    skips it while still retrying genuinely transient failures.
+    """
+    try:
+        setattr(exc, PROVIDER_NON_RETRYABLE_ATTR, True)
+    except Exception:  # noqa: BLE001 - never let tagging crash the caller
+        pass
+
+
+def _is_provider_call_non_retryable(exc: BaseException) -> bool:
+    return bool(getattr(exc, PROVIDER_NON_RETRYABLE_ATTR, False))
 
 
 def reset_provider_limit_state_for_tests() -> None:
@@ -278,11 +304,20 @@ def _provider_key_from_base_url(base_url: str | None) -> str | None:
     if not raw:
         return None
     try:
-        hostname = (urlsplit(raw).hostname or "").rstrip(".").casefold()
+        parts = urlsplit(raw)
+        hostname = (parts.hostname or "").rstrip(".").casefold()
+        path = (parts.path or "").casefold()
     except ValueError:
         return None
     if not hostname:
         return None
+    # Hosted Sylliptor MiMo trial proxy (Supabase Edge Function forwarding to
+    # OpenRouter/Xiaomi). Match the proxy path so other *.supabase.co apps are
+    # not captured. Mirrors openai_compat._is_sylliptor_trial_proxy.
+    if "/functions/v1/llm" in path and (
+        hostname == "supabase.co" or hostname.endswith(".supabase.co")
+    ):
+        return "openrouter"
     if "dashscope" in hostname:
         return _QWEN_CANONICAL_KEY
     if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):

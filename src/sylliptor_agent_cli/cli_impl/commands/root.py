@@ -154,6 +154,7 @@ def main(
 
 @app.command()
 def run(
+    ctx: typer.Context = None,
     instruction: str = typer.Argument(..., help="What you want the agent to do."),
     path: Path = typer.Option(Path("."), "--path", help="Working directory/root."),
     create_path: bool = typer.Option(
@@ -240,11 +241,13 @@ def run(
         api_key_stdin,
         api_key,
         yes,
+        cli_ctx=ctx,
     )
 
 
 @app.command()
 def chat(
+    ctx: typer.Context = None,
     path: Path = typer.Option(Path("."), "--path", help="Working directory/root."),
     create_path: bool = typer.Option(
         False,
@@ -333,6 +336,7 @@ def chat(
         api_key_stdin,
         api_key,
         yes,
+        cli_ctx=ctx,
     )
 
 
@@ -563,23 +567,38 @@ def setup(
 
     from ..setup_wizard import run_setup_wizard
 
-    if run_setup_wizard():
-        console = _console()
-        try:
-            result = _patchable("diagnose_sandbox", diagnose_sandbox)(
-                _patchable("load_config", load_config)(),
-                include_smoke=False,
-                include_server_image=False,
-            )
-        except ConfigError:
-            return
-        if not result.ready:
-            console.print()
-            console.print(
-                "[yellow]Safe runner setup is not complete yet. "
-                "Run `sylliptor doctor sandbox` for details or `sylliptor setup sandbox` "
-                "after installing/starting Docker.[/yellow]"
-            )
+    # `sylliptor setup` defaults to the interactive alt-screen wizard (arrow-key
+    # selection) regardless of SYLLIPTOR_TUI; it only falls back to the classic
+    # Rich wizard when the TUI can't run (and says why).
+    tui_result = _cli_module()._try_setup_tui(require_flag=False, announce_fallback=True)
+    if tui_result is None:
+        # Classic Rich wizard (non-interactive terminal or TUI failure): configure
+        # only, then surface any remaining sandbox setup.
+        if run_setup_wizard():
+            console = _console()
+            try:
+                result = _patchable("diagnose_sandbox", diagnose_sandbox)(
+                    _patchable("load_config", load_config)(),
+                    include_smoke=False,
+                    include_server_image=False,
+                )
+            except ConfigError:
+                return
+            if not result.ready:
+                console.print()
+                console.print(
+                    "[yellow]Safe runner setup is not complete yet. "
+                    "Run `sylliptor doctor sandbox` for details or `sylliptor setup sandbox` "
+                    "after installing/starting Docker.[/yellow]"
+                )
+        return
+
+    # The interactive TUI ran (it already walked the user through sandbox). On a
+    # saved setup, flow straight into chat — the final screen promised "Press
+    # Enter to start chatting" — in the workspace they just configured (so the
+    # broad-workspace guard does not re-ask about it). On cancel, back to shell.
+    if tui_result:
+        _cli_module()._run_chat_after_setup()
 
 
 @app.command()

@@ -14,9 +14,12 @@ def test_path_binding_source_detects_explicit_path() -> None:
     observed: dict[str, str] = {}
 
     @app.command()
-    def command(path: str = forge_impl.typer.Option(".", "--path")) -> None:
+    def command(
+        ctx: forge_impl.typer.Context,
+        path: str = forge_impl.typer.Option(".", "--path"),
+    ) -> None:
         _ = path
-        observed["source"] = forge_impl._path_binding_source()
+        observed["source"] = forge_impl._path_binding_source(ctx)
 
     result = CliRunner().invoke(app, ["--path", "/tmp/example"])
 

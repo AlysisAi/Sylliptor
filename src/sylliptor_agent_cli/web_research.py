@@ -575,6 +575,26 @@ class SessionWebResearchTracker:
             ), effective_normalized
         return None, strict_normalized
 
+    def fetchable_urls(self, *, limit: int = 10) -> list[str]:
+        """Normalized URLs that ``web_fetch`` will currently authorize.
+
+        These are the exact canonical forms ``resolve_fetch_url`` matches against,
+        so the model can copy one verbatim into ``web_fetch``. web_search source
+        URLs come first (the common "fetch a result" case), then user-provided
+        URLs; order within each group is the order they were observed. Bounded so
+        a long session does not bloat an error payload.
+        """
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for url in (*self._returned_source_urls.keys(), *self._user_urls.keys()):
+            normalized = str(url or "").strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                ordered.append(normalized)
+        if limit is not None and limit > 0:
+            return ordered[:limit]
+        return ordered
+
     def observe_event(
         self,
         *,

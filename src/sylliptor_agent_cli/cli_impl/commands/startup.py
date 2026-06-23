@@ -45,26 +45,65 @@ def _home_prompt_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _run_default_chat_action() -> None:
+def _run_default_chat_action(
+    *,
+    path: Path | None = None,
+    allow_broad_workspace: bool = False,
+    mode: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    temperature: float | None = None,
+    stream: bool | None = None,
+    max_steps: int | None = None,
+    subagents: bool | None = None,
+    no_log: bool = False,
+    verify_cmd: list[str] | None = None,
+    yes: bool = False,
+) -> None:
+    # Execution-posture flags (mode/yes/no_log/verify_cmd/…) default to the plain
+    # launch values, but callers may forward the current session's flags so a
+    # relaunch (e.g. /config → switch project) preserves the user's chosen posture
+    # instead of silently resetting auto-approve/mode/logging.
     _patchable("chat", chat)(
-        path=Path("."),
+        path=path or Path("."),
         create_path=False,
-        allow_broad_workspace=False,
+        allow_broad_workspace=allow_broad_workspace,
         image=None,
-        mode=None,
-        model=None,
-        base_url=None,
-        temperature=None,
-        stream=None,
-        max_steps=None,
-        subagents=None,
-        no_log=False,
-        verify_cmd=None,
+        mode=mode,
+        model=model,
+        base_url=base_url,
+        temperature=temperature,
+        stream=stream,
+        max_steps=max_steps,
+        subagents=subagents,
+        no_log=no_log,
+        verify_cmd=verify_cmd,
         api_key_env=None,
         api_key_stdin=False,
         api_key=None,
-        yes=False,
+        yes=yes,
     )
+
+
+def _configured_default_workspace() -> Path | None:
+    """The workspace folder setup persisted (``default_workspace_path``), if any."""
+    try:
+        cfg = _patchable("load_config", load_config)()
+        raw = str((cfg.extra_fields or {}).get("default_workspace_path") or "").strip()
+    except Exception:
+        return None
+    return Path(raw).expanduser() if raw else None
+
+
+def _run_chat_after_setup() -> None:
+    """Launch chat right after setup, in the workspace the user just configured.
+
+    The broad-workspace consent was already given during setup (the wizard binds
+    with ``allow_broad_workspace=True``), so we don't re-prompt the guard for that
+    same folder. Falls back to the current directory when no workspace was saved.
+    """
+    workspace = _configured_default_workspace()
+    _run_default_chat_action(path=workspace, allow_broad_workspace=workspace is not None)
 
 
 def _maybe_run_startup_config_menu() -> None:
@@ -85,9 +124,56 @@ def _should_run_first_run_setup_wizard() -> bool:
     return not cfg_exists or (not cfg.model and not api_key_present)
 
 
+def _try_setup_tui(*, require_flag: bool = True, announce_fallback: bool = False) -> bool | None:
+    """Run the alt-screen setup wizard (arrow-key selection screens).
+
+    Returns ``True``/``False`` on a completed run (saved / cancelled), or
+    ``None`` when the TUI could not run so the caller falls back to the classic
+    Rich wizard. ``require_flag`` honors ``SYLLIPTOR_TUI=0`` as an explicit
+    opt-out; the explicit ``sylliptor setup`` command passes
+    ``require_flag=False`` so it still shows the interactive screens. When
+    ``announce_fallback`` is set, the reason for dropping to the classic wizard
+    is printed (dim) so a launch failure is visible rather than silent.
+    """
+    reason: str | None = None
+    try:
+        from ..tui import is_tui_enabled
+    except Exception as exc:  # noqa: BLE001 - the TUI is optional
+        reason = f"the TUI module is unavailable ({exc})"
+    else:
+        if require_flag and not is_tui_enabled():
+            reason = "SYLLIPTOR_TUI is off"
+        # ``_is_non_interactive_terminal`` is defined in this module (via the
+        # cli_common surface); call it directly — there is no ``cli_impl.cli``.
+        elif _is_non_interactive_terminal():
+            reason = "this terminal is not interactive"
+
+    if reason is None:
+        try:
+            from ..tui.setup_app import run_setup_tui
+
+            return bool(run_setup_tui())
+        except Exception as exc:  # noqa: BLE001 - any prompt_toolkit/terminal failure
+            # app.run restored the terminal on its way out, so printing is safe.
+            reason = f"the setup TUI failed to start ({exc})"
+
+    if announce_fallback and reason:
+        try:
+            _console().print(f"[dim]Using the classic setup wizard — {reason}.[/dim]")
+        except Exception:
+            pass
+    return None
+
+
 def _maybe_run_first_run_setup_wizard() -> bool:
     if not _should_run_first_run_setup_wizard():
         return True
+    tui_result = _try_setup_tui()
+    if tui_result is True:
+        return True
+    if tui_result is False:
+        _console().print("[yellow]Exiting without starting chat.[/yellow]")
+        return False
     from ..setup_wizard import run_setup_wizard
 
     if run_setup_wizard():

@@ -13,6 +13,7 @@ from sylliptor_agent_cli.llm.provider_limits import (
     ProviderRetrySettings,
     best_effort_provider_key,
     canonical_provider_key,
+    mark_provider_call_non_retryable,
     qwen_provider_aliases,
     reset_provider_limit_state_for_tests,
     resolve_provider_concurrency_cap,
@@ -86,6 +87,12 @@ def test_qwen_aliases_fold_to_single_canonical_key() -> None:
         ),
         ("https://api.mistral.ai/v1", "mistral-large-latest", "mistral"),
         ("https://api.x.ai/v1", "grok-4", "xai"),
+        # Hosted Sylliptor MiMo trial proxy forwards to OpenRouter/Xiaomi.
+        (
+            "https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1",
+            "mimo-v2.5-pro",
+            "openrouter",
+        ),
     ],
 )
 def test_known_endpoint_provider_keys(
@@ -276,6 +283,38 @@ def test_backoff_success_after_transient_provider_unavailable_error() -> None:
     assert result == "ok"
     assert attempts == 3
     assert sleeps == [1.0, 2.0]
+
+
+def test_marked_non_retryable_error_is_not_retried_despite_retryable_message() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def call() -> str:
+        nonlocal attempts
+        attempts += 1
+        # Message would otherwise be classified as provider_unavailable (retryable),
+        # but the marker must short-circuit the retry loop.
+        error = LLMError("LLM request failed: The read operation timed out")
+        mark_provider_call_non_retryable(error)
+        raise error
+
+    with pytest.raises(LLMError):
+        run_provider_limited_call(
+            call=call,
+            provider_key="openrouter",
+            provider_concurrency_caps={},
+            retry_settings=ProviderRetrySettings(
+                max_retries=5,
+                base_delay_seconds=1.0,
+                max_delay_seconds=30.0,
+            ),
+            operation="test_non_retryable",
+            sleep_fn=sleeps.append,
+            random_fn=lambda: 0.5,
+        )
+
+    assert attempts == 1
+    assert sleeps == []
 
 
 def test_openai_compat_retries_429_rate_limit_but_not_500() -> None:

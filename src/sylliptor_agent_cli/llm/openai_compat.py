@@ -199,16 +199,38 @@ def _normalize_provider_key(provider_key: str | None) -> str:
     return "".join(char if char.isalnum() else "_" for char in normalized).strip("_")
 
 
+_SYLLIPTOR_TRIAL_PROXY_PATH_MARKER = "/functions/v1/llm"
+
+
+def _is_sylliptor_trial_proxy(*, host: str, path: str) -> bool:
+    """True for the hosted Sylliptor MiMo trial proxy (a Supabase Edge Function).
+
+    Match the ``/functions/v1/llm`` proxy path so unrelated ``*.supabase.co``
+    apps are never misclassified.
+    """
+    if _SYLLIPTOR_TRIAL_PROXY_PATH_MARKER not in path:
+        return False
+    return host == "supabase.co" or host.endswith(".supabase.co")
+
+
 def _provider_key_from_base_url(base_url: str | None) -> str | None:
     raw = str(base_url or "").strip()
     if not raw:
         return None
     try:
-        host = (urlparse(raw).hostname or "").rstrip(".").casefold()
+        parsed = urlparse(raw)
+        host = (parsed.hostname or "").rstrip(".").casefold()
+        path = (parsed.path or "").casefold()
     except Exception:
         return None
     if not host:
         return None
+    if _is_sylliptor_trial_proxy(host=host, path=path):
+        # Hosted Sylliptor MiMo trial: a Supabase Edge Function that forwards to
+        # OpenRouter/Xiaomi and speaks the OpenRouter reasoning shape. Classifying
+        # it as openrouter activates reasoning capture/round-trip so a MiMo turn
+        # that answers only in the reasoning channel is not lost.
+        return _OPENROUTER_PROVIDER_KEY
     if "dashscope" in host:
         return "qwen"
     if host == "openrouter.ai" or host.endswith(".openrouter.ai"):
@@ -547,6 +569,23 @@ def _normalize_assistant_content_to_text(raw: Any) -> str:
     return ""
 
 
+def _reasoning_fallback_content(message: dict[str, Any]) -> str:
+    """Reasoning text to use as content when the assistant ``content`` is empty.
+
+    Some reasoning models (e.g. Xiaomi MiMo served through the hosted Sylliptor
+    trial proxy) put their whole answer in the reasoning channel and return an
+    empty/whitespace ``content`` for a simple turn like "hi". Left as-is that
+    empty content silently degrades the chat turn to the generic clarification
+    fallback. We surface the reasoning text instead, but only when there is no
+    real content and no tool calls, so normal completions are never altered.
+    """
+    for key in (_OPENROUTER_REASONING_KEY, _DEEPSEEK_REASONING_CONTENT_KEY):
+        reasoning = _normalize_assistant_content_to_text(message.get(key))
+        if reasoning.strip():
+            return reasoning
+    return ""
+
+
 def _parse_arguments(args_s: str) -> dict[str, Any]:
     try:
         args = json.loads(args_s)
@@ -881,8 +920,10 @@ class OpenAICompatClient:
         response_format: dict[str, Any] | None = None,
         stream: bool = False,
         on_text_delta: Callable[[str], None] | None = None,
+        on_reasoning_delta: Callable[[str], None] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        cancellation_token: Any | None = None,
     ) -> LLMResponse:
         url = f"{self.base_url}/chat/completions"
         headers = {
@@ -1004,7 +1045,9 @@ class OpenAICompatClient:
                                     response = self._parse_stream_response(
                                         resp,
                                         on_text_delta=telemetry_on_text_delta,
+                                        on_reasoning_delta=on_reasoning_delta,
                                         provider_key=transport_provider_key,
+                                        cancellation_token=cancellation_token,
                                     )
                             else:
                                 resp = client.post(url, headers=headers, json=payload)
@@ -1101,6 +1144,8 @@ class OpenAICompatClient:
         content = _normalize_assistant_content_to_text(msg.get("content"))
         tool_calls_raw = msg.get("tool_calls") or []
         tool_calls = _parse_tool_calls(tool_calls_raw)
+        if not content.strip() and not tool_calls:
+            content = _reasoning_fallback_content(msg) or content
         response_model = data.get("model") if isinstance(data.get("model"), str) else None
         return LLMResponse(
             content=content,
@@ -1126,7 +1171,9 @@ class OpenAICompatClient:
         resp: httpx.Response,
         *,
         on_text_delta: Callable[[str], None] | None,
+        on_reasoning_delta: Callable[[str], None] | None = None,
         provider_key: str | None,
+        cancellation_token: Any | None = None,
     ) -> LLMResponse:
         if resp.status_code >= 400:
             body = self._safe_error_body(resp)
@@ -1141,7 +1188,30 @@ class OpenAICompatClient:
         reasoning_parts: list[str] = []
         reasoning_details: list[Any] = []
 
-        for line in resp.iter_lines():
+        # Make the (possibly long) initial read interruptible: register the live
+        # response's close so a cancel from another thread unblocks iter_lines, and
+        # re-check the flag per line. A close mid-read surfaces as a read error that
+        # we translate into a clean interrupt below.
+        _set_abort = getattr(cancellation_token, "set_abort_callback", None)
+        _clear_abort = getattr(cancellation_token, "clear_abort_callback", None)
+        if callable(_set_abort):
+            _set_abort(resp.close)
+        _stream_iter = resp.iter_lines()
+        while True:
+            try:
+                line = next(_stream_iter)
+            except StopIteration:
+                break
+            except Exception:
+                if cancellation_token is not None and getattr(
+                    cancellation_token, "is_cancelled", False
+                ):
+                    raise KeyboardInterrupt("cancelled_by_user") from None
+                raise
+            if cancellation_token is not None and getattr(
+                cancellation_token, "is_cancelled", False
+            ):
+                raise KeyboardInterrupt("cancelled_by_user")
             if not line:
                 continue
             if isinstance(line, bytes):
@@ -1185,6 +1255,8 @@ class OpenAICompatClient:
                 reasoning_delta = delta.get(_OPENROUTER_REASONING_KEY)
             if isinstance(reasoning_delta, str) and reasoning_delta:
                 reasoning_parts.append(reasoning_delta)
+                if on_reasoning_delta is not None:
+                    on_reasoning_delta(reasoning_delta)
             details_delta = delta.get(_OPENROUTER_REASONING_DETAILS_KEY)
             if isinstance(details_delta, list) and details_delta:
                 reasoning_details.extend(details_delta)
@@ -1240,9 +1312,24 @@ class OpenAICompatClient:
                         incoming=args_piece,
                     )
 
+        if callable(_clear_abort):
+            _clear_abort()
+        if cancellation_token is not None and getattr(cancellation_token, "is_cancelled", False):
+            # Stream ended because the abort closed it (clean EOF, not an error).
+            raise KeyboardInterrupt("cancelled_by_user")
+        streamed_tool_calls = _parse_stream_tool_calls(tool_chunks)
+        streamed_content = "".join(content_parts)
+        if not streamed_content.strip() and not streamed_tool_calls:
+            # Reasoning-only completion (see _reasoning_fallback_content): the
+            # model streamed its answer in the reasoning channel and emitted no
+            # content deltas. Use the accumulated reasoning so the turn does not
+            # degrade to the static clarification fallback.
+            reasoning_text = "".join(reasoning_parts)
+            if reasoning_text.strip():
+                streamed_content = reasoning_text
         return LLMResponse(
-            content="".join(content_parts),
-            tool_calls=_parse_stream_tool_calls(tool_chunks),
+            content=streamed_content,
+            tool_calls=streamed_tool_calls,
             raw={"stream": True, "events": event_count},
             response_model=response_model,
             usage=usage,

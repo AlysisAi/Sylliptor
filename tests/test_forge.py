@@ -936,7 +936,7 @@ def test_forge_planner_turn_policy_matches_chat_forge(tmp_path: Path, monkeypatc
             },
         )
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state) -> bool:
+    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state, **_kwargs) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = chat_paths

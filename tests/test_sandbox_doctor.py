@@ -245,3 +245,137 @@ def test_pull_sandbox_images_reports_pull_timeout_without_traceback(
     assert result.results[0].image == "image:dev"
     assert result.results[0].ok is False
     assert "timed out after 3s" in result.results[0].output
+
+
+def test_detect_bubblewrap_install_plan_apt_with_sudo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox_doctor_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(sandbox_doctor_mod, "_needs_sudo", lambda: True)
+    available = {"apt-get": "/usr/bin/apt-get", "sudo": "/usr/bin/sudo"}
+    monkeypatch.setattr(sandbox_doctor_mod.shutil, "which", lambda name: available.get(name))
+
+    plan = sandbox_doctor_mod.detect_bubblewrap_install_plan()
+
+    assert plan is not None
+    assert plan.manager == "apt-get"
+    assert plan.command == ("sudo", "apt-get", "install", "-y", "bubblewrap")
+    assert plan.display == "sudo apt-get install -y bubblewrap"
+
+
+def test_detect_bubblewrap_install_plan_root_drops_sudo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox_doctor_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(sandbox_doctor_mod, "_needs_sudo", lambda: False)
+    monkeypatch.setattr(
+        sandbox_doctor_mod.shutil,
+        "which",
+        lambda name: "/sbin/apk" if name == "apk" else None,
+    )
+
+    plan = sandbox_doctor_mod.detect_bubblewrap_install_plan()
+
+    assert plan is not None
+    assert plan.command == ("apk", "add", "bubblewrap")
+
+
+def test_detect_bubblewrap_install_plan_none_when_already_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox_doctor_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        sandbox_doctor_mod.shutil,
+        "which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+
+    assert sandbox_doctor_mod.detect_bubblewrap_install_plan() is None
+
+
+def test_detect_bubblewrap_install_plan_none_on_non_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox_doctor_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(sandbox_doctor_mod.shutil, "which", lambda _name: None)
+
+    assert sandbox_doctor_mod.detect_bubblewrap_install_plan() is None
+
+
+def test_detect_bubblewrap_install_plan_none_when_sudo_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox_doctor_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(sandbox_doctor_mod, "_needs_sudo", lambda: True)
+    monkeypatch.setattr(
+        sandbox_doctor_mod.shutil,
+        "which",
+        lambda name: "/usr/bin/apt-get" if name == "apt-get" else None,
+    )
+
+    assert sandbox_doctor_mod.detect_bubblewrap_install_plan() is None
+
+
+def test_install_bubblewrap_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    plan = sandbox_doctor_mod.BubblewrapInstallPlan(
+        manager="apt-get",
+        command=("apt-get", "install", "-y", "bubblewrap"),
+        display="apt-get install -y bubblewrap",
+    )
+    ran: list[list[str]] = []
+
+    def fake_run(args, **_kwargs):  # type: ignore[no-untyped-def]
+        ran.append(list(args))
+        return _cp(args, returncode=0)
+
+    monkeypatch.setattr(sandbox_doctor_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sandbox_doctor_mod.shutil,
+        "which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+
+    result = sandbox_doctor_mod.install_bubblewrap(plan=plan)
+
+    assert result.ok is True
+    assert ran == [["apt-get", "install", "-y", "bubblewrap"]]
+
+
+def test_install_bubblewrap_reports_when_binary_still_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = sandbox_doctor_mod.BubblewrapInstallPlan(
+        manager="apt-get",
+        command=("apt-get", "install", "-y", "bubblewrap"),
+        display="apt-get install -y bubblewrap",
+    )
+    monkeypatch.setattr(
+        sandbox_doctor_mod.subprocess, "run", lambda args, **_kwargs: _cp(args, returncode=0)
+    )
+    monkeypatch.setattr(sandbox_doctor_mod.shutil, "which", lambda _name: None)
+
+    result = sandbox_doctor_mod.install_bubblewrap(plan=plan)
+
+    assert result.ok is False
+    assert "still not on PATH" in result.detail
+
+
+def test_install_bubblewrap_reports_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    plan = sandbox_doctor_mod.BubblewrapInstallPlan(
+        manager="apt-get",
+        command=("apt-get", "install", "-y", "bubblewrap"),
+        display="apt-get install -y bubblewrap",
+    )
+    monkeypatch.setattr(
+        sandbox_doctor_mod.subprocess, "run", lambda args, **_kwargs: _cp(args, returncode=100)
+    )
+
+    result = sandbox_doctor_mod.install_bubblewrap(plan=plan)
+
+    assert result.ok is False
+    assert "code 100" in result.detail
+
+
+def test_install_bubblewrap_without_plan_when_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox_doctor_mod, "detect_bubblewrap_install_plan", lambda: None)
+
+    result = sandbox_doctor_mod.install_bubblewrap()
+
+    assert result.ok is False
+    assert "No supported Linux package manager" in result.detail

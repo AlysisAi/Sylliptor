@@ -13,9 +13,12 @@ from sylliptor_agent_cli.llm.openai_compat import (
     LLMUsage,
     OpenAICompatClient,
     ToolCall,
+    _provider_key_from_base_url,
     attach_provider_metadata_to_assistant_message,
     sylliptor_trial_error_message,
 )
+
+_SYLLIPTOR_TRIAL_BASE_URL = "https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1"
 
 
 def test_openai_compat_reexports_shared_llm_types() -> None:
@@ -521,6 +524,67 @@ def test_stream_retries_with_default_temperature_when_provider_accepts_only_defa
     assert len(requests) == 2
     assert requests[0]["temperature"] == 0.0
     assert requests[1]["temperature"] == 1.0
+
+
+def test_stream_cancellation_token_interrupts_midstream() -> None:
+    # A cancel mid-stream must raise KeyboardInterrupt (so the TUI shows
+    # "Interrupted.") and stop consuming further deltas — not finish the response.
+    import pytest
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+                b'data: {"choices":[{"delta":{"content":"b"}}]}\n\n'
+                b'data: {"choices":[{"delta":{"content":"c"}}]}\n\n'
+                b"data: [DONE]\n\n"
+            ),
+        )
+
+    client = OpenAICompatClient(
+        base_url="https://api.openai.com/v1",
+        api_key="test",
+        model="m",
+        transport=httpx.MockTransport(handler),
+    )
+
+    class _Tok:
+        def __init__(self) -> None:
+            self._cancelled = False
+            self._abort = None
+
+        def set_abort_callback(self, fn):
+            self._abort = fn
+
+        def clear_abort_callback(self):
+            self._abort = None
+
+        @property
+        def is_cancelled(self) -> bool:
+            return self._cancelled
+
+        def cancel(self) -> None:
+            self._cancelled = True
+            if self._abort is not None:
+                self._abort()
+
+    tok = _Tok()
+    seen: list[str] = []
+
+    def on_text(delta: str) -> None:
+        seen.append(delta)
+        tok.cancel()  # user interrupts right after the first delta
+
+    with pytest.raises(KeyboardInterrupt):
+        client.chat(
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            on_text_delta=on_text,
+            cancellation_token=tok,
+        )
+    assert seen == ["a"]  # stopped immediately, did not consume "b"/"c"
 
 
 def test_chat_sends_tool_choice_and_response_format() -> None:
@@ -1874,3 +1938,110 @@ def test_stream_parses_cached_prompt_tokens() -> None:
     resp = client.chat(messages=[{"role": "user", "content": "hi"}], tools=[], stream=True)
     assert resp.usage is not None
     assert resp.usage.cached_prompt_tokens == 6
+
+
+def _content_handler(message: dict[str, object]):  # type: ignore[no-untyped-def]
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": message}]})
+
+    return handler
+
+
+def _trial_client(handler) -> OpenAICompatClient:  # type: ignore[no-untyped-def]
+    return OpenAICompatClient(
+        base_url=_SYLLIPTOR_TRIAL_BASE_URL,
+        api_key="test",
+        model="mimo-v2.5-pro",
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def test_non_stream_folds_reasoning_into_empty_content() -> None:
+    # MiMo reasoning models can answer entirely in the reasoning channel with an
+    # empty `content`. The fold surfaces that text so the turn does not degrade
+    # to the generic clarification fallback.
+    handler = _content_handler({"content": "", "reasoning": "Hi! How can I help?"})
+    resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}])
+    assert resp.content == "Hi! How can I help?"
+
+
+def test_non_stream_folds_reasoning_content_into_whitespace_content() -> None:
+    handler = _content_handler({"content": "   ", "reasoning_content": "Hello there."})
+    resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}])
+    assert resp.content == "Hello there."
+
+
+def test_non_stream_keeps_empty_when_no_reasoning() -> None:
+    # Genuinely empty completion with no reasoning must stay empty so the
+    # legitimate clarification fallback still triggers upstream.
+    handler = _content_handler({"content": ""})
+    resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}])
+    assert resp.content == ""
+
+
+def test_non_stream_does_not_overwrite_real_content_with_reasoning() -> None:
+    handler = _content_handler({"content": "real answer", "reasoning": "scratch work"})
+    resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}])
+    assert resp.content == "real answer"
+
+
+def test_non_stream_empty_content_with_tool_calls_is_not_folded() -> None:
+    # Tool-call turns legitimately carry empty content; the fold must not run.
+    message = {
+        "content": "",
+        "reasoning": "deciding to call a tool",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "fs_read", "arguments": json.dumps({"path": "README.md"})},
+            }
+        ],
+    }
+    resp = _trial_client(_content_handler(message)).chat(
+        messages=[{"role": "user", "content": "hi"}], tools=[]
+    )
+    assert resp.content == ""
+    assert len(resp.tool_calls) == 1
+
+
+def test_stream_folds_reasoning_into_empty_content() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        events = [
+            {"choices": [{"delta": {"reasoning": "Hi! "}}]},
+            {"choices": [{"delta": {"reasoning": "How can I help?"}}]},
+        ]
+        body_sse = "".join(f"data: {json.dumps(e)}\n" for e in events) + "data: [DONE]\n"
+        return httpx.Response(200, text=body_sse)
+
+    resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}], stream=True)
+    assert resp.content == "Hi! How can I help?"
+
+
+def test_stream_keeps_content_over_reasoning() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        events = [
+            {"choices": [{"delta": {"reasoning": "thinking"}}]},
+            {"choices": [{"delta": {"content": "real "}}]},
+            {"choices": [{"delta": {"content": "answer"}}]},
+        ]
+        body_sse = "".join(f"data: {json.dumps(e)}\n" for e in events) + "data: [DONE]\n"
+        return httpx.Response(200, text=body_sse)
+
+    resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}], stream=True)
+    assert resp.content == "real answer"
+
+
+def test_sylliptor_trial_proxy_resolves_to_openrouter_provider_key() -> None:
+    assert _provider_key_from_base_url(_SYLLIPTOR_TRIAL_BASE_URL) == "openrouter"
+    # A plain supabase host without the LLM proxy path must NOT be captured.
+    assert _provider_key_from_base_url("https://other.supabase.co/rest/v1") != "openrouter"
+
+
+def test_trial_proxy_captures_reasoning_into_provider_metadata() -> None:
+    # Because the trial proxy is classified as openrouter, a reasoning field on a
+    # normal (non-empty content) completion is preserved in provider_metadata.
+    handler = _content_handler({"content": "ok", "reasoning": "hidden reasoning"})
+    resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}])
+    assert resp.content == "ok"
+    assert resp.provider_metadata == {"openrouter": {"reasoning": "hidden reasoning"}}

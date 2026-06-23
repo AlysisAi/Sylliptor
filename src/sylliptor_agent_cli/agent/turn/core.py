@@ -601,6 +601,24 @@ def run_turn(
             return active_turn_budget
         return max(1, int(self.max_steps))
 
+    # Live reasoning channel shared by both the non-repo and repo turn paths:
+    # surfaces that opt in (the TUI) receive the model's streamed thinking via
+    # ``on_reasoning_token``; the classic RichSurface defines no such method, so
+    # this stays a no-op there and the classic CLI is untouched.
+    _reasoning_sink_exists = callable(getattr(self.surface, "on_reasoning_token", None))
+
+    def _on_reasoning_delta(delta: str) -> None:
+        # Per-token cancellation check: a long (streamed) reasoning phase must be
+        # interruptible, not just at step boundaries. Raises KeyboardInterrupt,
+        # which propagates out of the LLM stream (past ``except LLMError``).
+        _throw_if_cancelled()
+        sink = getattr(self.surface, "on_reasoning_token", None)
+        if delta and callable(sink):
+            try:
+                sink(delta)
+            except Exception:
+                pass
+
     if (
         routing_mode_override is None
         and routing_mode == _ROUTING_MODE_CODE_ONLY
@@ -759,12 +777,14 @@ def run_turn(
                 ),
             },
         )
+
         if route_decision.route != "repo":
             _phase_update_key("phase_drafting_response")
             non_repo_streamed_text_emitted = False
 
             def _on_non_repo_text_delta(delta: str) -> None:
                 nonlocal non_repo_streamed_text_emitted
+                _throw_if_cancelled()  # interruptible mid-stream (see _on_reasoning_delta)
                 if delta:
                     _emit_message_delta_event(self.surface, delta)
                     non_repo_streamed_text_emitted = True
@@ -813,6 +833,11 @@ def run_turn(
                         store=self.store,
                         stream=self.stream,
                         on_text_delta=_on_non_repo_text_delta if self.stream else None,
+                        on_reasoning_delta=(
+                            _on_reasoning_delta
+                            if (self.stream and _reasoning_sink_exists)
+                            else None
+                        ),
                     )
                     assistant_message_candidate = getattr(
                         non_repo_response,
@@ -1144,10 +1169,15 @@ def run_turn(
 
         def _on_text_delta(delta: str) -> None:
             nonlocal streamed_text_emitted
+            _throw_if_cancelled()  # interruptible mid-stream (see _on_reasoning_delta)
             if delta:
                 _emit_message_delta_event(self.surface, delta)
                 streamed_text_emitted = True
             self.surface.on_assistant_token(delta)
+
+        # Reasoning sink (``_on_reasoning_delta``) is defined once before the route
+        # split above; here we only gate it on this step's effective stream mode.
+        _reasoning_enabled = stream_used and _reasoning_sink_exists
 
         request_messages = _request_messages_for_step(self.messages)
         try:
@@ -1186,6 +1216,8 @@ def run_turn(
                 tools=turn_tool_list,
                 stream=stream_used,
                 on_text_delta=_on_text_delta if stream_used else None,
+                on_reasoning_delta=_on_reasoning_delta if _reasoning_enabled else None,
+                cancellation_token=cancellation_token,
             )
         except LLMError as e:
             if stream_used and _is_stream_unsupported_error(e):
@@ -1203,6 +1235,7 @@ def run_turn(
                         tools=turn_tool_list,
                         stream=False,
                         on_text_delta=None,
+                        cancellation_token=cancellation_token,
                     )
                 except LLMError as retry_err:
                     self.store.append("error", {"error": str(retry_err)})

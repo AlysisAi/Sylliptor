@@ -317,6 +317,134 @@ def test_marked_non_retryable_error_is_not_retried_despite_retryable_message() -
     assert sleeps == []
 
 
+def test_typed_remote_protocol_truncation_is_retryable() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def call() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.RemoteProtocolError(
+                "peer closed connection without sending complete message body"
+            )
+        return "ok"
+
+    result = run_provider_limited_call(
+        call=call,
+        provider_key="openrouter",
+        provider_concurrency_caps={},
+        retry_settings=ProviderRetrySettings(max_retries=1),
+        operation="typed_truncation",
+        sleep_fn=sleeps.append,
+        random_fn=lambda: 0.5,
+    )
+
+    assert result == "ok"
+    assert attempts == 2
+    assert sleeps == [1.0]
+
+
+def test_wrapped_transport_truncation_stays_retryable_through_cause_chain() -> None:
+    attempts = 0
+    reasons: list[str] = []
+
+    def call() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            cause = httpx.RemoteProtocolError("incomplete chunked read")
+            raise LLMError("LLM request failed: stream interrupted") from cause
+        return "ok"
+
+    result = run_provider_limited_call(
+        call=call,
+        provider_key="openrouter",
+        provider_concurrency_caps={},
+        retry_settings=ProviderRetrySettings(max_retries=1),
+        operation="wrapped_truncation",
+        sleep_fn=lambda _seconds: None,
+        random_fn=lambda: 0.5,
+        on_retry=lambda _attempt, reason, _seconds: reasons.append(reason),
+    )
+
+    assert result == "ok"
+    assert attempts == 2
+    assert reasons == ["provider_stream_truncated"]
+
+
+def test_incomplete_chunked_body_message_is_transient_but_auth_is_not() -> None:
+    attempts = 0
+
+    def call() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise LLMError(
+                "LLM request failed: peer closed connection without sending complete "
+                "message body (incomplete chunked read)"
+            )
+        return "ok"
+
+    assert (
+        run_provider_limited_call(
+            call=call,
+            provider_key="openrouter",
+            provider_concurrency_caps={},
+            retry_settings=ProviderRetrySettings(max_retries=1),
+            operation="message_truncation",
+            sleep_fn=lambda _seconds: None,
+            random_fn=lambda: 0.5,
+        )
+        == "ok"
+    )
+
+    auth_attempts = 0
+
+    def auth_call() -> str:
+        nonlocal auth_attempts
+        auth_attempts += 1
+        raise LLMError("LLM error 401: invalid api key")
+
+    with pytest.raises(LLMError, match="401"):
+        run_provider_limited_call(
+            call=auth_call,
+            provider_key="openrouter",
+            provider_concurrency_caps={},
+            retry_settings=ProviderRetrySettings(max_retries=3),
+            operation="auth",
+            sleep_fn=lambda _seconds: (_ for _ in ()).throw(
+                AssertionError("auth errors must not retry")
+            ),
+        )
+    assert auth_attempts == 1
+
+
+def test_deadline_callback_prevents_unsafe_provider_retry() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def call() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise LLMError("LLM request failed: The read operation timed out")
+
+    with pytest.raises(LLMError, match="timed out"):
+        run_provider_limited_call(
+            call=call,
+            provider_key="deepseek",
+            provider_concurrency_caps={},
+            retry_settings=ProviderRetrySettings(max_retries=3),
+            operation="deadline_blocked",
+            sleep_fn=sleeps.append,
+            random_fn=lambda: 0.5,
+            retry_deadline_allows=lambda _wait_seconds: False,
+        )
+
+    assert attempts == 1
+    assert sleeps == []
+
+
 def test_openai_compat_retries_429_rate_limit_but_not_500() -> None:
     attempts = 0
     sleeps: list[float] = []

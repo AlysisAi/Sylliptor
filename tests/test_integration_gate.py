@@ -56,7 +56,7 @@ def test_resolve_integration_verify_commands_prefers_dedicated_then_verify_fallb
         verify_cmd=None,
     )
     assert fallback.commands == ("pytest -q",)
-    assert fallback.source == "config.verify_commands_fallback"
+    assert fallback.source == "config.verify_commands_generic_preset_fallback"
 
 
 def test_resolve_integration_verify_commands_uses_noop_when_only_generic_default_is_available(

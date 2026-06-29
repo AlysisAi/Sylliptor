@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import io
+import threading
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from rich.console import Console
@@ -408,6 +410,75 @@ def test_run_turn_tool_success_emits_lifecycle_events_and_legacy(tmp_path: Path)
     assert len(surface.legacy_tool_starts) == 1
     assert len(surface.legacy_tool_outputs) == 1
     assert len(surface.legacy_tool_ends) == 1
+
+
+def test_run_turn_dispatches_same_batch_subagent_runs_in_parallel(tmp_path: Path) -> None:
+    start_times: dict[str, float] = {}
+    end_times: dict[str, float] = {}
+    lock = threading.Lock()
+    both_started = threading.Event()
+
+    def _run_subagent(args: dict[str, Any]) -> dict[str, Any]:
+        task = str(args["task"])
+        with lock:
+            start_times[task] = perf_counter()
+            if len(start_times) == 2:
+                both_started.set()
+        both_started.wait(timeout=1.0)
+        with lock:
+            end_times[task] = perf_counter()
+        return {
+            "subagent": "explorer",
+            "subagent_session_id": f"sub-{task}",
+            "result": f"catalog for {task}",
+        }
+
+    tool = ToolDef(
+        name="subagent_run",
+        description="fake subagent",
+        parameters={"type": "object", "properties": {}, "required": []},
+        run=_run_subagent,
+    )
+    surface = _RecordingEventSurface()
+    client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call_a",
+                        name="subagent_run",
+                        arguments={"name": "explorer", "task": "alpha"},
+                    ),
+                    ToolCall(
+                        id="call_b",
+                        name="subagent_run",
+                        arguments={"name": "explorer", "task": "beta"},
+                    ),
+                ],
+                raw={},
+            ),
+            LLMResponse(content="done", tool_calls=[], raw={}),
+        ]
+    )
+    session = _make_session(root=tmp_path, client=client, surface=surface, tool=tool)
+
+    try:
+        exit_code = session.run_turn("catalog two areas")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert set(start_times) == {"alpha", "beta"}
+    assert set(end_times) == {"alpha", "beta"}
+    assert max(start_times.values()) < min(end_times.values())
+
+    tool_messages = [
+        message for message in client.call_messages[1] if message.get("role") == "tool"
+    ]
+    assert [message["tool_call_id"] for message in tool_messages] == ["call_a", "call_b"]
+    assert "catalog for alpha" in tool_messages[0]["content"]
+    assert "catalog for beta" in tool_messages[1]["content"]
 
 
 def test_run_turn_tool_failure_emits_failed_completion_event(tmp_path: Path) -> None:

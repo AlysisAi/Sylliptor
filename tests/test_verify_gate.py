@@ -11,6 +11,12 @@ import sylliptor_agent_cli.sandbox_runner as sandbox_runner_mod
 import sylliptor_agent_cli.verify_gate as verify_gate_mod
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.failure_category import FailureCategory
+from sylliptor_agent_cli.repo_scan import scan_workspace
+from sylliptor_agent_cli.verification_contract import (
+    VerificationCommandExecutionMode,
+    VerificationCommandValidationStatus,
+    build_verification_command_specs,
+)
 from sylliptor_agent_cli.verify_gate import (
     ResolvedVerifyCommands,
     VerifyCommandResult,
@@ -31,6 +37,7 @@ from sylliptor_agent_cli.verify_gate import (
     verification_selection_payload,
     verify_run_result_to_payload,
 )
+from sylliptor_agent_cli.workspace_context import resolve_workspace_context
 
 
 def _cp(
@@ -59,6 +66,30 @@ def _verify_cfg(*, mode: str | None = None) -> AppConfig:
     if mode is not None:
         cfg.extra_fields["verify_sandbox"] = {"mode": mode}
     return cfg
+
+
+def test_typed_verification_contract_marks_explicit_pipeline_trusted() -> None:
+    specs = build_verification_command_specs(
+        ("tool args | tail -n 1",),
+        source="task_refinement.explicit_user_command",
+        contract_type="task_acceptance",
+    )
+
+    assert specs[0].execution_mode == VerificationCommandExecutionMode.TRUSTED_SHELL_EXPRESSION
+    assert specs[0].validation_status == VerificationCommandValidationStatus.VALID
+    assert specs[0].provenance == "EXPLICIT_USER_COMMAND"
+
+
+def test_typed_verification_contract_rejects_inferred_pipeline() -> None:
+    specs = build_verification_command_specs(
+        ("tool args | tail -n 1",),
+        source="task_refinement.no_authoritative_commands",
+        contract_type="task_inferred",
+    )
+
+    assert specs[0].execution_mode == VerificationCommandExecutionMode.INVALID
+    assert specs[0].validation_status == VerificationCommandValidationStatus.INVALID
+    assert specs[0].rejection_reason == "untrusted_shell_expression"
 
 
 def test_verify_gate_explicit_off_runs_commands_and_writes_artifact(
@@ -1462,6 +1493,29 @@ def test_task_aware_verify_resolution_returns_no_authoritative_for_docs_only_tas
     assert resolved.reason == "docs-only task does not expose a confident verification command"
 
 
+def test_task_aware_verify_resolution_suppresses_generic_pytest_for_static_artifact(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "index.html").write_text("<h1>Demo</h1>\n", encoding="utf-8")
+    cfg = AppConfig(model="test-model", verify_commands=["pytest -q"])
+
+    resolved = resolve_task_aware_verify_command_selection(
+        cfg=cfg,
+        verify_cmd=None,
+        root=repo,
+        task={
+            "estimated_files": ["output.txt"],
+            "write_scope": ["output.txt"],
+            "acceptance_criteria": ["Create the requested static output artifact."],
+        },
+    )
+
+    assert resolved.commands == ()
+    assert resolved.contract_type == "unavailable"
+
+
 def test_task_aware_verify_resolution_uses_doctest_for_docs_task_that_requests_it(
     tmp_path: Path,
 ) -> None:
@@ -1942,6 +1996,15 @@ def test_task_aware_verify_resolution_returns_no_authoritative_for_python_repo_w
         ),
         (
             {
+                "index.html": "<!doctype html><title>Demo</title>\n",
+                "styles.css": "body { font-family: sans-serif; }\n",
+                "assets/logo.svg": "<svg></svg>\n",
+            },
+            "Fix the bug.",
+            "repo scan found a static web workspace with no authoritative verification surface",
+        ),
+        (
+            {
                 "package.json": '{"name":"demo-web","scripts":{"build":"vite build"}}\n',
                 "src/index.ts": "export const value = 1;\n",
             },
@@ -2015,6 +2078,15 @@ def test_task_aware_verify_resolution_suppresses_generic_fallback_for_pathless_p
         task={"acceptance_criteria": [instruction]},
     )
 
+    if "package.json" in files:
+        assert resolved == ResolvedVerifyCommands(
+            commands=("npm run build",),
+            source="repo_scan.likely_test_commands",
+        )
+        assert resolved.contract_type == "repo_native"
+        assert "pytest" not in " ".join(resolved.commands)
+        return
+
     assert resolved == ResolvedVerifyCommands(
         commands=(),
         source="repo_scan.no_authoritative_commands",
@@ -2087,6 +2159,15 @@ def test_task_aware_verify_resolution_keeps_repo_grounded_invalidation_for_neutr
             "acceptance_criteria": [instruction],
         },
     )
+
+    if "package.json" in files:
+        assert resolved == ResolvedVerifyCommands(
+            commands=("npm run build",),
+            source="repo_scan.likely_test_commands",
+        )
+        assert resolved.contract_type == "repo_native"
+        assert "pytest" not in " ".join(resolved.commands)
+        return
 
     assert resolved == ResolvedVerifyCommands(
         commands=(),
@@ -2279,6 +2360,15 @@ def test_task_aware_verify_resolution_keeps_task_specific_no_authoritative_behav
         },
     )
 
+    if task_paths == ["src/index.ts"]:
+        assert resolved == ResolvedVerifyCommands(
+            commands=("npm run build",),
+            source="repo_scan.likely_test_commands",
+        )
+        assert resolved.contract_type == "repo_native"
+        assert "pytest" not in " ".join(resolved.commands)
+        return
+
     assert resolved == ResolvedVerifyCommands(
         commands=(),
         source="task_refinement.no_authoritative_commands",
@@ -2323,13 +2413,43 @@ def test_task_aware_verify_resolution_keeps_js_bootstrap_paths_non_authoritative
     )
 
     assert resolved == ResolvedVerifyCommands(
+        commands=("npm run build",),
+        source="repo_scan.likely_test_commands",
+    )
+    assert resolved.contract_type == "repo_native"
+    assert "pytest" not in " ".join(resolved.commands)
+
+
+def test_task_aware_verify_resolution_suppresses_generic_pytest_for_static_html_task(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_repo_files(
+        repo,
+        {
+            "index.html": "<!doctype html><title>Demo</title>\n",
+            "styles.css": "body { font-family: sans-serif; }\n",
+        },
+    )
+    cfg = AppConfig(model="test-model", verify_commands=["pytest -q"])
+
+    resolved = resolve_task_aware_verify_command_selection(
+        cfg=cfg,
+        verify_cmd=None,
+        root=repo,
+        task={
+            "estimated_files": ["index.html", "styles.css"],
+            "write_scope": ["index.html", "styles.css"],
+            "acceptance_criteria": ["Build a static HTML timer page."],
+        },
+    )
+
+    assert resolved == ResolvedVerifyCommands(
         commands=(),
         source="task_refinement.no_authoritative_commands",
     )
-    assert (
-        resolved.reason
-        == "frontend/JS task should not inherit a generic Python verification fallback"
-    )
+    assert resolved.reason == "static web task does not expose a confident verification command"
     assert resolved.contract_type == "unavailable"
 
 
@@ -2381,6 +2501,65 @@ def test_task_aware_verify_resolution_keeps_repo_native_commands_for_pathless_pr
     assert resolved.reason == "repo scan discovered authoritative repo-native verification commands"
 
 
+def test_task_aware_verify_resolution_uses_node_build_and_lint_scripts(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_repo_files(
+        repo,
+        {
+            "package.json": (
+                '{"name":"demo-web","scripts":{"build":"next build","lint":"next lint"}}\n'
+            ),
+            "src/index.ts": "export const value = 1;\n",
+        },
+    )
+    cfg = AppConfig(model="test-model", verify_commands=["pytest -q"])
+
+    resolved = resolve_task_aware_verify_command_selection(
+        cfg=cfg,
+        verify_cmd=None,
+        root=repo,
+        task={"acceptance_criteria": ["Fix the bug."]},
+    )
+
+    assert resolved == ResolvedVerifyCommands(
+        commands=("npm run build", "npm run lint"),
+        source="repo_scan.likely_test_commands",
+    )
+    assert resolved.contract_type == "repo_native"
+    assert "pytest" not in " ".join(resolved.commands)
+
+
+def test_task_aware_verify_resolution_returns_unavailable_for_node_repo_without_scripts(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_repo_files(
+        repo,
+        {
+            "package.json": '{"name":"demo-web","scripts":{"test":"echo no test specified"}}\n',
+            "src/index.ts": "export const value = 1;\n",
+        },
+    )
+    cfg = AppConfig(model="test-model", verify_commands=["pytest -q"])
+
+    resolved = resolve_task_aware_verify_command_selection(
+        cfg=cfg,
+        verify_cmd=None,
+        root=repo,
+        task={"acceptance_criteria": ["Fix the bug."]},
+    )
+
+    assert resolved == ResolvedVerifyCommands(
+        commands=(),
+        source="repo_scan.no_authoritative_commands",
+    )
+    assert resolved.contract_type == "unavailable"
+
+
 def test_verify_command_refinement_does_not_override_explicit_cli_or_config_commands() -> None:
     task = {
         "estimated_files": ["test/app.test.js", "src/app.js"],
@@ -2411,6 +2590,108 @@ def test_verify_command_refinement_does_not_override_explicit_cli_or_config_comm
         commands=("pnpm --dir packages/web test",),
         source="cli.verify_cmd",
     )
+
+
+def test_task_aware_plain_non_python_directory_gets_no_generic_pytest(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "output.txt").write_text("existing\n", encoding="utf-8")
+
+    resolved = resolve_task_aware_verify_command_selection(
+        cfg=AppConfig(model="test-model"),
+        verify_cmd=None,
+        root=repo,
+        task={"acceptance_criteria": ["Create result.txt."]},
+    )
+
+    assert resolved == ResolvedVerifyCommands(
+        commands=(),
+        source="repo_scan.no_authoritative_commands",
+    )
+    assert resolved.contract_type == "unavailable"
+    assert "generic pytest fallback" in resolved.reason
+
+
+def test_task_aware_existing_python_pytest_surface_keeps_pytest(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_repo_files(
+        repo,
+        {
+            "src/demo.py": "def value() -> int:\n    return 1\n",
+            "tests/test_demo.py": "def test_value() -> None:\n    assert True\n",
+        },
+    )
+
+    resolved = resolve_task_aware_verify_command_selection(
+        cfg=AppConfig(model="test-model"),
+        verify_cmd=None,
+        root=repo,
+        task={"acceptance_criteria": ["Fix the Python behavior."]},
+    )
+
+    assert resolved == ResolvedVerifyCommands(
+        commands=("pytest -q",),
+        source="repo_scan.likely_test_commands",
+    )
+
+
+def test_agent_created_test_file_does_not_retroactively_establish_contract(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "src" / "demo.py").write_text("def value() -> int:\n    return 1\n", encoding="utf-8")
+    pre_turn_scan = scan_workspace(context=resolve_workspace_context(repo))
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_generated.py").write_text(
+        "def test_generated() -> None:\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    resolved = resolve_task_aware_verify_command_selection(
+        cfg=AppConfig(model="test-model"),
+        verify_cmd=None,
+        root=repo,
+        repo_scan=pre_turn_scan,
+        task={"acceptance_criteria": ["Fix the Python behavior."]},
+    )
+
+    assert resolved == ResolvedVerifyCommands(
+        commands=(),
+        source="repo_scan.no_authoritative_commands",
+    )
+    assert resolved.contract_type == "unavailable"
+
+
+def test_non_python_repo_with_make_check_selects_project_native_command(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_repo_files(
+        repo,
+        {
+            "Makefile": "check:\n\tcc -Wall main.c -o main && ./main\n",
+            "main.c": "int main(void) { return 0; }\n",
+        },
+    )
+
+    resolved = resolve_task_aware_verify_command_selection(
+        cfg=AppConfig(model="test-model"),
+        verify_cmd=None,
+        root=repo,
+        task={"acceptance_criteria": ["Fix the C checker."]},
+    )
+
+    assert resolved == ResolvedVerifyCommands(
+        commands=("make check",),
+        source="repo_scan.likely_test_commands",
+    )
+    assert resolved.contract_type == "repo_native"
 
 
 def test_verify_command_refinement_prefers_node_test_targets_over_pytest_text_mentions() -> None:

@@ -367,6 +367,70 @@ def _workspace_candidate_roots(workspace_context: dict[str, Any] | None) -> tupl
     return tuple(out)
 
 
+def _workspace_known_scope_paths(workspace_context: dict[str, Any] | None) -> tuple[str, ...]:
+    if not isinstance(workspace_context, dict):
+        return ()
+    raw_paths: list[str] = []
+    raw_paths.extend(str(item or "") for item in workspace_context.get("observed_paths") or [])
+    raw_paths.extend(str(item or "") for item in workspace_context.get("readme_paths") or [])
+    conventions_path = str(workspace_context.get("conventions_path") or "").strip()
+    if conventions_path:
+        raw_paths.append(conventions_path)
+    for entry in workspace_context.get("manifests") or []:
+        if isinstance(entry, dict):
+            raw_paths.append(str(entry.get("path") or ""))
+    for entry in workspace_context.get("top_level_entries") or []:
+        if isinstance(entry, dict):
+            raw_paths.append(str(entry.get("path") or ""))
+
+    known: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_paths:
+        normalized = _normalize_constraint_path(raw)
+        if not normalized:
+            continue
+        parts = [part for part in normalized.split("/") if part]
+        candidates = [normalized]
+        if len(parts) > 1:
+            candidates.extend("/".join(parts[:index]) for index in range(1, len(parts)))
+        for candidate in candidates:
+            key = candidate.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            known.append(candidate)
+    return tuple(known)
+
+
+def _path_is_grounded_in_workspace_context(
+    path: str,
+    *,
+    workspace_context: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(workspace_context, dict):
+        return True
+    normalized = _normalize_constraint_path(path)
+    if not normalized:
+        return False
+    path_key = _constraint_root(normalized).casefold()
+    if not path_key:
+        return False
+    for candidate in (
+        *_workspace_candidate_roots(workspace_context),
+        *_workspace_known_scope_paths(workspace_context),
+    ):
+        candidate_key = _constraint_root(candidate).casefold()
+        if not candidate_key:
+            continue
+        if (
+            path_key == candidate_key
+            or candidate_key.startswith(path_key + "/")
+            or ("/" in candidate_key and path_key.startswith(candidate_key + "/"))
+        ):
+            return True
+    return False
+
+
 def _candidate_roots_by_leaf(workspace_context: dict[str, Any] | None) -> dict[str, str]:
     grouped: dict[str, list[str]] = {}
     for root in _workspace_candidate_roots(workspace_context):
@@ -483,6 +547,11 @@ def extract_planning_scope_constraints(
         if reason is None:
             continue
         kind, reason_code = reason
+        if kind == "target_root" and not _path_is_grounded_in_workspace_context(
+            path,
+            workspace_context=workspace_context,
+        ):
+            continue
         _append_constraint(
             raw_constraints,
             path=path,

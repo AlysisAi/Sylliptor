@@ -5342,7 +5342,7 @@ def test_swarm_verify_strict_failure_marks_verify_failed_and_skips_merge(tmp_pat
     assert statuses[task["id"]] == "verify_failed"
 
 
-def test_swarm_rejects_successful_worker_when_verification_did_not_execute_tests(
+def test_swarm_warn_mode_merges_successful_worker_when_verification_did_not_execute_tests(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "repo"
@@ -5414,13 +5414,16 @@ def test_swarm_rejects_successful_worker_when_verification_did_not_execute_tests
         current_branch_fn=lambda _root: "main",
     )
 
-    assert code == 1
-    assert merges == []
+    assert code == 0
+    assert merges == ["feat/t01-a"]
     final_plan = _load_json(paths.plan_json_path)
     statuses = {entry["id"]: entry["status"] for entry in final_plan["tasks"]}
-    assert statuses[task["id"]] == "verify_failed"
+    assert statuses[task["id"]] == "done"
     summary = (paths.execution_dir / "swarm_summary.md").read_text(encoding="utf-8")
     assert "verification did not execute tests: pytest_no_tests_collected" in summary
+    assert "- Run Status: `completed_with_verification_warnings`" in summary
+    assert "- Clean: `no`" in summary
+    assert "- Verification Status: `failed_tolerated_by_warn_policy`" in summary
 
 
 def test_swarm_blocks_merge_that_would_overwrite_untracked_workspace_file(

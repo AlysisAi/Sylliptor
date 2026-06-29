@@ -80,6 +80,53 @@ def _is_blank(row: Row) -> bool:
     return not "".join(text for _style, text in row).strip()
 
 
+def _rstrip_row(row: Row) -> Row:
+    trimmed = list(row)
+    while trimmed:
+        style, text = trimmed[-1]
+        stripped = str(text).rstrip(" ")
+        if stripped:
+            if stripped != text:
+                trimmed[-1] = (style, stripped)
+            break
+        trimmed.pop()
+    return trimmed
+
+
+def _fit_row_width(row: Row, width: int) -> list[Row]:
+    width = max(1, int(width))
+    trimmed = _rstrip_row(row)
+    if not trimmed:
+        return [[]]
+    fitted: list[Row] = []
+    current: Row = []
+    used = 0
+    for style, text in trimmed:
+        remaining = str(text)
+        if not remaining:
+            continue
+        while remaining:
+            available = width - used
+            if available <= 0:
+                fitted.append(current)
+                current = []
+                used = 0
+                available = width
+            chunk = remaining[:available]
+            current.append((style, chunk))
+            used += len(chunk)
+            remaining = remaining[available:]
+    fitted.append(current)
+    return fitted
+
+
+def _fit_rows_width(rows: list[Row], width: int) -> list[Row]:
+    fitted: list[Row] = []
+    for row in rows:
+        fitted.extend(_fit_row_width(row, width))
+    return fitted
+
+
 def render_markdown_rows(text: str, width: int) -> list[Row] | None:
     """Markdown-render ``text`` into rows of fragments, or ``None`` to render plain.
 
@@ -102,7 +149,7 @@ def render_markdown_rows(text: str, width: int) -> list[Row] | None:
     # the caller can drop its accent marker on the first non-blank row).
     while rows and _is_blank(rows[-1]):
         rows.pop()
-    return rows or None
+    return _fit_rows_width(rows, int(width)) or None
 
 
 __all__ = ["render_markdown_rows", "looks_like_markdown", "Row"]

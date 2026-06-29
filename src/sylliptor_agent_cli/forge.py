@@ -20,6 +20,7 @@ from .repo_scan import (
     render_repo_scan_summary_lines,
     scan_workspace,
 )
+from .runtime_artifacts import is_runtime_artifact_path
 from .serialized_paths import safe_serialized_path
 from .task_dependencies import infer_ordered_predecessor_dependency
 from .task_readiness import (
@@ -110,6 +111,7 @@ class RunPaths:
     workspace_kind: str = "plain_dir"
     git_root: Path | None = None
     has_head_commit: bool = False
+    greenfield: bool = False
     current_branch: str | None = None
     binding_requested_path: Path | None = None
     binding_source: str = "explicit_path"
@@ -171,6 +173,7 @@ def make_run_paths(
     workspace_kind: str = "plain_dir",
     git_root: Path | None = None,
     has_head_commit: bool = False,
+    greenfield: bool | None = None,
     current_branch: str | None = None,
     binding_requested_path: Path | None = None,
     binding_source: str = "explicit_path",
@@ -198,6 +201,16 @@ def make_run_paths(
     execution_dir = run_dir / "execution"
     plan_context_dir = plan_dir / "context"
     asset_store_dir = run_dir / "assets"
+    resolved_greenfield = (
+        bool(greenfield)
+        if greenfield is not None
+        else derive_greenfield_workspace(
+            root=root,
+            workspace_kind=workspace_kind or "plain_dir",
+            has_head_commit=has_head_commit,
+            workspace_created_at_startup=workspace_created_at_startup,
+        )
+    )
     return RunPaths(
         root=root,
         run_id=run_id,
@@ -251,6 +264,7 @@ def make_run_paths(
         workspace_kind=workspace_kind or "plain_dir",
         git_root=resolved_git_root,
         has_head_commit=has_head_commit,
+        greenfield=resolved_greenfield,
         current_branch=current_branch.strip() if current_branch else None,
         binding_requested_path=resolved_requested_path,
         binding_source=binding_source.strip() or "explicit_path",
@@ -261,6 +275,48 @@ def make_run_paths(
         ),
         binding_broad_workspace_override_used=binding_broad_workspace_override_used,
     )
+
+
+def derive_greenfield_workspace(
+    *,
+    root: Path,
+    workspace_kind: str,
+    has_head_commit: bool,
+    workspace_created_at_startup: bool = False,
+) -> bool:
+    """Classify workspaces where declared plan paths are usually create targets."""
+    normalized_kind = str(workspace_kind or "").strip()
+    if normalized_kind == "plain_dir":
+        return True
+    if not has_head_commit:
+        return True
+    if workspace_created_at_startup:
+        return True
+    return _workspace_tree_is_empty_or_near_empty(root)
+
+
+def _workspace_tree_is_empty_or_near_empty(root: Path) -> bool:
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        return False
+    visited_dirs = 0
+    for current_dir, dirnames, filenames in os.walk(root_resolved):
+        visited_dirs += 1
+        if visited_dirs > 128:
+            return False
+        current_path = Path(current_dir)
+        kept_dirs: list[str] = []
+        for dirname in dirnames:
+            rel_path = (current_path / dirname).relative_to(root_resolved).as_posix()
+            if not is_runtime_artifact_path(rel_path, root=root_resolved):
+                kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
+        for filename in filenames:
+            rel_path = (current_path / filename).relative_to(root_resolved).as_posix()
+            if not is_runtime_artifact_path(rel_path, root=root_resolved):
+                return False
+    return True
 
 
 def _repo_rel(root: Path, path: Path) -> str:
@@ -1218,6 +1274,7 @@ def write_current_run_pointer(paths: RunPaths) -> None:
         "focus_relpath": paths.focus_relpath or ".",
         "workspace_kind": paths.workspace_kind or "plain_dir",
         "has_head_commit": paths.has_head_commit,
+        "greenfield": paths.greenfield,
         "binding_requested_path": os.fspath(
             paths.binding_requested_path or paths.focus_path or paths.root
         ),

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import sylliptor_agent_cli.background_runner as background_runner_mod
+import sylliptor_agent_cli.durable_service_manager as durable_service_manager_mod
 import sylliptor_agent_cli.sandbox_runner as sandbox_runner_mod
 from sylliptor_agent_cli.background_runner import (
     BwrapBackgroundRunner,
@@ -16,6 +17,8 @@ from sylliptor_agent_cli.background_runner import (
     build_background_shell_runner,
 )
 from sylliptor_agent_cli.config import AppConfig, ConfigError
+from sylliptor_agent_cli.durable_service_manager import DurableServiceManager
+from sylliptor_agent_cli.sandbox_settings import ShellSandboxSettings
 
 TEST_DOCKER_IMAGE = "test/sylliptor-sandbox:dev"
 
@@ -203,6 +206,33 @@ def test_bwrap_background_runner_uses_process_group_termination(
     spawn = BwrapBackgroundRunner().start(root=tmp_path, cwd=tmp_path, cmd="echo hi")
 
     assert spawn.termination_mode == "process_group"
+
+
+def test_durable_service_bwrap_launch_removes_die_with_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(durable_service_manager_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        durable_service_manager_mod.shutil,
+        "which",
+        lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+    monkeypatch.setattr(
+        durable_service_manager_mod,
+        "_build_bwrap_argv",
+        lambda **_kwargs: (["bwrap", "--die-with-parent", "sentinel"], {"BASE": "1"}),
+    )
+    manager = DurableServiceManager(
+        root=tmp_path,
+        state_dir=tmp_path / "services",
+        settings=ShellSandboxSettings(mode="strict", backend="bwrap"),
+    )
+
+    launch = manager._build_launch(cmd="echo hi", cwd=tmp_path, service_id="svc_test")
+
+    assert launch["popen_args"] == ["bwrap", "sentinel"]
+    assert launch["env"] == {"BASE": "1"}
 
 
 def test_bwrap_background_runner_resolves_cgroup_support_outside_argv_helper(

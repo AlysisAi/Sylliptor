@@ -269,6 +269,8 @@ class ProviderCallTelemetryRecorder:
                 "final_latency_ms": final_latency_ms,
                 "stream_error_type": None,
                 "unknown_event_count": 0,
+                "stream_restart_count": 0,
+                "stream_restart_reason": "",
             }
         return {
             "enabled": True,
@@ -281,6 +283,8 @@ class ProviderCallTelemetryRecorder:
             "final_latency_ms": final_latency_ms,
             "stream_error_type": error_type,
             "unknown_event_count": _stream_unknown_event_count(raw),
+            "stream_restart_count": _stream_restart_count(raw),
+            "stream_restart_reason": _stream_restart_reason(raw),
         }
 
 
@@ -462,6 +466,21 @@ def _stream_unknown_event_count(raw: Mapping[str, Any] | None) -> int:
         if isinstance(unknown_chunks, list):
             return len(unknown_chunks)
     return 0
+
+
+def _stream_restart_count(raw: Mapping[str, Any] | None) -> int:
+    if not isinstance(raw, Mapping):
+        return 0
+    try:
+        return max(0, int(raw.get("stream_restart_count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _stream_restart_reason(raw: Mapping[str, Any] | None) -> str:
+    if not isinstance(raw, Mapping):
+        return ""
+    return _safe_label(raw.get("stream_restart_reason"))
 
 
 def _provider_metadata_web_search_counts(response: LLMResponse) -> dict[str, int]:

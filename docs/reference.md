@@ -146,6 +146,7 @@ Common keys:
 - `subagents_enabled`
 - `custom_tools_enabled`
 - `web_search_mode`
+- `web_search_adapter`
 - `web_search_base_url`
 - `web_search_model`
 - `web_search_timeout_s`
@@ -205,7 +206,7 @@ Common tool families:
 - filesystem reads, writes, edits, moves, copies, and deletes
 - repository text search and symbol lookup
 - git history inspection
-- shell command execution
+- shell command execution, background terminals, and durable service helpers
 - verification command execution
 - web fetch and optional web search
 - session history and local artifacts
@@ -221,7 +222,8 @@ for the current built-in tool catalog and configuration-dependent availability.
 ## Web Access
 
 `web_fetch` retrieves one specific HTTP(S) URL. It is for targeted page or
-document retrieval.
+document retrieval. Use it for URLs explicitly provided by the user, returned
+by search, or discovered from trusted fetched or local content.
 
 `web_search` is a discovery tool. It appears only when search is enabled and a
 supported backend is ready. In this public build, web search is available

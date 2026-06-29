@@ -121,6 +121,20 @@ def test_explicit_scope_rejects_bare_broad_directory_without_trailing_slash() ->
     assert normalize_scope_patterns({"estimated_files": ["src/"], "write_scope": []}) == ["src/**"]
 
 
+def test_explicit_scope_broadens_existing_bare_directory_when_root_is_known(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "src").mkdir()
+
+    assert (
+        normalize_repo_path_entry("src", allow_extensionless_file=True, root=tmp_path) == "src/**"
+    )
+    assert normalize_scope_patterns(
+        {"estimated_files": ["src"], "write_scope": []},
+        root=tmp_path,
+    ) == ["src/**"]
+
+
 def test_normalize_scope_patterns_adds_python_support_files_for_explicit_modules() -> None:
     task = {
         "estimated_files": ["tests/test_team_labels.py", "src/pkg/module.py"],

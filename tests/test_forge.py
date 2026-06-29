@@ -16,6 +16,7 @@ from sylliptor_agent_cli import forge as forge_mod
 from sylliptor_agent_cli import workspace_binding as workspace_binding_mod
 from sylliptor_agent_cli.cli import app as sylliptor_app
 from sylliptor_agent_cli.cli_impl import forge as forge_cli
+from sylliptor_agent_cli.cli_impl.commands.forge_helpers import _workspace_context_payload_for_paths
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.forge import (
     ForgeError,
@@ -37,6 +38,36 @@ from sylliptor_agent_cli.plan_assistant import PlannerTurnResult
 _MCP_FIXTURE_SERVER = (
     Path(__file__).resolve().parent / "fixtures" / "mcp_servers" / "minimal_stdio_server.py"
 )
+
+
+def test_make_run_paths_marks_greenfield_from_workspace_metadata(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    plain_paths = make_run_paths(root=plain, run_id="run_plain")
+    assert plain_paths.greenfield is True
+
+    mature = tmp_path / "mature"
+    mature.mkdir()
+    (mature / "README.md").write_text("existing project\n", encoding="utf-8")
+    mature_paths = make_run_paths(
+        root=mature,
+        run_id="run_mature",
+        workspace_kind="git_repo",
+        has_head_commit=True,
+    )
+    assert mature_paths.greenfield is False
+
+
+def test_workspace_context_payload_threads_greenfield_signal(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    paths = make_run_paths(root=repo, run_id="run_greenfield")
+
+    payload = _workspace_context_payload_for_paths(paths=paths)
+
+    assert payload is not None
+    assert payload["greenfield"] is True
+    assert payload["workspace_kind"] == "plain_dir"
 
 
 def _env(tmp_path: Path) -> dict[str, str]:

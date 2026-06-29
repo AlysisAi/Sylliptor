@@ -1420,6 +1420,14 @@ def run_task_worker(
                 failure_category_value(verify_failure_category)
                 == FailureCategory.INFRA_UNAVAILABLE.value
             )
+            worker_had_material_change = (
+                material_changes_detected
+                or commit_hash is not None
+                or bool(head_before_run and head_after_run and head_after_run != head_before_run)
+            )
+            tolerate_warn_infra = (
+                verify_mode == "warn" and verify_infra_unavailable and worker_had_material_change
+            )
             baseline_comparison: dict[str, Any] | None = None
             if (
                 allow_baseline_improved_failure
@@ -1477,7 +1485,7 @@ def run_task_worker(
                     )
                 else:
                     _append_run_error(f"strict verification failed: {verify_result.summary}")
-            elif fail_on_failed_verify:
+            elif fail_on_failed_verify and not tolerate_warn_infra:
                 if mark_verify_failed:
                     verify_failed = True
                 failure_reason = failure_reason or (
@@ -1493,7 +1501,12 @@ def run_task_worker(
                 else:
                     _append_run_error(f"{failed_verify_error_prefix}: {verify_result.summary}")
             else:
-                warnings.append(f"Verification warning: {verify_result.summary}")
+                warning_prefix = (
+                    "Verification infrastructure warning"
+                    if verify_infra_unavailable
+                    else "Verification warning"
+                )
+                warnings.append(f"{warning_prefix}: {verify_result.summary}")
 
         return verification_ok and verify_result.all_passed
 

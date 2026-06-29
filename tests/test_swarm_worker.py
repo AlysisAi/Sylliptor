@@ -30,7 +30,11 @@ from sylliptor_agent_cli.swarm_trace import (
     SwarmWorkerTraceSurface,
     format_swarm_trace_message,
 )
-from sylliptor_agent_cli.swarm_worker import _baseline_improved_failure_comparison, run_task_worker
+from sylliptor_agent_cli.swarm_worker import (
+    _baseline_improved_failure_comparison,
+    resolve_worker_verify_contract,
+    run_task_worker,
+)
 from sylliptor_agent_cli.verify_gate import (
     ResolvedVerifyCommands,
     VerifyCommandResult,
@@ -131,6 +135,33 @@ def _build_verify_run_result(
         artifact_path=artifact_path,
         failure_category=failure_category,
     )
+
+
+def test_worker_verify_contract_keeps_explicit_cli_java_verify_command(
+    tmp_path: Path,
+) -> None:
+    task = {
+        "title": "Fix Java ConfigLoader",
+        "description": "Patch ConfigLoader and do not substitute pytest.",
+        "acceptance_criteria": ["The explicit javac/java verification command passes."],
+        "estimated_files": ["src/main/java/example/ConfigLoader.java"],
+        "write_scope": ["src/main/java/example/ConfigLoader.java"],
+    }
+
+    command = "javac src/main/java/example/ConfigLoader.java && java example.ConfigLoader"
+    contract = resolve_worker_verify_contract(
+        cfg=AppConfig(model="test-model", verify_commands=["pytest -q"]),
+        verify_mode="warn",
+        verify_commands=[command],
+        verify_command_selection=None,
+        task=task,
+        root=tmp_path,
+    )
+
+    assert contract.commands == (command,)
+    assert contract.selection is not None
+    assert contract.selection.source == "cli.verify_cmd"
+    assert contract.cfg.verify_commands == [command]
 
 
 def _prepare_zero_diff_worker_case(tmp_path: Path) -> tuple[Path, object, dict[str, object], Path]:
@@ -2392,6 +2423,67 @@ def test_run_task_worker_classifies_zero_diff_infra_verification_failure(
     assert result.failure_reason == "verification_infra_unavailable"
     assert result.failure_category == FailureCategory.INFRA_UNAVAILABLE.value
     assert "verification infrastructure unavailable" in result.summary
+
+
+def test_run_task_worker_warn_accepts_material_change_when_verification_infra_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    base_branch = _init_git_repo(repo)
+    paths = create_plan_run(repo)
+    plan = load_plan(paths)
+    task = add_task(
+        plan,
+        title="Build static page",
+        estimated_files=["index.html"],
+        branch="feat/t01-static-page",
+    )
+    save_plan(paths, plan)
+
+    def fake_run_agent(*, root: Path, **_kwargs) -> int:
+        (root / "index.html").write_text("<!doctype html><title>Demo</title>\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr("sylliptor_agent_cli.swarm_worker.run_agent", fake_run_agent)
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.swarm_worker.run_task_verification",
+        lambda **kwargs: _build_verify_run_result(
+            artifact_path=kwargs["artifact_path"],
+            commands=["pytest -q"],
+            exit_codes=[1],
+            real_executions=[None],
+            outputs=["verify sandbox unavailable: no usable backend\n"],
+            failure_category=FailureCategory.INFRA_UNAVAILABLE,
+        ),
+    )
+
+    result = run_task_worker(
+        task=task,
+        plan=load_plan(paths),
+        worktree_repo_path=repo,
+        base_branch=base_branch,
+        run_paths=paths,
+        cfg=AppConfig(model="test-model"),
+        mode="auto",
+        yes=True,
+        max_steps=5,
+        api_key_override="k",
+        no_log=True,
+        console=_console(),
+        scope_mode="strict",
+        verify_mode="warn",
+        verify_commands=["pytest -q"],
+    )
+
+    assert result.success is True
+    assert result.commit_hash is not None
+    assert result.verify_failed is False
+    assert result.failure_reason is None
+    assert result.effective_result_kind == "success_commit"
+    assert result.verify_payload is not None
+    assert result.verify_payload["all_passed"] is False
+    assert any("Verification infrastructure warning" in warning for warning in result.warnings)
 
 
 def test_run_task_worker_setup_failure_is_not_salvaged(tmp_path: Path, monkeypatch) -> None:

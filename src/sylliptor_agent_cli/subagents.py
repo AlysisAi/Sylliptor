@@ -99,7 +99,9 @@ def built_in_subagents() -> dict[str, SubagentDefinition]:
                 "3. Open questions or ambiguities, if any, with the fastest way to "
                 "resolve each.\n"
                 "Keep responses tight. Transcripts of what you searched are not "
-                "useful to the parent agent."
+                "useful to the parent agent. Your final response is the handoff "
+                "contract: it must contain findings, evidence, ambiguities, or a "
+                "concrete blocker."
             ),
             prompt_trust="trusted",
             mode="readonly",
@@ -158,7 +160,9 @@ def built_in_subagents() -> dict[str, SubagentDefinition]:
                 "two sentences, key evidence or paths the parent should "
                 "look at, anything you could not do with the concrete "
                 "blocker, and verification you actually ran with commands "
-                "and outcomes. No transcript of every step you took."
+                "and outcomes. No transcript of every step you took. Your "
+                "final response is the handoff contract: it must contain "
+                "results, evidence, verification, or a concrete blocker."
             ),
             prompt_trust="trusted",
             mode="auto",

@@ -2,10 +2,22 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 from typing import Literal
 
 RepoExecutionIntent = Literal["execute", "plan_or_analysis_only", "advisory_non_execution"]
 SkillLifecycleIntent = Literal["create", "install", "enable", "disable", "remove", "validate"]
+
+
+@dataclass(frozen=True)
+class LocalMaterializationRequirement:
+    required: bool
+    confidence: float = 0.0
+    output_paths: tuple[str, ...] = tuple()
+    action_verb: str = ""
+    evidence_span: str = ""
+    reason: str = ""
+
 
 _PLAN_OR_ANALYSIS_ONLY_MARKERS = (
     "plan only",
@@ -79,6 +91,20 @@ _EXPLANATORY_NON_EXECUTION_PATTERNS = (
     re.compile(
         r"^(?:μπορεις(?:\s+να)?|θα\s+μπορουσες(?:\s+να)?)\s+"
         r"(?:εξηγησεις|εξηγησε|βοηθησεις\s+με\s+να\s+καταλαβω)\b"
+    ),
+)
+_READ_ONLY_REPO_INSPECTION_PATTERNS = (
+    re.compile(
+        r"^(?:(?:can|could)\s+you\s+|please\s+)?"
+        r"(?:locate\s+(?:and\s+)?inspect|inspect|look\s+(?:at|over|through)|"
+        r"take\s+a\s+look\s+at|list|show|map|summari[sz]e|orient(?:\s+me)?|"
+        r"check\s+(?:the\s+)?status|read)\b"
+        r".*\b(?:repo|repository|workspace|codebase|project|tree|files?|status|"
+        r"branch|remote|diff|changes?)\b"
+    ),
+    re.compile(
+        r"^(?:(?:can|could)\s+you\s+|please\s+)?"
+        r"(?:where\s+is|where\s+are|what\s+files?|which\s+files?)\b"
     ),
 )
 _REPO_CHANGE_SUMMARY_FOLLOW_UP_PATTERNS = (
@@ -241,6 +267,33 @@ _TASK_BRIEF_CONSTRAINT_ARTIFACT_HINT_PATTERNS = (
         r"field|fields|record|records)\b"
     ),
 )
+_LOCAL_MATERIALIZATION_ACTION_VERB_RE = re.compile(
+    r"\b(save|write|create|produce|output|generate|emit|export|store|move|"
+    r"put|place|materiali[sz]e|persist)\b",
+    re.IGNORECASE,
+)
+_LOCAL_MATERIALIZATION_TARGET_RE = re.compile(
+    r"\b(?:answer|result|results|count|counts|output|artifact|file|report|summary)\b",
+    re.IGNORECASE,
+)
+_LOCAL_MATERIALIZATION_PATH_RE = re.compile(
+    r"`([^`\n]+)`|"
+    r"(?<![\w@])((?:\.{1,2}/|/|~\/|[A-Za-z]:[\\/])?[A-Za-z0-9_.@:+-]+"
+    r"(?:[\\/][A-Za-z0-9_.@:+-]+)*"
+    r"(?:\.[A-Za-z0-9][A-Za-z0-9_-]{0,12}|[\\/]))"
+)
+_LOCAL_MATERIALIZATION_DIR_RE = re.compile(
+    r"\b(?:file|path|dir|directory|folder|output\s+(?:file|dir|directory|folder))\s+"
+    r"(?:named\s+|called\s+|at\s+|to\s+|in\s+|into\s+|as\s+)?"
+    r"(`[^`\n]+`|(?:\.{1,2}/|/|~\/|[A-Za-z]:[\\/])?[A-Za-z0-9_.@:+-]+"
+    r"(?:[\\/][A-Za-z0-9_.@:+-]+)*(?:\.[A-Za-z0-9][A-Za-z0-9_-]{0,12}|[\\/])?)",
+    re.IGNORECASE,
+)
+_LOCAL_MATERIALIZATION_SERVICE_RE = re.compile(
+    r"\b(?:create|build|implement|add|generate|write|start|run|serve|launch)\b"
+    r".{0,80}\b(?:service|server|daemon|executable|binary|package|cli|command)\b",
+    re.IGNORECASE | re.DOTALL,
+)
 _SKILL_LIFECYCLE_OBJECT_PATTERN = (
     r"(?:skill(?:s)?|skill\s+bundle(?:s)?|δεξιοτ(?:ητα|ητες|ητων|ητας)?)"
 )
@@ -343,10 +396,159 @@ def contains_any_normalized_marker(normalized_text: str, markers: tuple[str, ...
     return False
 
 
+def _clean_materialization_path(raw: str) -> str:
+    cleaned = str(raw or "").strip().strip("`'\"").replace("\\", "/")
+    cleaned = cleaned.rstrip(".,;:!?)]}")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned
+
+
+def _looks_like_materialization_path(raw: str) -> bool:
+    cleaned = _clean_materialization_path(raw)
+    if not cleaned or cleaned.startswith("-"):
+        return False
+    lowered = cleaned.casefold()
+    if lowered.startswith(("http://", "https://", "mailto:")):
+        return False
+    if cleaned in {".", "..", "/"}:
+        return False
+    if ".." in cleaned.split("/"):
+        return False
+    if "/" in cleaned or cleaned.startswith(("~", "/")):
+        return True
+    if re.search(r"\.[A-Za-z0-9][A-Za-z0-9_-]{0,12}$", cleaned):
+        return True
+    return cleaned in {"Dockerfile", "Gemfile", "Makefile", "Procfile", "Rakefile"}
+
+
+def _materialization_paths_in_text(text: str) -> tuple[str, ...]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for match in _LOCAL_MATERIALIZATION_PATH_RE.finditer(text):
+        raw = match.group(1) or match.group(2) or ""
+        cleaned = _clean_materialization_path(raw)
+        if not _looks_like_materialization_path(cleaned):
+            continue
+        key = cleaned.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(cleaned)
+        if len(paths) >= 8:
+            break
+    return tuple(paths)
+
+
+def _first_materialization_action_verb(text: str) -> str:
+    match = _LOCAL_MATERIALIZATION_ACTION_VERB_RE.search(text)
+    return str(match.group(1) or "").casefold() if match else ""
+
+
+def classify_local_materialization_requirement(
+    instruction: str,
+) -> LocalMaterializationRequirement:
+    text = str(instruction or "").strip()
+    if not text:
+        return LocalMaterializationRequirement(
+            required=False,
+            reason="empty_instruction",
+        )
+    normalized = normalize_turn_intent_text(text)
+    if contains_any_normalized_marker(normalized, _PLAN_OR_ANALYSIS_ONLY_MARKERS):
+        return LocalMaterializationRequirement(
+            required=False,
+            reason="plan_or_analysis_only_opt_out",
+        )
+    if contains_any_normalized_marker(normalized, _ADVISORY_NON_EXECUTION_MARKERS):
+        return LocalMaterializationRequirement(
+            required=False,
+            reason="advisory_non_execution_opt_out",
+        )
+    if contains_any_normalized_marker(normalized, _NON_EXECUTION_OPT_OUT_MARKERS):
+        return LocalMaterializationRequirement(
+            required=False,
+            reason="non_execution_opt_out",
+        )
+
+    paths = _materialization_paths_in_text(text)
+    action = _first_materialization_action_verb(text)
+    output_target = bool(_LOCAL_MATERIALIZATION_TARGET_RE.search(text))
+    action_match = _LOCAL_MATERIALIZATION_ACTION_VERB_RE.search(text)
+    evidence_span = ""
+    if action_match is not None:
+        evidence_span = text[max(0, action_match.start() - 40) : action_match.end() + 120]
+    elif paths:
+        evidence_span = text[:180]
+
+    if paths and action:
+        return LocalMaterializationRequirement(
+            required=True,
+            confidence=0.95,
+            output_paths=paths,
+            action_verb=action,
+            evidence_span=" ".join(evidence_span.split()),
+            reason="output_path_with_materialization_action",
+        )
+
+    dir_match = _LOCAL_MATERIALIZATION_DIR_RE.search(text)
+    if dir_match is not None and action:
+        raw_path = str(dir_match.group(1) or "")
+        path = _clean_materialization_path(raw_path)
+        output_paths = (path,) if _looks_like_materialization_path(path) else paths
+        return LocalMaterializationRequirement(
+            required=True,
+            confidence=0.9,
+            output_paths=output_paths,
+            action_verb=action,
+            evidence_span=" ".join(str(dir_match.group(0) or "").split()),
+            reason="explicit_output_file_or_directory",
+        )
+
+    if paths and output_target and re.search(r"\b(?:to|into|in|at|as)\b", normalized):
+        return LocalMaterializationRequirement(
+            required=True,
+            confidence=0.86,
+            output_paths=paths,
+            action_verb=action or "write",
+            evidence_span=" ".join(text[:180].split()),
+            reason="answer_or_result_targeted_to_local_path",
+        )
+
+    service_match = _LOCAL_MATERIALIZATION_SERVICE_RE.search(text)
+    if service_match is not None and (
+        action or instruction_explicitly_requests_repo_changes(normalized)
+    ):
+        return LocalMaterializationRequirement(
+            required=True,
+            confidence=0.82,
+            output_paths=paths,
+            action_verb=action or "create",
+            evidence_span=" ".join(str(service_match.group(0) or "").split()),
+            reason="local_executable_or_service_materialization",
+        )
+
+    return LocalMaterializationRequirement(
+        required=False,
+        confidence=0.0,
+        output_paths=paths,
+        action_verb=action,
+        evidence_span="",
+        reason="no_high_confidence_materialization",
+    )
+
+
 def looks_like_explanatory_repo_question(normalized_instruction: str) -> bool:
     return any(
         pattern.search(normalized_instruction) is not None
         for pattern in _EXPLANATORY_NON_EXECUTION_PATTERNS
+    )
+
+
+def looks_like_read_only_repo_inspection_request(normalized_instruction: str) -> bool:
+    return any(
+        pattern.search(normalized_instruction) is not None
+        for pattern in _READ_ONLY_REPO_INSPECTION_PATTERNS
     )
 
 
@@ -490,6 +692,8 @@ def classify_repo_execution_intent(instruction: str) -> RepoExecutionIntent:
         return "advisory_non_execution"
     if contains_any_normalized_marker(normalized, _NON_EXECUTION_OPT_OUT_MARKERS):
         return "advisory_non_execution"
+    if classify_local_materialization_requirement(instruction).required:
+        return "execute"
     direct_change_requested = instruction_explicitly_requests_repo_changes(normalized)
     if looks_like_repo_change_explanation_follow_up(normalized) and not direct_change_requested:
         return "advisory_non_execution"
@@ -502,6 +706,8 @@ def classify_repo_execution_intent(instruction: str) -> RepoExecutionIntent:
         return "advisory_non_execution"
     if direct_change_requested:
         return "execute"
+    if looks_like_read_only_repo_inspection_request(normalized):
+        return "advisory_non_execution"
     if looks_like_explanatory_repo_question(normalized):
         return "advisory_non_execution"
     return "execute"

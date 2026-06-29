@@ -117,6 +117,7 @@ class AppConfig(BaseModel):
     base_url: str = "https://api.openai.com/v1"
     model: str = ""
     llm_timeout_s: float = 60.0
+    run_deadline_seconds: float | None = None
     llm_enable_thinking: bool | None = None
     llm_reasoning_effort: str | None = None
     provider_concurrency_caps: dict[str, int] = Field(
@@ -163,6 +164,7 @@ class AppConfig(BaseModel):
     feedback_github_repo: str = DEFAULT_FEEDBACK_GITHUB_REPO
     feedback_open_browser: bool = True
     session_log_dir: str | None = None
+    crash_diagnostic_log_path: str | None = None
     prompt_cache_key: str | None = None
     prompt_cache_retention: str | None = None
     verify_commands: list[str] = Field(
@@ -922,6 +924,7 @@ _SETTABLE_KEYS: set[str] = {
     "base_url",
     "model",
     "llm_timeout_s",
+    "run_deadline_seconds",
     "llm_enable_thinking",
     "llm_reasoning_effort",
     "provider_concurrency_caps",
@@ -961,6 +964,7 @@ _SETTABLE_KEYS: set[str] = {
     "feedback_github_repo",
     "feedback_open_browser",
     "session_log_dir",
+    "crash_diagnostic_log_path",
     "prompt_cache_key",
     "prompt_cache_retention",
     "verify_commands",
@@ -1069,6 +1073,21 @@ def _coerce_positive_float(value: str, *, key: str) -> float:
     parsed = _coerce_non_negative_float(value, key=key)
     if parsed <= 0 or not math.isfinite(parsed):
         raise ConfigError(f"{key} must be > 0")
+    return parsed
+
+
+def _coerce_optional_positive_float(value: Any, *, key: str) -> float | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if normalized.lower() in {"", "none", "null", "default", "off"}:
+        return None
+    try:
+        parsed = float(normalized)
+    except (TypeError, ValueError) as e:
+        raise ConfigError(f"{key} must be a finite number > 0") from e
+    if parsed <= 0 or not math.isfinite(parsed):
+        raise ConfigError(f"{key} must be a finite number > 0")
     return parsed
 
 
@@ -1229,6 +1248,74 @@ def resolve_llm_timeout_s(cfg: AppConfig | None) -> float:
     if cfg_timeout is not None:
         return cfg_timeout
     return 60.0
+
+
+@dataclass(frozen=True)
+class ResolvedRunDeadline:
+    seconds: float | None
+    source: str
+
+
+def resolve_run_deadline(
+    cfg: AppConfig | None,
+    *,
+    cli_deadline_seconds: float | None = None,
+) -> ResolvedRunDeadline:
+    if cli_deadline_seconds is not None:
+        return ResolvedRunDeadline(
+            seconds=_coerce_optional_positive_float(
+                cli_deadline_seconds,
+                key="--deadline-seconds",
+            ),
+            source="explicit_cli",
+        )
+
+    env_value = env_get("SYLLIPTOR_RUN_DEADLINE_SECONDS")
+    if env_value is not None:
+        return ResolvedRunDeadline(
+            seconds=_coerce_optional_positive_float(
+                env_value,
+                key="SYLLIPTOR_RUN_DEADLINE_SECONDS",
+            ),
+            source="environment",
+        )
+
+    cfg_value = _coerce_optional_positive_float(
+        getattr(cfg, "run_deadline_seconds", None),
+        key="run_deadline_seconds",
+    )
+    if cfg_value is not None:
+        return ResolvedRunDeadline(seconds=cfg_value, source="config")
+    return ResolvedRunDeadline(seconds=None, source="absent")
+
+
+def resolve_run_deadline_seconds(
+    cfg: AppConfig | None,
+    *,
+    cli_deadline_seconds: float | None = None,
+) -> float | None:
+    return resolve_run_deadline(
+        cfg,
+        cli_deadline_seconds=cli_deadline_seconds,
+    ).seconds
+
+
+def resolve_crash_diagnostic_log_path(
+    cfg: AppConfig | None,
+    *,
+    cli_diagnostic_log_path: str | os.PathLike[str] | None = None,
+) -> str | None:
+    if cli_diagnostic_log_path is not None:
+        raw = str(cli_diagnostic_log_path).strip()
+        return raw or None
+
+    env_value = env_get("SYLLIPTOR_CRASH_DIAGNOSTIC_LOG_PATH")
+    if env_value is not None:
+        raw = str(env_value).strip()
+        return raw or None
+
+    raw = str(getattr(cfg, "crash_diagnostic_log_path", "") or "").strip()
+    return raw or None
 
 
 def resolve_llm_enable_thinking(cfg: AppConfig | None) -> bool | None:
@@ -1586,6 +1673,10 @@ def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
         cfg.llm_timeout_s = _coerce_positive_float(value, key=key)
         return cfg
 
+    if key == "run_deadline_seconds":
+        cfg.run_deadline_seconds = _coerce_optional_positive_float(value, key=key)
+        return cfg
+
     if key == "llm_enable_thinking":
         cfg.llm_enable_thinking = _coerce_optional_bool(value, key=key)
         return cfg
@@ -1752,6 +1843,10 @@ def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
 
     if key == "session_log_dir":
         cfg.session_log_dir = value if value.strip() else None
+        return cfg
+
+    if key == "crash_diagnostic_log_path":
+        cfg.crash_diagnostic_log_path = value.strip() or None
         return cfg
 
     if key == "prompt_cache_key":

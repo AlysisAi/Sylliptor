@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import TypeVar
 from urllib.parse import urlsplit
 
-from ..failure_category import is_provider_throttling_error, is_provider_unavailable_error
+from ..failure_category import is_provider_throttling_error, provider_unavailable_retry_reason
 
 T = TypeVar("T")
 
@@ -145,6 +145,7 @@ def run_provider_limited_call(
     sleep_fn: Callable[[float], None] | None = None,
     random_fn: Callable[[], float] | None = None,
     on_retry: Callable[[int, str, float], None] | None = None,
+    retry_deadline_allows: Callable[[float], bool] | None = None,
 ) -> T:
     settings = retry_settings or ProviderRetrySettings()
     canonical_key = canonical_provider_key(provider_key)
@@ -168,6 +169,18 @@ def run_provider_limited_call(
             ):
                 raise
             wait_seconds = _retry_delay_seconds(settings, retries_used, jitter)
+            if retry_deadline_allows is not None and not retry_deadline_allows(wait_seconds):
+                _LOGGER.info(
+                    "provider_retry_deadline_blocked",
+                    extra={
+                        "operation": operation,
+                        "provider_key": canonical_key,
+                        "retry_attempt": retries_used + 1,
+                        "wait_seconds": wait_seconds,
+                        "retry_reason": retry_reason,
+                    },
+                )
+                raise
             if on_retry is not None:
                 try:
                     on_retry(retries_used + 1, retry_reason, wait_seconds)
@@ -192,9 +205,7 @@ def run_provider_limited_call(
 def _provider_retry_reason(exc: Exception) -> str | None:
     if is_provider_throttling_error(exc):
         return "provider_throttled"
-    if is_provider_unavailable_error(exc):
-        return "provider_unavailable"
-    return None
+    return provider_unavailable_retry_reason(exc)
 
 
 PROVIDER_NON_RETRYABLE_ATTR = "_provider_call_non_retryable"

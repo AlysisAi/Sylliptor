@@ -49,7 +49,8 @@ def test_render_returns_none_for_plain_text():
     assert render_markdown_rows("", 80) is None
 
 
-def test_render_code_block_keeps_code_and_styles_it():
+def test_render_code_block_keeps_code_and_styles_it(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
     rows = render_markdown_rows(_CODE_REPLY, 60)
     assert rows is not None
     joined = "\n".join(_row_text(r) for r in rows)

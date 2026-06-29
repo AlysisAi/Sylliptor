@@ -743,7 +743,13 @@ def _apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> No
     coding_temperature = resolve_role_temperature(session.cfg, role=ROLE_CODING)
     provider_retry_settings = resolve_provider_retry_settings(session.cfg)
 
-    def _apply_client_config(client: Any, *, model: str, temperature: float | None = None) -> None:
+    def _apply_client_config(
+        client: Any,
+        *,
+        model: str,
+        temperature: float | None = None,
+        disable_reasoning: bool = False,
+    ) -> None:
         client.base_url = effective_base_url
         client.api_key = session.api_key
         client.model = model
@@ -752,8 +758,18 @@ def _apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> No
             client.temperature = temperature
         client.prompt_cache_key = prompt_cache_key
         client.prompt_cache_retention = prompt_cache_retention
-        client.enable_thinking = enable_thinking
-        client.reasoning_effort = reasoning_effort
+        # The router/classification client is built reasoning-off in session.py so
+        # latency-sensitive routing/non-repo turns stay fast on slow reasoning
+        # models (e.g. Xiaomi MiMo via the trial proxy). Re-applying the
+        # session-wide reasoning settings here would silently re-enable that
+        # chain-of-thought and reintroduce the timeout->clarification-fallback bug,
+        # so honor disable_reasoning for that client.
+        if disable_reasoning:
+            client.enable_thinking = False
+            client.reasoning_effort = None
+        else:
+            client.enable_thinking = enable_thinking
+            client.reasoning_effort = reasoning_effort
         if hasattr(client, "extra_headers"):
             client.extra_headers = dict(active_profile.extra_headers)
         if hasattr(client, "provider_key"):
@@ -778,7 +794,11 @@ def _apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> No
 
     router_client = getattr(session, "router_client", None)
     if router_client is not None:
-        _apply_client_config(router_client, model=str(session.cfg.model or ""))
+        _apply_client_config(
+            router_client,
+            model=str(session.cfg.model or ""),
+            disable_reasoning=True,
+        )
 
     compactor = getattr(session, "conversation_compactor", None)
     compactor_client = getattr(compactor, "compactor_client", None)
@@ -1146,6 +1166,11 @@ def chat(
         False,
         "--yes",
         help="In auto mode, skip confirmations for sensitive commands.",
+    ),
+    diagnostic_log: Path | None = typer.Option(
+        None,
+        "--diagnostic-log",
+        help="Append minimal crash-safe diagnostic events to this JSONL path.",
     ),
     cli_ctx: Any = None,
 ) -> None:
@@ -2109,6 +2134,7 @@ def chat(
             "verify_cmd": verify_cmd,
             "subagents_enabled": effective.subagents_enabled,
             "workspace_binding": workspace_binding,
+            "crash_diagnostic_log_path": diagnostic_log,
         }
         try:
             session = create_session(**create_session_kwargs)
@@ -2417,6 +2443,24 @@ def run(
         "--yes",
         help="In auto mode, skip confirmations for sensitive commands (hard blocks still apply).",
     ),
+    deadline_seconds: float | None = typer.Option(
+        None,
+        "--deadline-seconds",
+        help="Stop this one-shot run after the given invocation-wide wall-clock seconds.",
+    ),
+    require_deadline: bool = typer.Option(
+        False,
+        "--require-deadline",
+        help=(
+            "Require a finite one-shot run deadline from CLI, environment, or config. "
+            "Intended for managed hosts."
+        ),
+    ),
+    diagnostic_log: Path | None = typer.Option(
+        None,
+        "--diagnostic-log",
+        help="Append minimal crash-safe diagnostic events to this JSONL path.",
+    ),
     cli_ctx: Any = None,
 ) -> None:
     console = _console()
@@ -2489,6 +2533,9 @@ def run(
             chat_turn_fixed_override=(effective.max_steps if max_steps_provided else None),
             verify_cmd=verify_cmd,
             workspace_binding=workspace_binding,
+            run_deadline_seconds=deadline_seconds,
+            require_run_deadline=require_deadline,
+            crash_diagnostic_log_path=diagnostic_log,
         )
     except ConfigError as e:
         console.print(f"[red]Config error:[/red] {e}")

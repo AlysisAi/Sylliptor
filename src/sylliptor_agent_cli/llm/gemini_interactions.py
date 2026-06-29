@@ -47,6 +47,8 @@ def gemini_interactions_disabled_message() -> str:
 class GeminiInteractionsClient:
     """Minimal text-only prototype for Google's beta Gemini Interactions API."""
 
+    supports_forced_tool_choice = False
+
     def __init__(
         self,
         *,
@@ -201,6 +203,7 @@ class GeminiInteractionsClient:
                 sleep_fn=self._provider_sleep_fn,
                 random_fn=self._provider_random_fn,
                 on_retry=telemetry.on_retry,
+                retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
             )
         )
 

@@ -742,6 +742,7 @@ def _compute_swarm_run_outcome(
     *,
     plan: dict[str, Any],
     integration_results: list[IntegrationGateResult],
+    worker_verification_warnings: bool,
     review_blocked: bool,
     remote_blocked_any: bool,
     integration_blocked: bool,
@@ -812,6 +813,14 @@ def _compute_swarm_run_outcome(
             else "failed_blocking"
         )
 
+    if worker_verification_warnings and status == "clean":
+        verification_status = "failed_tolerated_by_warn_policy"
+        status = "completed_with_verification_warnings"
+        reason_codes.append("worker_verification_failed_warn_mode")
+    elif worker_verification_warnings and verification_status == "not_run":
+        verification_status = "failed_tolerated_by_warn_policy"
+        reason_codes.append("worker_verification_failed_warn_mode")
+
     clean = status == "clean" and exit_code == 0 and verification_status in {"passed", "not_run"}
     return SwarmRunOutcome(
         status=status,
@@ -862,6 +871,7 @@ def _write_swarm_summary(
     executed: list[str],
     merge_outcomes: list[MergeOutcome],
     integration_results: list[IntegrationGateResult],
+    worker_verification_warnings: dict[str, str] | None = None,
     replanning_results: list[ReplanAttemptResult],
     skipped: dict[str, str],
     recovered: dict[str, str],
@@ -965,6 +975,13 @@ def _write_swarm_summary(
                 f"{', '.join(item.merged_task_ids) or '(none)'}; summary: "
                 f"`{_repo_rel(paths.root, item.summary_path)}`"
             )
+    else:
+        lines.append("- (none)")
+
+    lines.extend(["", "## Worker Verification Warnings", ""])
+    if worker_verification_warnings:
+        for task_id, reason in sorted(worker_verification_warnings.items()):
+            lines.append(f"- `{task_id}`: {reason}")
     else:
         lines.append("- (none)")
 
@@ -1990,6 +2007,7 @@ def run_swarm(
         integration_gate_index = 0
         integration_blocked = False
         tolerated_integration_failures: list[IntegrationGateResult] = []
+        worker_verification_warnings: dict[str, str] = {}
         final_gate_task_ids: list[str] = []
         final_gate_paths: list[str] = []
         recovered_tasks: dict[str, str] = _recover_stale_in_progress(paths=paths, plan=plan)
@@ -2867,7 +2885,7 @@ def run_swarm(
                 _batch_merged_paths: list[str] = []
                 batch_promoted_knowledge = False
                 batch_task_attempt_resolutions = False
-                for result in worker_results:
+                for result_index, result in enumerate(worker_results):
                     _persist_worker_result(paths, result)
                     executed.append(result.task_id)
                     if result.success:
@@ -2878,31 +2896,43 @@ def run_swarm(
                             reason = (
                                 f"verification did not execute tests: {nonexecuting_verify_reason}"
                             )
-                            _mark_status(paths, plan, result.task_id, "verify_failed")
-                            execution_skipped[result.task_id] = reason
-                            batch_task_attempt_resolutions = (
-                                _resolve_worker_task_attempt_acceptance(
-                                    paths,
-                                    plan=plan,
-                                    task_id=result.task_id,
-                                    acceptance_state="rejected",
-                                    summary=(f"Worker result was rejected because {reason}."),
-                                    result=result,
+                            if verify_mode == "warn":
+                                worker_verification_warnings[result.task_id] = reason
+                                result = replace(
+                                    result,
+                                    warnings=[
+                                        *result.warnings,
+                                        f"Verification warning: {reason}",
+                                    ],
                                 )
-                                or batch_task_attempt_resolutions
-                            )
-                            _mark_worker_knowledge_capture_skipped(
-                                paths,
-                                task_id=result.task_id,
-                                result=result,
-                                reason="worker result was not accepted because verification did not execute tests",
-                            )
-                            _cleanup_nonmerged_workspace(
-                                task_id=result.task_id,
-                                prepared_workspace=prepared_workspaces.get(result.task_id),
-                            )
-                            _trace("verify.error", reason, task_id=result.task_id)
-                            continue
+                                worker_results[result_index] = result
+                                _trace("verify.warning", reason, task_id=result.task_id)
+                            else:
+                                _mark_status(paths, plan, result.task_id, "verify_failed")
+                                execution_skipped[result.task_id] = reason
+                                batch_task_attempt_resolutions = (
+                                    _resolve_worker_task_attempt_acceptance(
+                                        paths,
+                                        plan=plan,
+                                        task_id=result.task_id,
+                                        acceptance_state="rejected",
+                                        summary=(f"Worker result was rejected because {reason}."),
+                                        result=result,
+                                    )
+                                    or batch_task_attempt_resolutions
+                                )
+                                _mark_worker_knowledge_capture_skipped(
+                                    paths,
+                                    task_id=result.task_id,
+                                    result=result,
+                                    reason="worker result was not accepted because verification did not execute tests",
+                                )
+                                _cleanup_nonmerged_workspace(
+                                    task_id=result.task_id,
+                                    prepared_workspace=prepared_workspaces.get(result.task_id),
+                                )
+                                _trace("verify.error", reason, task_id=result.task_id)
+                                continue
                         if result.noop_success:
                             task = find_task(plan, result.task_id)
                             if task is None:
@@ -3689,6 +3719,7 @@ def run_swarm(
         run_outcome = _compute_swarm_run_outcome(
             plan=plan,
             integration_results=integration_results,
+            worker_verification_warnings=bool(worker_verification_warnings),
             review_blocked=review_blocked,
             remote_blocked_any=remote_blocked_any,
             integration_blocked=integration_blocked,
@@ -3708,6 +3739,7 @@ def run_swarm(
             executed=executed,
             merge_outcomes=merge_outcomes,
             integration_results=integration_results,
+            worker_verification_warnings=worker_verification_warnings,
             replanning_results=replanning_results,
             skipped=_compose_summary_skipped(
                 scheduler_skipped=scheduler_skipped,

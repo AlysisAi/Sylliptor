@@ -8,6 +8,7 @@ import pytest
 
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.execution_deadline import ExecutionDeadline
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse, ToolCall
 from sylliptor_agent_cli.session_store import read_session_events
 from sylliptor_agent_cli.surface.noop_surface import NoopSurface
@@ -365,6 +366,53 @@ def test_forced_final_summary_uses_fallback_when_needed(
     assert final_events[-1]["content"] == surface.final_messages[-1]
 
 
+def test_forced_final_summary_uses_local_fallback_when_deadline_is_too_close(
+    tmp_path: Path,
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+    surface = _ForcedSummarySurface()
+    deadline = ExecutionDeadline.from_absolute(
+        started_at_monotonic=10.0,
+        deadline_monotonic=11.0,
+        configured_duration_seconds=1.0,
+        clock=lambda: 10.75,
+    )
+    session = create_session(
+        cfg=AppConfig(model=SMOKE_MODEL, routing_mode="code_only"),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=sessions_dir,
+        session_id_override="forced-summary-deadline-fallback",
+        surface=surface,
+        execution_deadline=deadline,
+    )
+    client = _BudgetExhaustionClient()
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        summary = session._emit_forced_final_summary_before_termination(
+            reason="deadline_exhausted",
+            termination_cause="the run deadline is exhausted",
+            termination_kind="deadline_exhausted",
+            max_steps=2,
+        )
+        log_path = session.store.path
+    finally:
+        session.close()
+
+    assert client.calls == []
+    assert "run deadline was exhausted" in summary
+    assert "step budget before completion" not in summary
+    fallback_events = _event_payloads(log_path, "forced_final_summary_fallback")
+    assert fallback_events[-1]["reason"] == "deadline_exhausted"
+    assert fallback_events[-1]["termination_kind"] == "deadline_exhausted"
+    assert fallback_events[-1]["fallback_reason"] == "local_summary_due_to_deadline"
+
+
 def test_exploration_retry_exhausted_fallback_summary_uses_truthful_termination_wording(
     tmp_path: Path,
 ) -> None:
@@ -659,6 +707,7 @@ def test_repeated_non_final_progress_termination_emits_forced_final_summary(
         [
             LLMResponse(content=repeated_progress_text, tool_calls=[], raw={}),
             LLMResponse(content=repeated_progress_text, tool_calls=[], raw={}),
+            LLMResponse(content=repeated_progress_text, tool_calls=[], raw={}),
         ],
         finalization_response=LLMResponse(
             content=(
@@ -679,17 +728,19 @@ def test_repeated_non_final_progress_termination_emits_forced_final_summary(
         session.close()
 
     assert exit_code == 1
-    assert len(client.calls) == 3
+    assert len(client.calls) == 4
     incomplete_events = _event_payloads(log_path, "one_shot_incomplete_after_retries")
     assert incomplete_events
-    assert incomplete_events[-1]["reason"] == "repeated_progress"
+    assert incomplete_events[-1]["reason"] == "stagnant_progress"
     requested = _event_payloads(log_path, "forced_final_summary_requested")
     assert requested[-1]["reason"] == "non_final_progress_retry_exhausted"
-    assert requested[-1]["termination_cause"] == "repeated non-final progress is detected"
+    expected_cause = "non-final progress stagnated without implementation or verification progress"
+    assert requested[-1]["termination_cause"] == expected_cause
+    assert requested[-1]["termination_kind"] == "completion_gate_stagnation"
     _assert_last_forced_summary_request(
         client,
         latest_assistant_text=repeated_progress_text,
-        termination_cause="repeated non-final progress is detected",
+        termination_cause=expected_cause,
     )
     summary = _assert_forced_summary_artifacts(log_path=log_path, surface=surface)
     assert "Known issues or risks: repeated non-final progress stopped the run." in summary
@@ -713,18 +764,18 @@ def test_non_final_progress_continuation_cap_emits_forced_final_summary(
         session_id_override="forced-summary-non-final-progress-cap",
         surface=surface,
     )
-    final_progress_text = "I will add tests next."
+    final_progress_text = "I will update the parser next."
     client = _ScriptedClient(
         [
             LLMResponse(content="I will inspect the parser next.", tool_calls=[], raw={}),
-            LLMResponse(content="I will update the parser next.", tool_calls=[], raw={}),
+            LLMResponse(content=final_progress_text, tool_calls=[], raw={}),
             LLMResponse(content=final_progress_text, tool_calls=[], raw={}),
         ],
         finalization_response=LLMResponse(
             content=(
                 "Completed work: gathered partial implementation progress signals.\n"
                 "Remaining work: the requested change is still unfinished.\n"
-                "Known issues or risks: the non-final progress continuation cap was reached."
+                "Known issues or risks: non-final progress stagnated."
             ),
             tool_calls=[],
             raw={},
@@ -742,19 +793,19 @@ def test_non_final_progress_continuation_cap_emits_forced_final_summary(
     assert len(client.calls) == 4
     incomplete_events = _event_payloads(log_path, "one_shot_incomplete_after_retries")
     assert incomplete_events
-    assert incomplete_events[-1]["reason"] == "continuation_cap"
+    assert incomplete_events[-1]["reason"] == "stagnant_progress"
     requested = _event_payloads(log_path, "forced_final_summary_requested")
-    assert requested[-1]["reason"] == "non_final_progress_continuation_cap_reached"
-    assert (
-        requested[-1]["termination_cause"] == "the non-final progress continuation limit is reached"
-    )
+    assert requested[-1]["reason"] == "non_final_progress_retry_exhausted"
+    expected_cause = "non-final progress stagnated without implementation or verification progress"
+    assert requested[-1]["termination_cause"] == expected_cause
+    assert requested[-1]["termination_kind"] == "completion_gate_stagnation"
     _assert_last_forced_summary_request(
         client,
         latest_assistant_text=final_progress_text,
-        termination_cause="the non-final progress continuation limit is reached",
+        termination_cause=expected_cause,
     )
     summary = _assert_forced_summary_artifacts(log_path=log_path, surface=surface)
-    assert "Known issues or risks: the non-final progress continuation cap was reached." in summary
+    assert "Known issues or risks: non-final progress stagnated." in summary
 
 
 def test_completion_gate_terminal_failure_emits_forced_final_summary(
@@ -795,6 +846,7 @@ def test_completion_gate_terminal_failure_emits_forced_final_summary(
             ),
             LLMResponse(content=latest_final_text, tool_calls=[], raw={}),
             LLMResponse(content=latest_final_text, tool_calls=[], raw={}),
+            LLMResponse(content=latest_final_text, tool_calls=[], raw={}),
         ],
         finalization_response=LLMResponse(
             content=(
@@ -815,7 +867,7 @@ def test_completion_gate_terminal_failure_emits_forced_final_summary(
         session.close()
 
     assert exit_code == 1
-    assert len(client.calls) == 4
+    assert len(client.calls) == 5
     incomplete_events = _event_payloads(
         log_path, "one_shot_completion_gate_incomplete_after_retries"
     )
@@ -823,11 +875,16 @@ def test_completion_gate_terminal_failure_emits_forced_final_summary(
     assert incomplete_events[-1]["stage"] == "verification_not_attempted"
     requested = _event_payloads(log_path, "forced_final_summary_requested")
     assert requested[-1]["reason"] == "completion_gate_terminal_failure"
-    assert requested[-1]["termination_cause"] == "completion-gate repair attempts are exhausted"
+    expected_cause = (
+        "completion-gate stagnation after repeated invalid finalization attempts "
+        "without new implementation or verification progress"
+    )
+    assert requested[-1]["termination_cause"] == expected_cause
+    assert requested[-1]["termination_kind"] == "completion_gate_stagnation"
     _assert_last_forced_summary_request(
         client,
         latest_assistant_text=latest_final_text,
-        termination_cause="completion-gate repair attempts are exhausted",
+        termination_cause=expected_cause,
     )
     summary = _assert_forced_summary_artifacts(log_path=log_path, surface=surface)
     assert "Known issues or risks: completion-gate repair attempts were exhausted." in summary

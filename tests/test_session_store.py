@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 from typing import Any
 
+from sylliptor_agent_cli.agent_loop import create_session
+from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.execution_deadline import ExecutionDeadline
 from sylliptor_agent_cli.session_store import (
     SessionStore,
     list_sessions,
@@ -61,6 +64,23 @@ def test_session_store_writes_jsonl(tmp_path: Path) -> None:
     assert all("repo_root" in event for event in events)
 
 
+def test_session_store_assigns_monotonic_event_ids(tmp_path: Path) -> None:
+    store = SessionStore(
+        enabled=True,
+        sessions_dir=tmp_path,
+        session_id="event-id-test",
+        cwd=".",
+        repo_root=".",
+    )
+    store.append("user_message", {"content": "hi"})
+    store.append("final", {"content": "bye"})
+    store.close()
+
+    events = list(read_session_events(tmp_path / "event-id-test.jsonl"))
+
+    assert [event["event_id"] for event in events] == ["event-id-test:1", "event-id-test:2"]
+
+
 def test_session_store_disables_logging_when_sessions_dir_is_read_only(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -88,6 +108,44 @@ def test_session_store_disables_logging_when_sessions_dir_is_read_only(
     assert store.enabled is False
     assert store.artifact_persistence_enabled is False
     assert not (sessions_dir / f"{sid}.jsonl").exists()
+
+
+def test_no_log_keeps_session_log_disabled_but_allows_explicit_diagnostics(
+    tmp_path: Path,
+) -> None:
+    diagnostic_log = tmp_path / "diagnostics" / "events.jsonl"
+    deadline = ExecutionDeadline.from_absolute(
+        started_at_monotonic=10.0,
+        deadline_monotonic=10.0,
+        configured_duration_seconds=1.0,
+        clock=lambda: 10.0,
+    )
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="code_only"),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=True,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+        execution_deadline=deadline,
+        crash_diagnostic_log_path=diagnostic_log,
+    )
+
+    try:
+        assert session.run_turn("Do the task.") == 1
+        session_log_path = session.store.path
+    finally:
+        session.close()
+
+    assert session_log_path.exists() is False
+    events = [json.loads(line) for line in diagnostic_log.read_text(encoding="utf-8").splitlines()]
+    event_types = [event["event_type"] for event in events]
+    assert "run_started" in event_types
+    assert "turn_started" in event_types
+    assert "deadline_exhausted" in event_types
+    assert "run_finished" in event_types
 
 
 def test_normalize_web_url_preserves_valid_parenthesized_path() -> None:

@@ -125,7 +125,21 @@ def test_sylliptor_one_shot_addendum_invariants() -> None:
         _SYSTEM_PROMPT_ONE_SHOT_SECTION,
         [
             "One-shot execution mode",
-            "This is a one-shot execution run.",
+            "This is a one-shot execute-intent run.",
+            "Do not emit a standalone text-only plan and wait for the user.",
+            "Planning may be internal",
+            "same assistant response must also include implementation-oriented tool calls.",
+            "A progress update is not a final answer.",
+            "Finalize only after material-work and verification requirements are satisfied",
+            "After read/explore-only tool calls",
+            "run an implementation-producing command",
+            "verify when the implementation already exists",
+            "concrete evidence-backed blocker",
+            "Material action may be source edits, generated artifacts",
+            "Do not fabricate edits or verification.",
+            "Explicit non-execution requests",
+            "plan-only",
+            "advice-only",
             "Use repo-root-relative file paths for concrete targets",
         ],
     )
@@ -133,6 +147,12 @@ def test_sylliptor_one_shot_addendum_invariants() -> None:
         "After a successful research subagent run (for example explorer or general-purpose), proceed to implementation/tests/docs"
         not in _SYSTEM_PROMPT_ONE_SHOT_SECTION
     )
+
+
+def test_sylliptor_base_prompt_short_plan_guidance_is_not_one_shot_autonomy() -> None:
+    assert "For non-trivial work, make a short plan before editing" in SYSTEM_PROMPT
+    assert "Do not emit a standalone text-only plan and wait for the user." not in SYSTEM_PROMPT
+    assert "one-shot execute-intent run" not in SYSTEM_PROMPT
 
 
 def test_tool_descriptions_capture_canonical_workflow_guidance() -> None:

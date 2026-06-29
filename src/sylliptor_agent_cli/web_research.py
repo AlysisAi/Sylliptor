@@ -3,12 +3,13 @@ from __future__ import annotations
 import copy
 import json
 import re
+from collections.abc import Iterable
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 # Brackets can be legitimate URL path/query characters, such as ?foo[bar]=1.
 # Surrounding wrapper brackets are removed later by context-aware cleanup.
-_URL_RE = re.compile(r"https?://[^\s<>{}\"]+")
+_URL_RE = re.compile(r"https?://[^\s<>{}\"]+", re.IGNORECASE)
 _URL_CANDIDATE_STOP_CHARS = set('<>{}"')
 _STRUCTURED_URL_FORBIDDEN_CHARS = set('<>{}"')
 _SIMPLE_TRAILING_URL_PUNCTUATION = ".,;:?"
@@ -25,6 +26,26 @@ _URL_CLOSING_WRAPPERS = {")": "(", "]": "[", "}": "{"}
 _MARKDOWN_URL_WRAPPER_MARKERS = ("`", "*", "_")
 _USER_PROVIDED = "user_provided"
 _RETURNED_BY_WEB_SEARCH = "returned_by_web_search"
+_CANONICAL_REDIRECT = "canonical_redirect"
+_SEARCH_MEDIATED_RECOVERY = "search_mediated_recovery"
+_SAME_ORIGIN_DERIVED = "same_origin_derived_search_result"
+_FETCHED_PAGE_LINK = "fetched_page_link"
+_TRUSTED_LOCAL_FILE = "trusted_local_file"
+_TRUSTED_TOOL_OUTPUT = "trusted_tool_output"
+_MAX_PROVENANCE_NODES = 512
+_MAX_URLS_PER_EVENT = 24
+_MAX_URL_TEXT_CHARS = 32_000
+_MAX_PROVENANCE_URL_LENGTH = 2048
+_FETCHABLE_PROVENANCE_CLASSES = {
+    _USER_PROVIDED,
+    _RETURNED_BY_WEB_SEARCH,
+    _FETCHED_PAGE_LINK,
+    _TRUSTED_LOCAL_FILE,
+    _TRUSTED_TOOL_OUTPUT,
+    _CANONICAL_REDIRECT,
+    _SEARCH_MEDIATED_RECOVERY,
+    _SAME_ORIGIN_DERIVED,
+}
 
 
 def _domain_for_url(url: str) -> str:
@@ -54,6 +75,21 @@ def normalize_web_query(raw_query: Any) -> str:
     return re.sub(r"\s+", " ", str(raw_query or "").strip()).casefold()
 
 
+def build_web_fetch_recovery_search_query(raw_url: Any) -> str:
+    normalized = normalize_web_url(raw_url) or canonicalize_web_url_input(raw_url)
+    if normalized is None:
+        return ""
+    try:
+        split = urlsplit(normalized)
+    except ValueError:
+        return ""
+    host = (split.hostname or "").rstrip(".").lower()
+    path_terms = [
+        segment for segment in re.split(r"[^A-Za-z0-9]+", split.path or "") if len(segment) >= 2
+    ][:4]
+    return " ".join([host, *path_terms]).strip()
+
+
 def normalize_web_url(raw_url: Any) -> str | None:
     text = str(raw_url or "").strip()
     if not text:
@@ -81,6 +117,57 @@ def normalize_web_url(raw_url: Any) -> str | None:
     netloc = hostname if port is None else f"{hostname}:{port}"
     path = split.path or "/"
     return urlunsplit((scheme, netloc, path, split.query, ""))
+
+
+def _equivalent_fetch_url_variants(normalized_url: str) -> set[str]:
+    normalized = normalize_web_url(normalized_url)
+    if normalized is None:
+        return set()
+    variants = {normalized}
+    split = urlsplit(normalized)
+    if not split.query:
+        path = split.path or "/"
+        if path == "/":
+            variants.add(urlunsplit((split.scheme, split.netloc, "", "", "")))
+        elif path.endswith("/"):
+            variants.add(urlunsplit((split.scheme, split.netloc, path.rstrip("/"), "", "")))
+        else:
+            variants.add(urlunsplit((split.scheme, split.netloc, path + "/", "", "")))
+    return {variant for variant in variants if normalize_web_url(variant) is not None}
+
+
+def _same_origin_bounded_derivative(source_url: str, requested_url: str) -> bool:
+    source = normalize_web_url(source_url)
+    requested = normalize_web_url(requested_url)
+    if source is None or requested is None:
+        return False
+    source_split = urlsplit(source)
+    requested_split = urlsplit(requested)
+    if (
+        source_split.scheme,
+        source_split.netloc,
+    ) != (
+        requested_split.scheme,
+        requested_split.netloc,
+    ):
+        return False
+    source_path = source_split.path.rstrip("/")
+    requested_path = requested_split.path.rstrip("/")
+    if source_path == requested_path:
+        return True
+    if not source_path or source_path == "/":
+        return False
+    bounded_pairs = (
+        ("/blob/", "/raw/"),
+        ("/-/blob/", "/-/raw/"),
+    )
+    for source_marker, requested_marker in bounded_pairs:
+        if source_marker not in source_path:
+            continue
+        expected = source_path.replace(source_marker, requested_marker, 1)
+        if requested_path == expected:
+            return True
+    return False
 
 
 def _looks_like_http_url(text: str) -> bool:
@@ -553,6 +640,9 @@ class SessionWebResearchTracker:
     def __init__(self) -> None:
         self._user_urls: dict[str, dict[str, Any]] = {}
         self._returned_source_urls: dict[str, dict[str, Any]] = {}
+        self._canonical_redirect_urls: dict[str, dict[str, Any]] = {}
+        self._search_mediated_urls: dict[str, dict[str, Any]] = {}
+        self._provenance_nodes: dict[str, dict[str, Any]] = {}
         self._searches: list[dict[str, Any]] = []
         self._fetches: list[dict[str, Any]] = []
         self._pending_search_indices: list[int] = []
@@ -601,25 +691,32 @@ class SessionWebResearchTracker:
         event_type: str,
         payload: dict[str, Any],
         ts: str | None,
+        event_id: str | None = None,
     ) -> bool:
         event_name = str(event_type or "").strip()
         if not isinstance(payload, dict):
             return False
         if event_name == "user_message":
-            return self._record_user_message(payload=payload, ts=ts)
+            return self._record_user_message(payload=payload, ts=ts, event_id=event_id)
         if event_name == "tool_call":
             name = str(payload.get("name") or "").strip()
             if name == "web_search":
-                return self._record_web_search_call(payload=payload, ts=ts)
+                return self._record_web_search_call(payload=payload, ts=ts, event_id=event_id)
             if name == "web_fetch":
-                return self._record_web_fetch_call(payload=payload, ts=ts)
+                return self._record_web_fetch_call(payload=payload, ts=ts, event_id=event_id)
             return False
         if event_name == "tool_result":
             name = str(payload.get("name") or "").strip()
             if name == "web_search":
-                return self._record_web_search_result(payload=payload, ts=ts)
+                return self._record_web_search_result(payload=payload, ts=ts, event_id=event_id)
             if name == "web_fetch":
-                return self._record_web_fetch_result(payload=payload, ts=ts)
+                return self._record_web_fetch_result(payload=payload, ts=ts, event_id=event_id)
+            return self._record_trusted_tool_result_urls(
+                tool_name=name,
+                payload=payload,
+                ts=ts,
+                event_id=event_id,
+            )
         return False
 
     def artifact_payload(self) -> dict[str, Any]:
@@ -627,6 +724,11 @@ class SessionWebResearchTracker:
         fetches = [copy.deepcopy(entry) for entry in self._fetches]
         user_urls = [copy.deepcopy(entry) for entry in self._user_urls.values()]
         returned_urls = [copy.deepcopy(entry) for entry in self._returned_source_urls.values()]
+        redirect_urls = [copy.deepcopy(entry) for entry in self._canonical_redirect_urls.values()]
+        search_mediated_urls = [
+            copy.deepcopy(entry) for entry in self._search_mediated_urls.values()
+        ]
+        provenance_nodes = [copy.deepcopy(entry) for entry in self._provenance_nodes.values()]
         deduped_normalized_queries = _dedupe_ordered(
             [str(entry.get("normalized_query") or "") for entry in searches]
             + [
@@ -642,14 +744,28 @@ class SessionWebResearchTracker:
             [str(entry.get("normalized_final_url") or "") for entry in fetches]
         )
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "user_provided_urls": user_urls,
             "returned_by_web_search_urls": returned_urls,
+            "canonical_redirect_urls": redirect_urls,
+            "search_mediated_recovery_urls": search_mediated_urls,
+            "url_provenance_graph": {
+                "node_count": len(provenance_nodes),
+                "max_nodes": _MAX_PROVENANCE_NODES,
+                "nodes": provenance_nodes,
+            },
             "searches": searches,
             "fetches": fetches,
             "deduped_normalized_queries": deduped_normalized_queries,
             "deduped_normalized_user_urls": list(self._user_urls.keys()),
             "deduped_normalized_search_source_urls": list(self._returned_source_urls.keys()),
+            "deduped_normalized_canonical_redirect_urls": list(
+                self._canonical_redirect_urls.keys()
+            ),
+            "deduped_normalized_search_mediated_recovery_urls": list(
+                self._search_mediated_urls.keys()
+            ),
+            "deduped_normalized_provenance_graph_urls": list(self._provenance_nodes.keys()),
             "deduped_normalized_fetch_urls": deduped_normalized_fetch_urls,
             "deduped_normalized_final_fetch_urls": deduped_normalized_final_fetch_urls,
         }
@@ -688,26 +804,94 @@ class SessionWebResearchTracker:
 
     def has_activity(self) -> bool:
         return bool(
-            self._user_urls or self._returned_source_urls or self._searches or self._fetches
+            self._user_urls
+            or self._returned_source_urls
+            or self._canonical_redirect_urls
+            or self._search_mediated_urls
+            or self._provenance_nodes
+            or self._searches
+            or self._fetches
         )
 
     def _classification_for_normalized_url(self, normalized: str) -> str | None:
-        if normalized in self._user_urls:
-            return _USER_PROVIDED
-        if normalized in self._returned_source_urls:
-            return _RETURNED_BY_WEB_SEARCH
+        for variant in _equivalent_fetch_url_variants(normalized):
+            if variant in self._user_urls:
+                return _USER_PROVIDED
+            if variant in self._returned_source_urls:
+                return _RETURNED_BY_WEB_SEARCH
+            if variant in self._canonical_redirect_urls:
+                return _CANONICAL_REDIRECT
+            if variant in self._search_mediated_urls:
+                return _SEARCH_MEDIATED_RECOVERY
+            node = self._provenance_nodes.get(variant)
+            if node is not None:
+                classification = str(node.get("provenance_classification") or "").strip()
+                if classification in _FETCHABLE_PROVENANCE_CLASSES:
+                    return classification
+        if self._is_same_origin_derived_search_url(normalized):
+            return _SAME_ORIGIN_DERIVED
         return None
+
+    def establish_search_mediated_fetch_url(
+        self,
+        *,
+        raw_url: Any,
+        query: str,
+        source_url: str | None = None,
+    ) -> tuple[bool, str | None]:
+        normalized = normalize_web_url(raw_url) or canonicalize_web_url_input(raw_url)
+        if normalized is None:
+            return False, None
+        if normalized not in self._search_mediated_urls:
+            self._search_mediated_urls[normalized] = {
+                "url": str(raw_url or "").strip() or normalized,
+                "normalized_url": normalized,
+                "domain": _domain_for_url(normalized),
+                "query": str(query or "").strip(),
+                "source_url": str(source_url or "").strip(),
+                "provenance_classification": _SEARCH_MEDIATED_RECOVERY,
+            }
+            self._add_provenance_node(
+                raw_url=raw_url,
+                provenance_classification=_SEARCH_MEDIATED_RECOVERY,
+                source_event_id=None,
+                parent_url=source_url or "",
+                parent_source_event_id=None,
+                discovery_mechanism="search_mediated_recovery",
+                ts=None,
+                redirect_chain=(),
+                security_validation_status="syntax_validated_fetch_revalidates_target",
+            )
+            return True, normalized
+        return False, normalized
+
+    def _is_same_origin_derived_search_url(self, normalized: str) -> bool:
+        return any(
+            _same_origin_bounded_derivative(source_url, normalized)
+            for source_url in self._returned_source_urls
+        )
 
     def hydrate_from_artifact_payload(self, payload: dict[str, Any]) -> bool:
         if not isinstance(payload, dict):
             return False
         user_urls = payload.get("user_provided_urls")
         returned_urls = payload.get("returned_by_web_search_urls")
+        redirect_urls = payload.get("canonical_redirect_urls")
+        search_mediated_urls = payload.get("search_mediated_recovery_urls")
+        provenance_graph = payload.get("url_provenance_graph")
         searches = payload.get("searches")
         fetches = payload.get("fetches")
         if not any(
             isinstance(value, list) and value
-            for value in (user_urls, returned_urls, searches, fetches)
+            for value in (
+                user_urls,
+                returned_urls,
+                redirect_urls,
+                search_mediated_urls,
+                provenance_graph.get("nodes") if isinstance(provenance_graph, dict) else None,
+                searches,
+                fetches,
+            )
         ):
             return False
         self._user_urls = self._hydrate_url_index(
@@ -717,6 +901,19 @@ class SessionWebResearchTracker:
         self._returned_source_urls = self._hydrate_url_index(
             raw_entries=returned_urls,
             fallback_classification=_RETURNED_BY_WEB_SEARCH,
+        )
+        self._canonical_redirect_urls = self._hydrate_url_index(
+            raw_entries=redirect_urls,
+            fallback_classification=_CANONICAL_REDIRECT,
+        )
+        self._search_mediated_urls = self._hydrate_url_index(
+            raw_entries=search_mediated_urls,
+            fallback_classification=_SEARCH_MEDIATED_RECOVERY,
+        )
+        raw_nodes = provenance_graph.get("nodes") if isinstance(provenance_graph, dict) else None
+        self._provenance_nodes = self._hydrate_url_index(
+            raw_entries=raw_nodes,
+            fallback_classification=_TRUSTED_TOOL_OUTPUT,
         )
         self._searches = self._hydrate_event_entries(searches)
         self._fetches = self._hydrate_event_entries(fetches)
@@ -734,6 +931,15 @@ class SessionWebResearchTracker:
         changed = False
         changed |= self._merge_url_index(self._user_urls, other._user_urls)
         changed |= self._merge_url_index(self._returned_source_urls, other._returned_source_urls)
+        changed |= self._merge_url_index(
+            self._canonical_redirect_urls,
+            other._canonical_redirect_urls,
+        )
+        changed |= self._merge_url_index(
+            self._search_mediated_urls,
+            other._search_mediated_urls,
+        )
+        changed |= self._merge_url_index(self._provenance_nodes, other._provenance_nodes)
         changed |= self._merge_search_entries(other._searches)
         changed |= self._merge_fetch_entries(other._fetches)
         return changed
@@ -742,7 +948,165 @@ class SessionWebResearchTracker:
         self._pending_search_indices = []
         self._pending_fetch_indices = []
 
-    def _record_user_message(self, *, payload: dict[str, Any], ts: str | None) -> bool:
+    def _add_provenance_node(
+        self,
+        *,
+        raw_url: Any,
+        provenance_classification: str,
+        source_event_id: str | None,
+        parent_url: str,
+        parent_source_event_id: str | None,
+        discovery_mechanism: str,
+        ts: str | None,
+        redirect_chain: tuple[str, ...],
+        security_validation_status: str,
+        source_type: str = "",
+    ) -> bool:
+        normalized = normalize_web_url(raw_url) or canonicalize_web_url_input(raw_url)
+        if normalized is None:
+            return False
+        if len(normalized) > _MAX_PROVENANCE_URL_LENGTH:
+            return False
+        existing = self._provenance_nodes.get(normalized)
+        entry = {
+            "url": str(raw_url or "").strip() or normalized,
+            "normalized_url": normalized,
+            "domain": _domain_for_url(normalized),
+            "provenance_classification": str(provenance_classification or "").strip(),
+            "source_event_id": str(source_event_id or "").strip() or None,
+            "parent_url": str(parent_url or "").strip(),
+            "parent_source_event_id": str(parent_source_event_id or "").strip() or None,
+            "discovery_mechanism": str(discovery_mechanism or "").strip(),
+            "source_type": str(source_type or "").strip(),
+            "ts": ts,
+            "redirect_chain": [
+                item
+                for item in (
+                    normalize_web_url(url) or canonicalize_web_url_input(url) or ""
+                    for url in redirect_chain
+                )
+                if item
+            ][:_MAX_URLS_PER_EVENT],
+            "security_validation_status": str(security_validation_status or "").strip(),
+        }
+        if existing is None:
+            if len(self._provenance_nodes) >= _MAX_PROVENANCE_NODES:
+                return False
+            self._provenance_nodes[normalized] = entry
+            return True
+
+        changed = False
+        for key, value in entry.items():
+            if key == "redirect_chain":
+                if not existing.get(key) and value:
+                    existing[key] = value
+                    changed = True
+                continue
+            current = existing.get(key)
+            if (current is None or current == "") and value not in (None, ""):
+                existing[key] = value
+                changed = True
+        return changed
+
+    def _record_urls_from_text(
+        self,
+        *,
+        text: Any,
+        provenance_classification: str,
+        source_event_id: str | None,
+        parent_url: str,
+        parent_source_event_id: str | None,
+        discovery_mechanism: str,
+        source_type: str,
+        ts: str | None,
+    ) -> bool:
+        body = str(text or "")
+        if not body:
+            return False
+        changed = False
+        for entry in extract_public_web_urls(body[:_MAX_URL_TEXT_CHARS])[:_MAX_URLS_PER_EVENT]:
+            changed |= self._add_provenance_node(
+                raw_url=entry["url"],
+                provenance_classification=provenance_classification,
+                source_event_id=source_event_id,
+                parent_url=parent_url,
+                parent_source_event_id=parent_source_event_id,
+                discovery_mechanism=discovery_mechanism,
+                source_type=source_type,
+                ts=ts,
+                redirect_chain=(),
+                security_validation_status="syntax_validated_fetch_revalidates_target",
+            )
+        return changed
+
+    def _record_trusted_tool_result_urls(
+        self,
+        *,
+        tool_name: str,
+        payload: dict[str, Any],
+        ts: str | None,
+        event_id: str | None,
+    ) -> bool:
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        if not result or "error" in result or "error_code" in result:
+            return False
+        if tool_name in {"fs_read", "fs_read_lines"}:
+            return self._record_urls_from_text(
+                text=result.get("content"),
+                provenance_classification=_TRUSTED_LOCAL_FILE,
+                source_event_id=event_id,
+                parent_url=str(result.get("path") or ""),
+                parent_source_event_id=event_id,
+                discovery_mechanism="workspace_file_content",
+                source_type=tool_name,
+                ts=ts,
+            )
+        if tool_name in {"web_search", "web_fetch"}:
+            return False
+        snippets = list(self._iter_result_text_snippets(result))
+        if not snippets:
+            return False
+        changed = False
+        for snippet in snippets[:8]:
+            changed |= self._record_urls_from_text(
+                text=snippet,
+                provenance_classification=_TRUSTED_TOOL_OUTPUT,
+                source_event_id=event_id,
+                parent_url=tool_name,
+                parent_source_event_id=event_id,
+                discovery_mechanism="registered_tool_output",
+                source_type=tool_name,
+                ts=ts,
+            )
+        return changed
+
+    def _iter_result_text_snippets(
+        self,
+        value: Any,
+        *,
+        depth: int = 0,
+    ) -> Iterable[str]:
+        if depth > 4:
+            return
+        if isinstance(value, str):
+            if "http://" in value or "https://" in value:
+                yield value[:_MAX_URL_TEXT_CHARS]
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from self._iter_result_text_snippets(item, depth=depth + 1)
+            return
+        if isinstance(value, list):
+            for item in value[:64]:
+                yield from self._iter_result_text_snippets(item, depth=depth + 1)
+
+    def _record_user_message(
+        self,
+        *,
+        payload: dict[str, Any],
+        ts: str | None,
+        event_id: str | None,
+    ) -> bool:
         content = payload.get("content")
         if not isinstance(content, str):
             return False
@@ -757,12 +1121,30 @@ class SessionWebResearchTracker:
                 "domain": entry["domain"],
                 "ts": ts,
                 "step": None,
+                "source_event_id": event_id,
                 "provenance_classification": _USER_PROVIDED,
             }
+            self._add_provenance_node(
+                raw_url=entry["url"],
+                provenance_classification=_USER_PROVIDED,
+                source_event_id=event_id,
+                parent_url="",
+                parent_source_event_id=None,
+                discovery_mechanism="user_message_url",
+                ts=ts,
+                redirect_chain=(),
+                security_validation_status="syntax_validated_fetch_revalidates_target",
+            )
             changed = True
         return changed
 
-    def _record_web_search_call(self, *, payload: dict[str, Any], ts: str | None) -> bool:
+    def _record_web_search_call(
+        self,
+        *,
+        payload: dict[str, Any],
+        ts: str | None,
+        event_id: str | None,
+    ) -> bool:
         arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
         query = str(arguments.get("query") or "").strip()
         normalized_query = normalize_web_query(query)
@@ -794,6 +1176,7 @@ class SessionWebResearchTracker:
             "source_count": 0,
             "allowed_domains": allowed_domains,
             "external_web_access": external_web_access,
+            "source_event_id": event_id,
             "response_id": "",
             "sources_truncated": False,
             "returned_sources": [],
@@ -803,7 +1186,13 @@ class SessionWebResearchTracker:
         self._pending_search_indices.append(len(self._searches) - 1)
         return True
 
-    def _record_web_search_result(self, *, payload: dict[str, Any], ts: str | None) -> bool:
+    def _record_web_search_result(
+        self,
+        *,
+        payload: dict[str, Any],
+        ts: str | None,
+        event_id: str | None,
+    ) -> bool:
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
         step = payload.get("step") if isinstance(payload.get("step"), int) else None
         if self._pending_search_indices:
@@ -829,6 +1218,7 @@ class SessionWebResearchTracker:
                 "source_count": 0,
                 "allowed_domains": [],
                 "external_web_access": None,
+                "source_event_id": event_id,
                 "response_id": "",
                 "sources_truncated": False,
                 "returned_sources": [],
@@ -880,8 +1270,20 @@ class SessionWebResearchTracker:
                     "ts": ts,
                     "step": entry.get("step"),
                     "backend": str(result.get("backend") or "").strip(),
+                    "source_event_id": event_id,
                     "provenance_classification": _RETURNED_BY_WEB_SEARCH,
                 }
+                self._add_provenance_node(
+                    raw_url=raw_url,
+                    provenance_classification=_RETURNED_BY_WEB_SEARCH,
+                    source_event_id=event_id,
+                    parent_url="",
+                    parent_source_event_id=None,
+                    discovery_mechanism="web_search_source",
+                    ts=ts,
+                    redirect_chain=(),
+                    security_validation_status="syntax_validated_fetch_revalidates_target",
+                )
 
         entry["query"] = query
         entry["normalized_query"] = normalized_query
@@ -926,7 +1328,13 @@ class SessionWebResearchTracker:
         entry["error"] = ""
         return True
 
-    def _record_web_fetch_call(self, *, payload: dict[str, Any], ts: str | None) -> bool:
+    def _record_web_fetch_call(
+        self,
+        *,
+        payload: dict[str, Any],
+        ts: str | None,
+        event_id: str | None,
+    ) -> bool:
         arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
         raw_requested_url = str(arguments.get("url") or "").strip()
         provenance_classification, effective_requested_url = self.resolve_fetch_url(
@@ -953,6 +1361,7 @@ class SessionWebResearchTracker:
             "title": "",
             "backend": "",
             "provenance_classification": provenance_classification or "",
+            "source_event_id": event_id,
             "error": "",
             "error_code": "",
         }
@@ -960,7 +1369,13 @@ class SessionWebResearchTracker:
         self._pending_fetch_indices.append(len(self._fetches) - 1)
         return True
 
-    def _record_web_fetch_result(self, *, payload: dict[str, Any], ts: str | None) -> bool:
+    def _record_web_fetch_result(
+        self,
+        *,
+        payload: dict[str, Any],
+        ts: str | None,
+        event_id: str | None,
+    ) -> bool:
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
         step = payload.get("step") if isinstance(payload.get("step"), int) else None
         if self._pending_fetch_indices:
@@ -980,6 +1395,7 @@ class SessionWebResearchTracker:
                 "title": "",
                 "backend": "",
                 "provenance_classification": "",
+                "source_event_id": event_id,
                 "error": "",
                 "error_code": "",
             }
@@ -1018,6 +1434,50 @@ class SessionWebResearchTracker:
         entry["backend"] = str(result.get("backend") or "").strip()
         entry["error"] = ""
         entry["error_code"] = ""
+        provenance = str(entry.get("provenance_classification") or "").strip()
+        if (
+            normalized_final_url
+            and normalized_requested_url
+            and normalized_final_url != normalized_requested_url
+            and provenance
+            in {
+                _USER_PROVIDED,
+                _RETURNED_BY_WEB_SEARCH,
+                _SEARCH_MEDIATED_RECOVERY,
+                _SAME_ORIGIN_DERIVED,
+            }
+            and normalized_final_url not in self._canonical_redirect_urls
+        ):
+            self._canonical_redirect_urls[normalized_final_url] = {
+                "url": final_url,
+                "normalized_url": normalized_final_url,
+                "domain": _domain_for_url(normalized_final_url),
+                "source_url": requested_url,
+                "source_provenance_classification": provenance,
+                "source_event_id": event_id,
+                "provenance_classification": _CANONICAL_REDIRECT,
+            }
+            self._add_provenance_node(
+                raw_url=final_url,
+                provenance_classification=_CANONICAL_REDIRECT,
+                source_event_id=event_id,
+                parent_url=requested_url,
+                parent_source_event_id=str(entry.get("source_event_id") or "").strip() or None,
+                discovery_mechanism="validated_redirect",
+                ts=ts,
+                redirect_chain=(requested_url, final_url),
+                security_validation_status="validated_by_web_fetch",
+            )
+        self._record_urls_from_text(
+            text=result.get("content"),
+            provenance_classification=_FETCHED_PAGE_LINK,
+            source_event_id=event_id,
+            parent_url=final_url or requested_url,
+            parent_source_event_id=event_id,
+            discovery_mechanism="fetched_page_content",
+            source_type="web_fetch_result",
+            ts=ts,
+        )
         return True
 
     def _hydrate_url_index(
@@ -1043,6 +1503,21 @@ class SessionWebResearchTracker:
                 "domain": str(raw_entry.get("domain") or _domain_for_url(normalized_url)).strip(),
                 "ts": str(raw_entry.get("ts") or "").strip() or None,
                 "step": raw_entry.get("step") if isinstance(raw_entry.get("step"), int) else None,
+                "source_event_id": str(raw_entry.get("source_event_id") or "").strip() or None,
+                "parent_url": str(raw_entry.get("parent_url") or "").strip(),
+                "parent_source_event_id": (
+                    str(raw_entry.get("parent_source_event_id") or "").strip() or None
+                ),
+                "discovery_mechanism": str(raw_entry.get("discovery_mechanism") or "").strip(),
+                "source_type": str(raw_entry.get("source_type") or "").strip(),
+                "redirect_chain": [
+                    str(item or "").strip()
+                    for item in list(raw_entry.get("redirect_chain") or [])
+                    if str(item or "").strip()
+                ][:_MAX_URLS_PER_EVENT],
+                "security_validation_status": str(
+                    raw_entry.get("security_validation_status") or ""
+                ).strip(),
                 "provenance_classification": str(
                     raw_entry.get("provenance_classification") or fallback_classification
                 ).strip()
@@ -1095,11 +1570,23 @@ class SessionWebResearchTracker:
             "snippet",
             "backend",
             "provenance_classification",
+            "source_event_id",
+            "parent_url",
+            "parent_source_event_id",
+            "discovery_mechanism",
+            "source_type",
+            "security_validation_status",
         ):
             current_value = str(merged.get(key) or "").strip()
             incoming_value = str(incoming.get(key) or "").strip()
             if not current_value and incoming_value:
                 merged[key] = incoming_value
+        if not list(merged.get("redirect_chain") or []) and list(
+            incoming.get("redirect_chain") or []
+        ):
+            merged["redirect_chain"] = list(incoming.get("redirect_chain") or [])[
+                :_MAX_URLS_PER_EVENT
+            ]
         if not str(merged.get("normalized_url") or "").strip():
             merged["normalized_url"] = str(incoming.get("normalized_url") or "").strip()
         if not isinstance(merged.get("step"), int) and isinstance(incoming.get("step"), int):
@@ -1335,24 +1822,26 @@ class SessionWebResearchTracker:
 
 def build_web_research_artifact_from_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     tracker = SessionWebResearchTracker()
-    for event in events:
+    for index, event in enumerate(events, start=1):
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         tracker.observe_event(
             event_type=str(event.get("type") or "").strip(),
             payload=payload,
             ts=str(event.get("ts") or "").strip() or None,
+            event_id=str(event.get("event_id") or "").strip() or f"event:{index}",
         )
     return tracker.artifact_payload()
 
 
 def build_web_research_metrics_from_events(events: list[dict[str, Any]]) -> dict[str, int]:
     tracker = SessionWebResearchTracker()
-    for event in events:
+    for index, event in enumerate(events, start=1):
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         tracker.observe_event(
             event_type=str(event.get("type") or "").strip(),
             payload=payload,
             ts=str(event.get("ts") or "").strip() or None,
+            event_id=str(event.get("event_id") or "").strip() or f"event:{index}",
         )
     return tracker.metrics_payload()
 
@@ -1367,8 +1856,16 @@ def build_web_research_metrics_from_artifact_payload(payload: dict[str, Any]) ->
 def web_research_artifact_has_activity(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
-    for key in ("user_provided_urls", "returned_by_web_search_urls", "searches", "fetches"):
+    for key in (
+        "user_provided_urls",
+        "returned_by_web_search_urls",
+        "searches",
+        "fetches",
+    ):
         value = payload.get(key)
         if isinstance(value, list) and value:
             return True
+    graph = payload.get("url_provenance_graph")
+    if isinstance(graph, dict) and isinstance(graph.get("nodes"), list) and graph["nodes"]:
+        return True
     return False

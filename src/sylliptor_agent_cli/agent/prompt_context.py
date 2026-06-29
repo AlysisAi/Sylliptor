@@ -259,15 +259,22 @@ Subagent delegation
 - Subagents are first-class for non-trivial repo investigation: multiple files, unfamiliar areas, or questions not answered by one targeted read.
 - Use direct tools when context already answers the question, one known-file read is enough, or you are mid-implementation verifying one fact.
 - Choose the declared purpose that fits; custom subagents are first-class. Run unrelated investigations in parallel in one tool batch instead of serializing them.
-- Never delegate synthesis. Brief each subagent with the goal, exact repo-root-relative paths/symbols, prior findings, and answer format. Treat its output as a report, not ground truth; verify load-bearing claims before acting, and after a successful research subagent run proceed to implementation/tests/docs unless new uncertainty appears.
+- Never delegate synthesis. Brief each subagent with the goal, exact repo-root-relative paths/symbols, prior findings, and answer format. Treat its output as a report, not ground truth; verify load-bearing claims before acting, and after a successful research subagent run proceed to implementation/tests/docs unless new uncertainty appears. Do not re-read the same files merely to reconstruct a catalog the subagent already returned.
 """
 
 _SYSTEM_PROMPT_ONE_SHOT_SECTION = """
 
 One-shot execution mode
-- This is a one-shot execution run. Do not stop after a plan/progress update.
-- Continue until requested changes are implemented and verified, or explain a concrete blocker.
-- Do not spend many consecutive steps only reading files, including repeated failed reads/searches. After enough context, transition to implementation/tests or state a blocker.
+- This is a one-shot execute-intent run. It is autonomous: continue until requested work is implemented and verified, or explain a concrete blocker.
+- Do not emit a standalone text-only plan and wait for the user. Planning may be internal; if you include a visible short plan, the same assistant response must also include implementation-oriented tool calls.
+- A progress update is not a final answer. Finalize only after material-work and verification requirements are satisfied, or after reporting a concrete evidence-backed blocker.
+- After read/explore-only tool calls, the next assistant response should normally edit or create the requested deliverable, run an implementation-producing command, verify when the implementation already exists, or report a concrete evidence-backed blocker.
+- Do not ask a generic clarification question for an actionable execute task when the repo and request contain enough information for a safe best effort. Ask only when a scope-defining ambiguity affects safety, credentials or unavailable external inputs are required, or destructive alternatives require the user's choice.
+- Material action may be source edits, generated artifacts, configuration or data transformations, or another requested deliverable; it does not have to be source code.
+- Use `shell_background` for temporary session-owned servers, watchers, or log tails; these are reaped on session close. If the task explicitly requires a service to remain alive after finalization, start it with `shell_service_start` and a readiness probe, then use `shell_service_status` to verify readiness before finalizing.
+- Do not fabricate edits or verification. Report only changes and validation that actually happened.
+- Explicit non-execution requests, such as plan-only, advice-only, explanation-only, review-only, or "do not modify files", remain non-execution and should not be converted into autonomous implementation.
+- Do not spend many consecutive steps only reading files, including repeated failed reads/searches. After enough context, transition to implementation/tests/deliverable creation or state a blocker.
 - Use repo-root-relative file paths for concrete targets (for example `src/pkg/file.py`), and do not confuse import/module names with file-system paths.
 - If write/edit attempts fail repeatedly, change strategy instead of repeating the same failing call.
 """
@@ -1024,7 +1031,7 @@ def _environment_context_message(
     ]
     if one_shot_execution:
         lines.append(
-            "one_shot_guidance: continue past planning/progress updates until implementation is complete and verified; avoid many consecutive read-only steps; prefer one focused research subagent when mapping unfamiliar code; use repo-root-relative file targets; switch strategy after repeated write/edit failures; report a concrete blocker when needed"
+            "one_shot_guidance: autonomous execute-intent run; do not wait after a standalone text-only plan/progress update; after read-only exploration, move to implementation, deliverable creation, verification for existing work, or a concrete evidence-backed blocker; explicit plan-only/advice-only requests remain non-execution"
         )
     if authoritative_verification_commands is not None:
         lines.append("verification_commands_authoritative: true")
@@ -2246,6 +2253,7 @@ def _subagent_context_message(
         "guidance:",
         "- Choose a subagent by declared purpose; custom project-defined subagents are first-class alongside built-ins.",
         "- Pass a complete self-contained task brief and run unrelated subagent calls in parallel when useful.",
+        "- Use successful subagent reports as context; do not re-read the same files merely to rebuild the same catalog.",
         "available_subagents:",
     ]
     lines = list(base_lines)

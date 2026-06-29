@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from ..failure_category import provider_unavailable_retry_reason
 from ..provider_telemetry import ProviderCallTelemetryRecorder
 from .metadata import (
     DEEPSEEK_REASONING_CONTENT_KEY as _DEEPSEEK_REASONING_CONTENT_KEY,
@@ -848,7 +849,29 @@ def _merge_transport_metadata(
     )
 
 
+def _response_with_stream_restart_metadata(
+    response: LLMResponse,
+    *,
+    count: int,
+    reason: str,
+) -> LLMResponse:
+    raw = dict(response.raw) if isinstance(response.raw, dict) else {}
+    raw["stream_restart_count"] = max(0, int(count))
+    if reason:
+        raw["stream_restart_reason"] = str(reason)
+    return LLMResponse(
+        content=response.content,
+        tool_calls=list(response.tool_calls),
+        raw=raw,
+        response_model=response.response_model,
+        usage=response.usage,
+        provider_metadata=response.provider_metadata,
+    )
+
+
 class OpenAICompatClient:
+    supports_forced_tool_choice = True
+
     def __init__(
         self,
         *,
@@ -893,6 +916,8 @@ class OpenAICompatClient:
         self.provider_retry_settings = provider_retry_settings or ProviderRetrySettings()
         self._provider_sleep_fn = provider_sleep_fn
         self._provider_random_fn = provider_random_fn
+        self._provider_retry_deadline_allows: Callable[[float], bool] | None = None
+        self._provider_finalization_retry_used = False
         self._temperature_compat_modes: dict[tuple[str, str], str] = {}
         self._temperature_compat_lock = threading.Lock()
 
@@ -1030,8 +1055,11 @@ class OpenAICompatClient:
             operation="chat_completions",
         )
         telemetry_on_text_delta = telemetry.wrap_text_delta(on_text_delta)
+        stream_restart_count = 0
+        stream_restart_reason = ""
 
         def _send_request() -> LLMResponse:
+            nonlocal stream_restart_count, stream_restart_reason
             temperature_retry_count = 0
             temperature_retry_modes: set[str] = set()
             try:
@@ -1042,13 +1070,56 @@ class OpenAICompatClient:
                                 with client.stream(
                                     "POST", url, headers=headers, json=payload
                                 ) as resp:
-                                    response = self._parse_stream_response(
-                                        resp,
-                                        on_text_delta=telemetry_on_text_delta,
-                                        on_reasoning_delta=on_reasoning_delta,
-                                        provider_key=transport_provider_key,
-                                        cancellation_token=cancellation_token,
-                                    )
+                                    attempt_deltas: list[str] = []
+                                    forward_attempt_deltas = cancellation_token is not None
+
+                                    def _on_attempt_delta(
+                                        delta: str,
+                                        *,
+                                        _attempt_deltas: list[str] = attempt_deltas,
+                                        _forward_attempt_deltas: bool = forward_attempt_deltas,
+                                    ) -> None:
+                                        _attempt_deltas.append(delta)
+                                        if (
+                                            _forward_attempt_deltas
+                                            and telemetry_on_text_delta is not None
+                                        ):
+                                            telemetry_on_text_delta(delta)
+
+                                    try:
+                                        response = self._parse_stream_response(
+                                            resp,
+                                            on_text_delta=_on_attempt_delta,
+                                            on_reasoning_delta=on_reasoning_delta,
+                                            provider_key=transport_provider_key,
+                                            cancellation_token=cancellation_token,
+                                        )
+                                    except Exception as stream_error:
+                                        if attempt_deltas:
+                                            stream_restart_count += 1
+                                            stream_restart_reason = (
+                                                provider_unavailable_retry_reason(stream_error)
+                                                or "provider_stream_interrupted"
+                                            )
+                                            transport_metadata["stream_restart_count"] = (
+                                                stream_restart_count
+                                            )
+                                            transport_metadata["stream_restart_reason"] = (
+                                                stream_restart_reason
+                                            )
+                                        raise
+                                    if (
+                                        telemetry_on_text_delta is not None
+                                        and not forward_attempt_deltas
+                                    ):
+                                        for delta in attempt_deltas:
+                                            telemetry_on_text_delta(delta)
+                                    if stream_restart_count:
+                                        response = _response_with_stream_restart_metadata(
+                                            response,
+                                            count=stream_restart_count,
+                                            reason=stream_restart_reason,
+                                        )
                             else:
                                 resp = client.post(url, headers=headers, json=payload)
                                 if resp.status_code >= 400:
@@ -1121,6 +1192,7 @@ class OpenAICompatClient:
                 sleep_fn=self._provider_sleep_fn,
                 random_fn=self._provider_random_fn,
                 on_retry=telemetry.on_retry,
+                retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
             )
         )
 
@@ -1187,6 +1259,7 @@ class OpenAICompatClient:
         accumulated_content = ""
         reasoning_parts: list[str] = []
         reasoning_details: list[Any] = []
+        saw_done = False
 
         # Make the (possibly long) initial read interruptible: register the live
         # response's close so a cancel from another thread unblocks iter_lines, and
@@ -1197,126 +1270,136 @@ class OpenAICompatClient:
         if callable(_set_abort):
             _set_abort(resp.close)
         _stream_iter = resp.iter_lines()
-        while True:
-            try:
-                line = next(_stream_iter)
-            except StopIteration:
-                break
-            except Exception:
-                if cancellation_token is not None and getattr(
-                    cancellation_token, "is_cancelled", False
-                ):
-                    raise KeyboardInterrupt("cancelled_by_user") from None
-                raise
-            if cancellation_token is not None and getattr(
+
+        def _is_cancelled() -> bool:
+            return cancellation_token is not None and getattr(
                 cancellation_token, "is_cancelled", False
-            ):
-                raise KeyboardInterrupt("cancelled_by_user")
-            if not line:
-                continue
-            if isinstance(line, bytes):
-                text = line.decode("utf-8", errors="ignore")
-            else:
-                text = line
-            if not text.startswith("data:"):
-                continue
-            payload = text[5:].strip()
-            if not payload:
-                continue
-            if payload == "[DONE]":
-                break
+            )
 
-            try:
-                event = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            event_count += 1
-            model = event.get("model")
-            if isinstance(model, str) and model:
-                response_model = model
-            parsed_usage = _parse_usage(event.get("usage"))
-            if parsed_usage is not None:
-                usage = parsed_usage
-
-            choices = event.get("choices") or []
-            if not isinstance(choices, list) or not choices:
-                continue
-            choice0 = choices[0]
-            if not isinstance(choice0, dict):
-                continue
-            delta = choice0.get("delta") or {}
-            if not isinstance(delta, dict):
-                continue
-
-            reasoning_delta = delta.get(_DEEPSEEK_REASONING_CONTENT_KEY)
-            if not isinstance(reasoning_delta, str):
-                reasoning_delta = delta.get(_OPENROUTER_REASONING_KEY)
-            if isinstance(reasoning_delta, str) and reasoning_delta:
-                reasoning_parts.append(reasoning_delta)
-                if on_reasoning_delta is not None:
-                    on_reasoning_delta(reasoning_delta)
-            details_delta = delta.get(_OPENROUTER_REASONING_DETAILS_KEY)
-            if isinstance(details_delta, list) and details_delta:
-                reasoning_details.extend(details_delta)
-
-            content_delta = _normalize_assistant_content_to_text(delta.get("content"))
-            if content_delta:
-                content_suffix = _stream_delta_suffix(
-                    previous=accumulated_content,
-                    incoming=content_delta,
-                )
-                if content_suffix:
-                    content_parts.append(content_suffix)
-                    accumulated_content += content_suffix
-                    if on_text_delta is not None:
-                        on_text_delta(content_suffix)
-
-            tc_delta = delta.get("tool_calls") or []
-            if not isinstance(tc_delta, list):
-                continue
-            for raw_tc in tc_delta:
-                if not isinstance(raw_tc, dict):
+        try:
+            while True:
+                try:
+                    line = next(_stream_iter)
+                except StopIteration:
+                    break
+                except Exception:
+                    if _is_cancelled():
+                        raise KeyboardInterrupt("cancelled_by_user") from None
+                    raise
+                if _is_cancelled():
+                    raise KeyboardInterrupt("cancelled_by_user")
+                if not line:
                     continue
-                idx = raw_tc.get("index")
-                if not isinstance(idx, int):
+                if isinstance(line, bytes):
+                    text = line.decode("utf-8", errors="ignore")
+                else:
+                    text = line
+                if not text.startswith("data:"):
                     continue
-                entry = tool_chunks.setdefault(
-                    idx,
-                    {"id": "", "name": "", "arguments": "", "provider_metadata": None},
-                )
+                payload = text[5:].strip()
+                if not payload:
+                    continue
+                if payload == "[DONE]":
+                    saw_done = True
+                    break
 
-                tc_id = raw_tc.get("id")
-                if isinstance(tc_id, str) and tc_id:
-                    entry["id"] = tc_id
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_count += 1
+                model = event.get("model")
+                if isinstance(model, str) and model:
+                    response_model = model
+                parsed_usage = _parse_usage(event.get("usage"))
+                if parsed_usage is not None:
+                    usage = parsed_usage
 
-                provider_metadata = _gemini_tool_call_provider_metadata(raw_tc)
-                if provider_metadata:
-                    existing_metadata = entry.get("provider_metadata")
-                    entry["provider_metadata"] = _merge_provider_metadata(
-                        existing_metadata if isinstance(existing_metadata, dict) else None,
-                        provider_metadata,
+                choices = event.get("choices") or []
+                if not isinstance(choices, list) or not choices:
+                    continue
+                choice0 = choices[0]
+                if not isinstance(choice0, dict):
+                    continue
+                delta = choice0.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+
+                reasoning_delta = delta.get(_DEEPSEEK_REASONING_CONTENT_KEY)
+                if not isinstance(reasoning_delta, str):
+                    reasoning_delta = delta.get(_OPENROUTER_REASONING_KEY)
+                if isinstance(reasoning_delta, str) and reasoning_delta:
+                    reasoning_parts.append(reasoning_delta)
+                    if on_reasoning_delta is not None:
+                        on_reasoning_delta(reasoning_delta)
+                    if _is_cancelled():
+                        raise KeyboardInterrupt("cancelled_by_user")
+                details_delta = delta.get(_OPENROUTER_REASONING_DETAILS_KEY)
+                if isinstance(details_delta, list) and details_delta:
+                    reasoning_details.extend(details_delta)
+
+                content_delta = _normalize_assistant_content_to_text(delta.get("content"))
+                if content_delta:
+                    content_suffix = _stream_delta_suffix(
+                        previous=accumulated_content,
+                        incoming=content_delta,
+                    )
+                    if content_suffix:
+                        content_parts.append(content_suffix)
+                        accumulated_content += content_suffix
+                        if on_text_delta is not None:
+                            on_text_delta(content_suffix)
+                        if _is_cancelled():
+                            raise KeyboardInterrupt("cancelled_by_user")
+
+                tc_delta = delta.get("tool_calls") or []
+                if not isinstance(tc_delta, list):
+                    continue
+                for raw_tc in tc_delta:
+                    if not isinstance(raw_tc, dict):
+                        continue
+                    idx = raw_tc.get("index")
+                    if not isinstance(idx, int):
+                        continue
+                    entry = tool_chunks.setdefault(
+                        idx,
+                        {"id": "", "name": "", "arguments": "", "provider_metadata": None},
                     )
 
-                fn = raw_tc.get("function")
-                if not isinstance(fn, dict):
-                    continue
-                name = fn.get("name")
-                if isinstance(name, str) and name:
-                    entry["name"] = name
-                args_piece = fn.get("arguments")
-                if isinstance(args_piece, str):
-                    entry["arguments"] += _stream_delta_suffix(
-                        previous=entry["arguments"],
-                        incoming=args_piece,
-                    )
+                    tc_id = raw_tc.get("id")
+                    if isinstance(tc_id, str) and tc_id:
+                        entry["id"] = tc_id
 
-        if callable(_clear_abort):
-            _clear_abort()
-        if cancellation_token is not None and getattr(cancellation_token, "is_cancelled", False):
+                    provider_metadata = _gemini_tool_call_provider_metadata(raw_tc)
+                    if provider_metadata:
+                        existing_metadata = entry.get("provider_metadata")
+                        entry["provider_metadata"] = _merge_provider_metadata(
+                            existing_metadata if isinstance(existing_metadata, dict) else None,
+                            provider_metadata,
+                        )
+
+                    fn = raw_tc.get("function")
+                    if not isinstance(fn, dict):
+                        continue
+                    name = fn.get("name")
+                    if isinstance(name, str) and name:
+                        entry["name"] = name
+                    args_piece = fn.get("arguments")
+                    if isinstance(args_piece, str):
+                        entry["arguments"] += _stream_delta_suffix(
+                            previous=entry["arguments"],
+                            incoming=args_piece,
+                        )
+        finally:
+            if callable(_clear_abort):
+                _clear_abort()
+        if _is_cancelled():
             # Stream ended because the abort closed it (clean EOF, not an error).
             raise KeyboardInterrupt("cancelled_by_user")
+        if not saw_done:
+            raise LLMError("LLM stream truncated before [DONE]")
         streamed_tool_calls = _parse_stream_tool_calls(tool_chunks)
         streamed_content = "".join(content_parts)
         if not streamed_content.strip() and not streamed_tool_calls:

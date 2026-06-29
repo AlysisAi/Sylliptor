@@ -122,13 +122,7 @@ def test_validate_replanning_plan_update_rejects_completed_task_rewrite() -> Non
                 "status": "done",
                 "dependencies": [],
                 "estimated_files": [],
-            },
-            {
-                "id": "T02",
-                "title": "Planned",
-                "status": "planned",
-                "dependencies": [],
-                "estimated_files": [],
+                "write_scope": [],
             },
         ],
         "requirements": [],
@@ -138,10 +132,38 @@ def test_validate_replanning_plan_update_rejects_completed_task_rewrite() -> Non
         plan_update={"tasks_update": [{"id": "T01", "title": "Rewrite done task"}]},
     )
     assert validation.valid is False
-    assert any("cannot rewrite completed/terminal task: T01" in item for item in validation.errors)
+    assert not any("mutated protected task history: T01" in item for item in validation.errors)
+    assert plan["tasks"][0]["title"] == "Done"
 
 
-def test_validate_replanning_plan_update_stays_strict_when_safe_additions_are_mixed_in() -> None:
+def test_validate_replanning_plan_update_rejects_protected_rewrite_with_scope_context() -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Done",
+                "status": "done",
+                "dependencies": [],
+                "estimated_files": ["src/parser.py"],
+                "write_scope": ["src/parser.py"],
+            },
+        ],
+        "requirements": [],
+    }
+    validation, apply_preview = validate_replanning_plan_update(
+        plan=plan,
+        plan_update={"tasks_update": [{"id": "T01", "title": "Rewrite done task"}]},
+        latest_user_text="Only work in src/parser.py while following up on the integration issue.",
+    )
+
+    assert validation.valid is False
+    assert "replanning proposal made no executable plan changes" in validation.errors
+    assert apply_preview.added_task_ids == []
+    assert apply_preview.updated_task_ids == []
+    assert plan["tasks"][0]["title"] == "Done"
+
+
+def test_validate_replanning_plan_update_recovers_when_safe_additions_are_mixed_in() -> None:
     plan = {
         "tasks": [
             {
@@ -153,10 +175,12 @@ def test_validate_replanning_plan_update_stays_strict_when_safe_additions_are_mi
             },
             {
                 "id": "T02",
-                "title": "Planned",
+                "title": "Update planned implementation",
                 "status": "planned",
                 "dependencies": [],
-                "estimated_files": [],
+                "acceptance_criteria": ["Planned implementation remains runnable."],
+                "estimated_files": ["src/planned.py"],
+                "write_scope": ["src/planned.py"],
             },
         ],
         "requirements": [],
@@ -178,10 +202,100 @@ def test_validate_replanning_plan_update_stays_strict_when_safe_additions_are_mi
         },
     )
 
-    assert validation.valid is False
-    assert any("cannot rewrite completed/terminal task: T01" in item for item in validation.errors)
-    assert not any("Ignored planner tasks_update" in item for item in validation.warnings)
+    assert validation.valid is True
+    assert validation.errors == ()
+    assert any("protected non-planned task history" in item for item in validation.warnings)
     assert apply_preview.added_task_ids == ["T03"]
+    assert apply_preview.updated_task_ids == []
+
+
+def test_validate_replanning_plan_update_synthesizes_failed_task_follow_up() -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix parser",
+                "description": "Initial parser fix failed verification.",
+                "status": "failed",
+                "dependencies": [],
+                "acceptance_criteria": ["Parser handles blank lines."],
+                "estimated_files": ["src/parser.py"],
+                "write_scope": ["src/parser.py"],
+            },
+        ],
+        "requirements": [],
+    }
+
+    validation, apply_preview = validate_replanning_plan_update(
+        plan=plan,
+        plan_update={
+            "tasks_update": [
+                {
+                    "id": "T01",
+                    "title": "Repair parser blank-line handling",
+                    "description": "Add a new follow-up task for blank-line parser behavior.",
+                    "acceptance_criteria": ["Blank-line parser behavior passes."],
+                    "dependencies": ["T01"],
+                    "estimated_files": ["src/parser.py"],
+                    "write_scope": ["src/parser.py"],
+                }
+            ]
+        },
+    )
+
+    assert validation.valid is True
+    assert apply_preview.synthesized_task_ids == ["T02"]
+    assert apply_preview.added_task_ids == ["T02"]
+    assert any("protected non-planned task history" in item for item in validation.warnings)
+    assert any(
+        "Dropped protected non-done dependencies for synthesized follow-up task 'T02': T01" in item
+        for item in validation.warnings
+    )
+
+
+def test_validate_replanning_plan_update_drops_failed_dependency_from_added_follow_up() -> None:
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix parser",
+                "description": "Initial parser fix failed verification.",
+                "status": "failed",
+                "dependencies": [],
+                "acceptance_criteria": ["Parser handles blank lines."],
+                "estimated_files": ["src/parser.py"],
+                "write_scope": ["src/parser.py"],
+            },
+        ],
+        "requirements": [],
+    }
+
+    validation, apply_preview = validate_replanning_plan_update(
+        plan=plan,
+        plan_update={
+            "tasks_supersede": ["T01"],
+            "tasks_add": [
+                {
+                    "title": "Repair parser blank-line handling",
+                    "description": "Patch the parser in src/parser.py.",
+                    "acceptance_criteria": ["Parser handles blank lines."],
+                    "dependencies": ["T01"],
+                    "estimated_files": ["src/parser.py"],
+                    "write_scope": ["src/parser.py"],
+                }
+            ],
+        },
+    )
+
+    assert validation.valid is True
+    assert apply_preview.added_task_ids == ["T02"]
+    assert apply_preview.superseded_task_ids == []
+    assert any("protected non-planned task history" in item for item in validation.warnings)
+    assert any(
+        "Dropped protected non-done dependencies for new task 'Repair parser blank-line handling': T01"
+        in item
+        for item in validation.warnings
+    )
 
 
 def test_validate_replanning_plan_update_applies_latest_direction_context() -> None:

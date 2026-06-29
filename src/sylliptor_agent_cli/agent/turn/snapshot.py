@@ -10,11 +10,12 @@ from ...runtime_artifacts import is_runtime_artifact_path
 from ..prompt_context import _normalize_repo_relative_hint_path
 
 _SHELL_MUTATION_SNAPSHOT_METADATA_PREFIX = "meta"
+_subprocess_run = subprocess.run
 
 
 def _list_git_workspace_snapshot_paths(root: Path) -> set[str] | None:
     try:
-        proc = subprocess.run(
+        proc = _subprocess_run(
             [
                 "git",
                 "-C",
@@ -34,12 +35,23 @@ def _list_git_workspace_snapshot_paths(root: Path) -> set[str] | None:
         return None
 
     paths: set[str] = set()
-    for raw_item in proc.stdout.split(b"\0"):
+    stdout = proc.stdout or b""
+    raw_items: list[str | bytes]
+    if isinstance(stdout, str):
+        raw_items = stdout.split("\0")
+    else:
+        raw_items = stdout.split(b"\0")
+    for raw_item in raw_items:
         if not raw_item:
             continue
+        raw_path = (
+            raw_item
+            if isinstance(raw_item, str)
+            else raw_item.decode("utf-8", errors="surrogateescape")
+        )
         normalized = _normalize_repo_relative_hint_path(
             root=root,
-            raw=raw_item.decode("utf-8", errors="surrogateescape"),
+            raw=raw_path,
         )
         if not normalized or is_runtime_artifact_path(normalized, root=root):
             continue

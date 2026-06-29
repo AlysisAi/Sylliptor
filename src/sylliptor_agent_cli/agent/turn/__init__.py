@@ -25,6 +25,8 @@ _LAZY_ATTR_MODULES = {
     "_assistant_text_contains_progress_intent": "exploration",
     "_assistant_text_has_blocker_marker": "exploration",
     "_assistant_text_has_completion_marker": "exploration",
+    "_assistant_text_has_structured_blocker_marker": "exploration",
+    "_assistant_text_has_well_formed_blocker": "exploration",
     "_build_post_explore_bootstrap_nudge": "exploration",
     "_edit_similarity_key": "exploration",
     "_exploration_attempt_outcome": "exploration",

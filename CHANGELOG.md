@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-06-29
+
+### Added
+
+- Added stronger completion gating, acceptance contracts, and verification evidence
+  handling for one-shot and managed task flows.
+- Added `shell_wait` and durable service tools for long-running workflows.
+- Added improved web fetch provenance handling for safer URL retrieval.
+
+### Improved
+
+- Improved Forge verification behavior, runtime deadline handling, planning, routing,
+  and recovery paths.
+- Improved provider adapter behavior, web search handling, usage tracking, and TUI
+  markdown rendering.
+
+### Fixed
+
+- Fixed edge cases around task finalization, provider responses, shell workflows,
+  verification evidence, and recovery from unknown tool calls.
+
 ## [0.9.7] - 2026-06-23
 
 ### Added

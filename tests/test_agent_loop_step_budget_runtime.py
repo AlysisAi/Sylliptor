@@ -7,6 +7,7 @@ from typing import Any
 from sylliptor_agent_cli import agent_loop as agent_loop_mod
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.execution_deadline import ExecutionDeadline
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse, ToolCall
 from sylliptor_agent_cli.session_store import read_session_events
 
@@ -209,6 +210,49 @@ def test_disabled_session_keeps_fixed_runtime_behavior(tmp_path: Path, monkeypat
     assert _event_payloads(log_path, "turn_step_budget_resolved") == []
     error_events = _event_payloads(log_path, "error")
     assert error_events[-1]["max_steps"] == 12
+
+
+def test_deadline_exhausted_before_first_llm_skips_model_and_not_step_budget(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(model="test-model", routing_mode="code_only")
+    deadline = ExecutionDeadline.from_absolute(
+        started_at_monotonic=10.0,
+        deadline_monotonic=10.0,
+        configured_duration_seconds=1.0,
+        clock=lambda: 10.0,
+    )
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="review",
+        yes=True,
+        max_steps=12,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+        execution_deadline=deadline,
+        enable_compaction=False,
+    )
+    client = _LoopingToolClient()
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Keep working on the repo change.")
+        log_path = session.store.path
+    finally:
+        session.close()
+
+    assert exit_code == 1
+    assert client.calls == 0
+    deadline_events = _event_payloads(log_path, "deadline_exhausted")
+    assert deadline_events[-1]["operation"] == "main_llm"
+    assert deadline_events[-1]["deadline_exhausted"] is True
+    forced_summary_requests = _event_payloads(log_path, "forced_final_summary_requested")
+    assert forced_summary_requests[-1]["termination_kind"] == "deadline_exhausted"
+    assert forced_summary_requests[-1]["termination_cause"] == "the run deadline is exhausted"
+    error_events = _event_payloads(log_path, "error")
+    assert all(event.get("max_steps") is None for event in error_events)
 
 
 def test_non_repo_fast_path_clears_active_turn_budget_without_new_resolution_event(

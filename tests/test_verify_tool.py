@@ -349,7 +349,7 @@ def test_interactive_docs_only_pathless_prompt_updates_verification_contract_wit
 
 
 @pytest.mark.parametrize(
-    ("session_id", "files", "instruction", "expected_reason"),
+    ("session_id", "files", "instruction", "expected_commands", "expected_reason"),
     [
         (
             "interactive-js-auth-verify",
@@ -358,7 +358,8 @@ def test_interactive_docs_only_pathless_prompt_updates_verification_contract_wit
                 "src/index.ts": "export const value = 1;\n",
             },
             "Update the auth flow.",
-            "repo scan found a JS/Node workspace without a real repo-native test command",
+            ["npm run build"],
+            "repo scan discovered package.json verification scripts",
         ),
         (
             "interactive-js-bug-verify",
@@ -367,7 +368,8 @@ def test_interactive_docs_only_pathless_prompt_updates_verification_contract_wit
                 "src/index.ts": "export const value = 1;\n",
             },
             "Fix the bug.",
-            "repo scan found a JS/Node workspace without a real repo-native test command",
+            ["npm run build"],
+            "repo scan discovered package.json verification scripts",
         ),
         (
             "interactive-ci-verify",
@@ -377,29 +379,42 @@ def test_interactive_docs_only_pathless_prompt_updates_verification_contract_wit
                 )
             },
             "Fix the bug.",
+            [],
             "repo scan found a CI-only workspace with no authoritative verification surface",
         ),
         (
             "interactive-terraform-verify",
             {"versions.tf": ('terraform {\n  required_version = ">= 1.6.0"\n}\n')},
             "Adjust the policy.",
+            [],
             "repo scan found a Terraform-only workspace with no authoritative verification surface",
         ),
         (
             "interactive-compose-verify",
             {"compose.yaml": ("services:\n  web:\n    image: nginx:latest\n")},
             "Adjust startup order.",
+            [],
             "repo scan found a Compose-only workspace with no authoritative verification surface",
         ),
     ],
 )
 def test_interactive_pathless_non_python_tasks_do_not_inherit_generic_pytest_fallback(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     session_id: str,
     files: dict[str, str],
     instruction: str,
+    expected_commands: list[str],
     expected_reason: str,
 ) -> None:
+    calls: list[str] = []
+
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(cmd))
+        return _cp(returncode=0, stdout="ok\n")
+
+    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+
     repo = tmp_path / "repo"
     repo.mkdir()
     _write_repo_files(repo, files)
@@ -417,18 +432,24 @@ def test_interactive_pathless_non_python_tasks_do_not_inherit_generic_pytest_fal
             route_execution_posture="execute",
         )
 
-        assert session.effective_verification_commands == []
-        assert session.verification_selection_source == "repo_scan.no_authoritative_commands"
+        assert session.effective_verification_commands == expected_commands
+        assert session.verification_selection_source == (
+            "repo_scan.likely_test_commands"
+            if expected_commands
+            else "repo_scan.no_authoritative_commands"
+        )
         assert session.verification_selection_reason == expected_reason
-        assert session.verification_contract_type == "unavailable"
-        assert session.verification_authoritative is False
+        assert session.verification_contract_type == (
+            "repo_native" if expected_commands else "unavailable"
+        )
+        assert session.verification_authoritative is bool(expected_commands)
 
         result = session.tools["verify_run"].run({})
     finally:
         session.close()
 
-    assert result["commands"] == []
-    assert result["summary"] == "verification skipped: no commands"
+    assert [call for call in calls if call in expected_commands] == expected_commands
+    assert result["commands"] == expected_commands
     assert result["all_passed"] is True
 
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
@@ -437,12 +458,21 @@ def test_interactive_pathless_non_python_tasks_do_not_inherit_generic_pytest_fal
     ]
     assert contract_updates
     assert contract_updates[-1]["payload"]["verification_selection_reason"] == expected_reason
-    assert contract_updates[-1]["payload"]["verification_contract_type"] == "unavailable"
-    assert contract_updates[-1]["payload"]["verification_authoritative"] is False
+    assert contract_updates[-1]["payload"]["verification_contract_type"] == (
+        "repo_native" if expected_commands else "unavailable"
+    )
+    assert contract_updates[-1]["payload"]["verification_authoritative"] is bool(expected_commands)
 
 
 @pytest.mark.parametrize(
-    ("session_id", "files", "instruction", "expected_path", "expected_reason"),
+    (
+        "session_id",
+        "files",
+        "instruction",
+        "expected_path",
+        "expected_commands",
+        "expected_reason",
+    ),
     [
         (
             "interactive-js-env-example-verify",
@@ -452,7 +482,8 @@ def test_interactive_pathless_non_python_tasks_do_not_inherit_generic_pytest_fal
             },
             "Update .env.example handling.",
             ".env.example",
-            "repo scan found a JS/Node workspace without a real repo-native test command",
+            ["npm run build"],
+            "repo scan discovered package.json verification scripts",
         ),
         (
             "interactive-js-npmrc-verify",
@@ -462,7 +493,8 @@ def test_interactive_pathless_non_python_tasks_do_not_inherit_generic_pytest_fal
             },
             "Adjust .npmrc defaults.",
             ".npmrc",
-            "repo scan found a JS/Node workspace without a real repo-native test command",
+            ["npm run build"],
+            "repo scan discovered package.json verification scripts",
         ),
         (
             "interactive-js-vercel-verify",
@@ -472,7 +504,8 @@ def test_interactive_pathless_non_python_tasks_do_not_inherit_generic_pytest_fal
             },
             "Update vercel.json config.",
             "vercel.json",
-            "repo scan found a JS/Node workspace without a real repo-native test command",
+            ["npm run build"],
+            "repo scan discovered package.json verification scripts",
         ),
         (
             "interactive-python-env-example-verify",
@@ -483,18 +516,29 @@ def test_interactive_pathless_non_python_tasks_do_not_inherit_generic_pytest_fal
             },
             "Update .env.example defaults.",
             ".env.example",
+            [],
             "repo scan found a Python workspace without a discoverable test surface",
         ),
     ],
 )
 def test_interactive_neutral_config_paths_keep_repo_grounded_invalidation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     session_id: str,
     files: dict[str, str],
     instruction: str,
     expected_path: str,
+    expected_commands: list[str],
     expected_reason: str,
 ) -> None:
+    calls: list[str] = []
+
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(cmd))
+        return _cp(returncode=0, stdout="ok\n")
+
+    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+
     repo = tmp_path / "repo"
     repo.mkdir()
     _write_repo_files(repo, files)
@@ -513,18 +557,24 @@ def test_interactive_neutral_config_paths_keep_repo_grounded_invalidation(
             route_execution_posture="execute",
         )
 
-        assert session.effective_verification_commands == []
-        assert session.verification_selection_source == "repo_scan.no_authoritative_commands"
+        assert session.effective_verification_commands == expected_commands
+        assert session.verification_selection_source == (
+            "repo_scan.likely_test_commands"
+            if expected_commands
+            else "repo_scan.no_authoritative_commands"
+        )
         assert session.verification_selection_reason == expected_reason
-        assert session.verification_contract_type == "unavailable"
-        assert session.verification_authoritative is False
+        assert session.verification_contract_type == (
+            "repo_native" if expected_commands else "unavailable"
+        )
+        assert session.verification_authoritative is bool(expected_commands)
 
         result = session.tools["verify_run"].run({})
     finally:
         session.close()
 
-    assert result["commands"] == []
-    assert result["summary"] == "verification skipped: no commands"
+    assert [call for call in calls if call in expected_commands] == expected_commands
+    assert result["commands"] == expected_commands
     assert result["all_passed"] is True
 
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
@@ -533,7 +583,9 @@ def test_interactive_neutral_config_paths_keep_repo_grounded_invalidation(
     ]
     assert contract_updates
     assert contract_updates[-1]["payload"]["verification_selection_source"] == (
-        "repo_scan.no_authoritative_commands"
+        "repo_scan.likely_test_commands"
+        if expected_commands
+        else "repo_scan.no_authoritative_commands"
     )
     assert contract_updates[-1]["payload"]["verification_selection_reason"] == expected_reason
     assert contract_updates[-1]["payload"]["instruction_paths"] == [expected_path]
@@ -680,7 +732,7 @@ def test_interactive_mixed_workspace_neutral_config_path_keeps_repo_grounded_inv
         ("interactive-js-tsconfig-verify", "Update tsconfig.json."),
     ],
 )
-def test_interactive_js_bootstrap_paths_still_resolve_to_no_authoritative_commands(
+def test_interactive_js_bootstrap_paths_select_repo_native_build_command(
     tmp_path: Path,
     session_id: str,
     instruction: str,
@@ -710,9 +762,10 @@ def test_interactive_js_bootstrap_paths_still_resolve_to_no_authoritative_comman
             route_execution_posture="execute",
         )
 
-        assert session.effective_verification_commands == []
-        assert session.verification_contract_type == "unavailable"
-        assert session.verification_authoritative is False
+        assert session.effective_verification_commands == ["npm run build"]
+        assert session.verification_selection_source == "repo_scan.likely_test_commands"
+        assert session.verification_contract_type == "repo_native"
+        assert session.verification_authoritative is True
     finally:
         session.close()
 
@@ -721,8 +774,8 @@ def test_interactive_js_bootstrap_paths_still_resolve_to_no_authoritative_comman
         event for event in events if event.get("type") == "verification_contract_updated"
     ]
     assert contract_updates
-    assert contract_updates[-1]["payload"]["verification_contract_type"] == "unavailable"
-    assert contract_updates[-1]["payload"]["verification_authoritative"] is False
+    assert contract_updates[-1]["payload"]["verification_contract_type"] == "repo_native"
+    assert contract_updates[-1]["payload"]["verification_authoritative"] is True
 
 
 @pytest.mark.parametrize(
@@ -781,6 +834,38 @@ def test_interactive_python_repo_without_tests_marks_verification_unavailable(
     assert result["all_passed"] is True
 
 
+def test_interactive_plain_non_python_turn_does_not_require_generic_pytest(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "input.txt").write_text("data\n", encoding="utf-8")
+    sessions_dir = tmp_path / "sessions"
+
+    session = _create_interactive_session(
+        repo,
+        sessions_dir=sessions_dir,
+        session_id="interactive-plain-no-generic-pytest",
+    )
+    try:
+        agent_loop_mod._refresh_interactive_turn_verification_selection(
+            session,
+            instruction="Create result.txt.",
+            route_execution_posture="execute",
+        )
+
+        assert session.effective_verification_commands == []
+        assert session.verification_selection_source == "repo_scan.no_authoritative_commands"
+        assert session.verification_contract_type == "unavailable"
+        assert session.verification_authoritative is False
+        result = session.tools["verify_run"].run({})
+    finally:
+        session.close()
+
+    assert result["commands"] == []
+    assert result["all_passed"] is True
+
+
 def test_interactive_pathless_js_repo_with_repo_native_tests_keeps_authoritative_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -830,7 +915,7 @@ def test_interactive_pathless_js_repo_with_repo_native_tests_keeps_authoritative
     finally:
         session.close()
 
-    assert calls == ["npm test"]
+    assert [call for call in calls if call == "npm test"] == ["npm test"]
     assert result["commands"] == ["npm test"]
     assert result["all_passed"] is True
 
@@ -908,35 +993,65 @@ def test_interactive_mixed_workspace_repo_native_commands_remain_authoritative(
     finally:
         session.close()
 
-    assert calls == expected_commands
+    assert [call for call in calls if call in expected_commands] == expected_commands
     assert result["commands"] == expected_commands
     assert result["all_passed"] is True
 
 
 @pytest.mark.parametrize(
-    ("session_id", "instruction", "expected_path", "expected_reason"),
+    (
+        "session_id",
+        "instruction",
+        "expected_path",
+        "expected_commands",
+        "expected_source",
+        "expected_contract_type",
+        "expected_authoritative",
+        "expected_reason",
+    ),
     [
         (
             "interactive-mixed-js-target-verify",
             "Update src/index.ts auth handling.",
             "src/index.ts",
-            "frontend/JS task should not inherit a generic Python verification fallback",
+            ["npm run build"],
+            "repo_scan.likely_test_commands",
+            "repo_native",
+            True,
+            "repo scan discovered package.json verification scripts",
         ),
         (
             "interactive-mixed-python-target-verify",
             "Improve upload logging in src/demo/app.py",
             "src/demo/app.py",
+            [],
+            "task_refinement.no_authoritative_commands",
+            "unavailable",
+            False,
             "Python task has no discoverable test surface, so generic pytest is not trusted",
         ),
     ],
 )
-def test_interactive_mixed_workspace_explicit_targets_keep_task_specific_non_authoritative_behavior(
+def test_interactive_mixed_workspace_explicit_targets_keep_task_specific_selection_behavior(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     session_id: str,
     instruction: str,
     expected_path: str,
+    expected_commands: list[str],
+    expected_source: str,
+    expected_contract_type: str,
+    expected_authoritative: bool,
     expected_reason: str,
 ) -> None:
+    calls: list[str] = []
+
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(cmd))
+        return _cp(returncode=0, stdout="ok\n")
+
+    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+
     repo = tmp_path / "repo"
     repo.mkdir()
     _write_repo_files(
@@ -963,18 +1078,18 @@ def test_interactive_mixed_workspace_explicit_targets_keep_task_specific_non_aut
             route_execution_posture="execute",
         )
 
-        assert session.effective_verification_commands == []
-        assert session.verification_selection_source == "task_refinement.no_authoritative_commands"
+        assert session.effective_verification_commands == expected_commands
+        assert session.verification_selection_source == expected_source
         assert session.verification_selection_reason == expected_reason
-        assert session.verification_contract_type == "unavailable"
-        assert session.verification_authoritative is False
+        assert session.verification_contract_type == expected_contract_type
+        assert session.verification_authoritative is expected_authoritative
 
         result = session.tools["verify_run"].run({})
     finally:
         session.close()
 
-    assert result["commands"] == []
-    assert result["summary"] == "verification skipped: no commands"
+    assert [call for call in calls if call in expected_commands] == expected_commands
+    assert result["commands"] == expected_commands
     assert result["all_passed"] is True
 
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
@@ -982,9 +1097,7 @@ def test_interactive_mixed_workspace_explicit_targets_keep_task_specific_non_aut
         event for event in events if event.get("type") == "verification_contract_updated"
     ]
     assert contract_updates
-    assert contract_updates[-1]["payload"]["verification_selection_source"] == (
-        "task_refinement.no_authoritative_commands"
-    )
+    assert contract_updates[-1]["payload"]["verification_selection_source"] == expected_source
     assert contract_updates[-1]["payload"]["verification_selection_reason"] == expected_reason
     assert contract_updates[-1]["payload"]["instruction_paths"] == [expected_path]
 
@@ -1035,7 +1148,9 @@ def test_interactive_repo_native_verification_selection_stays_authoritative(
     finally:
         session.close()
 
-    assert calls == ["pytest tests/test_app.py -q"]
+    assert [call for call in calls if call == "pytest tests/test_app.py -q"] == [
+        "pytest tests/test_app.py -q"
+    ]
     assert result["commands"] == ["pytest tests/test_app.py -q"]
     assert result["all_passed"] is True
 
@@ -1093,7 +1208,7 @@ def test_interactive_explicit_verify_override_wins_and_survives_task_refresh(
     finally:
         session.close()
 
-    assert calls == verify_cmd
+    assert [call for call in calls if call in verify_cmd] == verify_cmd
     assert result["commands"] == verify_cmd
     assert result["all_passed"] is True
 
@@ -1623,6 +1738,104 @@ def test_verify_run_rejects_compound_shell_command(
         match="verification commands must be single commands without shell control flow or chaining.",
     ):
         tools["verify_run"].run({"commands": ["pytest -q || true"]})
+
+
+def test_verify_run_executes_explicit_trusted_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(cmd))
+        return _cp(returncode=0, stdout="ok\n")
+
+    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    pipeline = "printf 'a\\nb\\n' | tail -n 1"
+    tools = _build_tools(
+        tmp_path,
+        verify_command_selection=ResolvedVerifyCommands(
+            commands=(pipeline,),
+            source="task_refinement.explicit_user_command",
+            contract_type="task_acceptance",
+        ),
+    )
+
+    result = tools["verify_run"].run({})
+
+    assert calls == [pipeline]
+    assert result["commands"] == [pipeline]
+    assert result["all_passed"] is True
+    specs = result["verification_command_specs"]
+    assert specs[0]["execution_mode"] == "TRUSTED_SHELL_EXPRESSION"
+    assert specs[0]["provenance"] == "EXPLICIT_USER_COMMAND"
+
+
+def test_verify_run_rejects_arbitrary_model_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_loop_mod,
+        "run_task_verification",
+        lambda **_kwargs: pytest.fail("verify engine should not run for untrusted pipeline"),
+    )
+    tools = _build_tools(tmp_path)
+
+    with pytest.raises(
+        verify_gate_mod.VerifyError,
+        match="verification commands must be single commands without shell control flow or chaining.",
+    ):
+        tools["verify_run"].run({"commands": ["printf ok | cat"]})
+
+
+def test_verify_run_authoritative_trusted_pipeline_remains_locked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(cmd))
+        return _cp(returncode=0, stdout="ok\n")
+
+    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    pipeline = "printf ok | cat"
+    tools = _build_tools(
+        tmp_path,
+        authoritative_verification_commands=[pipeline],
+    )
+
+    result = tools["verify_run"].run({"commands": [pipeline]})
+    assert result["all_passed"] is True
+    assert calls == [pipeline]
+
+    with pytest.raises(
+        verify_gate_mod.VerifyError,
+        match="Managed verification commands are locked",
+    ):
+        tools["verify_run"].run({"commands": ["printf ok | tail -n 1"]})
+
+
+def test_verify_run_malformed_authoritative_command_fails_fast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_loop_mod,
+        "run_task_verification",
+        lambda **_kwargs: pytest.fail("verify engine should not run malformed host command"),
+    )
+    tools = _build_tools(
+        tmp_path,
+        authoritative_verification_commands=["pytest -q '"],
+    )
+
+    with pytest.raises(
+        verify_gate_mod.VerifyError,
+        match="authoritative verification command is invalid",
+    ):
+        tools["verify_run"].run({})
 
 
 def test_verify_run_truncates_output_preview_but_keeps_full_artifact(

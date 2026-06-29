@@ -599,6 +599,24 @@ def _print_forge_meta(*, console: Console, message: str, style: str = "dim") -> 
     console.print(_forge_bar_text(text=message, style=style), highlight=False)
 
 
+def _forge_supports_unicode_glyphs(console: Console) -> bool:
+    # Legacy Windows consoles cannot render box-drawing/bullet glyphs; everything
+    # else is UTF-capable (the CLI reconfigures stdout to UTF-8 on startup), so we
+    # fall back to ASCII only when Rich flags a legacy console or a non-UTF encoding.
+    if bool(getattr(console, "legacy_windows", False)):
+        return False
+    encoding = str(getattr(console, "encoding", "") or "").lower()
+    return "utf" in encoding
+
+
+def _forge_phase_rule(*, console: Console, label: str) -> Any:
+    from rich.rule import Rule
+
+    rule_char = "─" if _forge_supports_unicode_glyphs(console) else "-"
+    title = str(label or "").strip()
+    return Rule(title=title, characters=rule_char, style="bright_black", align="left")
+
+
 def _print_forge_warning_messages(
     *,
     console: Console,

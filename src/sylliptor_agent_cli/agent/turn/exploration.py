@@ -80,6 +80,27 @@ _ONE_SHOT_BLOCKER_MARKERS = (
     "ειμαι μπλοκαρισμενη",
     "δεν εχω προσβαση",
 )
+_STRUCTURED_BLOCKER_MARKER_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\[?\s*)?"
+    r"(?:blocked|blocker|needs[_\s-]?user|needs[_\s-]?input|need[_\s-]?user[_\s-]?input)"
+    r"(?:\s*\]?)?\s*:",
+    re.IGNORECASE,
+)
+_STRUCTURED_BLOCKER_CATEGORY_RE = re.compile(
+    r"\b(?:category|type|reason)\s*:\s*"
+    r"(?:approval|ambiguous(?:_requirement)?|credentials?|docker|environment|"
+    r"missing(?:_information|_dependency|_toolchain)?|network|permission|policy|"
+    r"sandbox|toolchain|unavailable)\b",
+    re.IGNORECASE,
+)
+_BLOCKER_OBSTACLE_RE = re.compile(
+    r"\b(?:approval|permission|permissions|sandbox|docker|network|offline|toolchain|"
+    r"missing|unavailable|not\s+available|not\s+installed|command\s+not\s+found|"
+    r"no\s+such\s+file|ambiguous|clarif(?:y|ication)|user\s+input|"
+    r"cannot\s+resolve|can't\s+resolve|environment|host|credential|credentials|"
+    r"secret|secrets|api\s+key|access|policy|blocked)\b",
+    re.IGNORECASE,
+)
 _EXPLORATION_FALLBACK_TOOL_NAMES = {
     "fs_read",
     "fs_read_lines",
@@ -128,6 +149,33 @@ def _assistant_text_has_completion_marker(text: str) -> bool:
 def _assistant_text_has_blocker_marker(text: str) -> bool:
     normalized = _normalize_marker_text(text)
     return _contains_any_normalized_marker(normalized, _ONE_SHOT_BLOCKER_MARKERS)
+
+
+def _assistant_text_has_structured_blocker_marker(text: str) -> bool:
+    return _STRUCTURED_BLOCKER_MARKER_RE.search(str(text or "")) is not None
+
+
+def _structured_blocker_has_concrete_detail(text: str) -> bool:
+    match = _STRUCTURED_BLOCKER_MARKER_RE.search(str(text or ""))
+    if match is None:
+        return False
+    detail = str(text or "")[match.end() :].strip()
+    if len(detail.split()) < 3:
+        return False
+    if _STRUCTURED_BLOCKER_CATEGORY_RE.search(detail):
+        return True
+    return _BLOCKER_OBSTACLE_RE.search(detail) is not None
+
+
+def _assistant_text_has_well_formed_blocker(text: str) -> bool:
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return False
+    if _assistant_text_has_structured_blocker_marker(raw_text):
+        return _structured_blocker_has_concrete_detail(raw_text)
+    if not _assistant_text_has_blocker_marker(raw_text):
+        return False
+    return _BLOCKER_OBSTACLE_RE.search(raw_text) is not None
 
 
 def _exploration_attempt_outcome(success_count: int, failed_count: int) -> str:

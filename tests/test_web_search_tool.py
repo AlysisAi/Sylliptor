@@ -11,8 +11,11 @@ from sylliptor_agent_cli.llm.openai_responses import (
     WebSearchResponse,
     WebSearchSource,
 )
+from sylliptor_agent_cli.sylliptor_cloud import DEFAULT_PROXY_BASE_URL
 from sylliptor_agent_cli.tools.web_search import (
+    _OPENROUTER_WEB_MIN_TIMEOUT_S,
     WebSearchError,
+    _is_openrouter_base_url,
     resolve_web_search_runtime,
     resolve_web_search_runtime_status,
     web_search,
@@ -283,6 +286,113 @@ def test_web_search_auto_status_uses_native_chinese_provider_adapters(
     assert status.provider == expected_provider
     assert runtime is not None
     assert runtime.provider == expected_provider
+
+
+def test_is_openrouter_base_url_recognizes_sylliptor_trial_proxy() -> None:
+    # The hosted Sylliptor MiMo (Xiaomi) trial proxy forwards to OpenRouter, so it
+    # must be treated as an OpenRouter base_url for web search — mirroring the
+    # transport-layer special-case in openai_compat/provider_limits.
+    assert (
+        _is_openrouter_base_url("https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1")
+        is True
+    )
+    assert _is_openrouter_base_url(DEFAULT_PROXY_BASE_URL) is True
+    assert _is_openrouter_base_url("https://openrouter.ai/api/v1") is True
+    # A bare *.supabase.co host without the /functions/v1/llm path marker must NOT
+    # match, so unrelated Supabase apps are never misclassified as OpenRouter.
+    assert _is_openrouter_base_url("https://example.supabase.co/rest/v1") is False
+    assert _is_openrouter_base_url("https://example.supabase.co/") is False
+    assert _is_openrouter_base_url("https://api.openai.com/v1") is False
+    assert _is_openrouter_base_url(None) is False
+
+
+def test_web_search_status_ready_for_sylliptor_mimo_trial_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Mirrors the hosted MiMo trial profile: the Supabase proxy base_url, the
+    # friendly "mimo" model, and the openrouter_web adapter pinned by the preset.
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_ADAPTER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_BASE_URL", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    cfg = AppConfig(
+        model="mimo",
+        base_url=DEFAULT_PROXY_BASE_URL,
+        web_search_mode="auto",
+        web_search_adapter="openrouter_web",
+    )
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="trial-access-key")
+    runtime = resolve_web_search_runtime(cfg=cfg, api_key="trial-access-key", strict=True)
+
+    assert status.registration_ready is True
+    assert status.provider == "openrouter_web"
+    assert "explicit adapter selected openrouter_web" in status.notes
+    assert runtime is not None
+    assert runtime.provider == "openrouter_web"
+    assert runtime.base_url == DEFAULT_PROXY_BASE_URL
+    assert runtime.model == "mimo"
+
+
+def test_web_search_openrouter_floors_short_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A short web_search_timeout_s (e.g. 20s) starves the OpenRouter web round-trip,
+    # so the openrouter_web adapter floors its per-attempt budget. An explicitly
+    # higher timeout is preserved untouched.
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_ADAPTER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    floored = resolve_web_search_runtime(
+        cfg=AppConfig(
+            model="mimo",
+            base_url=DEFAULT_PROXY_BASE_URL,
+            web_search_mode="auto",
+            web_search_adapter="openrouter_web",
+            web_search_timeout_s=20.0,
+        ),
+        api_key="trial-access-key",
+        strict=True,
+    )
+    assert floored is not None
+    assert floored.provider == "openrouter_web"
+    assert floored.timeout_s == _OPENROUTER_WEB_MIN_TIMEOUT_S
+
+    generous = resolve_web_search_runtime(
+        cfg=AppConfig(
+            model="mimo",
+            base_url=DEFAULT_PROXY_BASE_URL,
+            web_search_mode="auto",
+            web_search_adapter="openrouter_web",
+            web_search_timeout_s=120.0,
+        ),
+        api_key="trial-access-key",
+        strict=True,
+    )
+    assert generous is not None
+    assert generous.timeout_s == 120.0
+
+
+def test_web_search_auto_status_selects_openrouter_for_mimo_trial_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Even with no explicit adapter, auto mode must pick the OpenRouter web backend
+    # for the trial proxy (no other provider predicate matches the supabase host).
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_ADAPTER", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    cfg = AppConfig(
+        model="mimo",
+        base_url=DEFAULT_PROXY_BASE_URL,
+        web_search_mode="auto",
+    )
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="trial-access-key")
+
+    assert status.registration_ready is True
+    assert status.provider == "openrouter_web"
 
 
 def test_web_search_explicit_openai_override_uses_only_openai(

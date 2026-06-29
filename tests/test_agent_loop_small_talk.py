@@ -419,15 +419,17 @@ class _ScriptedClient:
         *,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
         stream: bool = False,
         on_text_delta=None,  # type: ignore[no-untyped-def]
         temperature: float | None = None,
     ) -> LLMResponse:
-        _ = on_text_delta, temperature
+        _ = on_text_delta, temperature, tool_choice
         self.call_records.append(
             {
                 "messages": list(messages),
                 "tools": tools,
+                "tool_choice": tool_choice,
                 "stream": stream,
             }
         )
@@ -988,6 +990,99 @@ def test_general_non_repo_turn_uses_web_tool_assisted_path_when_available(
     assert "use the available web tool instead of answering from memory" in system_text
     assert "canned/random example" in system_text
     assert "do not claim browsing is unavailable" in system_text
+
+
+def test_web_research_with_local_output_routes_to_repo_and_keeps_web_tools(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(
+        model="test-model",
+        web_search_mode="auto",
+        routing_mode="auto",
+    )
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=6,
+        no_log=False,
+        api_key_override="override-key",
+        verification_enabled=False,
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    event_path = session.store.path
+    router = _RouterStubClient(
+        route="general",
+        execution_posture="advisory_non_execution",
+        response_reply="This non-repo response must not be used.",
+    )
+    session.router_client = router
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc1",
+                        name="web_search",
+                        arguments={"query": "latest stable Python version"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc2",
+                        name="fs_write",
+                        arguments={"path": "answer.txt", "content": "Python 3.14.4\n"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="Created answer.txt.", tool_calls=[], raw={}),
+        ]
+    )  # type: ignore[assignment]
+    web_search_tool = session.tools["web_search"]
+    session.tools["web_search"] = agent_loop_mod.ToolDef(
+        name=web_search_tool.name,
+        description=web_search_tool.description,
+        parameters=web_search_tool.parameters,
+        metadata=web_search_tool.metadata,
+        run=lambda _args: {
+            "answer": "Python 3.14.4",
+            "sources": [{"title": "Python", "url": "https://www.python.org/"}],
+        },
+    )
+    session.tool_list = [tool.as_openai_tool() for tool in session.tools.values()]
+
+    try:
+        exit_code = session.run_turn(
+            "Search the web for the latest stable Python version and save it to answer.txt."
+        )
+    finally:
+        session.close()
+
+    route_payload = _session_event_payload(event_path, "route_decision")
+    first_tools = {
+        str(tool.get("function", {}).get("name") or "")
+        for tool in (session.client.call_records[0]["tools"] or [])  # type: ignore[attr-defined]
+    }
+
+    assert exit_code == 0
+    assert router.route_calls == 1
+    assert router.response_calls == 0
+    assert route_payload["route"] == "repo"
+    assert route_payload["original_route"] == "general"
+    assert route_payload["execution_posture"] == "execute"
+    assert route_payload["route_override_reason"] == "local_materialization_requires_repo_execution"
+    assert route_payload["local_materialization_required"] is True
+    assert "web_search" in first_tools
+    assert "web_fetch" in first_tools
+    assert "fs_write" in first_tools
+    assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == "Python 3.14.4\n"
 
 
 def test_non_repo_tool_prompt_does_not_advertise_search_when_unregistered(
@@ -1613,6 +1708,55 @@ def test_repo_backed_conceptual_git_question_stays_on_general_fast_path(
     assert route_payload["router_execution_posture"] == "advisory_non_execution"
     assert route_payload["route_selection_source"] == "router"
     assert route_payload["route_override_reason"] is None
+
+
+def test_failed_router_model_recovers_via_main_model(tmp_path: Path) -> None:
+    # A dedicated router-role model that fails to produce a decision (e.g. a
+    # broken/unavailable model returning a 502 upstream_error) must not silently
+    # degrade every turn to the static clarification reply. Routing retries once
+    # with the main model, and the non-repo response is served by it too instead
+    # of hitting the same dead router model.
+    cfg = AppConfig(model="test-model", routing_mode="auto", chat_temperature=0.5)
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    event_path = session.store.path
+    main_client = _RouterStubClient(
+        route="general",
+        response_reply="Recovered via the main model.",
+    )
+    session.client = main_client  # type: ignore[assignment]
+    broken_router = _MalformedRouterClient()
+    session.router_client = broken_router
+
+    try:
+        exit_code = session.run_turn("Tell me a fun fact about the ocean.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    # The broken router model was tried exactly once and never served the response.
+    assert broken_router.route_calls == 1
+    assert broken_router.response_calls == 0
+    # The main model re-ran routing and produced the response.
+    assert main_client.route_calls == 1
+    assert main_client.response_calls == 1
+    final_payload = _session_event_payload(event_path, "final")
+    assert final_payload["content"] == "Recovered via the main model."
+    fallback_payload = _session_event_payload(event_path, "router_model_fallback_to_main")
+    assert fallback_payload["router_decision_source"].startswith("fallback")
+    assert fallback_payload["retry_decision_source"] == "router"
+    assert fallback_payload["retry_route"] == "general"
+    route_payload = _session_event_payload(event_path, "route_decision")
+    assert route_payload["route"] == "general"
+    assert route_payload["router_decision_source"] == "router"
 
 
 def test_vague_bugfix_request_stays_on_general_fast_path_outside_repo_session(

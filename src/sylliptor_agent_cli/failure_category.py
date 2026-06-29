@@ -4,6 +4,8 @@ import re
 from enum import StrEnum
 from typing import Any
 
+import httpx
+
 
 class FailureCategory(StrEnum):
     INFRA_UNAVAILABLE = "infra_unavailable"
@@ -55,19 +57,32 @@ _PROVIDER_UNAVAILABLE_MESSAGE_MARKERS = (
     "connect timeout",
     "connecttimeout",
     "dns",
+    "incomplete chunked read",
     "name or service not known",
     "name resolution",
     "network is unreachable",
     "nodename nor servname",
+    "peer closed connection",
     "read operation timed out",
+    "read error",
     "read timeout",
     "readtimeout",
     "remote protocol error",
     "server disconnected",
+    "server disconnect",
     "temporary failure in name resolution",
     "timed out",
 )
+_PROVIDER_STREAM_TRUNCATED_MESSAGE_MARKERS = (
+    "incomplete chunked read",
+    "peer closed connection",
+    "remote protocol error",
+    "server disconnected without sending complete message body",
+    "stream truncated",
+    "response body ended early",
+)
 _PROVIDER_UNAVAILABLE_STATUS_CODES = frozenset({408, 502, 503, 504})
+_PROVIDER_PERMANENT_4XX_STATUS_CODES = frozenset(range(400, 500)) - {408, 429}
 
 
 def failure_category_value(category: FailureCategory | str | None) -> str | None:
@@ -120,14 +135,41 @@ def is_provider_throttling_error(error: Any) -> bool:
 
 
 def is_provider_unavailable_error(error: Any) -> bool:
-    status_code = _extract_status_code(error)
-    if status_code in _PROVIDER_UNAVAILABLE_STATUS_CODES:
-        return True
+    return provider_unavailable_retry_reason(error) is not None
 
-    message = str(error or "").casefold()
+
+def provider_unavailable_retry_reason(error: Any) -> str | None:
+    status_code = _extract_status_code_from_chain(error)
+    if status_code in _PROVIDER_PERMANENT_4XX_STATUS_CODES:
+        return None
+    if status_code in _PROVIDER_UNAVAILABLE_STATUS_CODES:
+        return "provider_unavailable"
+
+    for exc in _iter_exception_chain(error):
+        if isinstance(exc, httpx.RemoteProtocolError):
+            return "provider_stream_truncated"
+        if isinstance(exc, httpx.ReadError | httpx.ReadTimeout):
+            if _message_has_stream_truncation_marker(str(exc)):
+                return "provider_stream_truncated"
+            return "provider_unavailable"
+        if isinstance(
+            exc,
+            httpx.ConnectError
+            | httpx.ConnectTimeout
+            | httpx.NetworkError
+            | httpx.PoolTimeout
+            | httpx.TransportError,
+        ):
+            return "provider_unavailable"
+
+    message = _exception_chain_message(error)
     if not message:
-        return False
-    return any(marker in message for marker in _PROVIDER_UNAVAILABLE_MESSAGE_MARKERS)
+        return None
+    if _message_has_stream_truncation_marker(message):
+        return "provider_stream_truncated"
+    if any(marker in message for marker in _PROVIDER_UNAVAILABLE_MESSAGE_MARKERS):
+        return "provider_unavailable"
+    return None
 
 
 def is_infra_unavailable_error(error: Any) -> bool:
@@ -153,6 +195,36 @@ def _extract_status_code(error: Any) -> int | None:
     if match is None:
         return None
     return _coerce_status_code(match.group(1))
+
+
+def _extract_status_code_from_chain(error: Any) -> int | None:
+    for exc in _iter_exception_chain(error):
+        status_code = _extract_status_code(exc)
+        if status_code is not None:
+            return status_code
+    return None
+
+
+def _iter_exception_chain(error: Any) -> list[Any]:
+    chain: list[Any] = []
+    seen: set[int] = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        cause = getattr(current, "__cause__", None)
+        context = getattr(current, "__context__", None)
+        current = cause if cause is not None else context
+    return chain
+
+
+def _exception_chain_message(error: Any) -> str:
+    return " ".join(str(exc or "").casefold() for exc in _iter_exception_chain(error))
+
+
+def _message_has_stream_truncation_marker(message: str) -> bool:
+    normalized = str(message or "").casefold()
+    return any(marker in normalized for marker in _PROVIDER_STREAM_TRUNCATED_MESSAGE_MARKERS)
 
 
 def _coerce_status_code(value: Any) -> int | None:

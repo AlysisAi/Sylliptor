@@ -33,7 +33,7 @@ def shell_run(
     root: Path,
     cmd: str,
     cwd: str | None = None,
-    timeout_s: int = 60,
+    timeout_s: float = 60,
     runner: Any | None = None,
 ) -> dict[str, Any]:
     base = root.resolve()
@@ -52,7 +52,7 @@ def shell_run(
     try:
         cp = runner.run(root=base, cwd=cwd_path, cmd=cmd, timeout_s=timeout_s)
     except subprocess.TimeoutExpired as e:
-        raise ShellError(f"Command timed out after {timeout_s}s") from e
+        raise ShellError(f"Command timed out after {timeout_s:g}s") from e
     except Exception as e:  # noqa: BLE001
         raise ShellError(f"Failed to run command: {e}") from e
 
@@ -63,7 +63,7 @@ def shell_run(
             cp = runner.run(root=base, cwd=cwd_path, cmd=fallback_cmd, timeout_s=timeout_s)
             effective_cmd = fallback_cmd
         except subprocess.TimeoutExpired as e:
-            raise ShellError(f"Command timed out after {timeout_s}s") from e
+            raise ShellError(f"Command timed out after {timeout_s:g}s") from e
         except Exception as e:  # noqa: BLE001
             raise ShellError(f"Failed to run command: {e}") from e
 

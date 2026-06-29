@@ -319,6 +319,11 @@ def _verify_run_commands_match_effective_contract(
     incompatible: list[str] = []
     for command in requested_commands:
         normalized_command = _normalize_shell_command_for_match(command)
+        if any(
+            normalized_command == _normalize_shell_command_for_match(configured)
+            for configured in known
+        ):
+            continue
         if not _effective_verification_command_matches(
             normalized_cmd=normalized_command,
             known_verification_commands=known,
@@ -336,6 +341,13 @@ def _matching_effective_verification_commands(
     if not known:
         return set()
     normalized_observed = _normalize_shell_command_for_match(observed_command)
+    exact_matches = {
+        configured
+        for configured in known
+        if normalized_observed == _normalize_shell_command_for_match(configured)
+    }
+    if exact_matches:
+        return exact_matches
     observed_canonical = _canonicalize_verification_command_for_match(normalized_observed)
     if observed_canonical:
         exact_matches: set[str] = set()
@@ -405,7 +417,6 @@ def _looks_like_verification_entrypoint(parts: list[str]) -> bool:
         "flake8",
         "pylint",
         "ruff",
-        "rscript",
         "mix",
         "sbt",
         "swift",
@@ -454,15 +465,10 @@ def _shell_command_is_verification_attempt(
     *,
     known_verification_commands: list[str] | None,
 ) -> bool:
-    if _has_disallowed_shell_control_flow(cmd):
-        return False
-    normalized_cmd = _normalize_shell_command_for_match(cmd)
-    if not normalized_cmd:
-        return False
-    known = _normalized_verify_commands(known_verification_commands or [])
-    if known:
-        return _effective_verification_command_matches(
-            normalized_cmd=normalized_cmd,
-            known_verification_commands=known,
-        )
-    return _marker_fallback_is_verification_attempt(normalized_cmd)
+    from .verification_evidence import classify_verification_evidence
+
+    evidence = classify_verification_evidence(
+        cmd,
+        known_verification_commands=known_verification_commands,
+    )
+    return bool(evidence.allowed_to_satisfy_contract)

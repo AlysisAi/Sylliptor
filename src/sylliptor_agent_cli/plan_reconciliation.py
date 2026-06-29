@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .direction_change import detect_direction_change, filter_obsolete_direction_paths
@@ -29,12 +29,16 @@ from .task_scope import (
     extract_forbidden_repo_path_hints,
     extract_repo_path_hints,
     is_internal_sylliptor_path,
+    scope_path_matches_pattern,
     split_normalized_repo_path_list,
 )
 
-_GLOB_CHARS = ("*", "?", "[")
+_GLOB_CHARS = ("*", "?")
 _TASK_ID_HINT_RE = re.compile(r"\bT\d+\b", re.IGNORECASE)
 _NON_EXECUTABLE_OBSOLETE_STATUSES = frozenset({"superseded", "invalidated"})
+_FRAMEWORK_DYNAMIC_ROUTE_SEGMENT_RE = re.compile(
+    r"^(?:\[\[?\.\.\.[A-Za-z0-9_-]+\]?\]|\[[A-Za-z0-9_-]+\]|\([A-Za-z0-9_.-]+\))$"
+)
 _SYMBOL_CANDIDATE_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b")
 _SYMBOL_CANDIDATE_STOPWORDS = frozenset(
     {
@@ -66,6 +70,10 @@ _SYMBOL_CANDIDATE_STOPWORDS = frozenset(
     }
 )
 _FILENAME_TOKEN_RE = re.compile(r"\b[a-z][a-z0-9_]{2,}\b", re.IGNORECASE)
+_EXPLICIT_MISSING_PATH_ACTION_RE = re.compile(
+    r"\b(?:add|create|creating|generate|generating|introduce|new|scaffold|write|writing)\b",
+    re.IGNORECASE,
+)
 _MAX_SYMBOL_SCAN_FILES = 1500
 _MAX_SYMBOL_SCAN_BYTES = 512_000
 
@@ -114,6 +122,7 @@ def reconcile_plan_with_workspace(
 
     root = workspace_root.expanduser().resolve()
     known_paths = _known_workspace_paths(workspace_context)
+    greenfield = _workspace_context_is_greenfield(workspace_context)
     normalized_target_task_ids = (
         {str(task_id).strip() for task_id in target_task_ids if str(task_id).strip()}
         if target_task_ids is not None
@@ -160,10 +169,19 @@ def reconcile_plan_with_workspace(
             continue
         current_estimated = _string_list(task.get("estimated_files"))
         current_write_scope = _string_list(task.get("write_scope"))
+        allow_create_targets = _task_allows_create_targets(task=task, greenfield=greenfield)
         forbidden_path_identities = _task_forbidden_path_identities(
             task=task,
             user_text=user_text,
         )
+        task_explicit_path_hints = [
+            path
+            for path in _task_explicit_path_hints(
+                task=task,
+                latest_user_text=str(user_text or ""),
+            )
+            if _path_identity_key(path) not in forbidden_path_identities
+        ]
         task_anchor_paths = [
             path
             for path in _select_task_anchor_paths(
@@ -175,12 +193,19 @@ def reconcile_plan_with_workspace(
             if _path_identity_key(path) not in forbidden_path_identities
         ]
         task_anchor_set = set(task_anchor_paths)
+        protected_symbol_remap_path_identities = _missing_path_identities(
+            [*task_explicit_path_hints, *task_anchor_paths],
+            workspace_root=root,
+            known_paths=known_paths,
+        )
 
         normalized_estimated, dropped_estimated = split_normalized_repo_path_list(
-            task.get("estimated_files")
+            task.get("estimated_files"),
+            root=root,
         )
         normalized_write_scope, dropped_write_scope = split_normalized_repo_path_list(
-            task.get("write_scope")
+            task.get("write_scope"),
+            root=root,
         )
 
         if dropped_estimated:
@@ -226,7 +251,7 @@ def reconcile_plan_with_workspace(
             )
 
         if not estimated_files:
-            inferred_paths, ignored_hints = _infer_estimated_files(
+            inferred_paths, _ = _infer_estimated_files(
                 task=task,
                 workspace_root=root,
                 known_paths=known_paths,
@@ -239,8 +264,6 @@ def reconcile_plan_with_workspace(
                     f"Task {task_id}: inferred estimated_files from task text: "
                     + ", ".join(inferred_paths)
                 )
-            for hint in ignored_hints:
-                warnings.append(f"Task {task_id}: ignored suspicious inferred path hint: {hint}")
 
         estimated_files, dropped_ungrounded_estimated = _drop_ungrounded_suspicious_paths(
             paths=estimated_files,
@@ -254,7 +277,7 @@ def reconcile_plan_with_workspace(
                 "latest user request: " + ", ".join(dropped_ungrounded_estimated)
             )
             if not estimated_files:
-                inferred_paths, ignored_hints = _infer_estimated_files(
+                inferred_paths, _ = _infer_estimated_files(
                     task=task,
                     workspace_root=root,
                     known_paths=known_paths,
@@ -267,11 +290,7 @@ def reconcile_plan_with_workspace(
                         f"Task {task_id}: restored grounded estimated_files from task text: "
                         + ", ".join(inferred_paths)
                     )
-                for hint in ignored_hints:
-                    warnings.append(
-                        f"Task {task_id}: ignored suspicious inferred path hint: {hint}"
-                    )
-        explicit_task_paths, ignored_explicit_task_paths = _infer_estimated_files(
+        explicit_task_paths, _ = _infer_estimated_files(
             task=task,
             workspace_root=root,
             known_paths=known_paths,
@@ -287,8 +306,6 @@ def reconcile_plan_with_workspace(
                 f"Task {task_id}: added explicit task path hints to estimated_files: "
                 + ", ".join(added_explicit_estimated)
             )
-        for hint in ignored_explicit_task_paths:
-            warnings.append(f"Task {task_id}: ignored suspicious inferred path hint: {hint}")
 
         estimated_files, estimated_warning = _apply_task_anchor_paths(
             current_paths=estimated_files,
@@ -310,7 +327,11 @@ def reconcile_plan_with_workspace(
         for path in estimated_files:
             if path in task_anchor_set:
                 continue
-            if _is_suspicious_path(path=path, workspace_root=root, known_paths=known_paths):
+            if not allow_create_targets and _is_suspicious_path(
+                path=path,
+                workspace_root=root,
+                known_paths=known_paths,
+            ):
                 warnings.append(
                     f"Task {task_id}: estimated_files entry may be suspicious or missing: {path}"
                 )
@@ -386,6 +407,7 @@ def reconcile_plan_with_workspace(
                     workspace_root=root,
                     task=task,
                     field_name="estimated_files",
+                    protected_missing_path_identities=protected_symbol_remap_path_identities,
                 )
                 if estimated_symbol_warning:
                     warnings.append(f"Task {task_id}: {estimated_symbol_warning}")
@@ -395,6 +417,7 @@ def reconcile_plan_with_workspace(
                     workspace_root=root,
                     task=task,
                     field_name="write_scope",
+                    protected_missing_path_identities=protected_symbol_remap_path_identities,
                 )
                 if write_symbol_warning:
                     warnings.append(f"Task {task_id}: {write_symbol_warning}")
@@ -435,7 +458,11 @@ def reconcile_plan_with_workspace(
         for path in write_scope:
             if path in task_anchor_set:
                 continue
-            if _is_suspicious_path(path=path, workspace_root=root, known_paths=known_paths):
+            if not allow_create_targets and _is_suspicious_path(
+                path=path,
+                workspace_root=root,
+                known_paths=known_paths,
+            ):
                 warnings.append(
                     f"Task {task_id}: write_scope entry may be suspicious or missing: {path}"
                 )
@@ -582,6 +609,53 @@ def _task_forbidden_path_identities(*, task: dict[str, Any], user_text: str | No
     return {_path_identity_key(path) for path in extract_forbidden_repo_path_hints(text)}
 
 
+def _task_explicit_path_hints(
+    *,
+    task: dict[str, Any],
+    latest_user_text: str = "",
+) -> list[str]:
+    task_text = "\n".join(
+        [
+            str(task.get("title") or ""),
+            str(task.get("description") or ""),
+            *[str(item) for item in _string_list(task.get("acceptance_criteria"))],
+        ]
+    )
+    hints, _obsolete_hints = filter_obsolete_direction_paths(
+        extract_repo_path_hints(task_text),
+        latest_user_text=latest_user_text,
+        task_text=task_text,
+    )
+    out: list[str] = []
+    for hint in hints:
+        if _has_glob(hint):
+            continue
+        if is_internal_sylliptor_path(hint) or hint == ".git" or hint.startswith(".git/"):
+            continue
+        out.append(hint)
+    return _dedupe_keep_order(out)
+
+
+def _missing_path_identities(
+    paths: list[str],
+    *,
+    workspace_root: Path,
+    known_paths: set[str],
+) -> set[str]:
+    identities: set[str] = set()
+    for path in _dedupe_keep_order(paths):
+        if _has_glob(path) or path in known_paths:
+            continue
+        try:
+            exists = (workspace_root / path).resolve().exists()
+        except OSError:
+            exists = False
+        if exists:
+            continue
+        identities.add(_path_identity_key(path))
+    return identities
+
+
 def _candidate_user_messages(
     *,
     transcript_tail: list[dict[str, Any]] | None,
@@ -707,6 +781,23 @@ def _drop_protected_paths(paths: list[str]) -> tuple[list[str], list[str]]:
     return _dedupe_keep_order(kept), dropped
 
 
+def _workspace_context_is_greenfield(workspace_context: dict[str, Any] | None) -> bool:
+    return bool(isinstance(workspace_context, dict) and workspace_context.get("greenfield"))
+
+
+def _task_allows_create_targets(*, task: dict[str, Any], greenfield: bool) -> bool:
+    if greenfield:
+        return True
+    text = "\n".join(
+        [
+            str(task.get("title") or ""),
+            str(task.get("description") or ""),
+            *[str(item) for item in _string_list(task.get("acceptance_criteria"))],
+        ]
+    )
+    return bool(_EXPLICIT_MISSING_PATH_ACTION_RE.search(text))
+
+
 def _apply_task_anchor_paths(
     *,
     current_paths: list[str],
@@ -740,13 +831,12 @@ def _has_glob(path: str) -> bool:
     return any(char in path for char in _GLOB_CHARS)
 
 
-def _glob_prefix(path: str) -> str:
-    prefix_chars: list[str] = []
-    for char in path:
-        if char in _GLOB_CHARS:
-            break
-        prefix_chars.append(char)
-    return "".join(prefix_chars).rstrip("/")
+def _has_framework_dynamic_route_segment(path: str) -> bool:
+    try:
+        parts = PurePosixPath(path.replace("\\", "/")).parts
+    except ValueError:
+        return False
+    return any(_FRAMEWORK_DYNAMIC_ROUTE_SEGMENT_RE.fullmatch(part) for part in parts)
 
 
 def _known_workspace_paths(workspace_context: dict[str, Any] | None) -> set[str]:
@@ -783,14 +873,26 @@ def _is_suspicious_path(
 ) -> bool:
     if path in known_paths:
         return False
-    if _has_glob(path):
-        prefix = _glob_prefix(path)
-        if not prefix:
-            return False
-        prefix_path = (workspace_root / prefix).resolve()
-        return not prefix_path.exists() and not prefix_path.parent.exists()
+    if _has_glob(path) or _has_framework_dynamic_route_segment(path):
+        return False
     candidate = (workspace_root / path).resolve()
     return not candidate.exists() and not candidate.parent.exists()
+
+
+def _explicit_missing_path_is_grounded_in_task_text(*, task_text: str, path: str) -> bool:
+    normalized_path = str(path or "").strip().replace("\\", "/")
+    if not normalized_path:
+        return False
+    tail = normalized_path.rsplit("/", 1)[-1]
+    if "." not in tail:
+        return False
+    for raw_line in (task_text or "").splitlines():
+        line = raw_line.strip()
+        if not line or normalized_path.casefold() not in line.casefold():
+            continue
+        if _EXPLICIT_MISSING_PATH_ACTION_RE.search(line):
+            return True
+    return False
 
 
 def _infer_estimated_files(
@@ -833,6 +935,12 @@ def _infer_estimated_files(
             inferred.append(hint)
             continue
         if _is_suspicious_path(path=hint, workspace_root=workspace_root, known_paths=known_paths):
+            if _explicit_missing_path_is_grounded_in_task_text(
+                task_text=task_text,
+                path=hint,
+            ):
+                inferred.append(hint)
+                continue
             ignored.append(hint)
             continue
         inferred.append(hint)
@@ -1027,6 +1135,7 @@ def _apply_symbol_grounded_paths(
     workspace_root: Path,
     task: dict[str, Any],
     field_name: str,
+    protected_missing_path_identities: set[str] | None = None,
 ) -> tuple[list[str], str | None]:
     normalized_current = _dedupe_keep_order(current_paths)
     normalized_symbol_paths = _dedupe_keep_order(symbol_paths)
@@ -1034,10 +1143,31 @@ def _apply_symbol_grounded_paths(
         return normalized_current, None
     if any(path in normalized_current for path in normalized_symbol_paths):
         return normalized_current, None
+    if all(
+        any(
+            scope_path_matches_pattern(symbol_path, current_path, root=workspace_root)
+            for current_path in normalized_current
+        )
+        for symbol_path in normalized_symbol_paths
+    ):
+        return normalized_current, None
 
     implementation_paths = [
         path for path in normalized_current if _is_concrete_code_implementation_path(path)
     ]
+    protected_identities = protected_missing_path_identities or set()
+    protected_missing_paths = [
+        path for path in implementation_paths if _path_identity_key(path) in protected_identities
+    ]
+    if protected_missing_paths:
+        return normalized_current, (
+            f"kept explicit missing {field_name} path(s) and did not retarget them to "
+            "repository symbol definition path(s): "
+            + ", ".join(protected_missing_paths)
+            + " (candidate: "
+            + ", ".join(normalized_symbol_paths)
+            + ")"
+        )
     if implementation_paths and any(
         _path_contains_any_task_symbol(
             workspace_root=workspace_root,

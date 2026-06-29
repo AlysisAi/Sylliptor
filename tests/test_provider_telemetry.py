@@ -150,6 +150,46 @@ def test_streaming_telemetry_counts_events_deltas_and_first_token_latency(monkey
     assert summary["usage"]["total_tokens"] == 3
 
 
+class _TelemetryTruncatedSseStream(httpx.SyncByteStream):
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        raise httpx.RemoteProtocolError("incomplete chunked read")
+
+
+def test_stream_retry_telemetry_records_restart_without_raw_content() -> None:
+    reset_provider_telemetry_for_tests()
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(200, stream=_TelemetryTruncatedSseStream())
+        body = 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+        return httpx.Response(200, content=body)
+
+    client = OpenAICompatClient(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="gpt-test",
+        provider_key="openai",
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(max_retries=1),
+        provider_sleep_fn=lambda _seconds: None,
+        provider_random_fn=lambda: 0.5,
+    )
+
+    assert client.chat(messages=[{"role": "user", "content": "hi"}], stream=True).content == "ok"
+
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["retry_reasons"] == ["provider_stream_truncated"]
+    assert summary["streaming"]["stream_restart_count"] == 1
+    assert summary["streaming"]["stream_restart_reason"] == "provider_stream_truncated"
+    rendered = json.dumps(summary, sort_keys=True)
+    assert "partial" not in rendered
+
+
 def test_provider_retry_telemetry_uses_fake_clock_without_sleep(monkeypatch) -> None:
     reset_provider_telemetry_for_tests()
     timestamps = iter([2000.0, 2033.0])

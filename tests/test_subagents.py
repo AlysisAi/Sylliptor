@@ -8,9 +8,13 @@ from typing import Any
 import pytest
 
 from sylliptor_agent_cli import agent_loop
-from sylliptor_agent_cli.agent.turn.core import _resolve_subagent_turn_policy
+from sylliptor_agent_cli.agent.turn.core import (
+    _can_prelaunch_parallel_subagent_batch,
+    _resolve_subagent_turn_policy,
+)
 from sylliptor_agent_cli.agent_loop import SYSTEM_PROMPT, ToolDef, build_tools, create_session
 from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.execution_deadline import ExecutionDeadline
 from sylliptor_agent_cli.runtime_kind import RuntimeKind
 from sylliptor_agent_cli.step_budget import StepBudgetRuntime
 from sylliptor_agent_cli.subagents import (
@@ -74,19 +78,48 @@ class _FakeUsageSummary:
         return list(self._records)
 
 
+class _FakeSubSessionStore:
+    def __init__(
+        self,
+        *,
+        session_id: str = "sub-001",
+        events: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self._events = list(events or [])
+
+    def events_snapshot(self) -> list[dict[str, Any]]:
+        return list(self._events)
+
+
 class _FakeSubSession:
     def __init__(
         self,
         *,
         tools: dict[str, ToolDef],
         messages: list[dict[str, Any]] | None = None,
+        store_events: list[dict[str, Any]] | None = None,
         exit_code: int = 0,
         usage_summary: Any | None = None,
     ) -> None:
-        self.store = types.SimpleNamespace(session_id="sub-001")
         self.tools = tools
         self.tool_list = [tool.as_openai_tool() for tool in tools.values()]
         self.messages = messages or [{"role": "assistant", "content": "subagent final"}]
+        if store_events is None:
+            final_text = next(
+                (
+                    str(message.get("content") or "").strip()
+                    for message in reversed(self.messages)
+                    if isinstance(message, dict)
+                    and str(message.get("role") or "") == "assistant"
+                    and str(message.get("content") or "").strip()
+                ),
+                "",
+            )
+            store_events = (
+                [{"type": "final", "payload": {"content": final_text}}] if final_text else []
+            )
+        self.store = _FakeSubSessionStore(events=store_events)
         self.usage_summary = usage_summary or _FakeUsageSummary()
         self.exit_code = exit_code
         self.closed = False
@@ -170,6 +203,7 @@ class _ChildToolSession:
         self.surface.on_assistant_token("child token noise")
         self.tools["fs_write"].run({"path": "approved.txt", "content": "ok\n"})
         self.messages.append({"role": "assistant", "content": "approved write complete"})
+        self.surface.on_assistant_message_done("approved write complete")
         return 0
 
     def close(self) -> None:
@@ -239,6 +273,13 @@ def _rewrite_closure(func: Any, **replacements: Any) -> Any:
     )
 
 
+def _subagent_tool_call(call_id: str, *, name: str, mode: str | None = None) -> Any:
+    arguments = {"name": name, "task": f"Inspect with {name}"}
+    if mode is not None:
+        arguments["mode"] = mode
+    return types.SimpleNamespace(id=call_id, name="subagent_run", arguments=arguments)
+
+
 def _build_main_tools(
     *,
     tmp_path: Path,
@@ -253,6 +294,7 @@ def _build_main_tools(
     cfg: AppConfig | None = None,
     max_steps: int = 8,
     step_budget_runtime: StepBudgetRuntime | None = None,
+    execution_deadline: ExecutionDeadline | None = None,
 ) -> dict[str, ToolDef]:
     recording_store = store or _RecordingStore()
     effective_cfg = cfg or AppConfig(model="test-model")
@@ -272,6 +314,7 @@ def _build_main_tools(
         usage_summary=usage_summary,
         non_interactive=non_interactive,
         step_budget_runtime=step_budget_runtime,
+        execution_deadline=execution_deadline,
     )
 
 
@@ -430,11 +473,291 @@ def test_subagent_allowlist_denylist_and_default_readonly_mode(
     assert result["result"] == "Final summarized answer"
     assert result["sandbox"]["mode"] == "readonly"
     assert result["sandbox"]["tools"] == ["fs_read"]
+    catalog_messages = [
+        str(message.get("content") or "")
+        for message in fake_sub_session.messages
+        if isinstance(message, dict)
+        and str(message.get("role") or "") == "system"
+        and "<available_tool_catalog>" in str(message.get("content") or "")
+    ]
+    assert catalog_messages
+    assert "- fs_read:" in catalog_messages[-1]
+    assert "required_args=" in catalog_messages[-1]
+    assert "fs_write" not in catalog_messages[-1]
+    assert "subagent_run" not in catalog_messages[-1]
     assert "INTERMEDIATE-TOOL-OUTPUT" not in json.dumps(result)
     assert {event_type for event_type, _ in recording_store.events} == {
         "subagent_start",
+        "subagent_tool_catalog",
         "subagent_end",
     }
+    catalog_payload = _last_store_event_payload(recording_store, "subagent_tool_catalog")
+    assert catalog_payload["tool_names"] == ["fs_read"]
+
+
+def test_subagent_result_prefers_final_store_event_over_assistant_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_sub_session = _FakeSubSession(
+        tools=_readonly_subagent_tools(),
+        messages=[
+            {
+                "role": "assistant",
+                "content": "Opening transcript line that is not the final report.",
+            }
+        ],
+        store_events=[
+            {
+                "type": "assistant_message",
+                "payload": {"content": "Opening transcript line."},
+            },
+            {
+                "type": "final",
+                "payload": {"content": "Catalog:\n- README.md: project overview"},
+            },
+        ],
+    )
+
+    def _fake_create_session(**_kwargs: Any) -> _FakeSubSession:
+        return fake_sub_session
+
+    monkeypatch.setattr(agent_loop, "create_session", _fake_create_session)
+    recording_store = _RecordingStore()
+    registry = {
+        "sandboxed": SubagentDefinition(
+            name="sandboxed",
+            description="sandboxed test agent",
+            system_prompt="You are sandboxed.",
+            mode="readonly",
+        )
+    }
+    tools = _build_main_tools(
+        tmp_path=tmp_path,
+        subagents_enabled=True,
+        subagent_registry=registry,
+        store=recording_store,
+    )
+
+    result = tools["subagent_run"].run({"name": "sandboxed", "task": "Catalog files"})
+
+    assert result["result"] == "Catalog:\n- README.md: project overview"
+    assert result["result_source"] == "store_final"
+    assert "Opening transcript" not in result["result"]
+    end_payload = _last_store_event_payload(recording_store, "subagent_end")
+    assert end_payload["status"] == "success"
+    assert end_payload["final_text_source"] == "store_final"
+
+
+def test_subagent_without_final_report_signal_is_degraded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    partial_text = "Partial assistant transcript without a final-report signal."
+    fake_sub_session = _FakeSubSession(
+        tools=_readonly_subagent_tools(),
+        messages=[{"role": "assistant", "content": partial_text}],
+        store_events=[],
+    )
+
+    def _fake_create_session(**_kwargs: Any) -> _FakeSubSession:
+        return fake_sub_session
+
+    monkeypatch.setattr(agent_loop, "create_session", _fake_create_session)
+    recording_store = _RecordingStore()
+    registry = {
+        "sandboxed": SubagentDefinition(
+            name="sandboxed",
+            description="sandboxed test agent",
+            system_prompt="You are sandboxed.",
+            mode="readonly",
+        )
+    }
+    tools = _build_main_tools(
+        tmp_path=tmp_path,
+        subagents_enabled=True,
+        subagent_registry=registry,
+        store=recording_store,
+    )
+
+    result = tools["subagent_run"].run({"name": "sandboxed", "task": "Catalog files"})
+
+    assert "error" in result
+    assert result["status"] == "degraded"
+    assert result["final_report_problem"] == "missing_final_report_signal"
+    assert result["final_text"] == partial_text
+    assert result["final_text_source"] == "assistant_message"
+    assert "result" not in result
+    end_payload = _last_store_event_payload(recording_store, "subagent_end")
+    assert end_payload["status"] == "degraded"
+    assert end_payload["final_report_problem"] == "missing_final_report_signal"
+
+
+def test_subagent_receives_same_absolute_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+
+    def _fake_create_session(**kwargs: Any) -> _FakeSubSession:
+        captured_kwargs.update(kwargs)
+        return _FakeSubSession(tools=_readonly_subagent_tools())
+
+    monkeypatch.setattr(agent_loop, "create_session", _fake_create_session)
+    parent_deadline = ExecutionDeadline.from_absolute(
+        started_at_monotonic=10.0,
+        deadline_monotonic=30.0,
+        configured_duration_seconds=20.0,
+        clock=lambda: 12.0,
+    )
+    registry = {
+        "sandboxed": SubagentDefinition(
+            name="sandboxed",
+            description="sandboxed test agent",
+            system_prompt="You are sandboxed.",
+            mode="readonly",
+        )
+    }
+    tools = _build_main_tools(
+        tmp_path=tmp_path,
+        subagents_enabled=True,
+        subagent_registry=registry,
+        execution_deadline=parent_deadline,
+    )
+
+    result = tools["subagent_run"].run({"name": "sandboxed", "task": "Inspect repository"})
+
+    assert result["result"] == "subagent final"
+    assert captured_kwargs["execution_deadline"] is parent_deadline
+    assert captured_kwargs["execution_deadline"].deadline_monotonic == 30.0
+
+
+def test_subagent_refuses_launch_when_deadline_has_too_little_remaining_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_create_session(**_kwargs: Any) -> _FakeSubSession:
+        raise AssertionError("subagent session should not be created")
+
+    monkeypatch.setattr(agent_loop, "create_session", _fake_create_session)
+    parent_deadline = ExecutionDeadline.from_absolute(
+        started_at_monotonic=10.0,
+        deadline_monotonic=11.0,
+        configured_duration_seconds=1.0,
+        clock=lambda: 10.5,
+    )
+    registry = {
+        "sandboxed": SubagentDefinition(
+            name="sandboxed",
+            description="sandboxed test agent",
+            system_prompt="You are sandboxed.",
+            mode="readonly",
+        )
+    }
+    recording_store = _RecordingStore()
+    tools = _build_main_tools(
+        tmp_path=tmp_path,
+        subagents_enabled=True,
+        subagent_registry=registry,
+        store=recording_store,
+        execution_deadline=parent_deadline,
+    )
+
+    result = tools["subagent_run"].run({"name": "sandboxed", "task": "Inspect repository"})
+
+    assert "error" in result
+    assert result["failure_category"] == "deadline"
+    assert result["deadline_prevented_launch"] is True
+    assert result["subagent"] == "sandboxed"
+    assert result["subagent_session_id"] is None
+    assert result["remaining_seconds"] == 0.5
+    assert _store_event_payloads(recording_store, "subagent_start") == []
+    end_payload = _last_store_event_payload(recording_store, "subagent_end")
+    assert end_payload["failure_category"] == "deadline"
+    assert end_payload["deadline_prevented_launch"] is True
+
+
+def test_subagent_refuses_launch_during_deadline_finalization_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_create_session(**_kwargs: Any) -> _FakeSubSession:
+        raise AssertionError("subagent session should not be created")
+
+    monkeypatch.setattr(agent_loop, "create_session", _fake_create_session)
+    parent_deadline = ExecutionDeadline.from_absolute(
+        started_at_monotonic=0.0,
+        deadline_monotonic=20.0,
+        configured_duration_seconds=20.0,
+        clock=lambda: 16.0,
+    )
+    parent_deadline.observe_duration("main_llm", 4.0)
+    registry = {
+        "sandboxed": SubagentDefinition(
+            name="sandboxed",
+            description="sandboxed test agent",
+            system_prompt="You are sandboxed.",
+            mode="readonly",
+        )
+    }
+    recording_store = _RecordingStore()
+    tools = _build_main_tools(
+        tmp_path=tmp_path,
+        subagents_enabled=True,
+        subagent_registry=registry,
+        store=recording_store,
+        execution_deadline=parent_deadline,
+    )
+
+    result = tools["subagent_run"].run({"name": "sandboxed", "task": "Inspect repository"})
+
+    assert "error" in result
+    assert result["failure_category"] == "deadline"
+    assert result["deadline_prevented_launch"] is True
+    assert result["deadline_start_decision"]["reason"] == "finalization_disallows_operation"
+    assert result["deadline"]["phase"] == "finalization_window"
+    assert _store_event_payloads(recording_store, "subagent_start") == []
+    end_payload = _last_store_event_payload(recording_store, "subagent_end")
+    assert end_payload["failure_category"] == "deadline"
+    assert end_payload["deadline_prevented_launch"] is True
+
+
+def test_shell_run_timeout_is_clamped_by_execution_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _fake_shell_run(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {
+            "cmd": kwargs["cmd"],
+            "effective_cmd": kwargs["cmd"],
+            "cwd": str(tmp_path),
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(agent_loop, "shell_run", _fake_shell_run)
+    deadline = ExecutionDeadline.from_absolute(
+        started_at_monotonic=10.0,
+        deadline_monotonic=15.0,
+        configured_duration_seconds=5.0,
+        clock=lambda: 10.0,
+    )
+    tools = _build_main_tools(
+        tmp_path=tmp_path,
+        subagents_enabled=False,
+        mode="auto",
+        execution_deadline=deadline,
+    )
+
+    result = tools["shell_run"].run({"cmd": "echo ok"})
+
+    assert result["exit_code"] == 0
+    assert captured["timeout_s"] == 4.0
 
 
 def test_subagent_mode_override_applies_for_single_run(
@@ -1216,6 +1539,56 @@ def test_built_in_subagents_allow_navigation_tools() -> None:
     assert "web_search" not in registry["test-strategist"].allow_tools
 
 
+def test_parallel_subagent_prelaunch_requires_resolved_readonly_definition() -> None:
+    registry = built_in_subagents()
+    tool_calls = [
+        _subagent_tool_call("call-1", name="explorer"),
+        _subagent_tool_call("call-2", name="reviewer"),
+    ]
+
+    assert _can_prelaunch_parallel_subagent_batch(
+        tool_calls=tool_calls,
+        turn_tools={"subagent_run": object()},
+        subagent_registry=registry,
+        failed_tool_call_counts={},
+        hook_dispatcher=None,
+        subagent_policy_reason="repo_execution_turn",
+        deadline_can_start=True,
+    )
+
+    custom_registry = dict(registry)
+    custom_registry["explorer"] = SubagentDefinition(
+        name="explorer",
+        description="custom explorer",
+        system_prompt="You are a custom explorer.",
+        mode="auto",
+    )
+
+    assert not _can_prelaunch_parallel_subagent_batch(
+        tool_calls=tool_calls,
+        turn_tools={"subagent_run": object()},
+        subagent_registry=custom_registry,
+        failed_tool_call_counts={},
+        hook_dispatcher=None,
+        subagent_policy_reason="repo_execution_turn",
+        deadline_can_start=True,
+    )
+
+    readonly_override_calls = [
+        _subagent_tool_call("call-1", name="explorer", mode="readonly"),
+        _subagent_tool_call("call-2", name="reviewer"),
+    ]
+    assert _can_prelaunch_parallel_subagent_batch(
+        tool_calls=readonly_override_calls,
+        turn_tools={"subagent_run": object()},
+        subagent_registry=custom_registry,
+        failed_tool_call_counts={},
+        hook_dispatcher=None,
+        subagent_policy_reason="repo_execution_turn",
+        deadline_can_start=True,
+    )
+
+
 def test_subagent_tool_schema_includes_name_enum_when_registry_is_available(
     tmp_path: Path,
 ) -> None:
@@ -1293,6 +1666,9 @@ def test_create_session_injects_subagent_context_when_enabled(tmp_path: Path) ->
         assert "explorer" in subagent_context
         assert "reviewer" in subagent_context
         assert "test-strategist" in subagent_context
+        assert "do not re-read the same files merely to rebuild the same catalog" in (
+            subagent_context
+        )
 
         subagent_idx = next(
             i for i, text in enumerate(user_messages) if "<subagent_context>" in text
@@ -1377,6 +1753,7 @@ def test_create_session_appends_subagent_system_guidance_when_enabled(tmp_path: 
             "Run unrelated investigations in parallel in one tool batch instead of serializing them."
             in system_prompt
         )
+        assert "Do not re-read the same files merely to reconstruct a catalog" in system_prompt
     finally:
         session.close()
 

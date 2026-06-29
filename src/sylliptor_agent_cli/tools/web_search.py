@@ -22,7 +22,7 @@ from ..config import (
 )
 from ..llm.openai_responses import OpenAIResponsesClient, ResponsesError
 from ..llm.protocols import OPENAI_COMPAT_PROTOCOL
-from ..llm.provider_limits import resolve_provider_retry_settings
+from ..llm.provider_limits import ProviderRetrySettings, resolve_provider_retry_settings
 from ..profiles import get_active_profile
 from ..provider_telemetry import record_web_search_call
 from ..safety.safe_http import Resolver
@@ -95,6 +95,32 @@ _DASHSCOPE_SEARCH_MODEL_PREFIXES = (
     "qwen3.5-flash",
     "qwen3-max",
 )
+
+# web_search runs as a one-shot tool call that the agent loop re-issues on its own
+# when needed, so a slow/failed provider call should fail fast rather than burn the
+# full provider retry budget. A ~20s read timeout retried 5x is ~148s of dead air
+# before the agent's own retry even gets a chance. Cap web_search provider retries
+# low; a transient blip still gets one quick retry.
+_WEB_SEARCH_MAX_PROVIDER_RETRIES = 1
+
+# OpenRouter web_search runs a full upstream chat round-trip *plus* the web search,
+# and the hosted Sylliptor MiMo trial proxy adds a slow reasoning model on top, so a
+# short web_search_timeout_s starves it (a 20s budget times out mid-read). Floor the
+# OpenRouter web adapter's per-attempt budget so an under-configured timeout still has
+# time to return results; an explicitly higher web_search_timeout_s is preserved.
+_OPENROUTER_WEB_MIN_TIMEOUT_S = 60.0
+
+
+def _web_search_provider_retry_settings(cfg: AppConfig | None) -> ProviderRetrySettings:
+    base = resolve_provider_retry_settings(cfg)
+    capped = min(base.max_retries, _WEB_SEARCH_MAX_PROVIDER_RETRIES)
+    if capped == base.max_retries:
+        return base
+    return ProviderRetrySettings(
+        max_retries=capped,
+        base_delay_seconds=base.base_delay_seconds,
+        max_delay_seconds=base.max_delay_seconds,
+    )
 
 
 @dataclass(frozen=True)
@@ -358,8 +384,36 @@ def _is_xai_base_url(base_url: str | None) -> bool:
     return _is_host_or_subdomain(_base_url_host(base_url), "api.x.ai")
 
 
+_SYLLIPTOR_TRIAL_PROXY_PATH_MARKER = "/functions/v1/llm"
+
+
+def _is_sylliptor_trial_proxy_base_url(base_url: str | None) -> bool:
+    """True for the hosted Sylliptor MiMo trial proxy (a Supabase Edge Function).
+
+    The proxy forwards chat completions to OpenRouter/Xiaomi, so for web search it
+    must be treated as an OpenRouter base_url (otherwise web_search is never
+    registered for MiMo trial users and web_fetch loses its returned_by_web_search
+    URL source). Match the ``/functions/v1/llm`` path so unrelated ``*.supabase.co``
+    apps are never misclassified. Mirrors openai_compat._is_sylliptor_trial_proxy
+    and provider_limits._provider_key_from_base_url.
+    """
+    normalized = str(base_url or "").strip()
+    if not normalized:
+        return False
+    try:
+        path = (urlsplit(normalized).path or "").casefold()
+    except ValueError:
+        return False
+    if _SYLLIPTOR_TRIAL_PROXY_PATH_MARKER not in path:
+        return False
+    host = _base_url_host(base_url)
+    return host == "supabase.co" or host.endswith(".supabase.co")
+
+
 def _is_openrouter_base_url(base_url: str | None) -> bool:
-    return _is_host_or_subdomain(_base_url_host(base_url), "openrouter.ai")
+    if _is_host_or_subdomain(_base_url_host(base_url), "openrouter.ai"):
+        return True
+    return _is_sylliptor_trial_proxy_base_url(base_url)
 
 
 def _is_perplexity_base_url(base_url: str | None) -> bool:
@@ -600,6 +654,7 @@ def _resolve_native_provider_readiness(
     model_resolver: Callable[[AppConfig | None], str | None] | None = None,
     model_validator: Callable[[str | None], bool] | None = None,
     model_note: str | None = None,
+    min_timeout_s: float | None = None,
 ) -> _BackendReadiness:
     base_url = resolve_web_search_base_url(cfg)
     model = (
@@ -618,6 +673,9 @@ def _resolve_native_provider_readiness(
         timeout_s = resolve_web_search_timeout_s(cfg)
     except ConfigError as e:
         _append_unique_note(notes, str(e))
+
+    if timeout_s is not None and min_timeout_s is not None and timeout_s < min_timeout_s:
+        timeout_s = min_timeout_s
 
     if not base_url:
         _append_unique_note(
@@ -721,6 +779,7 @@ def _resolve_openrouter_web_readiness(
         base_url_label="OpenRouter",
         base_url_predicate=_is_openrouter_base_url,
         default_model="openrouter/auto",
+        min_timeout_s=_OPENROUTER_WEB_MIN_TIMEOUT_S,
     )
 
 
@@ -1286,7 +1345,7 @@ def _openai_responses_search(
         timeout_s=runtime.timeout_s,
         transport=transport,
         provider_concurrency_caps=getattr(cfg, "provider_concurrency_caps", None),
-        provider_retry_settings=resolve_provider_retry_settings(cfg),
+        provider_retry_settings=_web_search_provider_retry_settings(cfg),
     )
 
     try:
@@ -1426,7 +1485,7 @@ def web_search(
                     transport=transport,
                     resolver=resolver,
                     provider_concurrency_caps=getattr(cfg, "provider_concurrency_caps", None),
-                    provider_retry_settings=resolve_provider_retry_settings(cfg),
+                    provider_retry_settings=_web_search_provider_retry_settings(cfg),
                 ),
                 runtime=runtime,
                 cfg=cfg,
@@ -1434,7 +1493,7 @@ def web_search(
         except DashScopeChatSearchError as e:
             return _fallback_to_tavily_or_raise(_DASHSCOPE_CHAT_PROVIDER, e)
 
-    provider_retry_settings = resolve_provider_retry_settings(cfg)
+    provider_retry_settings = _web_search_provider_retry_settings(cfg)
     native_kwargs = {
         "query": validated_query,
         "base_url": str(runtime.base_url or ""),

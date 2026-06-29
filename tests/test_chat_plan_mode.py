@@ -146,7 +146,14 @@ def _install_dummy_forge_entry(monkeypatch, tmp_path: Path) -> None:
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         plan_dir = tmp_path / ".sylliptor" / "runs" / "wf" / "plan"
         notes_dir = plan_dir / "notes"
@@ -1241,7 +1248,14 @@ def test_chat_forge_entry_uses_session_active_workdir_for_workspace_binding(
         cfg=AppConfig(model="test-model", default_mode="review"),
     )
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = console, forge_state
         captured["root"] = root
         return True
@@ -1695,7 +1709,14 @@ def test_help_command_in_forge_mode_shows_forge_commands(tmp_path: Path, monkeyp
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         plan_dir = tmp_path / ".sylliptor" / "runs" / "wf" / "plan"
         notes_dir = plan_dir / "notes"
@@ -1795,7 +1816,14 @@ def test_forge_plan_markdown_command_is_handled(tmp_path: Path, monkeypatch) -> 
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = _forge_run_paths(tmp_path)
@@ -1942,7 +1970,14 @@ def test_forge_execute_plan_runs_swarm_with_session_wiring(tmp_path: Path, monke
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = paths
@@ -2391,7 +2426,14 @@ def test_forge_execute_plan_reports_human_summary(tmp_path: Path, monkeypatch) -
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = _forge_run_paths(tmp_path)
@@ -2516,7 +2558,14 @@ def test_forge_execute_plan_prints_validation_warnings_once_after_enrichment(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = _forge_run_paths(tmp_path)
@@ -2594,7 +2643,14 @@ def test_forge_execute_plan_swarm_trace_compact(tmp_path: Path, monkeypatch) -> 
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = _forge_run_paths(tmp_path)
@@ -2688,7 +2744,14 @@ def test_forge_execute_plan_swarm_trace_full(tmp_path: Path, monkeypatch) -> Non
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = _forge_run_paths(tmp_path)
@@ -2782,7 +2845,14 @@ def test_forge_execute_plan_swarm_trace_off(tmp_path: Path, monkeypatch) -> None
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = _forge_run_paths(tmp_path)
@@ -2851,7 +2921,14 @@ def test_forge_planner_uses_session_api_key_and_cfg(tmp_path: Path, monkeypatch)
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = _forge_run_paths(tmp_path)
@@ -2932,7 +3009,14 @@ def test_forge_planner_recovers_after_transient_request_retry_without_duplicate_
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = _forge_run_paths(tmp_path)
@@ -3045,7 +3129,14 @@ def test_forge_small_talk_routes_through_planner_when_assistant_on(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -3122,7 +3213,14 @@ def test_forge_greek_small_talk_routes_through_planner_when_assistant_on(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -3199,7 +3297,14 @@ def test_forge_assistant_off_captures_small_talk_as_requirement(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -3267,7 +3372,14 @@ def test_forge_no_plan_update_without_error_does_not_capture_requirement(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -3351,7 +3463,14 @@ def test_forge_noop_plan_update_does_not_capture_requirement(tmp_path: Path, mon
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -3435,7 +3554,14 @@ def test_forge_planner_follow_up_keeps_protected_history_immutable(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -3544,7 +3670,14 @@ def test_forge_planner_follow_up_synthesizes_task_from_protected_update_only(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -3656,7 +3789,14 @@ def test_forge_planner_follow_up_synthesizes_same_file_task_from_protected_updat
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -3775,7 +3915,14 @@ def test_forge_planner_follow_up_synthesizes_title_only_same_file_task(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -3885,7 +4032,14 @@ def test_forge_planner_follow_up_synthesizes_title_only_new_path_task(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -3995,7 +4149,14 @@ def test_forge_planner_follow_up_refuses_weak_generic_title_with_scope(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -4106,7 +4267,14 @@ def test_forge_planner_follow_up_synthesizes_same_file_task_from_description_del
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -4210,7 +4378,14 @@ def test_forge_planner_follow_up_refuses_trivial_protected_update_without_new_pa
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -4320,7 +4495,14 @@ def test_forge_planner_follow_up_refuses_punctuation_only_same_file_delta(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -4429,7 +4611,14 @@ def test_forge_planner_follow_up_refuses_formatting_only_same_file_delta(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -4530,7 +4719,14 @@ def test_forge_router_offtopic_result_leaves_plan_unchanged(tmp_path: Path, monk
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -4613,7 +4809,14 @@ def test_forge_clarification_follow_up_accepts_terse_planning_answer(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -4703,7 +4906,14 @@ def test_forge_planner_failure_falls_back_to_requirement_capture(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = _forge_run_paths(tmp_path)
@@ -4866,7 +5076,14 @@ def test_forge_planner_trace_progress_compact(tmp_path: Path, monkeypatch) -> No
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -4951,7 +5168,14 @@ def test_trace_compact_uses_truthful_planner_error_trace_and_summary(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -5041,7 +5265,14 @@ def test_forge_trace_off_disables_planner_trace_and_streaming(tmp_path: Path, mo
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -5115,7 +5346,14 @@ def test_forge_execute_plan_enrichment_default_off_in_non_interactive(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = _forge_run_paths(tmp_path)
@@ -5192,7 +5430,14 @@ def test_forge_execute_plan_enrichment_enabled_by_env_calls_planner(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         forge_state.ui_mode = "forge"
         forge_state.paths = _forge_run_paths(tmp_path)
@@ -5305,7 +5550,14 @@ def test_forge_execute_plan_enrichment_preserves_retry_context_on_final_error(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -5398,7 +5650,14 @@ def test_forge_execute_plan_enrichment_keeps_protected_history_immutable(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"
@@ -5527,7 +5786,14 @@ def test_forge_execute_plan_enrichment_strips_protected_update_only_follow_up(
         def close() -> None:
             return None
 
-    def fake_enter_forge_mode(*, root: Path, console: Console, forge_state: Any) -> bool:
+    def fake_enter_forge_mode(
+        *,
+        root: Path,
+        console: Console,
+        forge_state: Any,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> bool:
         _ = root, console
         paths = _forge_run_paths(tmp_path)
         forge_state.ui_mode = "forge"

@@ -3088,6 +3088,8 @@ def test_apply_guarded_planner_plan_update_refuses_weak_title_only_variants() ->
         "Finalize src/slugify.js",
         "meta for src/slugify.js",
         "admin for src/slugify.js",
+        "Rewrite done task",
+        "Task A bad replan",
     )
     for title in titles:
         plan = _base_plan()
@@ -4297,6 +4299,88 @@ def test_run_planner_turn_falls_back_to_read_only_locator_when_update_is_unspeci
     assert task["estimated_files"] == []
     assert task["write_scope"] == []
     assert "Do not change files" in " ".join(task["acceptance_criteria"])
+
+
+def test_run_planner_turn_greenfield_locator_question_becomes_scaffold_task(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
+
+    planner_payload = {
+        "assistant_message": "Which existing implementation file should I edit?",
+        "questions": ["Which file contains the existing implementation?"],
+        "plan_update": None,
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(planner_payload)}}]},
+        )
+
+    result = run_planner_turn(
+        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
+        api_key_override=None,
+        plan={**_base_plan(), "requirements": [], "tasks": []},
+        transcript_tail=[],
+        user_text="Build a Next.js portfolio with CV and thoughts pages.",
+        workspace_context={
+            "workspace_kind": "plain_dir",
+            "greenfield": True,
+            "top_level_entries": [],
+            "observed_paths": [],
+            "language_hints": [],
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.error is None
+    assert result.questions == []
+    assert result.plan_update is not None
+    task = result.plan_update["tasks_add"][0]
+    assert task["title"] == "Build requested project scaffold"
+    assert task["estimated_files"] == ["**"]
+    assert task["write_scope"] == ["**"]
+    assert "Locate requested repository implementation" not in task["title"]
+
+
+def test_run_planner_turn_greenfield_no_update_proactively_scaffolds(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
+
+    planner_payload = {
+        "assistant_message": "I can plan that.",
+        "questions": [],
+        "plan_update": None,
+    }
+    transport, _requests = _mock_transport_for_payloads(
+        planner_payload,
+        _question_repair_payload(should_replace=False),
+    )
+
+    result = run_planner_turn(
+        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
+        api_key_override=None,
+        plan={**_base_plan(), "requirements": [], "tasks": []},
+        transcript_tail=[],
+        user_text="Build a Next.js portfolio with CV and thoughts pages.",
+        workspace_context={
+            "workspace_kind": "plain_dir",
+            "greenfield": True,
+            "top_level_entries": [],
+            "observed_paths": [],
+            "language_hints": [],
+        },
+        transport=transport,
+    )
+
+    assert result.error is None
+    assert result.questions == []
+    assert result.plan_update is not None
+    task = result.plan_update["tasks_add"][0]
+    assert task["title"] == "Build requested project scaffold"
+    assert task["write_scope"] == ["**"]
 
 
 def test_run_planner_turn_keeps_mutating_locator_request_executable(

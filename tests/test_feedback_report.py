@@ -461,7 +461,7 @@ def test_create_feedback_bundle_includes_canonical_web_research_artifact(
     summary_md = (result.bundle_dir / "summary.md").read_text(encoding="utf-8")
 
     assert manifest["session"]["included_web_research_artifact"] is True
-    assert exported["schema_version"] == 1
+    assert exported["schema_version"] == 2
     assert exported["deduped_normalized_queries"] == ["docs example"]
     assert exported["deduped_normalized_user_urls"] == ["https://docs.example.com/start"]
     assert exported["deduped_normalized_search_source_urls"] == [

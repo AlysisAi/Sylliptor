@@ -49,6 +49,11 @@ _BWRAP_COMMON_TOOLCHAIN_COMMANDS = (
     "rustc",
     "rustup",
     "go",
+    "java",
+    "javac",
+    "jar",
+    "mvn",
+    "gradle",
 )
 
 
@@ -396,6 +401,34 @@ def _add_common_toolchain_bindings(
     return _toolchain_extra_env(bind_roots)
 
 
+def _hardened_java_config_ro_bind_paths(*, etc_root: Path = Path("/etc")) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    seen: set[str] = set()
+    try:
+        candidates = [*etc_root.glob("java-*"), etc_root / ".java"]
+    except OSError:
+        candidates = [etc_root / ".java"]
+    for candidate in sorted(candidates, key=os.fspath):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if not resolved.exists() or not resolved.is_dir():
+            continue
+        resolved_key = os.fspath(resolved)
+        if resolved_key in seen:
+            continue
+        seen.add(resolved_key)
+        paths.append(candidate)
+    return tuple(paths)
+
+
+def _add_hardened_java_config_bindings(args: list[str]) -> None:
+    for path in _hardened_java_config_ro_bind_paths():
+        path_s = os.fspath(path)
+        args.extend(["--ro-bind", path_s, path_s])
+
+
 def _bwrap_path_value(path_value: str | None) -> str:
     entries: list[str] = []
     for raw in (path_value or _DEFAULT_PATH).split(os.pathsep):
@@ -535,6 +568,7 @@ def _build_bwrap_argv(
         )
         if Path("/etc/alternatives").exists():
             args.extend(["--ro-bind", "/etc/alternatives", "/etc/alternatives"])
+        _add_hardened_java_config_bindings(args)
         _add_hardened_tls_bindings(args)
     else:
         for sys_dir in ("/usr", "/bin", "/lib", "/lib64", "/etc"):

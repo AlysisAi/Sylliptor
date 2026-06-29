@@ -17,6 +17,7 @@ from sylliptor_agent_cli.llm.openai_compat import (
     attach_provider_metadata_to_assistant_message,
     sylliptor_trial_error_message,
 )
+from sylliptor_agent_cli.llm.provider_limits import ProviderRetrySettings
 
 _SYLLIPTOR_TRIAL_BASE_URL = "https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1"
 
@@ -1908,6 +1909,50 @@ def test_stream_retries_without_stream_options_when_unsupported() -> None:
     assert resp.usage is not None
     assert resp.usage.total_tokens == 3
     assert len(calls) == 2
+
+
+class _TruncatedSseStream(httpx.SyncByteStream):
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body"
+        )
+
+
+def test_stream_transport_truncation_retries_without_partial_tool_batch() -> None:
+    attempts = 0
+    chunks: list[str] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(200, stream=_TruncatedSseStream())
+        body = 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+        return httpx.Response(200, content=body.encode("utf-8"))
+
+    client = OpenAICompatClient(
+        base_url="https://example.com/v1",
+        api_key="test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(max_retries=1),
+        provider_sleep_fn=lambda _seconds: None,
+        provider_random_fn=lambda: 0.5,
+    )
+
+    resp = client.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        stream=True,
+        on_text_delta=chunks.append,
+    )
+
+    assert attempts == 2
+    assert resp.content == "ok"
+    assert resp.tool_calls == []
+    assert chunks == ["ok"]
+    assert resp.raw["stream_restart_count"] == 1
 
 
 def test_stream_parses_cached_prompt_tokens() -> None:

@@ -861,6 +861,8 @@ class _GeminiStreamAccumulator:
 
 
 class GeminiGenerateContentClient:
+    supports_forced_tool_choice = True
+
     def __init__(
         self,
         *,
@@ -1062,6 +1064,7 @@ class GeminiGenerateContentClient:
                 sleep_fn=self._provider_sleep_fn,
                 random_fn=self._provider_random_fn,
                 on_retry=telemetry.on_retry,
+                retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
             )
         )
 

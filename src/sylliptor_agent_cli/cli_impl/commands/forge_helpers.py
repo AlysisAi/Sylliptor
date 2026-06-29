@@ -147,7 +147,7 @@ def _forge_enter_panel(
     if str(mode or "").strip():
         context_bits.append(f"mode {str(mode).strip()}")
     if context_bits:
-        lines.append(_forge_bar_text(text=" - ".join(context_bits), style="dim"))
+        lines.append(_forge_bar_text(text=" · ".join(context_bits), style="dim"))
     lines.extend(
         [
             _forge_bar_text(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 import re
 import shlex
@@ -30,6 +31,13 @@ from .file_classification import SOURCE_EXTENSIONS_BY_LANGUAGE
 from .repo_scan import RepoScanResult, scan_workspace
 from .sandbox_runner import HostShellRunner, build_shell_runner_from_settings
 from .sandbox_settings import resolve_shell_sandbox_settings
+from .verification_contract import (
+    VerificationCommandExecutionMode,
+    VerificationCommandSpec,
+    VerificationCommandValidationStatus,
+    build_verification_command_specs,
+    command_specs_payload,
+)
 from .workspace_context import WorkspaceContext, WorkspaceContextError, resolve_workspace_context
 
 VERIFY_MODES = {"off", "warn", "strict"}
@@ -179,9 +187,44 @@ _COMPOSE_TEXT_RE = re.compile(
 _JS_FRONTEND_TEXT_RE = re.compile(
     r"\b(?:frontend|front-end|ui|client(?:-side)?|browser|react|preact|next(?:\.js)?|nextjs|vue|nuxt|svelte|angular|vite|webpack|javascript|typescript|node|npm|pnpm|yarn|component)\b"
 )
+_STATIC_WEB_TEXT_RE = re.compile(
+    r"\b(?:static\s+(?:site|page|html)|html|css|landing\s+page|single\s+page|browser\s+page)\b"
+)
 _PYTHON_CODE_TASK_TEXT_RE = re.compile(
     r"\b(?:python|fastapi|flask|django|pydantic|sqlalchemy|alembic|uvicorn|endpoint|handler|route|serializer|schema|logging|logger|exception|traceback|import|upload|api)\b"
 )
+_STATIC_WEB_DIR_NAMES = {
+    "assets",
+    "css",
+    "img",
+    "images",
+    "js",
+    "public",
+    "scripts",
+    "static",
+}
+_STATIC_WEB_FILENAMES = {
+    "favicon.ico",
+    "manifest.json",
+    "robots.txt",
+    "site.webmanifest",
+}
+_STATIC_WEB_EXTENSIONS = {
+    ".avif",
+    ".css",
+    ".gif",
+    ".htm",
+    ".html",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".mjs",
+    ".png",
+    ".svg",
+    ".webmanifest",
+    ".webp",
+}
 CONFIG_VERIFY_COMMANDS_FALLBACK_SOURCE = "config.verify_commands_fallback"
 CONFIG_VERIFY_COMMANDS_GENERIC_PRESET_SOURCE = "config.verify_commands_generic_preset"
 REPO_SCAN_NO_AUTHORITATIVE_SOURCE = "repo_scan.no_authoritative_commands"
@@ -227,6 +270,7 @@ _MIXED_NODE_PYTHON_REPO_CLASSIFICATION_ALLOWED_PACKAGE_HINTS = (
     | _PYTHON_REPO_CLASSIFICATION_ALLOWED_PACKAGE_HINTS
 )
 _REPO_CLASSIFICATION_NEUTRAL_NAMES = {"codeowners"}
+_NODE_VERIFY_SCRIPT_PRIORITY = ("test", "build", "lint", "typecheck", "check")
 
 
 class VerifyError(RuntimeError):
@@ -306,6 +350,10 @@ class ResolvedVerifyCommands:
     source: str
     reason: str = field(default="", compare=False)
     contract_type: str = field(default="", compare=False)
+    command_specs: tuple[VerificationCommandSpec, ...] = field(
+        default_factory=tuple,
+        compare=False,
+    )
 
 
 def _default_verify_contract_type(source: str, *, commands: tuple[str, ...]) -> str:
@@ -390,7 +438,53 @@ def _resolved_verify_commands(
         source=source,
         reason=resolved_reason,
         contract_type=resolved_contract_type,
+        command_specs=build_verification_command_specs(
+            normalized_commands,
+            source=source,
+            contract_type=resolved_contract_type,
+        ),
     )
+
+
+def verification_command_specs_for_selection(
+    selection: ResolvedVerifyCommands | None,
+) -> tuple[VerificationCommandSpec, ...]:
+    if selection is None:
+        return tuple()
+    if selection.command_specs:
+        return selection.command_specs
+    return build_verification_command_specs(
+        selection.commands,
+        source=selection.source,
+        contract_type=selection.contract_type,
+    )
+
+
+def verification_command_specs_payload(
+    selection: ResolvedVerifyCommands | None,
+) -> dict[str, Any]:
+    specs = verification_command_specs_for_selection(selection)
+    return {"verification_command_specs": command_specs_payload(specs)}
+
+
+def trusted_shell_expression_command_set(selection: ResolvedVerifyCommands | None) -> set[str]:
+    return {
+        " ".join(spec.original_text.split())
+        for spec in verification_command_specs_for_selection(selection)
+        if spec.execution_mode == VerificationCommandExecutionMode.TRUSTED_SHELL_EXPRESSION
+        and spec.validation_status == VerificationCommandValidationStatus.VALID
+    }
+
+
+def validation_errors_for_selection(selection: ResolvedVerifyCommands | None) -> list[str]:
+    if selection is None:
+        return []
+    errors: list[str] = []
+    for spec in verification_command_specs_for_selection(selection):
+        if spec.validation_status != VerificationCommandValidationStatus.INVALID:
+            continue
+        errors.append(f"{spec.original_text}: {spec.rejection_reason or 'invalid_command'}")
+    return errors
 
 
 def verification_selection_payload(
@@ -537,6 +631,22 @@ def _looks_like_compose_target(path: str) -> bool:
     return pure.name.casefold() in _COMPOSE_FILENAMES
 
 
+def _looks_like_static_web_target(path: str) -> bool:
+    normalized = str(path or "").strip().replace("\\", "/")
+    if not normalized:
+        return False
+    pure = PurePosixPath(normalized)
+    parts = [part.casefold() for part in pure.parts]
+    name = pure.name.casefold()
+    if name in _STATIC_WEB_DIR_NAMES:
+        return True
+    if name in _STATIC_WEB_FILENAMES:
+        return True
+    if pure.suffix.casefold() in _STATIC_WEB_EXTENSIONS:
+        return True
+    return bool(parts and parts[0] in _STATIC_WEB_DIR_NAMES)
+
+
 def _explicitly_requests_node_test(texts: list[str]) -> bool:
     for raw_text in texts:
         normalized = re.sub(r'[`"]', "", str(raw_text or "")).strip().casefold()
@@ -660,6 +770,10 @@ def _texts_mention_compose_shorthand(texts: list[str]) -> bool:
 
 def _texts_look_js_frontend_task(texts: list[str]) -> bool:
     return any(_JS_FRONTEND_TEXT_RE.search(str(item or "").casefold()) for item in texts)
+
+
+def _texts_look_static_web_task(texts: list[str]) -> bool:
+    return any(_STATIC_WEB_TEXT_RE.search(str(item or "").casefold()) for item in texts)
 
 
 def _texts_look_python_code_task(texts: list[str]) -> bool:
@@ -799,6 +913,22 @@ def _repo_is_confident_docs_only_without_verify_surface(scan: RepoScanResult | N
     ):
         return False
     return _repo_paths_match_confident_shape(scan, path_matcher=_looks_like_docs_only_target)
+
+
+def _repo_is_confident_static_web_without_verify_surface(scan: RepoScanResult | None) -> bool:
+    if scan is None or _repo_has_authoritative_verify_commands(scan):
+        return False
+    if (
+        _scan_manifest_kind_set(scan)
+        or _scan_language_hint_set(scan)
+        or _scan_package_hint_set(scan)
+    ):
+        return False
+    return _repo_paths_match_confident_shape(
+        scan,
+        path_matcher=_looks_like_static_web_target,
+        allow_docs=True,
+    )
 
 
 def _repo_is_confident_ci_only_without_verify_surface(scan: RepoScanResult | None) -> bool:
@@ -946,6 +1076,13 @@ def _repo_grounded_no_authoritative_selection(
             reason="repo scan found a docs-only workspace with no authoritative verification surface",
             contract_type="unavailable",
         )
+    if _repo_is_confident_static_web_without_verify_surface(scan):
+        return _resolved_verify_commands(
+            commands=(),
+            source=REPO_SCAN_NO_AUTHORITATIVE_SOURCE,
+            reason="repo scan found a static web workspace with no authoritative verification surface",
+            contract_type="unavailable",
+        )
     if _repo_is_confident_ci_only_without_verify_surface(scan):
         return _resolved_verify_commands(
             commands=(),
@@ -1015,6 +1152,10 @@ def refine_generic_fallback_verify_command_selection(
     task_has_python_signals = any(_looks_like_python_verify_target(path) for path in task_paths)
     task_has_docs_only_signals = bool(task_paths) and all(
         _looks_like_docs_only_target(path) for path in task_paths
+    )
+    task_has_static_web_signals = bool(task_paths) and all(
+        _looks_like_static_web_target(path) or _looks_like_docs_only_target(path)
+        for path in task_paths
     )
     task_has_ci_only_signals = bool(task_paths) and all(
         _looks_like_ci_target(path) for path in task_paths
@@ -1094,6 +1235,13 @@ def refine_generic_fallback_verify_command_selection(
             reason="docs-only task does not expose a confident verification command",
             contract_type="unavailable",
         )
+    if task_has_static_web_signals or (not task_paths and _texts_look_static_web_task(task_texts)):
+        return _resolved_verify_commands(
+            commands=(),
+            source="task_refinement.no_authoritative_commands",
+            reason="static web task does not expose a confident verification command",
+            contract_type="unavailable",
+        )
     if task_has_ci_only_signals or (not task_paths and _texts_look_ci_only(task_texts)):
         return _resolved_verify_commands(
             commands=(),
@@ -1126,6 +1274,30 @@ def refine_generic_fallback_verify_command_selection(
             )
         return selection
 
+    node_project_script_commands = (
+        normalize_verify_command_list(
+            _infer_node_project_script_verify_commands(root=root, repo_scan=scan)
+        )
+        if root is not None
+        and scan is not None
+        and repo_node_hints
+        and not repo_has_authoritative_commands
+        else ()
+    )
+    task_points_to_node_surface = (
+        task_has_node_bootstrap_targets
+        or task_has_js_targets
+        or task_has_pathless_js_frontend_signals
+        or (not task_paths and not repo_python_hints)
+    )
+    if node_project_script_commands and (not repo_python_hints or task_points_to_node_surface):
+        return _resolved_verify_commands(
+            commands=node_project_script_commands,
+            source="repo_scan.likely_test_commands",
+            reason="repo scan discovered package.json verification scripts",
+            contract_type="repo_native",
+        )
+
     if (
         task_has_node_bootstrap_targets
         or task_has_js_targets
@@ -1140,6 +1312,24 @@ def refine_generic_fallback_verify_command_selection(
 
     if repo_grounded_no_authoritative is not None:
         return repo_grounded_no_authoritative
+
+    if (
+        scan is not None
+        and selection.source == CONFIG_VERIFY_COMMANDS_FALLBACK_SOURCE
+        and not repo_has_authoritative_commands
+        and not repo_python_hints
+        and not task_has_python_signals
+        and not task_has_pathless_python_code_signals
+        and not explicit_pytest_commands
+    ):
+        return _resolved_verify_commands(
+            commands=(),
+            source=REPO_SCAN_NO_AUTHORITATIVE_SOURCE,
+            reason=(
+                "generic pytest fallback requires a trustworthy pre-existing Python test surface"
+            ),
+            contract_type="unavailable",
+        )
 
     return selection
 
@@ -1817,7 +2007,7 @@ def _run_verify_command_once(
     root: Path,
     runner: object | None,
     runner_build_error: str | None,
-    timeout_s: int,
+    timeout_s: float,
 ) -> VerificationCommandExecution:
     if runner_build_error is not None:
         return VerificationCommandExecution(
@@ -1843,7 +2033,7 @@ def _run_verify_command_once(
         return VerificationCommandExecution(
             exit_code=124,
             stdout="",
-            stderr=f"Command timed out after {timeout_s}s",
+            stderr=f"Command timed out after {timeout_s:g}s",
         )
     except OSError as e:
         return VerificationCommandExecution(exit_code=127, stdout="", stderr=str(e))
@@ -2088,9 +2278,10 @@ def resolve_verify_command_selection(
     if inferred:
         return _resolved_verify_commands(commands=inferred, source="repo_scan.likely_test_commands")
 
+    verify_commands_explicitly_set = "verify_commands" in getattr(cfg, "model_fields_set", set())
     source = (
         CONFIG_VERIFY_COMMANDS_FALLBACK_SOURCE
-        if is_generic_verify_command_fallback(commands)
+        if is_generic_verify_command_fallback(commands) and not verify_commands_explicitly_set
         else CONFIG_VERIFY_COMMANDS_GENERIC_PRESET_SOURCE
     )
     return _resolved_verify_commands(commands=commands, source=source)
@@ -2119,15 +2310,149 @@ def _resolve_repo_inferred_verify_commands(
     repo_scan: RepoScanResult | None,
 ) -> tuple[str, ...]:
     scan = repo_scan
-    if root is not None:
+    if root is not None and (scan is None or not _repo_scan_matches_root(scan, root)):
         try:
             scan = scan_workspace(context=_resolve_verify_workspace_context(root, repo_scan))
         except (WorkspaceContextError, OSError):
-            if scan is None:
-                scan = None
+            scan = None
     if scan is None:
         return ()
-    return normalize_verify_command_list(scan.likely_test_commands)
+    likely_commands = normalize_verify_command_list(scan.likely_test_commands)
+    if likely_commands:
+        return likely_commands
+    return ()
+
+
+def _repo_scan_matches_root(scan: RepoScanResult, root: Path) -> bool:
+    raw_root = str(getattr(scan, "workspace_root", "") or "").strip()
+    if not raw_root:
+        return False
+    try:
+        return Path(raw_root).expanduser().resolve() == root.resolve()
+    except OSError:
+        return False
+
+
+def _infer_node_project_script_verify_commands(
+    *,
+    root: Path,
+    repo_scan: RepoScanResult,
+) -> tuple[str, ...]:
+    package_json_paths = [
+        str(item.get("path") or "").strip()
+        for item in repo_scan.manifests
+        if PurePosixPath(str(item.get("path") or "")).name == "package.json"
+    ]
+    commands: list[str] = []
+    for package_json_path in sorted(package_json_paths, key=_node_package_manifest_sort_key):
+        scripts = _read_package_json_scripts(root / package_json_path)
+        if not scripts:
+            continue
+        manager = _node_package_manager_for_manifest(
+            root=root,
+            package_json_path=package_json_path,
+            repo_scan=repo_scan,
+        )
+        selected_scripts = _select_node_verify_scripts(scripts)
+        for script_name in selected_scripts:
+            commands.append(
+                _node_package_script_command(
+                    manager=manager,
+                    package_json_path=package_json_path,
+                    script_name=script_name,
+                )
+            )
+        if commands:
+            break
+    return tuple(commands)
+
+
+def _node_package_manifest_sort_key(path: str) -> tuple[int, int, str]:
+    pure = PurePosixPath(str(path or "."))
+    return (0 if pure.parent.as_posix() in {"", "."} else 1, len(pure.parts), str(path))
+
+
+def _read_package_json_scripts(path: Path) -> dict[str, str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    scripts = payload.get("scripts")
+    if not isinstance(scripts, dict):
+        return {}
+    return {
+        str(name).strip(): str(command).strip()
+        for name, command in scripts.items()
+        if str(name).strip() and isinstance(command, str) and str(command).strip()
+    }
+
+
+def _select_node_verify_scripts(scripts: dict[str, str]) -> tuple[str, ...]:
+    selected: list[str] = []
+    for script_name in _NODE_VERIFY_SCRIPT_PRIORITY:
+        command = scripts.get(script_name)
+        if not command:
+            continue
+        if script_name == "test" and "no test specified" in command.casefold():
+            continue
+        selected.append(script_name)
+        if script_name == "test":
+            return tuple(selected)
+    return tuple(selected)
+
+
+def _node_package_manager_for_manifest(
+    *,
+    root: Path,
+    package_json_path: str,
+    repo_scan: RepoScanResult,
+) -> str:
+    try:
+        payload = json.loads((root / package_json_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        payload = None
+    if isinstance(payload, dict):
+        raw_manager = payload.get("packageManager")
+        if isinstance(raw_manager, str):
+            lowered = raw_manager.strip().casefold()
+            for manager in ("pnpm", "yarn", "bun", "npm"):
+                if lowered.startswith(f"{manager}@"):
+                    return manager
+    manifest_paths = {str(item.get("path") or "") for item in repo_scan.manifests}
+    package_dir = PurePosixPath(package_json_path).parent
+    for candidate_dir in (package_dir, *package_dir.parents):
+        prefix = "" if candidate_dir.as_posix() in {"", "."} else f"{candidate_dir.as_posix()}/"
+        if f"{prefix}pnpm-lock.yaml" in manifest_paths:
+            return "pnpm"
+        if f"{prefix}yarn.lock" in manifest_paths:
+            return "yarn"
+        if f"{prefix}bun.lockb" in manifest_paths:
+            return "bun"
+        if f"{prefix}package-lock.json" in manifest_paths:
+            return "npm"
+    return "npm"
+
+
+def _node_package_script_command(
+    *,
+    manager: str,
+    package_json_path: str,
+    script_name: str,
+) -> str:
+    package_dir = PurePosixPath(package_json_path).parent.as_posix()
+    verb = "test" if script_name == "test" else f"run {script_name}"
+    if package_dir in {"", "."}:
+        return f"{manager} {verb}"
+    quoted_dir = shlex.quote(package_dir)
+    if manager == "pnpm":
+        return f"pnpm --dir {quoted_dir} {verb}"
+    if manager == "yarn":
+        return f"yarn --cwd {quoted_dir} {verb}"
+    if manager == "bun":
+        return f"bun --cwd {quoted_dir} {verb}"
+    return f"npm --prefix {quoted_dir} {verb}"
 
 
 def _resolve_verify_workspace_context(
@@ -2240,7 +2565,7 @@ def run_task_verification(
     commands: list[str],
     artifact_path: Path,
     cfg: AppConfig | None = None,
-    timeout_s: int = 900,
+    timeout_s: float = 900,
 ) -> VerifyRunResult:
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     results: list[VerifyCommandResult] = []

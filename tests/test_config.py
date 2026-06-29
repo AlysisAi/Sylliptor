@@ -21,6 +21,7 @@ from sylliptor_agent_cli.config import (
     load_persisted_api_key,
     normalize_verify_command_list,
     resolve_api_key,
+    resolve_crash_diagnostic_log_path,
     resolve_feedback_github_enabled,
     resolve_feedback_github_repo,
     resolve_feedback_open_browser,
@@ -30,6 +31,8 @@ from sylliptor_agent_cli.config import (
     resolve_model_metadata_policy,
     resolve_prompt_cache_key,
     resolve_prompt_cache_retention,
+    resolve_run_deadline,
+    resolve_run_deadline_seconds,
     resolve_web_search_adapter,
     resolve_web_search_base_url,
     resolve_web_search_mode,
@@ -1355,6 +1358,64 @@ def test_resolve_llm_timeout_prefers_config_when_env_absent(
 def test_resolve_llm_timeout_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SYLLIPTOR_LLM_TIMEOUT_S", "42.0")
     assert resolve_llm_timeout_s(AppConfig(llm_timeout_s=17.5)) == 42.0
+
+
+def test_run_deadline_config_env_and_cli_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_RUN_DEADLINE_SECONDS", raising=False)
+    cfg = AppConfig(run_deadline_seconds=17.5)
+
+    assert resolve_run_deadline_seconds(AppConfig()) is None
+    assert resolve_run_deadline(AppConfig()).source == "absent"
+    assert resolve_run_deadline_seconds(cfg) == 17.5
+    assert resolve_run_deadline(cfg).source == "config"
+
+    monkeypatch.setenv("SYLLIPTOR_RUN_DEADLINE_SECONDS", "42.0")
+    assert resolve_run_deadline_seconds(cfg) == 42.0
+    assert resolve_run_deadline(cfg).source == "environment"
+    assert resolve_run_deadline_seconds(cfg, cli_deadline_seconds=8.0) == 8.0
+    assert resolve_run_deadline(cfg, cli_deadline_seconds=8.0).source == "explicit_cli"
+
+    monkeypatch.setenv("SYLLIPTOR_RUN_DEADLINE_SECONDS", "0")
+    with pytest.raises(ConfigError):
+        resolve_run_deadline_seconds(cfg)
+
+
+def test_set_run_deadline_validation() -> None:
+    cfg = set_config_value(AppConfig(), "run_deadline_seconds", "12.5")
+    assert cfg.run_deadline_seconds == 12.5
+
+    cfg = set_config_value(cfg, "run_deadline_seconds", "off")
+    assert cfg.run_deadline_seconds is None
+
+    with pytest.raises(ConfigError):
+        set_config_value(cfg, "run_deadline_seconds", "0")
+    with pytest.raises(ConfigError):
+        set_config_value(cfg, "run_deadline_seconds", "nan")
+
+
+def test_crash_diagnostic_log_path_config_env_and_cli_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_CRASH_DIAGNOSTIC_LOG_PATH", raising=False)
+    cfg = AppConfig(crash_diagnostic_log_path="/tmp/config-diag.jsonl")
+
+    assert resolve_crash_diagnostic_log_path(AppConfig()) is None
+    assert resolve_crash_diagnostic_log_path(cfg) == "/tmp/config-diag.jsonl"
+
+    monkeypatch.setenv("SYLLIPTOR_CRASH_DIAGNOSTIC_LOG_PATH", "/tmp/env-diag.jsonl")
+    assert resolve_crash_diagnostic_log_path(cfg) == "/tmp/env-diag.jsonl"
+    assert (
+        resolve_crash_diagnostic_log_path(
+            cfg,
+            cli_diagnostic_log_path="/tmp/cli-diag.jsonl",
+        )
+        == "/tmp/cli-diag.jsonl"
+    )
+
+    cfg = set_config_value(cfg, "crash_diagnostic_log_path", "")
+    assert cfg.crash_diagnostic_log_path is None
 
 
 def test_resolve_web_search_timeout_prefers_env_then_config(

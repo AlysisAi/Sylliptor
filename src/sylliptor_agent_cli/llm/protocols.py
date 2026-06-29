@@ -49,6 +49,7 @@ class ProviderProtocolCapabilities:
     default_web_search_adapter: str
     unsupported_parameters: tuple[str, ...] = ()
     quirks: tuple[str, ...] = ()
+    supports_forced_tool_choice: bool = True
 
     @property
     def supports_native_web_search(self) -> bool:
@@ -139,6 +140,7 @@ PROVIDER_PROTOCOL_CAPABILITIES: tuple[ProviderProtocolCapabilities, ...] = (
         supports_provider_hosted_web_search_adapter=False,
         default_web_search_adapter="gemini_grounding",
         unsupported_parameters=("stream", "tools", "tool_choice", "response_format", "web_search"),
+        supports_forced_tool_choice=False,
         quirks=(
             "Experimental Gemini Interactions prototype; gated by "
             "SYLLIPTOR_EXPERIMENTAL_GEMINI_INTERACTIONS=1 or "

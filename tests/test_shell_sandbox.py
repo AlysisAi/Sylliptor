@@ -597,6 +597,52 @@ def test_bwrap_hardened_runner_skips_symlinked_repo_metadata(
     assert not _has_argv_triple(argv, "--ro-bind", outside_host, "/workspace/.git")
 
 
+def test_bwrap_hardened_java_config_bind_paths_discovers_openjdk_dirs(
+    tmp_path: Path,
+) -> None:
+    etc = tmp_path / "etc"
+    java_dir = etc / "java-17-openjdk"
+    dot_java_dir = etc / ".java"
+    java_dir.mkdir(parents=True)
+    dot_java_dir.mkdir()
+    (etc / "java-not-a-dir").write_text("ignored\n", encoding="utf-8")
+
+    paths = sandbox_runner_mod._hardened_java_config_ro_bind_paths(etc_root=etc)
+
+    assert paths == (dot_java_dir.resolve(), java_dir.resolve())
+
+
+def test_bwrap_hardened_runner_binds_java_config_dirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(*args, **_kwargs):  # type: ignore[no-untyped-def]
+        captured["args"] = args
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox_runner_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(sandbox_runner_mod, "_supports_bwrap_unshare_cgroup", lambda: False)
+    monkeypatch.setattr(sandbox_runner_mod.shutil, "which", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        sandbox_runner_mod,
+        "_hardened_java_config_ro_bind_paths",
+        lambda: (Path("/etc/java-17-openjdk"),),
+    )
+
+    runner = BwrapShellRunner(network="off", clear_env=False, profile="hardened")
+    runner.run(root=tmp_path, cwd=tmp_path, cmd="javac src/Main.java", timeout_s=5)
+
+    argv = list(captured["args"][0])  # type: ignore[index]
+    assert _has_argv_triple(
+        argv,
+        "--ro-bind",
+        "/etc/java-17-openjdk",
+        "/etc/java-17-openjdk",
+    )
+
+
 def test_bwrap_runner_binds_active_python_runtime_after_tmpfs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

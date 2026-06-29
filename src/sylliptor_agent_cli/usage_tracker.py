@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -349,47 +350,50 @@ def build_usage_record(
 
 class UsageSummary:
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self._by_model: dict[str, _ModelUsageTotals] = {}
         self._records: list[UsageRecord] = []
         self.calls = 0
 
     def add_record(self, record: UsageRecord) -> None:
-        key = record.requested_model.strip() or "unknown-model"
-        totals = self._by_model.setdefault(key, _ModelUsageTotals())
-        self._records.append(record)
-        totals.prompt_tokens += record.prompt_tokens
-        totals.completion_tokens += record.completion_tokens
-        totals.total_tokens += record.total_tokens
-        if record.cost_usd is None:
-            totals.unknown_cost_count += 1
-        else:
-            totals.known_cost_usd += float(record.cost_usd)
-            totals.known_cost_calls += 1
-        if record.usage_source == "api":
-            totals.api_usage_calls += 1
-        else:
-            totals.estimate_usage_calls += 1
-        if record.usage_correction_reason:
-            totals.corrected_usage_calls += 1
-        totals.cached_prompt_tokens += max(0, record.cached_prompt_tokens or 0)
-        totals.uncached_prompt_tokens += max(0, record.uncached_prompt_tokens or 0)
-        breakdown = record.request_token_estimate
-        if breakdown is not None:
-            totals.estimated_bootstrap_prompt_tokens += breakdown.bootstrap_prompt_tokens
-            totals.estimated_tool_schema_tokens += breakdown.tool_schema_tokens
-            totals.estimated_live_conversation_history_tokens += (
-                breakdown.live_conversation_history_tokens
-            )
-            totals.estimated_inline_tool_transcript_tokens += (
-                breakdown.inline_tool_transcript_tokens
-            )
-            totals.estimated_memory_summary_tokens += breakdown.memory_summary_tokens
-            totals.estimated_pins_tokens += breakdown.pins_tokens
-            totals.estimated_total_request_tokens += breakdown.total_tokens
-        self.calls += 1
+        with self._lock:
+            key = record.requested_model.strip() or "unknown-model"
+            totals = self._by_model.setdefault(key, _ModelUsageTotals())
+            self._records.append(record)
+            totals.prompt_tokens += record.prompt_tokens
+            totals.completion_tokens += record.completion_tokens
+            totals.total_tokens += record.total_tokens
+            if record.cost_usd is None:
+                totals.unknown_cost_count += 1
+            else:
+                totals.known_cost_usd += float(record.cost_usd)
+                totals.known_cost_calls += 1
+            if record.usage_source == "api":
+                totals.api_usage_calls += 1
+            else:
+                totals.estimate_usage_calls += 1
+            if record.usage_correction_reason:
+                totals.corrected_usage_calls += 1
+            totals.cached_prompt_tokens += max(0, record.cached_prompt_tokens or 0)
+            totals.uncached_prompt_tokens += max(0, record.uncached_prompt_tokens or 0)
+            breakdown = record.request_token_estimate
+            if breakdown is not None:
+                totals.estimated_bootstrap_prompt_tokens += breakdown.bootstrap_prompt_tokens
+                totals.estimated_tool_schema_tokens += breakdown.tool_schema_tokens
+                totals.estimated_live_conversation_history_tokens += (
+                    breakdown.live_conversation_history_tokens
+                )
+                totals.estimated_inline_tool_transcript_tokens += (
+                    breakdown.inline_tool_transcript_tokens
+                )
+                totals.estimated_memory_summary_tokens += breakdown.memory_summary_tokens
+                totals.estimated_pins_tokens += breakdown.pins_tokens
+                totals.estimated_total_request_tokens += breakdown.total_tokens
+            self.calls += 1
 
     def records(self) -> list[UsageRecord]:
-        return list(self._records)
+        with self._lock:
+            return list(self._records)
 
     def merge_records(self, records: Iterable[UsageRecord]) -> int:
         merged = 0
@@ -446,95 +450,101 @@ class UsageSummary:
         self.add_record(record)
 
     def by_model_rows(self) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for model_name in sorted(self._by_model):
-            totals = self._by_model[model_name]
-            rows.append(
-                {
-                    "model": model_name,
-                    "prompt_tokens": totals.prompt_tokens,
-                    "completion_tokens": totals.completion_tokens,
-                    "total_tokens": totals.total_tokens,
-                    "cost_usd": (totals.known_cost_usd if totals.known_cost_calls > 0 else None),
-                    "known_cost_calls": totals.known_cost_calls,
-                    "unknown_cost_count": totals.unknown_cost_count,
-                    "api_usage_calls": totals.api_usage_calls,
-                    "estimate_usage_calls": totals.estimate_usage_calls,
-                    "corrected_usage_calls": totals.corrected_usage_calls,
-                    "cached_prompt_tokens": totals.cached_prompt_tokens,
-                    "uncached_prompt_tokens": totals.uncached_prompt_tokens,
-                    "request_token_estimate": {
-                        "bootstrap_prompt_tokens": totals.estimated_bootstrap_prompt_tokens,
-                        "tool_schema_tokens": totals.estimated_tool_schema_tokens,
-                        "live_conversation_history_tokens": (
-                            totals.estimated_live_conversation_history_tokens
+        with self._lock:
+            rows: list[dict[str, Any]] = []
+            for model_name in sorted(self._by_model):
+                totals = self._by_model[model_name]
+                rows.append(
+                    {
+                        "model": model_name,
+                        "prompt_tokens": totals.prompt_tokens,
+                        "completion_tokens": totals.completion_tokens,
+                        "total_tokens": totals.total_tokens,
+                        "cost_usd": (
+                            totals.known_cost_usd if totals.known_cost_calls > 0 else None
                         ),
-                        "inline_tool_transcript_tokens": (
-                            totals.estimated_inline_tool_transcript_tokens
-                        ),
-                        "memory_summary_tokens": totals.estimated_memory_summary_tokens,
-                        "pins_tokens": totals.estimated_pins_tokens,
-                        "total_tokens": totals.estimated_total_request_tokens,
-                    },
-                }
-            )
-        return rows
+                        "known_cost_calls": totals.known_cost_calls,
+                        "unknown_cost_count": totals.unknown_cost_count,
+                        "api_usage_calls": totals.api_usage_calls,
+                        "estimate_usage_calls": totals.estimate_usage_calls,
+                        "corrected_usage_calls": totals.corrected_usage_calls,
+                        "cached_prompt_tokens": totals.cached_prompt_tokens,
+                        "uncached_prompt_tokens": totals.uncached_prompt_tokens,
+                        "request_token_estimate": {
+                            "bootstrap_prompt_tokens": totals.estimated_bootstrap_prompt_tokens,
+                            "tool_schema_tokens": totals.estimated_tool_schema_tokens,
+                            "live_conversation_history_tokens": (
+                                totals.estimated_live_conversation_history_tokens
+                            ),
+                            "inline_tool_transcript_tokens": (
+                                totals.estimated_inline_tool_transcript_tokens
+                            ),
+                            "memory_summary_tokens": totals.estimated_memory_summary_tokens,
+                            "pins_tokens": totals.estimated_pins_tokens,
+                            "total_tokens": totals.estimated_total_request_tokens,
+                        },
+                    }
+                )
+            return rows
 
     def totals(self) -> dict[str, Any]:
-        prompt = sum(v.prompt_tokens for v in self._by_model.values())
-        completion = sum(v.completion_tokens for v in self._by_model.values())
-        total = sum(v.total_tokens for v in self._by_model.values())
-        known_cost = sum(v.known_cost_usd for v in self._by_model.values())
-        known_cost_calls = sum(v.known_cost_calls for v in self._by_model.values())
-        unknown_cost_calls = sum(v.unknown_cost_count for v in self._by_model.values())
-        api_usage_calls = sum(v.api_usage_calls for v in self._by_model.values())
-        estimate_usage_calls = sum(v.estimate_usage_calls for v in self._by_model.values())
-        corrected_usage_calls = sum(v.corrected_usage_calls for v in self._by_model.values())
-        cached_prompt_tokens = sum(v.cached_prompt_tokens for v in self._by_model.values())
-        uncached_prompt_tokens = sum(v.uncached_prompt_tokens for v in self._by_model.values())
-        estimated_bootstrap_prompt_tokens = sum(
-            v.estimated_bootstrap_prompt_tokens for v in self._by_model.values()
-        )
-        estimated_tool_schema_tokens = sum(
-            v.estimated_tool_schema_tokens for v in self._by_model.values()
-        )
-        estimated_live_conversation_history_tokens = sum(
-            v.estimated_live_conversation_history_tokens for v in self._by_model.values()
-        )
-        estimated_inline_tool_transcript_tokens = sum(
-            v.estimated_inline_tool_transcript_tokens for v in self._by_model.values()
-        )
-        estimated_memory_summary_tokens = sum(
-            v.estimated_memory_summary_tokens for v in self._by_model.values()
-        )
-        estimated_pins_tokens = sum(v.estimated_pins_tokens for v in self._by_model.values())
-        estimated_total_request_tokens = sum(
-            v.estimated_total_request_tokens for v in self._by_model.values()
-        )
-        return {
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "total_tokens": total,
-            "cost_usd": known_cost if known_cost_calls > 0 else None,
-            "known_cost_usd": known_cost,
-            "known_cost_calls": known_cost_calls,
-            "unknown_cost_calls": unknown_cost_calls,
-            "api_usage_calls": api_usage_calls,
-            "estimate_usage_calls": estimate_usage_calls,
-            "corrected_usage_calls": corrected_usage_calls,
-            "cached_prompt_tokens": cached_prompt_tokens,
-            "uncached_prompt_tokens": uncached_prompt_tokens,
-            "request_token_estimate": {
-                "bootstrap_prompt_tokens": estimated_bootstrap_prompt_tokens,
-                "tool_schema_tokens": estimated_tool_schema_tokens,
-                "live_conversation_history_tokens": (estimated_live_conversation_history_tokens),
-                "inline_tool_transcript_tokens": estimated_inline_tool_transcript_tokens,
-                "memory_summary_tokens": estimated_memory_summary_tokens,
-                "pins_tokens": estimated_pins_tokens,
-                "total_tokens": estimated_total_request_tokens,
-            },
-            "calls": self.calls,
-        }
+        with self._lock:
+            prompt = sum(v.prompt_tokens for v in self._by_model.values())
+            completion = sum(v.completion_tokens for v in self._by_model.values())
+            total = sum(v.total_tokens for v in self._by_model.values())
+            known_cost = sum(v.known_cost_usd for v in self._by_model.values())
+            known_cost_calls = sum(v.known_cost_calls for v in self._by_model.values())
+            unknown_cost_calls = sum(v.unknown_cost_count for v in self._by_model.values())
+            api_usage_calls = sum(v.api_usage_calls for v in self._by_model.values())
+            estimate_usage_calls = sum(v.estimate_usage_calls for v in self._by_model.values())
+            corrected_usage_calls = sum(v.corrected_usage_calls for v in self._by_model.values())
+            cached_prompt_tokens = sum(v.cached_prompt_tokens for v in self._by_model.values())
+            uncached_prompt_tokens = sum(v.uncached_prompt_tokens for v in self._by_model.values())
+            estimated_bootstrap_prompt_tokens = sum(
+                v.estimated_bootstrap_prompt_tokens for v in self._by_model.values()
+            )
+            estimated_tool_schema_tokens = sum(
+                v.estimated_tool_schema_tokens for v in self._by_model.values()
+            )
+            estimated_live_conversation_history_tokens = sum(
+                v.estimated_live_conversation_history_tokens for v in self._by_model.values()
+            )
+            estimated_inline_tool_transcript_tokens = sum(
+                v.estimated_inline_tool_transcript_tokens for v in self._by_model.values()
+            )
+            estimated_memory_summary_tokens = sum(
+                v.estimated_memory_summary_tokens for v in self._by_model.values()
+            )
+            estimated_pins_tokens = sum(v.estimated_pins_tokens for v in self._by_model.values())
+            estimated_total_request_tokens = sum(
+                v.estimated_total_request_tokens for v in self._by_model.values()
+            )
+            return {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+                "cost_usd": known_cost if known_cost_calls > 0 else None,
+                "known_cost_usd": known_cost,
+                "known_cost_calls": known_cost_calls,
+                "unknown_cost_calls": unknown_cost_calls,
+                "api_usage_calls": api_usage_calls,
+                "estimate_usage_calls": estimate_usage_calls,
+                "corrected_usage_calls": corrected_usage_calls,
+                "cached_prompt_tokens": cached_prompt_tokens,
+                "uncached_prompt_tokens": uncached_prompt_tokens,
+                "request_token_estimate": {
+                    "bootstrap_prompt_tokens": estimated_bootstrap_prompt_tokens,
+                    "tool_schema_tokens": estimated_tool_schema_tokens,
+                    "live_conversation_history_tokens": (
+                        estimated_live_conversation_history_tokens
+                    ),
+                    "inline_tool_transcript_tokens": estimated_inline_tool_transcript_tokens,
+                    "memory_summary_tokens": estimated_memory_summary_tokens,
+                    "pins_tokens": estimated_pins_tokens,
+                    "total_tokens": estimated_total_request_tokens,
+                },
+                "calls": self.calls,
+            }
 
 
 def aggregate_usage_from_session_logs(paths: list[Path]) -> UsageSummary:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -82,6 +83,7 @@ class SessionStore:
         self.active_workdir = active_workdir or cwd
         self.active_workdir_relpath = active_workdir_relpath
         self.path = sessions_dir / f"{session_id}.jsonl"
+        self._lock = threading.RLock()
         self.artifact_persistence_enabled = (
             enabled if artifact_persistence_enabled is None else bool(artifact_persistence_enabled)
         )
@@ -111,17 +113,20 @@ class SessionStore:
 
     def append(self, event_type: str, payload: dict[str, Any]) -> None:
         event = self._build_event(event_type=event_type, payload=payload)
-        self._events.append(event)
-        observed_web_research = self._web_research.observe_event(
-            event_type=event_type,
-            payload=payload,
-            ts=str(event.get("ts") or "").strip() or None,
-        )
-        if self.enabled and self._fh:
-            self._fh.write(json.dumps(event, ensure_ascii=True) + "\n")
-            self._fh.flush()
-        if observed_web_research and self.artifact_persistence_enabled:
-            self._persist_web_research_artifact()
+        with self._lock:
+            event["event_id"] = f"{self.session_id}:{len(self._events) + 1}"
+            self._events.append(event)
+            observed_web_research = self._web_research.observe_event(
+                event_type=event_type,
+                payload=payload,
+                ts=str(event.get("ts") or "").strip() or None,
+                event_id=str(event.get("event_id") or "").strip() or None,
+            )
+            if self.enabled and self._fh:
+                self._fh.write(json.dumps(event, ensure_ascii=True) + "\n")
+                self._fh.flush()
+            if observed_web_research and self.artifact_persistence_enabled:
+                self._persist_web_research_artifact()
 
     def _build_event(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         event = {
@@ -172,7 +177,8 @@ class SessionStore:
         return path
 
     def events_snapshot(self) -> list[dict[str, Any]]:
-        return json.loads(json.dumps(self._events, ensure_ascii=True))
+        with self._lock:
+            return json.loads(json.dumps(self._events, ensure_ascii=True))
 
     def classify_web_fetch_url(self, raw_url: Any) -> str | None:
         return self._web_research.classify_fetch_url(raw_url)
@@ -182,6 +188,23 @@ class SessionStore:
 
     def fetchable_web_fetch_urls(self, *, limit: int = 10) -> list[str]:
         return self._web_research.fetchable_urls(limit=limit)
+
+    def establish_search_mediated_web_fetch_url(
+        self,
+        *,
+        raw_url: Any,
+        query: str,
+        source_url: str | None = None,
+    ) -> tuple[bool, str | None]:
+        with self._lock:
+            changed, normalized = self._web_research.establish_search_mediated_fetch_url(
+                raw_url=raw_url,
+                query=query,
+                source_url=source_url,
+            )
+            if changed and self.artifact_persistence_enabled:
+                self._persist_web_research_artifact()
+            return changed, normalized
 
     def web_research_artifact_payload(self) -> dict[str, Any]:
         return self._web_research.artifact_payload()
@@ -224,12 +247,13 @@ class SessionStore:
         if not events:
             return False
         self._events = json.loads(json.dumps(events, ensure_ascii=True))
-        for event in self._events:
+        for index, event in enumerate(self._events, start=1):
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
             self._web_research.observe_event(
                 event_type=str(event.get("type") or "").strip(),
                 payload=payload,
                 ts=str(event.get("ts") or "").strip() or None,
+                event_id=str(event.get("event_id") or "").strip() or f"{self.session_id}:{index}",
             )
         return True
 

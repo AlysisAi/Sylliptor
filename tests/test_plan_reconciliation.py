@@ -171,6 +171,138 @@ def test_reconciliation_warns_for_suspicious_missing_paths_without_crashing(tmp_
     assert any("may be suspicious or missing" in warning for warning in result.warnings)
 
 
+def test_reconciliation_greenfield_treats_declared_paths_as_create_targets(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    workspace_context = _workspace_context_payload(root)
+    workspace_context["greenfield"] = True
+    declared_paths = [
+        "app/layout.tsx",
+        "components/Navbar.tsx",
+        "app/cv/page.tsx",
+        "data/cv.ts",
+        "content/thoughts/**",
+        "app/thoughts/[slug]/page.tsx",
+    ]
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Build Next.js portfolio",
+                "description": "Scaffold the app routes, CV data, and thoughts content.",
+                "acceptance_criteria": ["The requested app structure exists."],
+                "estimated_files": list(declared_paths),
+                "write_scope": list(declared_paths),
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+    )
+
+    assert result.changed is False
+    assert plan["tasks"][0]["estimated_files"] == declared_paths
+    assert plan["tasks"][0]["write_scope"] == declared_paths
+    joined = " | ".join(result.warnings)
+    assert "may be suspicious or missing" not in joined
+    assert "ignored suspicious inferred path hint" not in joined
+
+
+def test_reconciliation_create_task_suppresses_missing_create_target_warning(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Create app/thoughts/[slug]/page.tsx route",
+                "description": "Add the new dynamic route page from scratch.",
+                "acceptance_criteria": ["The dynamic route renders a thought entry."],
+                "estimated_files": ["app/thoughts/[slug]/page.tsx"],
+                "write_scope": ["app/thoughts/[slug]/page.tsx"],
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+    )
+
+    assert result.changed is False
+    assert not any("may be suspicious or missing" in warning for warning in result.warnings)
+
+
+def test_reconciliation_accepts_globs_and_dynamic_route_segments(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Update routed thoughts implementation",
+                "description": "Adjust thought routing and content loading.",
+                "acceptance_criteria": ["Thought routes resolve slugs."],
+                "estimated_files": ["content/thoughts/**", "app/thoughts/[...slug]/page.tsx"],
+                "write_scope": ["content/thoughts/**", "app/thoughts/[...slug]/page.tsx"],
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+    )
+
+    assert result.changed is False
+    assert not any("may be suspicious or missing" in warning for warning in result.warnings)
+
+
+def test_reconciliation_does_not_mine_framework_prose_as_path_hint(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Build Next.js site",
+                "description": "Use Next.js app router conventions.",
+                "acceptance_criteria": ["The app is implemented."],
+                "estimated_files": [],
+                "write_scope": [],
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+    )
+
+    assert "Next.js" not in plan["tasks"][0]["estimated_files"]
+    assert "Next.js" not in plan["tasks"][0]["write_scope"]
+    assert not any(
+        "ignored suspicious inferred path hint" in warning for warning in result.warnings
+    )
+
+
 def test_reconcile_plan_warns_when_mutating_task_still_lacks_runnable_scope(
     tmp_path: Path,
 ) -> None:
@@ -249,6 +381,70 @@ def test_reconciliation_preserves_explicit_user_paths_even_when_missing(tmp_path
         "tests/test_release_planner.py",
     ]
     assert not any("may be suspicious or missing" in warning for warning in result.warnings)
+
+
+def test_reconciliation_broadens_existing_directory_scope(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / "services" / "api" / "src").mkdir(parents=True)
+    (root / "services" / "api" / "src" / "config.ts").write_text(
+        "export const value = 1;\n",
+        encoding="utf-8",
+    )
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Fix API config behavior",
+                "description": "Update the API config implementation.",
+                "acceptance_criteria": ["API config behavior is correct."],
+                "estimated_files": ["services/api"],
+                "write_scope": ["services/api"],
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+    )
+
+    assert result.changed is True
+    assert plan["tasks"][0]["estimated_files"] == ["services/api/**"]
+    assert plan["tasks"][0]["write_scope"] == ["services/api/**"]
+
+
+def test_reconciliation_infers_explicit_new_file_creation_path(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "package.json").write_text('{"type":"module"}\n', encoding="utf-8")
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Create bin/word-summary.js CLI",
+                "description": "Add bin/word-summary.js as a new executable CLI entrypoint.",
+                "acceptance_criteria": ["bin/word-summary.js exists."],
+                "estimated_files": [],
+                "write_scope": [],
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+    )
+
+    assert result.changed is True
+    assert plan["tasks"][0]["estimated_files"] == ["bin/word-summary.js"]
+    assert plan["tasks"][0]["write_scope"] == ["bin/word-summary.js"]
+    assert not any(
+        "ignored suspicious inferred path hint" in warning for warning in result.warnings
+    )
 
 
 def test_reconciliation_drops_forbidden_user_anchor_and_restores_implementation_path(
@@ -592,6 +788,44 @@ def test_reconciliation_replaces_wrong_file_scope_with_symbol_definition(
     joined = " | ".join(result.warnings)
     assert "replaced symbol-mismatched estimated_files entries" in joined
     assert "replaced symbol-mismatched write_scope entries" in joined
+
+
+def test_reconciliation_keeps_explicit_new_file_when_named_scan_finds_existing_source(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    (root / "src" / "sylliptor_agent_cli").mkdir(parents=True)
+    (root / "src" / "sylliptor_agent_cli" / "cli.py").write_text(
+        "def main():\n    return None\n",
+        encoding="utf-8",
+    )
+    workspace_context = _workspace_context_payload(root)
+    plan = {
+        "tasks": [
+            {
+                "id": "T01",
+                "title": "Create pomo.py CLI",
+                "description": "Build the new timer command in pomo.py.",
+                "acceptance_criteria": ["pomo.py exposes the requested timer CLI."],
+                "estimated_files": ["pomo.py"],
+                "write_scope": ["pomo.py"],
+            }
+        ]
+    }
+
+    result = reconcile_plan_with_workspace(
+        plan,
+        workspace_root=root,
+        workspace_context=workspace_context,
+    )
+
+    assert result.changed is False
+    assert plan["tasks"][0]["estimated_files"] == ["pomo.py"]
+    assert plan["tasks"][0]["write_scope"] == ["pomo.py"]
+    joined = " | ".join(result.warnings)
+    assert "kept explicit missing estimated_files path(s)" in joined
+    assert "kept explicit missing write_scope path(s)" in joined
+    assert "src/sylliptor_agent_cli/cli.py" in joined
 
 
 def test_reconciliation_adds_unique_named_code_file_for_behavior_task_with_tests_only_scope(

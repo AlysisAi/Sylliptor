@@ -508,7 +508,8 @@ def test_build_tools_web_fetch_preserves_explicit_max_chars_value(
 
     result = tools["web_fetch"].run({"url": "https://example.com/spec", "max_chars": 0})
 
-    assert result == {"ok": True}
+    assert result["ok"] is True
+    assert result["provenance_classification"] == "user_provided"
     assert observed["url"] == "https://example.com/spec"
     assert observed["max_chars"] == 0
 

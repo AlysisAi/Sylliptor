@@ -218,6 +218,24 @@ def run(
         "--yes",
         help="In auto mode, skip confirmations for sensitive commands (hard blocks still apply).",
     ),
+    deadline_seconds: float | None = typer.Option(
+        None,
+        "--deadline-seconds",
+        help="Stop this one-shot run after the given invocation-wide wall-clock seconds.",
+    ),
+    require_deadline: bool = typer.Option(
+        False,
+        "--require-deadline",
+        help=(
+            "Require a finite one-shot run deadline from CLI, environment, or config. "
+            "Intended for managed hosts."
+        ),
+    ),
+    diagnostic_log: Path | None = typer.Option(
+        None,
+        "--diagnostic-log",
+        help="Append minimal crash-safe diagnostic events to this JSONL path.",
+    ),
 ) -> None:
     from ..chat import run_impl
 
@@ -241,6 +259,9 @@ def run(
         api_key_stdin,
         api_key,
         yes,
+        deadline_seconds,
+        require_deadline,
+        diagnostic_log,
         cli_ctx=ctx,
     )
 
@@ -314,6 +335,11 @@ def chat(
         "--yes",
         help="In auto mode, skip confirmations for sensitive commands.",
     ),
+    diagnostic_log: Path | None = typer.Option(
+        None,
+        "--diagnostic-log",
+        help="Append minimal crash-safe diagnostic events to this JSONL path.",
+    ),
 ) -> None:
     from ..chat import chat_impl
 
@@ -336,6 +362,7 @@ def chat(
         api_key_stdin,
         api_key,
         yes,
+        diagnostic_log,
         cli_ctx=ctx,
     )
 

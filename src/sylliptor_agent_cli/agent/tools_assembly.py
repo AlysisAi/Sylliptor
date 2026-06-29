@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import importlib
+import inspect
+import ipaddress
 import json
 import os
 import re
@@ -13,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from ..approval_scope import (
     exact_command_scope,
@@ -20,6 +23,7 @@ from ..approval_scope import (
     exact_verify_command_set_scope,
 )
 from ..config import AppConfig, ConfigError, resolve_role_temperature
+from ..crash_diagnostics import CrashDiagnosticLogger
 from ..custom_tools import (
     CustomToolDiscoveryResult,
     CustomToolSessionState,
@@ -28,6 +32,17 @@ from ..custom_tools import (
     run_custom_tool,
 )
 from ..diff_paths import iter_patch_paths
+from ..durable_service_manager import DurableServiceManager, ProcessOwnership
+from ..execution_deadline import (
+    DEFAULT_DEADLINE_CLEANUP_RESERVE_SECONDS,
+    MINIMUM_SUBAGENT_START_SECONDS,
+    MINIMUM_TOOL_START_SECONDS,
+    DeadlineExhausted,
+    DeadlineOperation,
+    DeadlinePhase,
+    ExecutionDeadline,
+    deadline_timeout_or_raise,
+)
 from ..extensions.activation import ActivationDecision
 from ..extensions.models import normalize_extension_id
 from ..mcp.manager import ForgeTaskScopedMcpManager, McpManager
@@ -87,7 +102,7 @@ from ..tools.search import search_rg
 from ..tools.shell import shell_run
 from ..tools.symbols import symbol_search
 from ..tools.web import web_fetch
-from ..tools.web_search import resolve_web_search_runtime_status, web_search
+from ..tools.web_search import WebSearchError, resolve_web_search_runtime_status, web_search
 from ..usage_tracker import UsageRecord, UsageSummary
 from ..verify_gate import (
     ResolvedVerifyCommands,
@@ -95,12 +110,21 @@ from ..verify_gate import (
     is_authoritative_verify_command_selection,
     resolve_verify_commands,
     run_task_verification,
+    trusted_shell_expression_command_set,
+    validation_errors_for_selection,
+    verification_command_specs_payload,
     verification_selection_payload,
     verify_run_result_to_payload,
+)
+from ..web_research import (
+    build_web_fetch_recovery_search_query,
+    canonicalize_web_url_input,
+    normalize_web_url,
 )
 from ..workspace_context import resolve_workspace_context
 from . import _patchable
 from .errors import AgentRuntimeError, SessionWorkdirError
+from .mutation_classification import classify_mutation_paths
 from .prompt_context import (
     _MODE_FULLACCESS,
     ALWAYS_PROTECTED_WRITE_PREFIXES,
@@ -110,6 +134,7 @@ from .prompt_context import (
     _normalize_workspace_relpath,
     _normalized_authoritative_verify_commands,
     _normalized_verify_commands,
+    _paths_require_verification,
     _PluginActivationIndex,
     _workspace_relpath_for_path,
     resolve_workdir_relpath_within_workspace,
@@ -117,6 +142,11 @@ from .prompt_context import (
 from .verification_commands import (
     _has_disallowed_shell_control_flow,
     _verify_run_commands_match_effective_contract,
+)
+from .verification_evidence import (
+    VerificationEvidence,
+    VerificationEvidenceCategory,
+    classify_verification_evidence,
 )
 
 _turn_snapshot = importlib.import_module("sylliptor_agent_cli.agent.turn.snapshot")
@@ -131,6 +161,156 @@ _snapshot_workspace_for_command_mutation_detection = (
 )
 _walk_workspace_snapshot_paths = _turn_snapshot._walk_workspace_snapshot_paths
 _workspace_snapshot_signature = _turn_snapshot._workspace_snapshot_signature
+
+
+def _call_with_optional_kwargs(
+    func: Callable[..., Any],
+    *,
+    required_kwargs: dict[str, Any],
+    optional_kwargs: dict[str, Any],
+) -> Any:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return func(**required_kwargs, **optional_kwargs)
+    accepts_var_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    accepted_kwargs = dict(required_kwargs)
+    for key, value in optional_kwargs.items():
+        if accepts_var_kwargs or key in signature.parameters:
+            accepted_kwargs[key] = value
+    return func(**accepted_kwargs)
+
+
+_AUTHORITATIVE_SUBAGENT_FINAL_TEXT_SOURCES = frozenset({"store_final", "surface_assistant_done"})
+
+
+def _latest_subagent_store_final_text(sub_session: Any) -> tuple[str, bool]:
+    child_store = getattr(sub_session, "store", None)
+    events_snapshot = getattr(child_store, "events_snapshot", None)
+    if not callable(events_snapshot):
+        return "", False
+    try:
+        events = events_snapshot()
+    except Exception:  # noqa: BLE001 - result capture should fall back instead of failing.
+        return "", False
+    for event in reversed(events if isinstance(events, list) else []):
+        if not isinstance(event, dict) or str(event.get("type") or "") != "final":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        text = str(payload.get("content") or "").strip()
+        if text:
+            return text, True
+    return "", True
+
+
+def _latest_subagent_message_text(sub_session: Any) -> str:
+    for message in reversed(getattr(sub_session, "messages", [])):
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "") != "assistant":
+            continue
+        text = str(message.get("content") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _resolve_subagent_final_text(
+    *,
+    sub_session: Any,
+    subagent_surface: NestedSubagentSurface,
+) -> tuple[str, str]:
+    store_text, store_checked = _latest_subagent_store_final_text(sub_session)
+    if store_text:
+        return store_text, "store_final"
+    if not store_checked:
+        surface_text = str(subagent_surface.last_assistant_message_done or "").strip()
+        if surface_text:
+            return surface_text, "surface_assistant_done"
+    message_text = _latest_subagent_message_text(sub_session)
+    if message_text:
+        return message_text, "assistant_message"
+    return "", "missing"
+
+
+def _subagent_final_report_problem(*, text: str, source: str) -> str | None:
+    if not str(text or "").strip():
+        return "missing_final_report"
+    if source not in _AUTHORITATIVE_SUBAGENT_FINAL_TEXT_SOURCES:
+        return "missing_final_report_signal"
+    return None
+
+
+def _command_mutation_metadata(
+    *,
+    root: Path,
+    touched_repo_paths: list[str],
+    command_was_verification: bool = False,
+) -> dict[str, Any]:
+    classifications = classify_mutation_paths(
+        touched_repo_paths,
+        root=root,
+        command_was_verification=command_was_verification,
+    )
+    material = [item.path for item in classifications if item.is_material]
+    benign = [item.path for item in classifications if not item.is_material]
+    out: dict[str, Any] = {
+        "mutation_path_classifications": [item.as_payload() for item in classifications],
+    }
+    if material:
+        out["material_touched_repo_paths"] = material
+    if benign:
+        out["benign_runtime_paths"] = benign
+    return out
+
+
+def _verification_relevant_material_paths(paths: list[str]) -> list[str]:
+    if not paths or not _paths_require_verification(set(paths)):
+        return []
+    return list(paths)
+
+
+def _aggregate_tool_evidence_payload(records: list[VerificationEvidence]) -> dict[str, Any]:
+    if not records:
+        return {
+            "verification_evidence_category": VerificationEvidenceCategory.NOT_VERIFICATION.value,
+            "verification_evidence_reason": "no_verification_evidence",
+            "verification_evidence_allowed": False,
+            "verification_evidence_supplemental_only": False,
+        }
+    priority = {
+        VerificationEvidenceCategory.AUTHORITATIVE: 0,
+        VerificationEvidenceCategory.REPO_NATIVE: 1,
+        VerificationEvidenceCategory.TASK_ACCEPTANCE: 2,
+        VerificationEvidenceCategory.NOT_VERIFICATION: 3,
+    }
+    primary = sorted(records, key=lambda item: priority[item.category])[0]
+    allowed = all(
+        item.allowed_to_satisfy_contract
+        for item in records
+        if item.category != VerificationEvidenceCategory.NOT_VERIFICATION
+    )
+    if any(item.category == VerificationEvidenceCategory.NOT_VERIFICATION for item in records):
+        allowed = False
+    return {
+        "verification_evidence_category": primary.category.value,
+        "verification_evidence_reason": (
+            primary.reason
+            if allowed
+            else next(
+                (item.reason for item in records if not item.allowed_to_satisfy_contract),
+                primary.reason,
+            )
+        ),
+        "verification_evidence_allowed": allowed,
+        "verification_evidence_supplemental_only": all(item.supplemental_only for item in records),
+        "verification_evidence_records": [item.as_payload() for item in records],
+    }
 
 
 def _custom_tool_plugin_id(
@@ -302,7 +482,11 @@ _BUILTIN_MODEL_DESCRIPTIONS: dict[str, str] = {
     "verify_run": "Run configured verifier; no pipes/filters or swapped tools.",
     "shell_run": "Run a policy-checked shell command.",
     "shell_background": "Start a policy-checked background shell command.",
+    "shell_service_start": "Start an explicit durable service with readiness checks.",
+    "shell_service_status": "Check a durable service and re-run its readiness probe.",
+    "shell_service_stop": "Stop a durable service by service_id.",
     "shell_output": "Read buffered output from a background shell process.",
+    "shell_wait": "Wait for background process output or exit without busy polling.",
     "shell_kill": "Terminate a background shell process.",
     "shell_list": "List background shell processes.",
     "session_set_workdir": (
@@ -317,6 +501,45 @@ _BUILTIN_MODEL_DESCRIPTIONS: dict[str, str] = {
     "git_history": "Inspect git log, show, or blame.",
     "git_apply_patch": "Apply a unified diff with git apply.",
 }
+
+
+def _subagent_exact_tool_catalog_message(
+    tools: dict[str, ToolDef],
+    *,
+    max_tools: int = 80,
+    max_chars: int = 8000,
+) -> str:
+    lines = [
+        "<available_tool_catalog>",
+        "Use only these exact tool names. Do not invent aliases or call unavailable tools.",
+        "If a tool call returns unknown_tool, inspect its structured recovery payload and retry once with an exact listed name.",
+        "tools:",
+    ]
+    for index, name in enumerate(sorted(tools)):
+        if index >= max_tools:
+            lines.append("- ...(truncated)")
+            break
+        tool = tools[name]
+        required = tool.parameters.get("required") if isinstance(tool.parameters, dict) else []
+        required_args = [
+            str(item)
+            for item in (required if isinstance(required, list) else [])
+            if str(item).strip()
+        ]
+        purpose = " ".join(
+            str(tool.metadata.get("model_description") or tool.description or "").split()
+        )
+        if len(purpose) > 140:
+            purpose = purpose[:137].rstrip() + "..."
+        required_text = ", ".join(required_args) if required_args else "(none)"
+        candidate = f"- {name}: {purpose or '-'} required_args={required_text}"
+        projected = "\n".join([*lines, candidate, "</available_tool_catalog>\n"])
+        if len(projected) > max_chars:
+            lines.append("- ...(truncated)")
+            break
+        lines.append(candidate)
+    lines.append("</available_tool_catalog>\n")
+    return "\n".join(lines)
 
 
 def _tool_event_metadata(tool: ToolDef | None) -> dict[str, Any]:
@@ -455,6 +678,7 @@ def build_tools(
     non_interactive: bool = False,
     shell_runner: Any | None = None,
     terminal_manager: TerminalManager | None = None,
+    durable_service_manager: DurableServiceManager | None = None,
     verification_enabled: bool = True,
     authoritative_verification_commands: list[str] | None = None,
     effective_verification_commands: list[str] | None = None,
@@ -475,6 +699,9 @@ def build_tools(
     get_active_workdir_relpath: Callable[[], str] | None = None,
     set_active_workdir_callback: Callable[[str, str], dict[str, Any]] | None = None,
     create_session_factory: Callable[..., Any] | None = None,
+    execution_deadline: ExecutionDeadline | None = None,
+    crash_diagnostic_log_path: str | os.PathLike[str] | None = None,
+    crash_diagnostics: CrashDiagnosticLogger | None = None,
 ) -> dict[str, ToolDef]:
     root = root.resolve()
     workspace_context = resolve_workspace_context(root)
@@ -495,6 +722,78 @@ def build_tools(
             else []
         )
     )
+
+    def _deadline_payload() -> dict[str, Any]:
+        if execution_deadline is None:
+            return {
+                "failure_category": "deadline",
+                "deadline_exhausted": False,
+                "remaining_seconds": None,
+                "deadline": None,
+            }
+        remaining = execution_deadline.remaining_seconds()
+        return {
+            "failure_category": "deadline",
+            "deadline_exhausted": execution_deadline.is_exhausted(),
+            "remaining_seconds": remaining,
+            "deadline": execution_deadline.telemetry_snapshot(),
+        }
+
+    def _deadline_error(
+        message: str,
+        *,
+        prevented_launch: bool = True,
+        start_decision: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "error": message,
+            "deadline_prevented_launch": prevented_launch,
+            **_deadline_payload(),
+        }
+        if start_decision is not None:
+            payload["deadline_start_decision"] = start_decision
+        if crash_diagnostics is not None:
+            crash_diagnostics.event(
+                "deadline_exhausted",
+                {
+                    "operation": "tool",
+                    "deadline_exhausted": payload["deadline_exhausted"],
+                    "remaining_seconds": payload["remaining_seconds"],
+                    "deadline": payload["deadline"],
+                    "deadline_start_decision": start_decision,
+                },
+                durable=True,
+            )
+        return payload
+
+    def _deadline_start_decision(
+        operation: DeadlineOperation,
+        *,
+        minimum_remaining_seconds: float,
+        configured_timeout_seconds: float | None = None,
+        allow_during_finalization: bool = False,
+    ) -> dict[str, Any] | None:
+        if execution_deadline is None:
+            return None
+        return execution_deadline.start_decision(
+            operation,
+            minimum_remaining_seconds=minimum_remaining_seconds,
+            configured_timeout_seconds=configured_timeout_seconds,
+            allow_during_finalization=allow_during_finalization,
+        ).telemetry_snapshot()
+
+    def _deadline_timeout(
+        configured_timeout_seconds: float,
+        *,
+        operation: str,
+    ) -> float:
+        timeout = deadline_timeout_or_raise(
+            execution_deadline,
+            configured_timeout_seconds,
+            reserve_seconds=DEFAULT_DEADLINE_CLEANUP_RESERVE_SECONDS,
+            operation=operation,
+        )
+        return float(configured_timeout_seconds if timeout is None else timeout)
 
     def _current_verify_selection() -> ResolvedVerifyCommands | None:
         if callable(get_verify_command_selection):
@@ -522,7 +821,10 @@ def build_tools(
             )
         return None
 
-    command_mutation_tracking_enabled = bool(one_shot_execution and subagent_depth == 0)
+    command_mutation_tracking_enabled = bool(
+        subagent_depth == 0
+        and (one_shot_execution or resolved_runtime_kind == RuntimeKind.INTERACTIVE_CHAT)
+    )
     command_mutation_ignored_paths: list[Path] = []
     if command_mutation_tracking_enabled:
         command_mutation_ignored_paths = [
@@ -849,6 +1151,39 @@ def build_tools(
                 "error": f"Unknown subagent: {raw_name}",
                 "available_subagents": available,
             }
+        deadline_decision = _deadline_start_decision(
+            DeadlineOperation.SUBAGENT,
+            minimum_remaining_seconds=MINIMUM_SUBAGENT_START_SECONDS,
+        )
+        if deadline_decision is not None and not bool(deadline_decision.get("allowed")):
+            payload = _deadline_error(
+                "Subagent launch skipped because the run deadline has too little remaining time.",
+                prevented_launch=True,
+                start_decision=deadline_decision,
+            )
+            payload.update(
+                {
+                    "subagent": definition.name,
+                    "subagent_session_id": None,
+                    "steps_completed": 0,
+                    "elapsed_ms": 0,
+                }
+            )
+            store.append(
+                "subagent_end",
+                {
+                    "name": definition.name,
+                    "subagent_session_id": None,
+                    "status": "failed",
+                    "failure_category": "deadline",
+                    "deadline_exhausted": payload["deadline_exhausted"],
+                    "deadline_prevented_launch": True,
+                    "remaining_seconds": payload["remaining_seconds"],
+                    "steps_completed": 0,
+                    "elapsed_ms": 0,
+                },
+            )
+            return payload
 
         requested_mode = normalize_subagent_mode(definition.mode)
         mode_override = str(args.get("mode", "") or "").strip()
@@ -906,8 +1241,28 @@ def build_tools(
                 "parent_turn_budget": parent_turn_budget,
                 "step_budget": resolution.to_payload(),
                 "task": task,
+                "deadline": (
+                    execution_deadline.telemetry_snapshot()
+                    if execution_deadline is not None
+                    else None
+                ),
             },
         )
+        if crash_diagnostics is not None:
+            crash_diagnostics.event(
+                "subagent_started",
+                {
+                    "subagent": definition.name,
+                    "subagent_role": temperature_role,
+                    "model": selected_model,
+                    "max_steps": effective_subagent_max_steps,
+                    "deadline": (
+                        execution_deadline.telemetry_snapshot()
+                        if execution_deadline is not None
+                        else None
+                    ),
+                },
+            )
         subagent_surface = NestedSubagentSurface(
             surface,
             subagent_name=definition.name,
@@ -953,14 +1308,17 @@ def build_tools(
                 subagents_enabled=False,
                 subagent_depth=subagent_depth + 1,
                 subagent_registry=subagent_registry,
+                execution_deadline=execution_deadline,
+                crash_diagnostic_log_path=crash_diagnostic_log_path,
             )
         except Exception as e:  # noqa: BLE001
+            elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
             subagent_surface.on_subagent_end(
                 SubagentEndEvent(
                     name=definition.name,
                     mode=resolved_mode,
                     status="failed",
-                    elapsed_ms=int((perf_counter() - subagent_started_at) * 1000),
+                    elapsed_ms=elapsed_ms,
                     steps_completed=subagent_surface.steps_completed,
                     error=f"Failed to initialize subagent session: {e}",
                 )
@@ -972,9 +1330,15 @@ def build_tools(
                     "subagent_session_id": None,
                     "status": "failed",
                     "error": f"Failed to initialize subagent session: {e}",
+                    "elapsed_ms": elapsed_ms,
+                    "steps_completed": subagent_surface.steps_completed,
                 },
             )
-            return {"error": f"Failed to initialize subagent session: {e}"}
+            return {
+                "error": f"Failed to initialize subagent session: {e}",
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+            }
 
         subagent_session_id = str(
             getattr(getattr(sub_session, "store", None), "session_id", "") or ""
@@ -992,12 +1356,13 @@ def build_tools(
         sub_session.tool_list = [tool.as_openai_tool() for tool in filtered_tools.values()]
         if not filtered_tools:
             sub_session.close()
+            elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
             subagent_surface.on_subagent_end(
                 SubagentEndEvent(
                     name=definition.name,
                     mode=resolved_mode,
                     status="failed",
-                    elapsed_ms=int((perf_counter() - subagent_started_at) * 1000),
+                    elapsed_ms=elapsed_ms,
                     steps_completed=subagent_surface.steps_completed,
                     subagent_session_id=subagent_session_id,
                     error="No tools available after allow/deny sandboxing.",
@@ -1010,13 +1375,31 @@ def build_tools(
                     "subagent_session_id": subagent_session_id,
                     "status": "failed",
                     "error": "No tools available after allow/deny sandboxing.",
+                    "elapsed_ms": elapsed_ms,
+                    "steps_completed": subagent_surface.steps_completed,
                 },
             )
             return {
-                "error": f"Subagent '{definition.name}' has no available tools after sandboxing."
+                "error": f"Subagent '{definition.name}' has no available tools after sandboxing.",
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
             }
 
+        tool_catalog_message = _subagent_exact_tool_catalog_message(filtered_tools)
+        if isinstance(getattr(sub_session, "messages", None), list):
+            sub_session.messages.append({"role": "system", "content": tool_catalog_message})
+        store.append(
+            "subagent_tool_catalog",
+            {
+                "name": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "tool_names": sorted(filtered_tools),
+                "tool_count": len(filtered_tools),
+            },
+        )
+
         final_text = ""
+        final_text_source = "missing"
         usage_payload: dict[str, Any] = {}
         exit_code = 1
         usage_replayed = False
@@ -1041,19 +1424,15 @@ def build_tools(
 
         try:
             exit_code = sub_session.run_turn(task)
-            for message in reversed(getattr(sub_session, "messages", [])):
-                if not isinstance(message, dict):
-                    continue
-                if str(message.get("role") or "") != "assistant":
-                    continue
-                text = str(message.get("content") or "").strip()
-                if text:
-                    final_text = text
-                    break
+            final_text, final_text_source = _resolve_subagent_final_text(
+                sub_session=sub_session,
+                subagent_surface=subagent_surface,
+            )
             usage_payload = sub_session.usage_summary.totals()
         except Exception as e:  # noqa: BLE001
             usage_payload = sub_session.usage_summary.totals()
             _try_replay_subagent_usage_once()
+            elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
             store.append(
                 "subagent_end",
                 {
@@ -1063,6 +1442,8 @@ def build_tools(
                     "exit_code": exit_code,
                     "error": f"Subagent execution failed: {e}",
                     "usage": usage_payload,
+                    "elapsed_ms": elapsed_ms,
+                    "steps_completed": subagent_surface.steps_completed,
                 },
             )
             subagent_surface.on_subagent_end(
@@ -1070,7 +1451,7 @@ def build_tools(
                     name=definition.name,
                     mode=resolved_mode,
                     status="failed",
-                    elapsed_ms=int((perf_counter() - subagent_started_at) * 1000),
+                    elapsed_ms=elapsed_ms,
                     steps_completed=subagent_surface.steps_completed,
                     subagent_session_id=subagent_session_id,
                     error=f"Subagent execution failed: {e}",
@@ -1081,33 +1462,60 @@ def build_tools(
                 "subagent": definition.name,
                 "subagent_session_id": subagent_session_id,
                 "usage": usage_payload,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
             }
         finally:
             sub_session.close()
 
         if exit_code != 0:
             _try_replay_subagent_usage_once()
+            elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
             error_payload = {
                 "name": definition.name,
                 "subagent_session_id": subagent_session_id,
                 "status": "failed",
                 "exit_code": exit_code,
                 "usage": usage_payload,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                "deadline_exhausted": (
+                    execution_deadline.is_exhausted() if execution_deadline is not None else False
+                ),
+                "deadline_prevented_launch": False,
             }
             if final_text:
                 error_payload["final_text"] = final_text
+                error_payload["final_text_source"] = final_text_source
             subagent_surface.on_subagent_end(
                 SubagentEndEvent(
                     name=definition.name,
                     mode=resolved_mode,
                     status="failed",
-                    elapsed_ms=int((perf_counter() - subagent_started_at) * 1000),
+                    elapsed_ms=elapsed_ms,
                     steps_completed=subagent_surface.steps_completed,
                     subagent_session_id=subagent_session_id,
                     error=(final_text or f"Subagent '{definition.name}' failed."),
                 )
             )
             store.append("subagent_end", error_payload)
+            if crash_diagnostics is not None:
+                crash_diagnostics.event(
+                    "subagent_completed",
+                    {
+                        "subagent": definition.name,
+                        "subagent_session_id": subagent_session_id,
+                        "status": "failed",
+                        "exit_code": exit_code,
+                        "duration_ms": elapsed_ms,
+                        "steps_completed": subagent_surface.steps_completed,
+                        "deadline": (
+                            execution_deadline.telemetry_snapshot()
+                            if execution_deadline is not None
+                            else None
+                        ),
+                    },
+                )
             return {
                 "error": f"Subagent '{definition.name}' failed.",
                 "subagent": definition.name,
@@ -1115,9 +1523,95 @@ def build_tools(
                 "exit_code": exit_code,
                 "usage": usage_payload,
                 "final_text": final_text,
+                "final_text_source": final_text_source,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                "deadline_exhausted": error_payload["deadline_exhausted"],
+                "deadline_prevented_launch": False,
+            }
+
+        final_report_problem = _subagent_final_report_problem(
+            text=final_text,
+            source=final_text_source,
+        )
+        if final_report_problem is not None:
+            _try_replay_subagent_usage_once()
+            elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
+            error_message = (
+                f"Subagent '{definition.name}' did not produce a substantive final report "
+                f"({final_report_problem})."
+            )
+            degraded_payload: dict[str, Any] = {
+                "name": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "degraded",
+                "failure_category": "final_report",
+                "final_report_problem": final_report_problem,
+                "final_text_source": final_text_source,
+                "exit_code": exit_code,
+                "usage": usage_payload,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                "deadline_exhausted": (
+                    execution_deadline.is_exhausted() if execution_deadline is not None else False
+                ),
+                "deadline_prevented_launch": False,
+                "error": error_message,
+            }
+            if final_text:
+                degraded_payload["final_text"] = final_text
+            store.append("subagent_end", degraded_payload)
+            subagent_surface.on_subagent_end(
+                SubagentEndEvent(
+                    name=definition.name,
+                    mode=resolved_mode,
+                    status="degraded",
+                    elapsed_ms=elapsed_ms,
+                    steps_completed=subagent_surface.steps_completed,
+                    subagent_session_id=subagent_session_id,
+                    error=error_message,
+                )
+            )
+            if crash_diagnostics is not None:
+                crash_diagnostics.event(
+                    "subagent_completed",
+                    {
+                        "subagent": definition.name,
+                        "subagent_session_id": subagent_session_id,
+                        "status": "degraded",
+                        "exit_code": exit_code,
+                        "duration_ms": elapsed_ms,
+                        "steps_completed": subagent_surface.steps_completed,
+                        "final_report_problem": final_report_problem,
+                        "deadline": (
+                            execution_deadline.telemetry_snapshot()
+                            if execution_deadline is not None
+                            else None
+                        ),
+                    },
+                )
+            return {
+                "error": error_message,
+                "subagent": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "degraded",
+                "failure_category": "final_report",
+                "final_report_problem": final_report_problem,
+                "usage": usage_payload,
+                "final_text": final_text,
+                "final_text_source": final_text_source,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                "deadline_exhausted": degraded_payload["deadline_exhausted"],
+                "deadline_prevented_launch": False,
+                "sandbox": {
+                    "mode": resolved_mode,
+                    "tools": list(filtered_tools.keys()),
+                },
             }
 
         _try_replay_subagent_usage_once()
+        elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
 
         store.append(
             "subagent_end",
@@ -1127,6 +1621,13 @@ def build_tools(
                 "status": "success",
                 "exit_code": exit_code,
                 "usage": usage_payload,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                "final_text_source": final_text_source,
+                "deadline_exhausted": (
+                    execution_deadline.is_exhausted() if execution_deadline is not None else False
+                ),
+                "deadline_prevented_launch": False,
             },
         )
         subagent_surface.on_subagent_end(
@@ -1134,16 +1635,40 @@ def build_tools(
                 name=definition.name,
                 mode=resolved_mode,
                 status="success",
-                elapsed_ms=int((perf_counter() - subagent_started_at) * 1000),
+                elapsed_ms=elapsed_ms,
                 steps_completed=subagent_surface.steps_completed,
                 subagent_session_id=subagent_session_id,
             )
         )
+        if crash_diagnostics is not None:
+            crash_diagnostics.event(
+                "subagent_completed",
+                {
+                    "subagent": definition.name,
+                    "subagent_session_id": subagent_session_id,
+                    "status": "success",
+                    "exit_code": exit_code,
+                    "duration_ms": elapsed_ms,
+                    "steps_completed": subagent_surface.steps_completed,
+                    "deadline": (
+                        execution_deadline.telemetry_snapshot()
+                        if execution_deadline is not None
+                        else None
+                    ),
+                },
+            )
         return {
             "subagent": definition.name,
             "subagent_session_id": subagent_session_id,
             "result": final_text,
+            "result_source": final_text_source,
             "usage": usage_payload,
+            "elapsed_ms": elapsed_ms,
+            "steps_completed": subagent_surface.steps_completed,
+            "deadline_exhausted": (
+                execution_deadline.is_exhausted() if execution_deadline is not None else False
+            ),
+            "deadline_prevented_launch": False,
             "sandbox": {
                 "mode": resolved_mode,
                 "tools": list(filtered_tools.keys()),
@@ -1513,6 +2038,214 @@ def build_tools(
         ),
     )
 
+    web_search_exposed_in_mode = _built_in_tool_exposed_in_mode(
+        tool_name="web_search",
+        mode=mode,
+        subagent_depth=subagent_depth,
+    )
+    web_search_status = (
+        resolve_web_search_runtime_status(cfg=cfg, api_key=api_key)
+        if web_search_exposed_in_mode
+        else None
+    )
+
+    def _web_fetch_recovery_is_public_candidate(raw_url: str) -> bool:
+        normalized = normalize_web_url(raw_url)
+        if normalized is None:
+            return False
+        try:
+            split = urlsplit(normalized)
+        except ValueError:
+            return False
+        host = (split.hostname or "").rstrip(".").lower()
+        if not host or host == "localhost" or host.endswith(".localhost"):
+            return False
+        if split.username is not None or split.password is not None:
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return True
+        return not (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_unspecified
+            or ip.is_reserved
+        )
+
+    def _web_fetch_source_matches_requested(*, source_url: str, requested_url: str) -> bool:
+        source = normalize_web_url(source_url)
+        requested = normalize_web_url(requested_url)
+        if source is None or requested is None:
+            return False
+        if source == requested:
+            return True
+        source_split = urlsplit(source)
+        requested_split = urlsplit(requested)
+        if (
+            source_split.scheme,
+            source_split.netloc,
+            source_split.query,
+        ) != (
+            requested_split.scheme,
+            requested_split.netloc,
+            requested_split.query,
+        ):
+            return False
+        return source_split.path.rstrip("/") == requested_split.path.rstrip("/")
+
+    def _web_fetch_recovery_display_url(raw_url: str) -> str:
+        normalized = normalize_web_url(raw_url)
+        if normalized is not None:
+            return normalized
+        canonical = canonicalize_web_url_input(raw_url)
+        if canonical is not None:
+            return canonical
+        try:
+            split = urlsplit(str(raw_url or "").strip())
+            port = split.port
+        except ValueError:
+            return "[invalid URL omitted]"
+        scheme = str(split.scheme or "").lower()
+        host = (split.hostname or "").rstrip(".").lower()
+        if scheme not in {"http", "https"} or not host:
+            return "[unsupported URL omitted]"
+        if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+            port = None
+        netloc = host if port is None else f"{host}:{port}"
+        path = split.path or "/"
+        return urlunsplit((scheme, netloc, path, split.query, ""))
+
+    def _web_fetch_recovery_payload(
+        *,
+        requested_url: str,
+        raw_requested_url: str,
+        finalization_suppressed: bool,
+        automatic_attempted: bool = False,
+        search_error: str = "",
+    ) -> dict[str, Any]:
+        display_url = _web_fetch_recovery_display_url(requested_url)
+        query = build_web_fetch_recovery_search_query(display_url)
+        payload: dict[str, Any] = {
+            "error": (
+                "web_fetch only allows a URL explicitly provided by the user or one returned "
+                "by web_search earlier in this session."
+            ),
+            "error_code": "web_fetch_provenance_required",
+            "url": display_url,
+            "allowed_provenance": [
+                "user_provided",
+                "returned_by_web_search",
+                "fetched_page_link",
+                "trusted_local_file",
+                "trusted_tool_output",
+                "canonical_redirect",
+                "search_mediated_recovery",
+                "same_origin_derived_search_result",
+            ],
+            "provenance_recovery": {
+                "suggested_search_query": query,
+                "web_search_available": bool(
+                    web_search_status is not None and web_search_status.registration_ready
+                ),
+                "automatic_recovery_attempted": automatic_attempted,
+                "finalization_suppressed": finalization_suppressed,
+                "search_error": search_error,
+            },
+        }
+        canonical_raw = normalize_web_url(raw_requested_url)
+        if canonical_raw is not None and canonical_raw != display_url:
+            payload["raw_input_url"] = raw_requested_url
+        return payload
+
+    def _maybe_establish_web_fetch_provenance_via_search(
+        *,
+        requested_url: str,
+        raw_requested_url: str,
+    ) -> tuple[str | None, str | None, dict[str, Any] | None]:
+        finalization_suppressed = (
+            execution_deadline is not None
+            and execution_deadline.phase() == DeadlinePhase.FINALIZATION_WINDOW
+        )
+        base_payload = _web_fetch_recovery_payload(
+            requested_url=requested_url,
+            raw_requested_url=raw_requested_url,
+            finalization_suppressed=finalization_suppressed,
+        )
+        if finalization_suppressed:
+            return None, None, base_payload
+        if web_search_status is None or not web_search_status.registration_ready:
+            return None, None, base_payload
+        if not _web_fetch_recovery_is_public_candidate(requested_url):
+            return None, None, base_payload
+        query = str(base_payload["provenance_recovery"]["suggested_search_query"] or "").strip()
+        if not query:
+            return None, None, base_payload
+        try:
+            host = (
+                urlsplit(normalize_web_url(requested_url) or requested_url).hostname or ""
+            ).lower()
+            search_result = web_search(
+                query=query,
+                cfg=cfg,
+                api_key=api_key,
+                allowed_domains=[host] if host else None,
+                max_sources=5,
+                external_web_access=True,
+            )
+        except WebSearchError as exc:
+            return (
+                None,
+                None,
+                _web_fetch_recovery_payload(
+                    requested_url=requested_url,
+                    raw_requested_url=raw_requested_url,
+                    finalization_suppressed=finalization_suppressed,
+                    automatic_attempted=True,
+                    search_error=str(exc),
+                ),
+            )
+        matching_source_url = ""
+        for source in list(search_result.get("sources") or []):
+            if not isinstance(source, dict):
+                continue
+            source_url = str(source.get("url") or "").strip()
+            if _web_fetch_source_matches_requested(
+                source_url=source_url,
+                requested_url=requested_url,
+            ):
+                matching_source_url = source_url
+                break
+        if not matching_source_url:
+            payload = _web_fetch_recovery_payload(
+                requested_url=requested_url,
+                raw_requested_url=raw_requested_url,
+                finalization_suppressed=finalization_suppressed,
+                automatic_attempted=True,
+            )
+            payload["provenance_recovery"]["search_result_source_count"] = len(
+                list(search_result.get("sources") or [])
+            )
+            return None, None, payload
+        _changed, normalized = store.establish_search_mediated_web_fetch_url(
+            raw_url=requested_url,
+            query=query,
+            source_url=matching_source_url,
+        )
+        store.append(
+            "web_fetch_provenance_recovery",
+            {
+                "url": requested_url,
+                "normalized_url": normalized,
+                "query": query,
+                "source_url": matching_source_url,
+                "provenance_classification": "search_mediated_recovery",
+            },
+        )
+        return store.resolve_web_fetch_url(requested_url)[0], normalized, None
+
     def _web_fetch_tool(args: dict[str, Any]) -> dict[str, Any]:
         raw_requested_url = str(args.get("url", "")).strip()
         provenance_classification, resolved_requested_url = store.resolve_web_fetch_url(
@@ -1520,48 +2253,48 @@ def build_tools(
         )
         requested_url = resolved_requested_url or raw_requested_url
         if provenance_classification is None:
-            result = {
-                "error": (
-                    "web_fetch only allows a URL explicitly provided by the user or one returned "
-                    "by web_search earlier in this session."
-                ),
-                "error_code": "web_fetch_provenance_required",
-                "url": requested_url,
-                "allowed_provenance": ["user_provided", "returned_by_web_search"],
-            }
-            # Make the rejection self-correcting: tell the model exactly which URLs
-            # it MAY fetch (web_search sources + user-provided URLs) so it retries
-            # against a real source instead of a guessed/restated one — without
-            # widening what is authorized.
-            fetchable_urls = store.fetchable_web_fetch_urls()
-            if fetchable_urls:
-                result["fetchable_urls"] = fetchable_urls
-                result["guidance"] = (
-                    "Do not guess or restate URLs from memory. Retry web_fetch with one of "
-                    "fetchable_urls (these came from web_search results or the user), or run "
-                    "web_search again to find the page."
+            (
+                provenance_classification,
+                recovered_url,
+                recovery_result,
+            ) = _maybe_establish_web_fetch_provenance_via_search(
+                requested_url=requested_url,
+                raw_requested_url=raw_requested_url,
+            )
+            if provenance_classification is None:
+                result = recovery_result or _web_fetch_recovery_payload(
+                    requested_url=requested_url,
+                    raw_requested_url=raw_requested_url,
+                    finalization_suppressed=False,
                 )
-            else:
-                result["guidance"] = (
-                    "No URLs are fetchable yet. Run web_search first, or ask the user for the "
-                    "exact URL. Do not guess URLs."
-                )
-            if raw_requested_url and raw_requested_url != requested_url:
-                result["raw_input_url"] = raw_requested_url
-            return result
-        return _patchable("web_fetch", web_fetch)(
+                fetchable_urls = store.fetchable_web_fetch_urls()
+                if fetchable_urls:
+                    result["fetchable_urls"] = fetchable_urls
+                    result["guidance"] = (
+                        "Do not guess or restate URLs from memory. Retry web_fetch with one of "
+                        "fetchable_urls (these came from web_search results or the user), or run "
+                        "web_search again to find the page."
+                    )
+                else:
+                    result["guidance"] = (
+                        "No URLs are fetchable yet. Run web_search first, or ask the user for the "
+                        "exact URL. Do not guess URLs."
+                    )
+                if raw_requested_url and raw_requested_url != requested_url:
+                    result["raw_input_url"] = raw_requested_url
+                return result
+            if recovered_url:
+                requested_url = recovered_url
+        result = _patchable("web_fetch", web_fetch)(
             url=requested_url,
             max_chars=(args["max_chars"] if "max_chars" in args else 20000),
         )
+        result["provenance_classification"] = provenance_classification
+        return result
 
     _append_builtin_tool("web_fetch", run=_web_fetch_tool)
 
-    if _built_in_tool_exposed_in_mode(
-        tool_name="web_search",
-        mode=mode,
-        subagent_depth=subagent_depth,
-    ):
-        web_search_status = resolve_web_search_runtime_status(cfg=cfg, api_key=api_key)
+    if web_search_exposed_in_mode and web_search_status is not None:
         if (
             emit_web_search_runtime_diagnostics
             and web_search_status.mode == "auto"
@@ -1674,6 +2407,22 @@ def build_tools(
         )
 
     def _verify_run(args: dict[str, Any]) -> dict[str, Any]:
+        deadline_decision = _deadline_start_decision(
+            DeadlineOperation.VERIFICATION,
+            minimum_remaining_seconds=MINIMUM_TOOL_START_SECONDS,
+            allow_during_finalization=True,
+        )
+        if deadline_decision is not None and not bool(deadline_decision.get("allowed")):
+            return _deadline_error(
+                "verify_run skipped because the run deadline is exhausted or too close.",
+                start_decision=deadline_decision,
+            )
+        try:
+            verify_timeout_s = _deadline_timeout(900, operation="verify_run")
+        except DeadlineExhausted:
+            return _deadline_error(
+                "verify_run skipped because the run deadline is exhausted or too close."
+            )
         effective_cfg = cfg or AppConfig(model="")
         raw_commands = args.get("commands")
         verify_cmd: list[str] | None = None
@@ -1696,6 +2445,7 @@ def build_tools(
                 else bool(authoritative_verify_commands is not None)
             ),
         )
+        selection_metadata.update(verification_command_specs_payload(current_selection))
         if raw_commands is not None:
             if not isinstance(raw_commands, list):
                 raise VerifyError("commands must be an array of command strings.")
@@ -1736,8 +2486,24 @@ def build_tools(
                 cfg=effective_cfg,
                 verify_cmd=verify_cmd,
             )
+        validation_errors = validation_errors_for_selection(current_selection)
+        if validation_errors and (
+            authoritative_verify_commands is not None
+            or (
+                current_selection is not None
+                and is_authoritative_verify_command_selection(current_selection)
+            )
+        ):
+            raise VerifyError(
+                "authoritative verification command is invalid: " + "; ".join(validation_errors[:3])
+            )
+        trusted_shell_commands = trusted_shell_expression_command_set(current_selection)
         for command in commands:
-            if _has_disallowed_shell_control_flow(command):
+            normalized_exact = " ".join(str(command or "").strip().split())
+            if (
+                _has_disallowed_shell_control_flow(command)
+                and normalized_exact not in trusted_shell_commands
+            ):
                 raise VerifyError(
                     "verification commands must be single commands without shell control flow or chaining."
                 )
@@ -1747,17 +2513,63 @@ def build_tools(
             root=root,
             enabled=command_mutation_tracking_enabled,
             ignored_paths=command_mutation_ignored_paths,
-            operation=lambda: _patchable("run_task_verification", run_task_verification)(
-                root=root,
-                commands=commands,
-                artifact_path=artifact_path,
-                cfg=effective_cfg,
+            operation=lambda: _call_with_optional_kwargs(
+                _patchable("run_task_verification", run_task_verification),
+                required_kwargs={
+                    "root": root,
+                    "commands": commands,
+                    "artifact_path": artifact_path,
+                    "cfg": effective_cfg,
+                },
+                optional_kwargs={"timeout_s": verify_timeout_s},
             ),
         )
         payload = verify_run_result_to_payload(root=root, result=result)
+        material_touched_repo_paths: list[str] = []
         if touched_repo_paths:
             payload = dict(payload)
             payload["touched_repo_paths"] = touched_repo_paths
+            mutation_metadata = _command_mutation_metadata(
+                root=root,
+                touched_repo_paths=touched_repo_paths,
+                command_was_verification=True,
+            )
+            payload.update(mutation_metadata)
+            material_touched_repo_paths = list(
+                mutation_metadata.get("material_touched_repo_paths") or []
+            )
+        verification_relevant_material_touched_paths = _verification_relevant_material_paths(
+            material_touched_repo_paths
+        )
+        evidence_records: list[VerificationEvidence] = []
+        command_results = payload.get("command_results")
+        if isinstance(command_results, list):
+            for item in command_results:
+                if not isinstance(item, dict):
+                    continue
+                command = str(item.get("command") or item.get("effective_command") or "")
+                if not command:
+                    continue
+                exit_code_raw = item.get("exit_code")
+                evidence_records.append(
+                    classify_verification_evidence(
+                        command,
+                        known_verification_commands=current_effective_verification_commands,
+                        authoritative=bool(selection_metadata.get("verification_authoritative")),
+                        material_touched_paths=verification_relevant_material_touched_paths,
+                        exit_code=(exit_code_raw if isinstance(exit_code_raw, int) else None),
+                        output=str(item.get("output_preview") or ""),
+                        real_execution=(
+                            item.get("real_execution")
+                            if isinstance(item.get("real_execution"), bool)
+                            or item.get("real_execution") is None
+                            else None
+                        ),
+                        root=root,
+                    )
+                )
+        payload.update(_aggregate_tool_evidence_payload(evidence_records))
+        payload.update(selection_metadata)
         stored_artifact_path = (
             os.fspath(result.artifact_path.resolve())
             if result.artifact_path.exists()
@@ -1777,6 +2589,14 @@ def build_tools(
                 "artifact_saved": payload.get("artifact_saved"),
                 "artifact_readable_via_fs": payload.get("artifact_readable_via_fs"),
                 "artifact_location": payload.get("artifact_location"),
+                "verification_evidence_category": payload.get("verification_evidence_category"),
+                "verification_evidence_reason": payload.get("verification_evidence_reason"),
+                "verification_evidence_allowed": payload.get("verification_evidence_allowed"),
+                "verification_evidence_supplemental_only": payload.get(
+                    "verification_evidence_supplemental_only"
+                ),
+                "material_touched_repo_paths": payload.get("material_touched_repo_paths", []),
+                "benign_runtime_paths": payload.get("benign_runtime_paths", []),
                 **selection_metadata,
             },
         )
@@ -1786,6 +2606,22 @@ def build_tools(
         _append_builtin_tool("verify_run", run=_verify_run)
 
     def _shell(args: dict[str, Any]) -> dict[str, Any]:
+        deadline_decision = _deadline_start_decision(
+            DeadlineOperation.SHELL_TOOL,
+            minimum_remaining_seconds=MINIMUM_TOOL_START_SECONDS,
+            allow_during_finalization=True,
+        )
+        if deadline_decision is not None and not bool(deadline_decision.get("allowed")):
+            return _deadline_error(
+                "shell_run skipped because the run deadline is exhausted or too close.",
+                start_decision=deadline_decision,
+            )
+        try:
+            shell_timeout_s = _deadline_timeout(60, operation="shell_run")
+        except DeadlineExhausted:
+            return _deadline_error(
+                "shell_run skipped because the run deadline is exhausted or too close."
+            )
         cmd = str(args.get("cmd", ""))
         effective_cwd = _resolve_workspace_relative_path(
             raw_path=args.get("cwd"),
@@ -1803,11 +2639,15 @@ def build_tools(
                 root=root,
                 enabled=command_mutation_tracking_enabled,
                 ignored_paths=command_mutation_ignored_paths,
-                operation=lambda: _patchable("shell_run", shell_run)(
-                    root=root,
-                    cmd=cmd,
-                    cwd=effective_cwd,
-                    runner=shell_runner,
+                operation=lambda: _call_with_optional_kwargs(
+                    _patchable("shell_run", shell_run),
+                    required_kwargs={
+                        "root": root,
+                        "cmd": cmd,
+                        "cwd": effective_cwd,
+                        "runner": shell_runner,
+                    },
+                    optional_kwargs={"timeout_s": shell_timeout_s},
                 ),
             )
         finally:
@@ -1828,6 +2668,44 @@ def build_tools(
         if touched_repo_paths:
             result = dict(result)
             result["touched_repo_paths"] = touched_repo_paths
+            result.update(
+                _command_mutation_metadata(
+                    root=root,
+                    touched_repo_paths=touched_repo_paths,
+                    command_was_verification=False,
+                )
+            )
+        current_selection = _current_verify_selection()
+        current_effective_verification_commands = _normalized_verify_commands(
+            list(current_selection.commands) if current_selection is not None else []
+        )
+        shell_exit_code = result.get("exit_code") if isinstance(result, dict) else None
+        shell_evidence = classify_verification_evidence(
+            str(result.get("effective_cmd") or result.get("cmd") or cmd),
+            known_verification_commands=current_effective_verification_commands,
+            authoritative=(
+                is_authoritative_verify_command_selection(current_selection)
+                if current_selection is not None
+                else bool(authoritative_verify_commands is not None)
+            ),
+            material_touched_paths=_verification_relevant_material_paths(
+                result.get("material_touched_repo_paths", [])
+                if isinstance(result.get("material_touched_repo_paths"), list)
+                else [],
+            ),
+            exit_code=(shell_exit_code if isinstance(shell_exit_code, int) else None),
+            output="\n".join(
+                [
+                    str(result.get("stdout") or "").strip(),
+                    str(result.get("stderr") or "").strip(),
+                ]
+            ).strip(),
+            root=root,
+        )
+        result["verification_evidence_category"] = shell_evidence.category.value
+        result["verification_evidence_reason"] = shell_evidence.reason
+        result["verification_evidence_allowed"] = shell_evidence.allowed_to_satisfy_contract
+        result["verification_evidence_supplemental_only"] = shell_evidence.supplemental_only
         return result
 
     _append_builtin_tool("shell_run", run=_shell)
@@ -1837,27 +2715,182 @@ def build_tools(
             raise AgentRuntimeError("Background shell tools are unavailable in this session.")
         return terminal_manager
 
+    def _require_durable_service_manager() -> DurableServiceManager:
+        if durable_service_manager is None:
+            raise AgentRuntimeError("Durable service tools are unavailable in this session.")
+        return durable_service_manager
+
+    def _service_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        readiness = payload.get("readiness") if isinstance(payload.get("readiness"), dict) else {}
+        return {
+            "service_id": payload.get("service_id"),
+            "ownership": payload.get("ownership") or ProcessOwnership.DURABLE_SERVICE.value,
+            "status": payload.get("status"),
+            "alive": bool(payload.get("alive")),
+            "backend": payload.get("backend"),
+            "readiness": {
+                "type": readiness.get("type"),
+                "status": readiness.get("status"),
+                "host": readiness.get("host"),
+                "port": readiness.get("port"),
+                "path": readiness.get("path"),
+            },
+            "failure_category": payload.get("failure_category"),
+            "log_paths": payload.get("log_paths"),
+        }
+
+    def _guard_service_readiness_spec(raw_readiness: Any) -> dict[str, Any] | None:
+        if raw_readiness is None:
+            return None
+        if not isinstance(raw_readiness, dict):
+            raise AgentRuntimeError("readiness must be an object when provided")
+        readiness = dict(raw_readiness)
+        if str(readiness.get("type") or "").strip().lower() == "command":
+            command = str(readiness.get("command") or "").strip()
+            if not command:
+                raise AgentRuntimeError("readiness.command is required for command readiness")
+            guard_shell(command, tool_name="shell_service_start")
+        return readiness
+
     def _format_bg_snapshot(
         *,
         process_id: str,
         snapshot: ProcessOutputSnapshot,
+        max_bytes: int | None = None,
     ) -> dict[str, Any]:
-        return {
+        lines: list[dict[str, Any]] = []
+        output_truncated_by_max_bytes = False
+        remaining_bytes = max_bytes if max_bytes is not None else None
+        for line in snapshot.lines:
+            text = line.text
+            if remaining_bytes is not None:
+                encoded = text.encode("utf-8", errors="replace")
+                if remaining_bytes <= 0:
+                    output_truncated_by_max_bytes = True
+                    break
+                if len(encoded) > remaining_bytes:
+                    text = encoded[:remaining_bytes].decode("utf-8", errors="replace")
+                    output_truncated_by_max_bytes = True
+                    remaining_bytes = 0
+                else:
+                    remaining_bytes -= len(encoded)
+            lines.append({"seq": line.seq, "stream": line.stream, "text": text})
+        payload = {
             "process_id": process_id,
             "status": snapshot.status,
             "exit_code": snapshot.exit_code,
             "failure_reason": snapshot.failure_reason,
-            "lines": [
-                {"seq": line.seq, "stream": line.stream, "text": line.text}
-                for line in snapshot.lines
-            ],
+            "lines": lines,
             "next_seq": snapshot.next_seq,
             "dropped_lines": snapshot.dropped_lines,
             "runtime_s": round(snapshot.runtime_s, 3),
             "total_bytes": snapshot.total_bytes,
         }
+        if output_truncated_by_max_bytes:
+            payload["output_truncated_by_max_bytes"] = True
+            payload["max_bytes"] = max_bytes
+        return payload
+
+    shell_empty_poll_counts: dict[tuple[str, int, int, str], int] = {}
+
+    def _coerce_shell_since(raw_since: Any) -> int:
+        try:
+            since = int(raw_since) if raw_since is not None else 0
+        except (TypeError, ValueError) as exc:
+            raise AgentRuntimeError(f"Invalid since value: {raw_since!r}") from exc
+        if since < 0:
+            raise AgentRuntimeError("since must be non-negative")
+        return since
+
+    def _coerce_shell_wait_seconds(raw_wait: Any) -> float:
+        try:
+            wait_seconds = float(raw_wait) if raw_wait is not None else 5.0
+        except (TypeError, ValueError) as exc:
+            raise AgentRuntimeError(f"Invalid wait_seconds value: {raw_wait!r}") from exc
+        if wait_seconds < 0:
+            raise AgentRuntimeError("wait_seconds must be non-negative")
+        return min(wait_seconds, 60.0)
+
+    def _coerce_shell_max_bytes(raw_max_bytes: Any) -> int | None:
+        if raw_max_bytes is None:
+            return None
+        try:
+            max_bytes = int(raw_max_bytes)
+        except (TypeError, ValueError) as exc:
+            raise AgentRuntimeError(f"Invalid max_bytes value: {raw_max_bytes!r}") from exc
+        if max_bytes <= 0:
+            raise AgentRuntimeError("max_bytes must be positive")
+        return max_bytes
+
+    def _coerce_shell_wait_until(raw_until: Any) -> str:
+        until = str(raw_until or "either").strip().lower()
+        if until not in {"output_available", "process_exited", "either"}:
+            raise AgentRuntimeError(
+                "until must be one of output_available, process_exited, or either"
+            )
+        return until
+
+    def _clamp_shell_wait_seconds(wait_seconds: float) -> tuple[float, dict[str, Any] | None]:
+        if execution_deadline is None:
+            return wait_seconds, None
+        decision = execution_deadline.start_decision(
+            DeadlineOperation.SHELL_TOOL,
+            minimum_remaining_seconds=MINIMUM_TOOL_START_SECONDS,
+            configured_timeout_seconds=wait_seconds,
+            allow_during_finalization=True,
+        ).telemetry_snapshot()
+        if not bool(decision.get("allowed")):
+            return 0.0, decision
+        clamped = execution_deadline.clamp_timeout(
+            wait_seconds,
+            reserve_seconds=DEFAULT_DEADLINE_CLEANUP_RESERVE_SECONDS,
+        )
+        if clamped is None:
+            return 0.0, decision
+        if execution_deadline.phase() == DeadlinePhase.FINALIZATION_WINDOW:
+            clamped = min(float(clamped), 1.0)
+        return float(clamped), decision
+
+    def _maybe_add_empty_poll_guidance(
+        *,
+        payload: dict[str, Any],
+        process_id: str,
+        since: int,
+        snapshot: ProcessOutputSnapshot,
+    ) -> None:
+        if snapshot.lines or snapshot.status != "running":
+            shell_empty_poll_counts.pop(
+                (process_id, since, snapshot.next_seq, snapshot.status), None
+            )
+            return
+        key = (process_id, since, snapshot.next_seq, snapshot.status)
+        count = shell_empty_poll_counts.get(key, 0) + 1
+        shell_empty_poll_counts[key] = count
+        payload["empty_poll_count"] = count
+        if count >= 2:
+            payload["wait_guidance"] = {
+                "recommended_tool": "shell_wait",
+                "reason": "No new output or process status change was observed for repeated immediate polls.",
+                "process_id": process_id,
+                "since": since,
+                "suggested_arguments": {
+                    "process_id": process_id,
+                    "since": since,
+                    "until": "either",
+                    "wait_seconds": 5,
+                },
+            }
 
     def _shell_background(args: dict[str, Any]) -> dict[str, Any]:
+        deadline_decision = _deadline_start_decision(
+            DeadlineOperation.SHELL_BACKGROUND,
+            minimum_remaining_seconds=MINIMUM_TOOL_START_SECONDS,
+        )
+        if deadline_decision is not None and not bool(deadline_decision.get("allowed")):
+            return _deadline_error(
+                "shell_background skipped because the run deadline policy blocks background work.",
+                start_decision=deadline_decision,
+            )
         manager = _require_terminal_manager()
         cmd = str(args.get("cmd", ""))
         effective_cwd_relpath = _resolve_workspace_relative_path(
@@ -1910,18 +2943,61 @@ def build_tools(
         process_id = str(args.get("process_id", "")).strip()
         if not process_id:
             raise AgentRuntimeError("Missing required argument: process_id")
-        raw_since = args.get("since")
-        try:
-            since = int(raw_since) if raw_since is not None else 0
-        except (TypeError, ValueError) as exc:
-            raise AgentRuntimeError(f"Invalid since value: {raw_since!r}") from exc
-        if since < 0:
-            raise AgentRuntimeError("since must be non-negative")
+        since = _coerce_shell_since(args.get("since"))
         try:
             snapshot = manager.read(process_id, since=since)
         except KeyError as exc:
             raise AgentRuntimeError(f"Unknown background process_id: {process_id}") from exc
-        return _format_bg_snapshot(process_id=process_id, snapshot=snapshot)
+        payload = _format_bg_snapshot(process_id=process_id, snapshot=snapshot)
+        _maybe_add_empty_poll_guidance(
+            payload=payload,
+            process_id=process_id,
+            since=since,
+            snapshot=snapshot,
+        )
+        return payload
+
+    def _shell_wait(args: dict[str, Any]) -> dict[str, Any]:
+        manager = _require_terminal_manager()
+        guard_terminal_op("shell_wait")
+        process_id = str(args.get("process_id", "")).strip()
+        if not process_id:
+            raise AgentRuntimeError("Missing required argument: process_id")
+        since = _coerce_shell_since(args.get("since"))
+        wait_seconds = _coerce_shell_wait_seconds(args.get("wait_seconds"))
+        until = _coerce_shell_wait_until(args.get("until"))
+        max_bytes = _coerce_shell_max_bytes(args.get("max_bytes"))
+        clamped_wait_seconds, deadline_decision = _clamp_shell_wait_seconds(wait_seconds)
+        started = perf_counter()
+        try:
+            snapshot, timed_out = manager.wait_for_output(
+                process_id,
+                since=since,
+                timeout_s=clamped_wait_seconds,
+                until=until,  # type: ignore[arg-type]
+            )
+        except KeyError as exc:
+            raise AgentRuntimeError(f"Unknown background process_id: {process_id}") from exc
+        elapsed_ms = int((perf_counter() - started) * 1000)
+        payload = _format_bg_snapshot(
+            process_id=process_id,
+            snapshot=snapshot,
+            max_bytes=max_bytes,
+        )
+        payload.update(
+            {
+                "waited": True,
+                "timed_out": timed_out,
+                "wait_seconds_requested": wait_seconds,
+                "wait_seconds_effective": clamped_wait_seconds,
+                "until": until,
+                "elapsed_ms": elapsed_ms,
+            }
+        )
+        if deadline_decision is not None:
+            payload["deadline_start_decision"] = deadline_decision
+            payload["deadline_clamped"] = clamped_wait_seconds < wait_seconds
+        return payload
 
     def _shell_kill(args: dict[str, Any]) -> dict[str, Any]:
         manager = _require_terminal_manager()
@@ -1962,10 +3038,82 @@ def build_tools(
             ]
         }
 
+    def _shell_service_start(args: dict[str, Any]) -> dict[str, Any]:
+        deadline_decision = _deadline_start_decision(
+            DeadlineOperation.SHELL_BACKGROUND,
+            minimum_remaining_seconds=MINIMUM_TOOL_START_SECONDS,
+        )
+        if deadline_decision is not None and not bool(deadline_decision.get("allowed")):
+            return _deadline_error(
+                "shell_service_start skipped because the run deadline policy blocks service work.",
+                start_decision=deadline_decision,
+            )
+        manager = _require_durable_service_manager()
+        cmd = str(args.get("cmd", ""))
+        guard_shell(cmd, tool_name="shell_service_start")
+        readiness = _guard_service_readiness_spec(args.get("readiness"))
+        effective_cwd_relpath = _resolve_workspace_relative_path(
+            raw_path=args.get("cwd"),
+            raw_base=args.get("cwd_base"),
+            field_name="cwd",
+            base_field_name="cwd_base",
+            allow_empty=True,
+        )
+        cwd_path = root if not effective_cwd_relpath else (root / effective_cwd_relpath).resolve()
+        try:
+            started = manager.start(cmd=cmd, cwd=cwd_path, readiness=readiness)
+        except ValueError as exc:
+            raise AgentRuntimeError(f"Invalid durable service request: {exc}") from exc
+        except (ConfigError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise AgentRuntimeError(f"Failed to start durable service: {exc}") from exc
+        payload = started.payload
+        store.append(
+            "service_start",
+            {
+                **_service_event_payload(payload),
+                "cwd": effective_cwd_relpath,
+            },
+        )
+        return payload
+
+    def _shell_service_status(args: dict[str, Any]) -> dict[str, Any]:
+        manager = _require_durable_service_manager()
+        guard_terminal_op("shell_service_status")
+        service_id = str(args.get("service_id", "")).strip()
+        if not service_id:
+            raise AgentRuntimeError("Missing required argument: service_id")
+        try:
+            payload = manager.status(service_id)
+        except ValueError as exc:
+            raise AgentRuntimeError(f"Invalid durable service_id: {exc}") from exc
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise AgentRuntimeError(f"Failed to inspect durable service: {exc}") from exc
+        store.append("service_status", _service_event_payload(payload))
+        return payload
+
+    def _shell_service_stop(args: dict[str, Any]) -> dict[str, Any]:
+        manager = _require_durable_service_manager()
+        guard_terminal_op("shell_service_stop")
+        service_id = str(args.get("service_id", "")).strip()
+        if not service_id:
+            raise AgentRuntimeError("Missing required argument: service_id")
+        try:
+            payload = manager.stop(service_id)
+        except ValueError as exc:
+            raise AgentRuntimeError(f"Invalid durable service_id: {exc}") from exc
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise AgentRuntimeError(f"Failed to stop durable service: {exc}") from exc
+        store.append("service_stop", _service_event_payload(payload))
+        return payload
+
     _append_builtin_tool("shell_background", run=_shell_background)
     _append_builtin_tool("shell_output", run=_shell_output)
+    _append_builtin_tool("shell_wait", run=_shell_wait)
     _append_builtin_tool("shell_kill", run=_shell_kill)
     _append_builtin_tool("shell_list", run=_shell_list)
+    _append_builtin_tool("shell_service_start", run=_shell_service_start)
+    _append_builtin_tool("shell_service_status", run=_shell_service_status)
+    _append_builtin_tool("shell_service_stop", run=_shell_service_stop)
 
     def _session_set_workdir(args: dict[str, Any]) -> dict[str, Any]:
         raw_path = str(args.get("path", "")).strip()

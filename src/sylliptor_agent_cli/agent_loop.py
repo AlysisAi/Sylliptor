@@ -3,8 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .config import ConfigError, resolve_run_deadline
+from .execution_deadline import ExecutionDeadline
+
 if TYPE_CHECKING:
     from .config import AppConfig
+    from .crash_diagnostics import CrashDiagnosticLogger
     from .mcp.manager import ForgeTaskScopedMcpManager, McpManager
     from .runtime_kind import RuntimeKind
     from .surface.base import Surface
@@ -196,6 +200,7 @@ from .agent.routing import (  # noqa: F401
     _is_repository_or_workspace_request,
     _is_stream_unsupported_error,
     _llm_error_status_code,
+    _safe_forced_tool_choice_for_recovery,
     _main_agent_chat,
     _managed_execution_route_override_reason,
     _non_repo_chat,
@@ -286,6 +291,48 @@ from .agent.tools_assembly import (  # noqa: F401
     build_tools,
 )
 
+# mutation classification re-exports
+from .agent.mutation_classification import (  # noqa: F401
+    MutationPathCategory,
+    MutationPathClassification,
+    benign_runtime_mutation_paths,
+    classify_mutation_path,
+    classify_mutation_paths,
+    material_mutation_paths,
+)
+
+# execution deadline re-exports
+from .execution_deadline import (  # noqa: F401
+    DEFAULT_DEADLINE_CLEANUP_RESERVE_SECONDS,
+    MINIMUM_FORCED_SUMMARY_SECONDS,
+    MINIMUM_LLM_START_SECONDS,
+    MINIMUM_OPERATION_TIMEOUT_SECONDS,
+    MINIMUM_SUBAGENT_START_SECONDS,
+    MINIMUM_TOOL_START_SECONDS,
+    DeadlineExhausted,
+    deadline_timeout_or_raise,
+    temporarily_clamp_client_timeout,
+    validate_deadline_seconds,
+)
+
+# completion gate controller re-exports
+from .agent.completion_gate import (  # noqa: F401
+    DEFAULT_COMPLETION_GATE_CONSECUTIVE_NO_PROGRESS_LIMIT,
+    DEFAULT_COMPLETION_GATE_STAGNANT_NUDGE_LIMIT,
+    NON_FINAL_PROGRESS_PROBLEM,
+    NON_FINAL_PROGRESS_STAGE,
+    CompletionGateControllerState,
+    CompletionGateDecision,
+    CompletionGateDecisionKind,
+    CompletionGateEvidenceSnapshot,
+    CompletionGateRepairPolicy,
+    build_completion_gate_snapshot,
+    completion_gate_decision_payload,
+    decide_completion_gate,
+    normalize_completion_gate_failure_signature,
+    record_completion_gate_decision,
+)
+
 # turn re-exports
 from .agent.turn import (  # noqa: F401
     _ACTION_PROGRESS_FALLBACK_TOOL_NAMES,
@@ -328,6 +375,8 @@ from .agent.turn import (  # noqa: F401
     _assistant_text_contains_progress_intent,
     _assistant_text_has_blocker_marker,
     _assistant_text_has_completion_marker,
+    _assistant_text_has_structured_blocker_marker,
+    _assistant_text_has_well_formed_blocker,
     _build_fs_read_lines_result_from_cached_range,
     _build_fs_read_lines_result_from_full_fs_read,
     _build_post_explore_bootstrap_nudge,
@@ -395,6 +444,7 @@ from .agent.verification import (  # noqa: F401
     _record_shell_verification_command_outcome,
     _record_tool_effect,
     _record_verify_run_command_outcomes,
+    _refresh_execute_turn_verification_selection,
     _refresh_interactive_turn_verification_selection,
     _runtime_message,
     _runtime_message_locale,
@@ -406,6 +456,13 @@ from .agent.verification import (  # noqa: F401
     _verification_failure_category_for_tool_result,
     extract_verification_failure_snippet,
     run_task_verification,
+)
+
+# verification evidence re-exports
+from .agent.verification_evidence import (  # noqa: F401
+    VerificationEvidence,
+    VerificationEvidenceCategory,
+    classify_verification_evidence,
 )
 
 # verification_commands re-exports
@@ -474,6 +531,35 @@ from .turn_intent import (  # noqa: F401
 # isort: on
 
 
+def _emit_required_run_deadline_missing(
+    *,
+    crash_diagnostic_log_path: str | Path | None,
+    crash_diagnostic_logger: CrashDiagnosticLogger | None,
+    runtime_kind_text: str,
+    deadline_config_source: str,
+) -> None:
+    logger = crash_diagnostic_logger
+    if logger is None:
+        from .crash_diagnostics import build_crash_diagnostic_logger
+
+        logger = build_crash_diagnostic_logger(
+            path=crash_diagnostic_log_path,
+            run_id="pre_session",
+            session_id="pre_session",
+            runtime_kind=runtime_kind_text,
+        )
+    logger.event(
+        "required_run_deadline_missing",
+        {
+            "status": "blocked",
+            "reason": "required_deadline_absent",
+            "deadline_config_source": deadline_config_source,
+            "runtime_kind": runtime_kind_text,
+        },
+        durable=True,
+    )
+
+
 def run_agent(
     *,
     cfg: AppConfig,
@@ -511,7 +597,55 @@ def run_agent(
     workspace_binding: WorkspaceBinding | None = None,
     runtime_kind: RuntimeKind | str | None = None,
     mcp_manager: McpManager | ForgeTaskScopedMcpManager | None = None,
+    execution_deadline: ExecutionDeadline | None = None,
+    run_deadline_seconds: float | None = None,
+    require_run_deadline: bool = False,
+    crash_diagnostic_log_path: str | Path | None = None,
+    crash_diagnostic_logger: CrashDiagnosticLogger | None = None,
 ) -> int:
+    runtime_kind_text = str(getattr(runtime_kind, "value", runtime_kind) or "").strip()
+    if execution_deadline is not None and run_deadline_seconds is not None:
+        raise ConfigError("run_deadline_seconds cannot be combined with execution_deadline")
+
+    if execution_deadline is None:
+        deadline_has_one_shot_semantics = (
+            one_shot_execution
+            or runtime_kind_text in {"one_shot", "forge_exec", "swarm_worker"}
+            or run_deadline_seconds is not None
+        )
+        if deadline_has_one_shot_semantics or require_run_deadline:
+            resolved_deadline = resolve_run_deadline(cfg, cli_deadline_seconds=run_deadline_seconds)
+            if resolved_deadline.seconds is None:
+                if require_run_deadline:
+                    _emit_required_run_deadline_missing(
+                        crash_diagnostic_log_path=crash_diagnostic_log_path,
+                        crash_diagnostic_logger=crash_diagnostic_logger,
+                        runtime_kind_text=runtime_kind_text,
+                        deadline_config_source=resolved_deadline.source,
+                    )
+                    raise ConfigError(
+                        "Managed-host run requires a finite run deadline. "
+                        "Pass --deadline-seconds, set SYLLIPTOR_RUN_DEADLINE_SECONDS, "
+                        "or configure run_deadline_seconds."
+                    )
+            else:
+                execution_deadline = ExecutionDeadline.from_duration(
+                    resolved_deadline.seconds,
+                    source=resolved_deadline.source,
+                )
+    elif require_run_deadline and not execution_deadline.enabled:
+        _emit_required_run_deadline_missing(
+            crash_diagnostic_log_path=crash_diagnostic_log_path,
+            crash_diagnostic_logger=crash_diagnostic_logger,
+            runtime_kind_text=runtime_kind_text,
+            deadline_config_source=str(getattr(execution_deadline, "source", "execution_deadline")),
+        )
+        raise ConfigError(
+            "Managed-host run requires a finite run deadline. "
+            "Pass --deadline-seconds, set SYLLIPTOR_RUN_DEADLINE_SECONDS, "
+            "or configure run_deadline_seconds."
+        )
+
     session = create_session(
         cfg=cfg,
         root=root,
@@ -546,6 +680,9 @@ def run_agent(
         enforce_explicit_subagent_requests=enforce_explicit_subagent_requests,
         workspace_binding=workspace_binding,
         mcp_manager=mcp_manager,
+        execution_deadline=execution_deadline,
+        crash_diagnostic_log_path=crash_diagnostic_log_path,
+        crash_diagnostic_logger=crash_diagnostic_logger,
     )
     try:
         return session.run_turn(instruction, image_paths=image_paths)

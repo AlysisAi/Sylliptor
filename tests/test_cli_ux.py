@@ -6,6 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from rich.console import Console
@@ -605,6 +606,93 @@ def test_chat_visible_command_lists_match_curated_surface() -> None:
             "/plan edit",
         ]
     )
+
+
+def test_chat_config_menu_reload_uses_injected_helpers_without_login_shadowing(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from sylliptor_agent_cli.cli_impl import config_menu as config_menu_mod
+    from sylliptor_agent_cli.cli_impl.chat import loop as chat_loop_mod
+
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "cfg"))
+    monkeypatch.setattr(cli_mod, "_is_non_interactive_terminal", lambda: False)
+    monkeypatch.setattr(
+        config_menu_mod,
+        "run_config_menu",
+        lambda: SimpleNamespace(saved=True, changes=["model"], api_key_changed=False),
+    )
+
+    reloaded: list[AppConfig] = []
+
+    def fake_apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> None:
+        reloaded.append(cfg)
+        session.cfg = cfg
+
+    monkeypatch.setattr(cli_mod, "load_config", lambda: AppConfig(model="menu-model"))
+    monkeypatch.setattr(
+        chat_loop_mod,
+        "_apply_config_menu_changes_to_session",
+        fake_apply_config_menu_changes_to_session,
+    )
+    session = SimpleNamespace(cfg=AppConfig(model="old"), client=SimpleNamespace(model="old"))
+    stream = io.StringIO()
+
+    result = cli_mod._handle_chat_command(
+        input_text="/config",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=stream, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert [cfg.model for cfg in reloaded] == ["menu-model"]
+    rendered = stream.getvalue()
+    assert "Saved 1 change" in rendered
+    assert "session reload failed" not in rendered
+
+
+def test_chat_config_set_model_reports_success_after_reload(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from sylliptor_agent_cli.cli_impl.chat import loop as chat_loop_mod
+    from sylliptor_agent_cli.config import load_config
+
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "cfg"))
+    reloaded: list[AppConfig] = []
+
+    def fake_apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> None:
+        reloaded.append(cfg)
+        session.cfg = cfg
+
+    monkeypatch.setattr(
+        chat_loop_mod,
+        "_apply_config_menu_changes_to_session",
+        fake_apply_config_menu_changes_to_session,
+    )
+    session = SimpleNamespace(cfg=AppConfig(model="old"), client=SimpleNamespace(model="old"))
+    stream = io.StringIO()
+
+    result = cli_mod._handle_chat_command(
+        input_text="/config set model new-model",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=stream, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert load_config().model == "new-model"
+    assert [cfg.model for cfg in reloaded] == ["new-model"]
+    rendered = stream.getvalue()
+    assert "Saved model" in rendered
+    assert "Config update failed" not in rendered
 
 
 def test_chat_command_sections_describe_forge_workspace_safe_resume_contract() -> None:
@@ -1540,6 +1628,51 @@ def test_chat_auto_binds_sane_project_dir_before_session_creation(
     binding = captured["workspace_binding"]
     assert binding.workspace_context.workspace_root == repo.resolve()
     assert binding.workspace_context.focus_path == repo.resolve()
+
+
+def test_chat_preserves_dash_leading_unusual_prompt_text(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runner = CliRunner()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("demo\n", encoding="utf-8")
+    prompt_text = "--starts-with-dash 'quoted' $(echo nope) Ω"
+    captured: dict[str, object] = {}
+
+    class _DummyStore:
+        enabled = False
+        session_id = "sid"
+
+    class _DummySession:
+        store = _DummyStore()
+        cfg = AppConfig(model="test-model")
+        mode = "review"
+        subagents_enabled = False
+        messages: list[dict[str, object]] = []
+
+        def run_turn(self, instruction: str, **kwargs: object) -> int:
+            captured["instruction"] = instruction
+            captured["kwargs"] = kwargs
+            return 0
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    monkeypatch.setattr(cli_mod, "create_session", lambda **_kwargs: _DummySession())
+    monkeypatch.chdir(repo)
+
+    result = runner.invoke(
+        sylliptor_app,
+        ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
+        input=f"{prompt_text}\nexit\n",
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 0
+    assert captured["instruction"] == prompt_text
+    assert captured["closed"] is True
 
 
 def test_chat_passes_explicit_max_steps_as_chat_turn_fixed_override(

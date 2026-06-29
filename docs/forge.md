@@ -86,7 +86,8 @@ merge back when the gates pass. `--keep-branch` keeps the task branch for debugg
 `--verify` controls verification policy:
 
 - `off`: do not run the verification gate
-- `warn`: collect verification output without hard-failing the flow
+- `warn`: collect verification output without hard-failing normal execution; in `--pr` mode, failed
+  verification still blocks merge
 - `strict`: fail the task when verification fails
 
 Repeat `--verify-cmd` to provide explicit verification commands.
@@ -115,6 +116,8 @@ tasks, and clear verification commands for strict gates.
 - `forge exec --pr` is the strongest acceptance path because it wraps execution in branch, commit,
   verification, review, and merge gates. Plain `forge exec` keeps a simpler local execution flow and
   should be reviewed before you commit or merge results manually.
+- A PR-style merge requires verification and review gates to pass. `--verify warn` records a
+  non-strict verification failure as evidence, but it does not merge a failing task branch.
 - Sequential execution and swarm workers currently run without subagents. Use top-level
   `sylliptor chat` or `sylliptor run` for delegated exploration before starting Forge execution, or
   split the plan into smaller scoped tasks.

@@ -539,3 +539,50 @@ def test_natural_language_navigation_logs_active_workdir_changes(
         )
     finally:
         session.close()
+
+
+def test_router_client_forces_reasoning_off_while_coding_client_keeps_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Routing/classification calls (the strict-JSON router plus short non-repo
+    # replies) must run with model reasoning disabled: on slow reasoning models
+    # (e.g. Xiaomi MiMo via the hosted trial proxy) the extra thinking inflates
+    # latency/tokens enough to exceed the request timeout, which silently degrades
+    # the turn to the generic clarification fallback. Deep reasoning must remain
+    # enabled on the coding client.
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    _fake_git_repo(repo)
+    workspace_binding = resolve_workspace_binding(repo, source="cwd")
+    monkeypatch.setattr(agent_loop_mod, "build_shell_runner", lambda **_kwargs: _FakeShellRunner())
+    session = create_session(
+        cfg=AppConfig(
+            model="test-model",
+            web_search_mode="off",
+            llm_enable_thinking=True,
+            llm_reasoning_effort="high",
+        ),
+        root=workspace_binding.workspace_context.workspace_root,
+        mode="auto",
+        runtime_kind="interactive_chat",
+        yes=True,
+        max_steps=1,
+        no_log=True,
+        api_key_override="override-key",
+        console=Console(file=io.StringIO(), force_terminal=False, width=140),
+        non_interactive=True,
+        session_log_dir_override=tmp_path / "sessions",
+        workspace_binding=workspace_binding,
+    )
+    try:
+        # Coding client honors the configured reasoning settings...
+        assert session.client.enable_thinking is True
+        assert session.client.reasoning_effort == "high"
+        # ...but the router/classification client forces reasoning off so routing
+        # stays fast and deterministic.
+        assert session.router_client is not None
+        assert session.router_client.enable_thinking is False
+        assert session.router_client.reasoning_effort in (None, "")
+    finally:
+        session.close()

@@ -14,6 +14,7 @@ Start with the [root README](../README.md) for installation and first use. Use t
 
 - [Architecture](architecture.md): understand the session loop, provider layer, tools, verification, and trust boundaries.
 - [Shell sandbox](shell_sandbox.md): configure Docker or Bubblewrap isolation for shell and verification commands.
+- [Background terminals](terminals.md): manage background commands and explicit durable services.
 - [Security model](security_model.md): review trust boundaries, HTTP protections, MCP boundaries, hooks, plugins, and fullaccess mode.
 - [Server mode](server.md): start the HTTP API and configure authentication, uploads, job queues, and workers.
 - [Forge](forge.md): plan, execute, verify, and review larger coding tasks.

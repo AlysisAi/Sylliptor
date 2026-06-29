@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 from typing import Any
 
@@ -15,6 +16,8 @@ from .types import (
     ToolOutputEvent,
     ToolStartEvent,
 )
+
+_PARENT_SURFACE_FORWARD_LOCK = threading.RLock()
 
 
 class HiddenApprovalSurface(NoopSurface):
@@ -193,10 +196,15 @@ class NestedSubagentSurface(HiddenApprovalSurface):
         self._subagent_mode = subagent_mode
         self._tool_call_prefix = f"subagent:{subagent_name}:"
         self._steps_completed = 0
+        self._assistant_messages_done: list[str] = []
 
     @property
     def steps_completed(self) -> int:
         return self._steps_completed
+
+    @property
+    def last_assistant_message_done(self) -> str:
+        return self._assistant_messages_done[-1] if self._assistant_messages_done else ""
 
     def _scoped_worker_id(self, worker_id: str | None) -> str:
         return worker_id or self._subagent_name
@@ -210,17 +218,25 @@ class NestedSubagentSurface(HiddenApprovalSurface):
     def _call_parent_emit(self, method_name: str, *args: Any, **kwargs: Any) -> None:
         handler = getattr(self._parent_surface, method_name, None)
         if callable(handler):
-            handler(*args, **kwargs)
+            with _PARENT_SURFACE_FORWARD_LOCK:
+                handler(*args, **kwargs)
+
+    def on_assistant_message_done(self, text: str) -> None:
+        clean = str(text or "").strip()
+        if clean:
+            self._assistant_messages_done.append(clean)
 
     def on_subagent_start(self, event: SubagentStartEvent) -> None:
         handler = getattr(self._parent_surface, "on_subagent_start", None)
         if callable(handler):
-            handler(event)
+            with _PARENT_SURFACE_FORWARD_LOCK:
+                handler(event)
 
     def on_subagent_end(self, event: SubagentEndEvent) -> None:
         handler = getattr(self._parent_surface, "on_subagent_end", None)
         if callable(handler):
-            handler(event)
+            with _PARENT_SURFACE_FORWARD_LOCK:
+                handler(event)
 
     def emit_message_delta(
         self,

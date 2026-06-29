@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .file_classification import INFERRED_FILE_EXTENSIONS
+from .file_classification import BROAD_SOURCE_EXTENSIONS, INFERRED_FILE_EXTENSIONS
 from .git_safe import build_git_process_env
 from .runtime_artifacts import ROOT_RUNTIME_ARTIFACT_DIR_NAMES, is_runtime_artifact_path
 
@@ -40,6 +40,9 @@ _BROAD_NON_PACKAGE_DIR_NAMES = {
     "tools",
 }
 _INFERRED_FILE_EXTENSIONS = INFERRED_FILE_EXTENSIONS
+_INFERRED_SOURCE_FILE_EXTENSIONS = frozenset(
+    suffix.lstrip(".").casefold() for suffix in BROAD_SOURCE_EXTENSIONS
+)
 _PATH_HINT_RE = re.compile(
     r"(?<![\w/-])("
     r"(?:\.[A-Za-z0-9_-]+(?:/[A-Za-z0-9_.-]+)*)"
@@ -259,6 +262,7 @@ def normalize_repo_path_entry(
     value: str,
     *,
     allow_extensionless_file: bool = False,
+    root: Path | None = None,
 ) -> str | None:
     cleaned = _normalize_path(_strip_wrapping_punctuation(value))
     if not cleaned:
@@ -277,6 +281,9 @@ def normalize_repo_path_entry(
         return cleaned
     if _has_glob(cleaned):
         return cleaned
+    existing_dir_pattern = _existing_directory_scope_pattern(cleaned, root=root)
+    if existing_dir_pattern is not None:
+        return existing_dir_pattern
     if "/" in cleaned or "." in cleaned:
         return cleaned
     if (
@@ -288,7 +295,26 @@ def normalize_repo_path_entry(
     return None
 
 
-def split_normalized_repo_path_list(value: Any) -> tuple[list[str], list[str]]:
+def _existing_directory_scope_pattern(value: str, *, root: Path | None) -> str | None:
+    if root is None:
+        return None
+    cleaned = str(value or "").strip().replace("\\", "/").strip("/")
+    if not cleaned or _has_glob(cleaned):
+        return None
+    try:
+        root_abs = root.resolve()
+        candidate = (root_abs / cleaned).resolve()
+        candidate.relative_to(root_abs)
+    except (OSError, ValueError):
+        return None
+    if not candidate.is_dir():
+        return None
+    return cleaned + "/**"
+
+
+def split_normalized_repo_path_list(
+    value: Any, *, root: Path | None = None
+) -> tuple[list[str], list[str]]:
     if not isinstance(value, list):
         return [], []
     seen: set[str] = set()
@@ -298,7 +324,11 @@ def split_normalized_repo_path_list(value: Any) -> tuple[list[str], list[str]]:
         raw = str(item).strip()
         if not raw:
             continue
-        normalized = normalize_repo_path_entry(raw, allow_extensionless_file=True)
+        normalized = normalize_repo_path_entry(
+            raw,
+            allow_extensionless_file=True,
+            root=root,
+        )
         identity_key = _scope_pattern_identity_key(normalized) if normalized else ""
         if not normalized or identity_key in seen:
             if not normalized:
@@ -309,8 +339,8 @@ def split_normalized_repo_path_list(value: Any) -> tuple[list[str], list[str]]:
     return out, dropped
 
 
-def normalize_repo_path_list(value: Any) -> list[str]:
-    out, _ = split_normalized_repo_path_list(value)
+def normalize_repo_path_list(value: Any, *, root: Path | None = None) -> list[str]:
+    out, _ = split_normalized_repo_path_list(value, root=root)
     return out
 
 
@@ -335,6 +365,12 @@ def extract_repo_path_hints(text: str) -> list[str]:
             ext = tail.rsplit(".", 1)[1].lower()
             if ext not in _INFERRED_FILE_EXTENSIONS:
                 continue
+            if (
+                "/" not in normalized
+                and ext in _INFERRED_SOURCE_FILE_EXTENSIONS
+                and not _single_segment_source_hint_looks_pathlike(tail)
+            ):
+                continue
         head_segment = normalized.split("/", 1)[0]
         if head_segment.isdigit():
             continue
@@ -345,6 +381,20 @@ def extract_repo_path_hints(text: str) -> list[str]:
     if "README.md" in seen and "README" in seen:
         hints = [hint for hint in hints if hint != "README"]
     return hints
+
+
+def _single_segment_source_hint_looks_pathlike(tail: str) -> bool:
+    stem, _sep, _ext = tail.rpartition(".")
+    if not stem:
+        return False
+    if stem in {"__init__", "conftest"}:
+        return True
+    if stem.casefold() in {"setup", "manage", "index", "main", "app", "server", "client"}:
+        return True
+    # Standalone prose like "Next.js" is not a repo-relative path hint. Single-token inferred
+    # source filenames must look like conventional file names; slash-qualified paths are handled
+    # before this helper.
+    return stem == stem.casefold() and bool(re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", stem))
 
 
 def _evidence_fragment(context: str) -> str:
@@ -435,7 +485,10 @@ def _forbidden_path_identity_keys_for_task(task: dict[str, Any]) -> set[str]:
 
 
 def normalize_scope_patterns(task: dict[str, Any], *, root: Path | None = None) -> list[str]:
-    expanded = _expand_support_file_patterns(normalize_claimed_scope_patterns(task), root=root)
+    expanded = _expand_support_file_patterns(
+        normalize_claimed_scope_patterns(task, root=root),
+        root=root,
+    )
     forbidden = _forbidden_path_identity_keys_for_task(task)
     if not forbidden:
         return expanded
@@ -444,9 +497,11 @@ def normalize_scope_patterns(task: dict[str, Any], *, root: Path | None = None) 
     ]
 
 
-def normalize_claimed_scope_patterns(task: dict[str, Any]) -> list[str]:
-    write_scope = normalize_repo_path_list(task.get("write_scope"))
-    estimated_files = normalize_repo_path_list(task.get("estimated_files"))
+def normalize_claimed_scope_patterns(
+    task: dict[str, Any], *, root: Path | None = None
+) -> list[str]:
+    write_scope = normalize_repo_path_list(task.get("write_scope"), root=root)
+    estimated_files = normalize_repo_path_list(task.get("estimated_files"), root=root)
     seen: set[str] = set()
     combined: list[str] = []
     for item in [*write_scope, *estimated_files]:

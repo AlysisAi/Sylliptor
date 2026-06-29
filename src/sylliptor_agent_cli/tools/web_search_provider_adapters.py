@@ -10,6 +10,7 @@ import httpx
 from ..llm.provider_limits import (
     ProviderRetrySettings,
     best_effort_provider_key,
+    mark_provider_call_non_retryable,
     run_provider_limited_call,
 )
 from ..safety import SafeHttpError, safe_http_request
@@ -94,13 +95,20 @@ def _post_json(
                 )
             )
         except httpx.TimeoutException as e:
-            raise ProviderWebSearchError(
+            error = ProviderWebSearchError(
                 format_http_timeout_error(
                     operation=f"{provider_label} web_search",
                     budget=timeout_budget,
                     error=e,
                 )
-            ) from e
+            )
+            # A read timeout means the provider accepted the request but did not
+            # answer within the budget; retrying immediately with the same budget
+            # just times out again and doubles the dead air. Fail fast on read
+            # timeouts while leaving connect/transient timeouts retryable.
+            if isinstance(e, httpx.ReadTimeout):
+                mark_provider_call_non_retryable(error)
+            raise error from e
         except SafeHttpError as e:
             raise ProviderWebSearchError(f"{provider_label} request blocked: {e}") from e
         except Exception as e:  # noqa: BLE001

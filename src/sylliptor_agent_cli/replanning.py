@@ -35,7 +35,7 @@ from .model_router import ROLE_PLANNER, resolve_model_for_role
 from .plan_assistant import (
     PlanApplyResult,
     PlannerTurnResult,
-    apply_plan_update,
+    apply_guarded_planner_plan_update,
     protected_task_ids,
     run_planner_turn,
     summarize_plan_update,
@@ -404,6 +404,20 @@ def _task_by_id(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _apply_result_has_executable_plan_changes(apply_result: PlanApplyResult) -> bool:
+    return bool(
+        apply_result.added_task_ids
+        or apply_result.removed_task_ids
+        or apply_result.updated_task_ids
+        or apply_result.synthesized_task_ids
+        or apply_result.superseded_task_ids
+        or apply_result.superseded_requirements
+        or apply_result.requirements_added
+        or apply_result.goal_updated
+        or apply_result.summary_updated
+    )
+
+
 def _dedupe_paths(values: list[str]) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -746,22 +760,14 @@ def validate_replanning_plan_update(
     for task_id in remove_ids:
         if task_id not in known_ids:
             errors.append(f"replanning proposal removes unknown task id: {task_id}")
-        elif task_id in protected_ids:
-            errors.append(f"replanning proposal cannot remove completed/terminal task: {task_id}")
 
     for task_id in update_ids:
         if task_id not in known_ids:
             errors.append(f"replanning proposal updates unknown task id: {task_id}")
-        elif task_id in protected_ids:
-            errors.append(f"replanning proposal cannot rewrite completed/terminal task: {task_id}")
 
     for task_id in supersede_ids:
         if task_id not in known_ids:
             errors.append(f"replanning proposal supersedes unknown task id: {task_id}")
-        elif task_id in protected_ids:
-            errors.append(
-                f"replanning proposal cannot supersede completed/terminal task: {task_id}"
-            )
 
     for spec in plan_update.get("tasks_add", []) or []:
         if not isinstance(spec, dict):
@@ -780,12 +786,26 @@ def validate_replanning_plan_update(
                 errors.append(f"replanning proposal references missing dependency id: {dep_id}")
 
     simulated_plan = copy.deepcopy(plan)
-    apply_result = apply_plan_update(
+    apply_result = apply_guarded_planner_plan_update(
         simulated_plan,
         copy.deepcopy(plan_update),
         latest_user_text=latest_user_text,
         workspace_context=workspace_context,
     )
+    if not _apply_result_has_executable_plan_changes(apply_result) and any(
+        plan_update.get(key)
+        for key in (
+            "tasks_add",
+            "tasks_update",
+            "tasks_remove",
+            "tasks_supersede",
+            "requirements_append",
+            "requirements_remove",
+            "project_goal",
+            "summary",
+        )
+    ):
+        errors.append("replanning proposal made no executable plan changes")
 
     for task_id in sorted(protected_ids):
         original = copy.deepcopy(task_by_id.get(task_id))
@@ -1078,7 +1098,7 @@ def run_replanning_attempt(
             workspace_context=workspace_context,
         )
         if validation.valid and effective_mode == "apply":
-            apply_preview = apply_plan_update(
+            apply_preview = apply_guarded_planner_plan_update(
                 plan,
                 copy.deepcopy(effective_plan_update),
                 latest_user_text=replan_user_text,

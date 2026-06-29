@@ -1165,10 +1165,13 @@ def _handle_chat_command(
         who = f" as [bold]{result.email}[/bold]" if result.email else ""
         console.print(f"[green]Logged in{who}.[/green] Your free MiMo trial is ready.")
         try:
-            from ...config import load_config
-            from .loop import _apply_config_menu_changes_to_session
+            from ... import config as _login_config
+            from . import loop as _login_loop
 
-            _apply_config_menu_changes_to_session(session=session, cfg=load_config())
+            _login_loop._apply_config_menu_changes_to_session(
+                session=session,
+                cfg=_login_config.load_config(),
+            )
             console.print(
                 f"Profile [bold]{result.profile_name}[/bold] (model "
                 f"[bold]{result.model}[/bold]) is now active for this session."

@@ -852,6 +852,34 @@ def sanitize_guarded_planner_plan_update(
 
     warnings: list[str] = []
     rejected_protected_updates: list[RejectedProtectedPlannerTaskUpdate] = []
+    task_status_by_id = {
+        str(task.get("id") or "").strip(): canonical_task_status(str(task.get("status") or ""))
+        for task in plan.get("tasks") or []
+        if isinstance(task, dict) and str(task.get("id") or "").strip()
+    }
+    protected_non_done_ids = {
+        task_id for task_id in protected_ids if task_status_by_id.get(task_id) != "done"
+    }
+
+    def filter_dependencies(spec: dict[str, Any], *, label: str) -> None:
+        raw_deps = spec.get("dependencies")
+        if not isinstance(raw_deps, list) or not protected_non_done_ids:
+            return
+        kept: list[Any] = []
+        dropped: list[str] = []
+        for raw_dep in raw_deps:
+            dep_id = str(raw_dep).strip()
+            if dep_id and dep_id in protected_non_done_ids:
+                dropped.append(dep_id)
+                continue
+            kept.append(raw_dep)
+        if not dropped:
+            return
+        spec["dependencies"] = kept
+        warnings.append(
+            f"Dropped protected non-done dependencies for {label}: "
+            + ", ".join(list(dict.fromkeys(dropped)))
+        )
 
     raw_updates = sanitized_update.get("tasks_update")
     if isinstance(raw_updates, list):
@@ -871,6 +899,7 @@ def sanitize_guarded_planner_plan_update(
                     )
                 )
                 continue
+            filter_dependencies(patch, label=f"planner tasks_update '{task_id}'")
             filtered_updates.append(patch)
         sanitized_update["tasks_update"] = filtered_updates
         if dropped_update_ids:
@@ -913,6 +942,16 @@ def sanitize_guarded_planner_plan_update(
                 )
             )
 
+    raw_additions = sanitized_update.get("tasks_add")
+    if isinstance(raw_additions, list):
+        filtered_additions: list[Any] = []
+        for spec in raw_additions:
+            if isinstance(spec, dict):
+                title = str(spec.get("title") or "").strip() or "(untitled)"
+                filter_dependencies(spec, label=f"new task '{title}'")
+            filtered_additions.append(spec)
+        sanitized_update["tasks_add"] = filtered_additions
+
     return GuardedPlannerPlanUpdateResult(
         plan_update=sanitized_update,
         warnings=list(dict.fromkeys(warnings)),
@@ -949,9 +988,11 @@ _NON_RUNNABLE_FOLLOW_UP_TEXT_RE = re.compile(
 _GENERIC_FOLLOW_UP_TITLE_TOKENS = frozenset(
     {
         "add",
+        "bad",
         "create",
         "change",
         "comment",
+        "done",
         "edit",
         "file",
         "follow",
@@ -962,6 +1003,7 @@ _GENERIC_FOLLOW_UP_TITLE_TOKENS = frozenset(
         "new",
         "path",
         "paths",
+        "replan",
         "task",
         "tasks",
         "update",
@@ -997,6 +1039,8 @@ _GENERIC_FOLLOW_UP_TITLE_TOKEN_PREFIXES = frozenset(
         "path",
         "polish",
         "refactor",
+        "replan",
+        "rewrit",
         "review",
         "ship",
         "support",
@@ -1091,7 +1135,9 @@ def _meaningful_title_delta_tokens(*, base_title: str, signal_title: str) -> set
     return {
         token
         for token in (signal_tokens - base_tokens)
-        if token and not _is_generic_follow_up_title_token(token) and token not in path_tokens
+        if len(token) > 1
+        and not _is_generic_follow_up_title_token(token)
+        and token not in path_tokens
     }
 
 
@@ -1587,6 +1633,10 @@ def _workspace_top_level_entries(workspace_context: dict[str, Any] | None) -> li
     return entries
 
 
+def _workspace_context_is_greenfield(workspace_context: dict[str, Any] | None) -> bool:
+    return bool(isinstance(workspace_context, dict) and workspace_context.get("greenfield"))
+
+
 def _workspace_has_existing_repo_context(workspace_context: dict[str, Any] | None) -> bool:
     if not isinstance(workspace_context, dict):
         return False
@@ -1618,6 +1668,15 @@ def _user_text_requests_mutating_repo_work(
     if planner_asked_locator:
         return _contains_mutating_task_signal(user_text)
     return _has_mutating_task_action_clause(user_text)
+
+
+def _greenfield_user_text_is_actionable(user_text: str) -> bool:
+    text = str(user_text or "").strip()
+    if not text:
+        return False
+    if _is_clearly_non_mutating_task(title="", description=text, acceptance_criteria=[]):
+        return False
+    return bool(_has_mutating_task_action_clause(text) or _contains_mutating_task_signal(text))
 
 
 def _workspace_manifest_paths(workspace_context: dict[str, Any] | None) -> set[str]:
@@ -1717,6 +1776,19 @@ def _apply_repo_grounding_fallback(
         str(item).strip() for item in validated.get("questions") or [] if str(item).strip()
     ]
     planner_asked_locator = bool(questions and _planner_questions_ask_for_repo_locator(questions))
+    if _workspace_context_is_greenfield(workspace_context):
+        if (
+            _plan_is_thin(plan)
+            and (not questions or planner_asked_locator)
+            and _greenfield_user_text_is_actionable(user_text)
+        ):
+            return _greenfield_scaffold_plan_fallback(
+                validated=validated,
+                user_text=user_text,
+                workspace_context=workspace_context,
+            )
+        return validated
+
     user_asked_locator = _user_text_requests_repo_locator(user_text)
     if not planner_asked_locator and not user_asked_locator:
         return validated
@@ -1782,6 +1854,50 @@ def _apply_repo_grounding_fallback(
                 "dependencies": [],
                 "estimated_files": scope,
                 "write_scope": scope,
+                "parallel_group": "",
+            }
+        ]
+    }
+    return fallback
+
+
+def _greenfield_scaffold_plan_fallback(
+    *,
+    validated: dict[str, Any],
+    user_text: str,
+    workspace_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    verify_commands = _workspace_string_list(workspace_context, "likely_test_commands")
+    verify_text = (
+        f"Run `{verify_commands[0]}` or a narrower relevant subset."
+        if verify_commands
+        else (
+            "Create project-appropriate verification scripts and run the relevant local "
+            "build/lint/test command once the scaffold exists."
+        )
+    )
+    fallback = dict(validated)
+    fallback["assistant_message"] = (
+        "I added a greenfield build task so execution can scaffold the requested project "
+        "instead of looking for existing implementation files."
+    )
+    fallback["questions"] = []
+    fallback["plan_update"] = {
+        "tasks_add": [
+            {
+                "title": "Build requested project scaffold",
+                "description": (
+                    "Create the requested project from scratch in this empty or uninitialized "
+                    f"workspace: {user_text.strip()}"
+                ),
+                "acceptance_criteria": [
+                    "Create the files, manifests, and local structure needed for the requested project.",
+                    "Keep generated files limited to the requested app/tool and its verification assets.",
+                    verify_text,
+                ],
+                "dependencies": [],
+                "estimated_files": ["**"],
+                "write_scope": ["**"],
                 "parallel_group": "",
             }
         ]
@@ -2287,6 +2403,7 @@ def compact_workspace_context_for_planner(workspace_context: dict[str, Any]) -> 
 
     digest: dict[str, Any] = {
         "workspace_kind": str(workspace_context.get("workspace_kind") or "").strip(),
+        "greenfield": bool(workspace_context.get("greenfield", False)),
         "focus_relpath": str(workspace_context.get("focus_relpath") or ".").strip() or ".",
         "top_level_paths": top_level_paths[:8],
         "manifests": manifests[:8],
@@ -2510,6 +2627,8 @@ def _planner_user_prompt(
         "- plan_update may be null and that is correct when the latest user message has no planning-relevant "
         "content (for example greeting/small talk/off-topic/meta).\n"
         "- Do not create tasks whose only purpose is requirement clarification; ask questions instead.\n"
+        "- When workspace context says greenfield=true, plan create/scaffold targets and do not ask "
+        "execution to locate an existing implementation.\n"
         "- requirements_append must not include greetings, filler, or off-topic chatter.\n"
         "- estimated_files must list repo-relative files likely to be modified.\n"
         "- write_scope must contain only repo-relative file paths or focused globs; never prose.\n"

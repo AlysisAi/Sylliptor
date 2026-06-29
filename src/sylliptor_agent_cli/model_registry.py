@@ -63,6 +63,20 @@ _BUILT_IN_MODEL_METADATA: dict[str, dict[str, Any]] = {
         "input_cost_per_token": 0.000000435,
         "output_cost_per_token": 0.00000087,
     },
+    "deepseek-chat": {
+        "context_window_tokens": 1_000_000,
+        "max_output_tokens": 384_000,
+        "supports_vision": False,
+        "input_cost_per_token": 0.000000435,
+        "output_cost_per_token": 0.00000087,
+    },
+    "deepseek-reasoner": {
+        "context_window_tokens": 1_000_000,
+        "max_output_tokens": 384_000,
+        "supports_vision": False,
+        "input_cost_per_token": 0.000000435,
+        "output_cost_per_token": 0.00000087,
+    },
     # Hosted Xiaomi MiMo trial models. The proxy serves these ids when allowlisted,
     # and falls back server-side to its canonical MiMo model otherwise.
     "mimo-v2.5-pro": {

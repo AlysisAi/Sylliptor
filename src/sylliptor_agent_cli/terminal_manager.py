@@ -28,6 +28,7 @@ _POST_SIGKILL_WAIT_TIMEOUT_S = 1.0
 
 ProcessStatus = Literal["running", "exited", "killed", "failed"]
 OutputStream = Literal["stdout", "stderr"]
+WaitUntil = Literal["output_available", "process_exited", "either"]
 _TERMINAL_STATUSES: set[ProcessStatus] = {"exited", "killed", "failed"}
 
 
@@ -193,6 +194,34 @@ class BackgroundProcess:
             total_bytes=total_bytes,
         )
 
+    def wait_for_output(
+        self,
+        *,
+        since: int = 0,
+        timeout_s: float = 0.0,
+        until: WaitUntil = "either",
+    ) -> tuple[ProcessOutputSnapshot, bool]:
+        if since < 0:
+            raise ValueError("since must be non-negative")
+        if until not in {"output_available", "process_exited", "either"}:
+            raise ValueError(f"unsupported wait condition: {until}")
+        deadline = time.perf_counter() + max(0.0, float(timeout_s))
+        while True:
+            snapshot = self.read(since)
+            has_output = bool(snapshot.lines)
+            exited = snapshot.status in _TERMINAL_STATUSES
+            if until == "output_available" and has_output:
+                return snapshot, False
+            if until == "process_exited" and exited:
+                return snapshot, False
+            if until == "either" and (has_output or exited):
+                return snapshot, False
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return snapshot, True
+            with self._condition:
+                self._condition.wait(remaining)
+
     def kill(self, timeout_s: float) -> ProcessOutputSnapshot:
         with self._kill_lock:
             with self._condition:
@@ -272,7 +301,7 @@ class BackgroundProcess:
                 decoded=decoder.decode(b"", final=True),
             )
             if pending:
-                self._output.append_line(stream=stream_name, text=pending)
+                self._append_output_line(stream=stream_name, text=pending)
         except OSError as exc:
             if not self._kill_requested:
                 self._fail_reader_and_request_kill(f"{stream_name} reader failed: {exc}")
@@ -308,7 +337,12 @@ class BackgroundProcess:
                 return pending
             line = pending[: newline_idx + 1]
             pending = pending[newline_idx + 1 :]
-            self._output.append_line(stream=stream_name, text=line)
+            self._append_output_line(stream=stream_name, text=line)
+
+    def _append_output_line(self, *, stream: OutputStream, text: str) -> None:
+        self._output.append_line(stream=stream, text=text)
+        with self._condition:
+            self._condition.notify_all()
 
     def _wait_for_process(self) -> None:
         try:
@@ -515,6 +549,20 @@ class TerminalManager:
 
     def read(self, process_id: str, *, since: int = 0) -> ProcessOutputSnapshot:
         return self._get_process(process_id).read(since)
+
+    def wait_for_output(
+        self,
+        process_id: str,
+        *,
+        since: int = 0,
+        timeout_s: float = 0.0,
+        until: WaitUntil = "either",
+    ) -> tuple[ProcessOutputSnapshot, bool]:
+        return self._get_process(process_id).wait_for_output(
+            since=since,
+            timeout_s=timeout_s,
+            until=until,
+        )
 
     def kill(self, process_id: str) -> ProcessOutputSnapshot:
         process = self._get_process(process_id)

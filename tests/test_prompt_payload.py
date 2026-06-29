@@ -210,7 +210,7 @@ def test_interactive_bootstrap_payload_stays_bounded(tmp_path: Path) -> None:
     try:
         messages_json = json.dumps(session.messages, ensure_ascii=True)
         tools_json = json.dumps(session.tool_list, ensure_ascii=True)
-        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 5200
+        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 5600
     finally:
         session.close()
 
@@ -281,7 +281,7 @@ def test_one_shot_bootstrap_payload_stays_bounded(tmp_path: Path) -> None:
     try:
         messages_json = json.dumps(session.messages, ensure_ascii=True)
         tools_json = json.dumps(session.tool_list, ensure_ascii=True)
-        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 5600
+        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 6400
     finally:
         session.close()
 

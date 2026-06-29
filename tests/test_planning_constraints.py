@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from sylliptor_agent_cli.agent.acceptance_contract import (
+    AcceptanceCriterionKind,
+    build_acceptance_contract,
+)
 from sylliptor_agent_cli.planning_constraints import (
     extract_planning_scope_constraints,
     filter_scope_entries_for_planning_constraints,
@@ -18,6 +24,21 @@ def test_extracts_target_root_and_decoy_path_constraints() -> None:
     assert [item.path for item in constraints.target_roots] == ["services/api"]
     assert [item.path for item in constraints.decoy_roots] == ["services/worker"]
     assert constraints.decoy_roots[0].reason_code == "decoy_path_constraint"
+
+
+def test_ungrounded_slash_prose_does_not_create_target_root() -> None:
+    workspace_context = {
+        "top_level_entries": [{"path": "src", "type": "dir"}, {"path": "Cargo.toml"}],
+        "observed_paths": ["src/lib.rs", "tests/parser.rs"],
+        "manifests": [{"path": "Cargo.toml", "kind": "rust"}],
+    }
+
+    constraints = extract_planning_scope_constraints(
+        "Implement the key/value parser and add regression tests.",
+        workspace_context=workspace_context,
+    )
+
+    assert constraints.target_roots == ()
 
 
 def test_decoy_language_does_not_poison_later_target_path() -> None:
@@ -84,6 +105,26 @@ def test_decoy_task_scope_violates_planning_constraints() -> None:
     assert len(violations) == 1
     assert violations[0].classification == "forbidden_root"
     assert violations[0].constraint_path == "services/worker"
+
+
+def test_acceptance_contract_preserves_blocked_planning_scope(tmp_path: Path) -> None:
+    constraints = extract_planning_scope_constraints(
+        "Only modify services/api. Do not touch services/worker."
+    )
+
+    contract = build_acceptance_contract(
+        root=tmp_path,
+        instruction="Only modify services/api. Do not touch services/worker.",
+        planning_constraints=constraints,
+    )
+
+    preservation_paths = {
+        path
+        for criterion in contract.criteria
+        if criterion.kind == AcceptanceCriterionKind.PRESERVATION_UNCHANGED_PATH
+        for path in criterion.paths
+    }
+    assert "services/worker" in preservation_paths
 
 
 def test_outside_target_root_requires_explicit_shared_evidence() -> None:

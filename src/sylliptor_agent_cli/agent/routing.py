@@ -25,6 +25,10 @@ from ..tools.availability import unavailable_tool_result
 from ..tools.web import WebFetchError
 from ..tools.web_search import WebSearchError
 from ..turn_intent import (
+    LocalMaterializationRequirement,
+    classify_local_materialization_requirement,
+)
+from ..turn_intent import (
     classify_repo_execution_intent as _classify_one_shot_repo_turn_intent,
 )
 from ..turn_intent import has_task_brief_constraint_signal as _has_task_brief_constraint_signal
@@ -311,6 +315,8 @@ def _is_repository_or_workspace_request(instruction: str) -> bool:
     text = instruction.strip()
     if not text:
         return False
+    if classify_local_materialization_requirement(text).required:
+        return True
     if any(pattern.search(text) is not None for pattern in _REPO_CONTEXT_PATTERNS):
         return True
     return _looks_like_explicit_local_workspace_action_request(text)
@@ -537,6 +543,8 @@ def _resolve_repo_turn_execution_intent(
         and runtime_kind == RuntimeKind.INTERACTIVE_CHAT
         and normalized_posture in _ROUTER_EXECUTION_POSTURES
     ):
+        if classified_turn_intent != "execute" and normalized_posture == "execute":
+            return classified_turn_intent
         return cast(_OneShotRepoTurnIntent, normalized_posture)
     return classified_turn_intent
 
@@ -551,6 +559,19 @@ def _managed_execution_route_override_reason(
     posture = str(route_execution_posture or "").strip().lower()
     if runtime_kind == RuntimeKind.FORGE_EXEC and route != "repo" and posture == "execute":
         return "forge_exec_managed_task_requires_repo_execution"
+    return None
+
+
+def _local_materialization_route_override_reason(
+    *,
+    materialization: LocalMaterializationRequirement,
+    original_route: str,
+) -> str | None:
+    route = str(original_route or "").strip().lower()
+    if route == "repo":
+        return None
+    if materialization.required and materialization.confidence >= 0.8:
+        return "local_materialization_requires_repo_execution"
     return None
 
 
@@ -1074,14 +1095,13 @@ def _main_agent_chat(
     on_reasoning_delta: Callable[[str], None] | None = None,
     temperature: float | None = None,
     cancellation_token: Any | None = None,
+    tool_choice: Any | None = None,
 ) -> Any:
-    base: dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "messages": messages,
         "tools": tools,
         "stream": stream,
         "on_text_delta": on_text_delta,
-    }
-    extra: dict[str, Any] = {
         "on_reasoning_delta": on_reasoning_delta,
         "temperature": temperature,
     }
@@ -1089,17 +1109,54 @@ def _main_agent_chat(
     # TypeError fallbacks below; clients that accept it can abort an in-flight
     # request the instant the user interrupts (even before the first token).
     if cancellation_token is not None:
-        extra["cancellation_token"] = cancellation_token
-    try:
-        return client.chat(**base, **extra)
-    except TypeError:
-        pass
-    # Narrower client without the reasoning sink: keep temperature (older 2-tier
-    # behaviour) before falling back to the minimal signature.
-    try:
-        return client.chat(**base, temperature=temperature)
-    except TypeError:
-        return client.chat(**base)
+        kwargs["cancellation_token"] = cancellation_token
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
+
+    optional_fallbacks = (
+        "cancellation_token",
+        "on_reasoning_delta",
+        "temperature",
+        "tool_choice",
+    )
+    remaining = dict(kwargs)
+    for optional_key in (None, *optional_fallbacks):
+        if optional_key is not None:
+            remaining.pop(optional_key, None)
+        try:
+            return client.chat(**remaining)
+        except TypeError:
+            continue
+    return client.chat(**remaining)
+
+
+def _client_supports_forced_tool_choice(client: Any) -> bool:
+    return getattr(client, "supports_forced_tool_choice", False) is True
+
+
+def _function_tool_choice(tool_name: str) -> dict[str, Any]:
+    return {"type": "function", "function": {"name": str(tool_name)}}
+
+
+def _safe_forced_tool_choice_for_recovery(
+    *,
+    client: Any,
+    tools: list[dict[str, Any]] | None,
+    preferred_tool_names: tuple[str, ...],
+) -> dict[str, Any] | None:
+    if not _client_supports_forced_tool_choice(client):
+        return None
+    available: set[str] = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        name = _tool_schema_function_name(tool)
+        if name:
+            available.add(name)
+    for name in preferred_tool_names:
+        if name in available:
+            return _function_tool_choice(name)
+    return None
 
 
 def _non_repo_chat(

@@ -16,6 +16,7 @@ RUNTIME_CACHE_DIR_NAMES = frozenset(
 )
 RUST_RUNTIME_ARTIFACT_DIR_NAME = "target"
 RUST_MANIFEST_FILENAME = "Cargo.toml"
+RUNTIME_ARTIFACT_FILE_NAMES = frozenset({".coverage"})
 RUNTIME_ARTIFACT_FILE_SUFFIXES = frozenset({".pyc", ".pyo"})
 RUNTIME_ARTIFACT_DIR_NAMES = ROOT_RUNTIME_ARTIFACT_DIR_NAMES | RUNTIME_CACHE_DIR_NAMES
 RUNTIME_ARTIFACT_GIT_EXCLUDE_ENTRIES = (
@@ -26,6 +27,7 @@ RUNTIME_ARTIFACT_GIT_EXCLUDE_ENTRIES = (
     ".mypy_cache/",
     ".pytest_cache/",
     ".ruff_cache/",
+    ".coverage",
     "*.pyc",
     "*.pyo",
 )
@@ -109,4 +111,6 @@ def is_runtime_artifact_path(path: str, *, root: Path | None = None) -> bool:
         return True
 
     filename = parts[-1]
+    if filename in RUNTIME_ARTIFACT_FILE_NAMES:
+        return True
     return any(filename.endswith(suffix) for suffix in RUNTIME_ARTIFACT_FILE_SUFFIXES)

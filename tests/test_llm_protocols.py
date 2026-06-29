@@ -57,6 +57,7 @@ def test_provider_protocol_capabilities_describe_native_web_search_adapters() ->
     assert openai_responses is not None
     assert openai_responses.supports_streaming is True
     assert openai_responses.supports_tool_calling is True
+    assert openai_responses.supports_forced_tool_choice is True
     assert openai_responses.supports_provider_hosted_web_search_adapter is True
     assert openai_responses.default_web_search_adapter == "openai_responses"
     assert any("Native OpenAI Responses chat supports" in q for q in openai_responses.quirks)
@@ -64,6 +65,7 @@ def test_provider_protocol_capabilities_describe_native_web_search_adapters() ->
     assert anthropic is not None
     assert anthropic.supports_streaming is True
     assert anthropic.supports_tool_calling is True
+    assert anthropic.supports_forced_tool_choice is True
     assert anthropic.supports_native_web_search is True
     assert anthropic.supports_provider_hosted_web_search_adapter is True
     assert anthropic.default_web_search_adapter == "anthropic_messages"
@@ -73,6 +75,7 @@ def test_provider_protocol_capabilities_describe_native_web_search_adapters() ->
     assert gemini is not None
     assert gemini.supports_streaming is True
     assert gemini.supports_tool_calling is True
+    assert gemini.supports_forced_tool_choice is True
     assert gemini.supports_native_web_search is True
     assert gemini.supports_provider_hosted_web_search_adapter is True
     assert gemini.default_web_search_adapter == "gemini_grounding"
@@ -82,6 +85,7 @@ def test_provider_protocol_capabilities_describe_native_web_search_adapters() ->
     assert interactions is not None
     assert interactions.supports_streaming is False
     assert interactions.supports_tool_calling is False
+    assert interactions.supports_forced_tool_choice is False
     assert interactions.supports_provider_hosted_web_search_adapter is False
     assert interactions.default_web_search_adapter == "gemini_grounding"
     assert "tools" in interactions.unsupported_parameters

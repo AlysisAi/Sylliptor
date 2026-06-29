@@ -7,24 +7,38 @@ They are meant for dev servers, file watchers, test runners in watch mode, log t
 processes where the agent needs to keep working while output accumulates in the background.
 
 The feature is session-scoped. A background process belongs to the current chat session, can be
-listed or inspected later, and is shut down when the session closes.
+listed or inspected later, and is shut down when the session closes. Use durable services only when
+the task explicitly needs a server or daemon to remain available after the session ends.
 
 ## Tools
 
-The LLM can use four background-terminal tools in write-capable chat modes.
+The LLM can use five background-terminal tools in write-capable chat modes.
 
 | Tool | Description |
 |---|---|
 | `shell_background` | Start a background process under the workspace root. |
 | `shell_output` | Read accumulated stdout and stderr from a background process. |
+| `shell_wait` | Wait briefly for a background process to emit output, exit, or either condition. |
 | `shell_kill` | Terminate a background process by `process_id`. |
 | `shell_list` | List background processes tracked by the current session. |
 
 `shell_background` uses the same command safety checks as `shell_run`. In review mode, starting a
 background process can request approval before the process is spawned.
 
-`shell_output`, `shell_kill`, and `shell_list` operate on already-started processes. They do not
-run new shell commands.
+`shell_output`, `shell_wait`, `shell_kill`, and `shell_list` operate on already-started processes.
+They do not run new shell commands.
+
+Durable service tools are also available for explicit long-lived services:
+
+| Tool | Description |
+|---|---|
+| `shell_service_start` | Start a durable service under the workspace root with optional readiness checks. |
+| `shell_service_status` | Check a durable service and re-run its readiness probe. |
+| `shell_service_stop` | Stop a durable service by `service_id`. |
+
+Unlike `shell_background`, durable services are not reaped when the chat session closes. They must
+be stopped with `shell_service_stop` when no longer needed. Prefer `shell_background` for ordinary
+dev servers, file watchers, and commands that only need to live during the current session.
 
 ## Slash command
 
@@ -87,7 +101,9 @@ reader keeps that text as pending data. When the stream closes, the pending part
 into the output buffer.
 
 For very chatty commands, poll more often with `shell_output` or inspect the process through
-`/terminals show`. If `dropped_lines` is greater than zero, older output has already been evicted.
+`/terminals show`. For quiet long-running commands, use `shell_wait` instead of repeatedly polling
+when no new output is available. If `dropped_lines` is greater than zero, older output has already
+been evicted.
 
 ## Lifecycle
 
@@ -97,6 +113,7 @@ Starting a process returns a `process_id`. That id is stable for the lifetime of
 and can be passed to:
 
 - `shell_output`
+- `shell_wait`
 - `shell_kill`
 - `/terminals show`
 - `/terminals kill`
@@ -115,6 +132,11 @@ kill.
 
 When the chat session closes, all running background processes are terminated. Dev servers,
 watchers, and log tailers started by `shell_background` do not survive past the chat session.
+
+Durable services return a `service_id` instead of a `process_id`. A service can use a readiness
+probe based on process liveness, a TCP host and port, a Unix socket path, or a command. Durable
+services are intended for explicit handoff to later work and should be stopped when that handoff is
+complete.
 
 ## Sandbox compatibility
 
@@ -254,13 +276,14 @@ Use an explicit command when state is needed:
 cd /path/to/repo && . .venv/bin/activate && python -m http.server 8000
 ```
 
-Output is buffered, not streamed live. The agent and user poll for output with `shell_output` or
-`/terminals show`.
+Output is buffered, not streamed live. The agent and user inspect output with `shell_output`,
+`shell_wait`, or `/terminals show`.
 
 A single line larger than `background_output_max_bytes` is dropped rather than truncated. This keeps
 buffer accounting simple and avoids storing oversized records.
 
 Background processes are not durable jobs. Closing the chat session terminates running processes.
+Use durable service tools only when the process must intentionally outlive the session.
 
-There is no `shell_wait` tool in this version. Use `shell_output` to observe status changes, or use
-`shell_run` for commands expected to complete quickly.
+`shell_wait` is bounded and non-interactive. It waits for output or process exit; it does not create
+a persistent shell or attach to a PTY.

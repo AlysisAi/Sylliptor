@@ -9,6 +9,7 @@ import warnings
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from ..config import (
     ConfigError,
     get_api_key,
     resolve_api_key,
+    resolve_crash_diagnostic_log_path,
     resolve_llm_enable_thinking,
     resolve_llm_reasoning_effort,
     resolve_llm_timeout_s,
@@ -34,7 +36,15 @@ from ..config import (
     resolve_prompt_cache_retention,
     resolve_role_temperature,
 )
+from ..crash_diagnostics import CrashDiagnosticLogger, build_crash_diagnostic_logger
 from ..custom_tools import CustomToolSessionState, build_custom_tool_session_state
+from ..durable_service_manager import DurableServiceManager
+from ..execution_deadline import (
+    MINIMUM_FORCED_SUMMARY_SECONDS,
+    DeadlineExhausted,
+    ExecutionDeadline,
+    temporarily_clamp_client_timeout,
+)
 from ..extensions.activation import (
     ActivationDecision,
     WorkspaceTrustPromptFn,
@@ -339,6 +349,26 @@ def _disable_unsupported_native_streaming(
     return cfg.model_copy(update={"stream": False}, deep=True), warning
 
 
+class ForcedFinalSummaryTerminationKind(StrEnum):
+    STEP_BUDGET_EXHAUSTED = "step_budget_exhausted"
+    COMPLETION_GATE_STAGNATION = "completion_gate_stagnation"
+    EXECUTION_GUARD_STAGNATION = "execution_guard_stagnation"
+    DEADLINE_EXHAUSTED = "deadline_exhausted"
+    OTHER = "other"
+
+
+def _normalize_forced_summary_termination_kind(
+    value: str | ForcedFinalSummaryTerminationKind,
+) -> ForcedFinalSummaryTerminationKind:
+    if isinstance(value, ForcedFinalSummaryTerminationKind):
+        return value
+    normalized = str(value or "").strip().lower()
+    for item in ForcedFinalSummaryTerminationKind:
+        if normalized == item.value:
+            return item
+    return ForcedFinalSummaryTerminationKind.OTHER
+
+
 @dataclass
 class AgentSession:
     cfg: AppConfig
@@ -367,6 +397,7 @@ class AgentSession:
     runtime_kind: RuntimeKind = RuntimeKind.INTERACTIVE_CHAT
     mcp_manager: McpManager | ForgeTaskScopedMcpManager | None = None
     terminal_manager: TerminalManager | None = None
+    durable_service_manager: DurableServiceManager | None = None
     router_client: Any | None = None
     api_key: str = ""
     api_key_source: str = "missing"
@@ -415,6 +446,9 @@ class AgentSession:
     workspace_touched_paths: set[str] = field(default_factory=set)
     custom_tool_session_state: CustomToolSessionState | None = None
     hook_dispatcher: HookDispatcher | None = None
+    execution_deadline: ExecutionDeadline | None = None
+    crash_diagnostics: CrashDiagnosticLogger | None = None
+    crash_diagnostic_log_path: str | None = None
 
     def close(self, *, reason: str = "session_close") -> None:
         if self.terminal_manager is not None:
@@ -426,7 +460,38 @@ class AgentSession:
                     f"Terminal manager shutdown failed: {exc}",
                     code="terminal_shutdown_failed",
                 )
+        if self.durable_service_manager is not None:
+            try:
+                active_services = self.durable_service_manager.list_active()
+            except Exception as exc:  # noqa: BLE001
+                self._hook_warning(
+                    f"Durable service status check failed during close: {exc}",
+                    code="durable_service_status_failed",
+                )
+            else:
+                if active_services:
+                    self.store.append(
+                        "durable_services_left_active",
+                        {
+                            "count": len(active_services),
+                            "services": active_services,
+                        },
+                    )
         try:
+            if self.crash_diagnostics is not None:
+                self.crash_diagnostics.event(
+                    "run_finished",
+                    {
+                        "status": reason,
+                        "runtime_kind": self.runtime_kind.value,
+                        "deadline": (
+                            self.execution_deadline.telemetry_snapshot()
+                            if self.execution_deadline is not None
+                            else None
+                        ),
+                    },
+                    durable=True,
+                )
             cwd, active_workdir_relpath = self._hook_runtime_context()
             self._safe_dispatch_hooks(
                 lambda: self.hook_dispatcher.fire_session_end(
@@ -726,6 +791,7 @@ class AgentSession:
         self,
         *,
         termination_cause: str,
+        termination_kind: str = "step_budget_exhausted",
         max_steps: int,
         fallback_reason: str,
         latest_assistant_text: str = "",
@@ -789,8 +855,24 @@ class AgentSession:
             )
         remaining.append("- Finish the requested implementation or report a concrete blocker.")
 
+        kind = _normalize_forced_summary_termination_kind(termination_kind)
+        if kind == ForcedFinalSummaryTerminationKind.STEP_BUDGET_EXHAUSTED:
+            stop_risk = f"- The turn exhausted its {max_steps}-step budget before completion."
+        elif kind == ForcedFinalSummaryTerminationKind.COMPLETION_GATE_STAGNATION:
+            stop_risk = (
+                "- Execution stopped after repeated invalid finalization attempts without "
+                "new implementation or verification progress."
+            )
+        elif kind == ForcedFinalSummaryTerminationKind.EXECUTION_GUARD_STAGNATION:
+            stop_risk = (
+                "- Execution stopped after a runtime guard observed repeated no-progress behavior."
+            )
+        elif kind == ForcedFinalSummaryTerminationKind.DEADLINE_EXHAUSTED:
+            stop_risk = "- The run deadline was exhausted before the turn could finish."
+        else:
+            stop_risk = "- The turn stopped before completion for the reported reason."
         risks = [
-            f"- The turn exhausted its {max_steps}-step budget before completion.",
+            stop_risk,
             "- This fallback was generated from runtime state before the turn terminated.",
         ]
         if not verification_commands:
@@ -808,12 +890,17 @@ class AgentSession:
         *,
         reason: str,
         termination_cause: str,
+        termination_kind: str = "step_budget_exhausted",
         max_steps: int,
         language: str = "",
         script: str = "",
         explicit_language_override: bool = False,
         latest_assistant_text: str = "",
+        allow_llm_summary: bool = True,
     ) -> str:
+        normalized_termination_kind = _normalize_forced_summary_termination_kind(
+            termination_kind
+        ).value
         request_messages = list(self.messages)
         latest_assistant_text = str(latest_assistant_text or "").strip()
         if latest_assistant_text:
@@ -831,6 +918,7 @@ class AgentSession:
             {
                 "reason": reason,
                 "termination_cause": termination_cause,
+                "termination_kind": normalized_termination_kind,
                 "max_steps": max_steps,
             },
         )
@@ -838,49 +926,64 @@ class AgentSession:
         final_text = ""
         fallback_reason: str | None = None
         fallback_error: str | None = None
-        try:
-            resp = _main_agent_chat(
-                client=self.client,
-                messages=request_messages,
-                tools=None,
-                stream=False,
-                on_text_delta=None,
-            )
-        except Exception as exc:  # noqa: BLE001
-            fallback_reason = "finalization_error"
-            fallback_error = str(exc)
+        resp = None
+        deadline = self.execution_deadline
+        if not allow_llm_summary or (
+            deadline is not None and not deadline.can_start(MINIMUM_FORCED_SUMMARY_SECONDS)
+        ):
+            fallback_reason = "local_summary_due_to_deadline"
         else:
-            usage = resp.usage
-            usage_record = build_usage_record(
-                role=self.usage_role,
-                requested_model=self.client.model,
-                response_model=resp.response_model,
-                messages=request_messages,
-                response_content=resp.content or "",
-                response_tool_calls=[
-                    {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                    for tc in resp.tool_calls
-                ],
-                api_prompt_tokens=(usage.prompt_tokens if usage else None),
-                api_completion_tokens=(usage.completion_tokens if usage else None),
-                api_total_tokens=(usage.total_tokens if usage else None),
-                api_cached_prompt_tokens=(usage.cached_prompt_tokens if usage else None),
-                pinned_prefix_len=self.pinned_prefix_len,
-                registry=self.model_registry,
-            )
-            self.usage_summary.add_record(usage_record)
-            self.store.append("llm_usage", usage_record.to_payload())
-            final_text = str(resp.content or "").strip()
-            if resp.tool_calls:
-                fallback_reason = "tool_call_response"
-            elif not final_text:
-                fallback_reason = "blank_response"
-            elif _looks_like_unexecuted_tool_call_markup(final_text):
-                fallback_reason = "tool_call_markup_response"
+            try:
+                with temporarily_clamp_client_timeout(
+                    self.client,
+                    deadline,
+                    operation="forced_final_summary_llm",
+                ):
+                    resp = _main_agent_chat(
+                        client=self.client,
+                        messages=request_messages,
+                        tools=None,
+                        stream=False,
+                        on_text_delta=None,
+                    )
+            except DeadlineExhausted:
+                fallback_reason = "local_summary_due_to_deadline"
+            except Exception as exc:  # noqa: BLE001
+                fallback_reason = "finalization_error"
+                fallback_error = str(exc)
+            else:
+                usage = resp.usage
+                usage_record = build_usage_record(
+                    role=self.usage_role,
+                    requested_model=self.client.model,
+                    response_model=resp.response_model,
+                    messages=request_messages,
+                    response_content=resp.content or "",
+                    response_tool_calls=[
+                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                        for tc in resp.tool_calls
+                    ],
+                    api_prompt_tokens=(usage.prompt_tokens if usage else None),
+                    api_completion_tokens=(usage.completion_tokens if usage else None),
+                    api_total_tokens=(usage.total_tokens if usage else None),
+                    api_cached_prompt_tokens=(usage.cached_prompt_tokens if usage else None),
+                    pinned_prefix_len=self.pinned_prefix_len,
+                    registry=self.model_registry,
+                )
+                self.usage_summary.add_record(usage_record)
+                self.store.append("llm_usage", usage_record.to_payload())
+                final_text = str(resp.content or "").strip()
+                if resp.tool_calls:
+                    fallback_reason = "tool_call_response"
+                elif not final_text:
+                    fallback_reason = "blank_response"
+                elif _looks_like_unexecuted_tool_call_markup(final_text):
+                    fallback_reason = "tool_call_markup_response"
 
         if fallback_reason is not None:
             final_text = self._forced_final_summary_fallback_text(
                 termination_cause=termination_cause,
+                termination_kind=normalized_termination_kind,
                 max_steps=max_steps,
                 fallback_reason=fallback_reason,
                 latest_assistant_text=latest_assistant_text,
@@ -888,6 +991,7 @@ class AgentSession:
             fallback_payload: dict[str, Any] = {
                 "reason": reason,
                 "termination_cause": termination_cause,
+                "termination_kind": normalized_termination_kind,
                 "max_steps": max_steps,
                 "fallback_reason": fallback_reason,
             }
@@ -908,6 +1012,7 @@ class AgentSession:
                 {
                     "reason": reason,
                     "termination_cause": termination_cause,
+                    "termination_kind": normalized_termination_kind,
                     "max_steps": max_steps,
                     "content_length": len(emitted_text),
                 },
@@ -975,6 +1080,9 @@ def create_session(
     mcp_manager: McpManager | ForgeTaskScopedMcpManager | None = None,
     session_source: str = "startup",
     session_source_metadata: dict[str, Any] | None = None,
+    execution_deadline: ExecutionDeadline | None = None,
+    crash_diagnostic_log_path: str | Path | None = None,
+    crash_diagnostic_logger: CrashDiagnosticLogger | None = None,
 ) -> AgentSession:
     surface = surface or NoopSurface()
     resolved_runtime_kind = resolve_session_runtime_kind(
@@ -1159,6 +1267,15 @@ def create_session(
     router_client: Any | None = None
     if routing_mode == _ROUTING_MODE_AUTO:
         assert router_model_name is not None
+        # The router client performs strict-JSON turn routing plus the short
+        # chat/general/tool responses. Model "thinking" adds no value to these
+        # dispatch/classification calls, but on slow reasoning models (e.g. Xiaomi
+        # MiMo via the hosted trial proxy) it triples latency and completion
+        # tokens — enough to exceed the request timeout or truncate the JSON,
+        # which silently degrades the turn to the generic clarification fallback
+        # ("Could you clarify..."). Force reasoning off here (both flags, so a
+        # configured reasoning_effort cannot re-enable it via the OpenRouter
+        # reasoning payload); deep reasoning stays enabled on the coding client.
         router_client = _make_session_llm_client(
             cfg=session_cfg,
             api_key=api_key,
@@ -1167,8 +1284,8 @@ def create_session(
             temperature=0.0,
             prompt_cache_key=resolve_prompt_cache_key(session_cfg),
             prompt_cache_retention=resolve_prompt_cache_retention(session_cfg),
-            enable_thinking=llm_enable_thinking,
-            reasoning_effort=llm_reasoning_effort,
+            enable_thinking=False,
+            reasoning_effort="",
         )
     sessions_dir = (
         session_log_dir_override
@@ -1195,6 +1312,29 @@ def create_session(
         runtime_kind=resolved_runtime_kind.value,
         active_workdir=str(initial_active_workdir),
         active_workdir_relpath=initial_active_workdir_relpath,
+    )
+    resolved_crash_diagnostic_log_path = resolve_crash_diagnostic_log_path(
+        session_cfg,
+        cli_diagnostic_log_path=crash_diagnostic_log_path,
+    )
+    crash_diagnostics = crash_diagnostic_logger or build_crash_diagnostic_logger(
+        path=resolved_crash_diagnostic_log_path,
+        run_id=session_id,
+        session_id=session_id,
+        runtime_kind=resolved_runtime_kind.value,
+    )
+    crash_diagnostics.event(
+        "run_started",
+        {
+            "runtime_kind": resolved_runtime_kind.value,
+            "model": session_cfg.model,
+            "max_steps": max_steps,
+            "session_source": normalized_session_source,
+            "deadline": (
+                execution_deadline.telemetry_snapshot() if execution_deadline is not None else None
+            ),
+        },
+        durable=True,
     )
     surface_on_warning = _meaningful_surface_warning_handler(surface)
 
@@ -1473,6 +1613,11 @@ def create_session(
         runner=bg_runner,
         settings=resolved_sandbox_settings,
     )
+    durable_service_manager = DurableServiceManager(
+        root=root,
+        state_dir=store.sessions_dir / "durable_services",
+        settings=resolved_sandbox_settings,
+    )
 
     try:
         active_workdir_state: dict[str, Any] = {
@@ -1551,6 +1696,7 @@ def create_session(
             non_interactive=non_interactive,
             shell_runner=runner,
             terminal_manager=terminal_manager,
+            durable_service_manager=durable_service_manager,
             verification_enabled=verification_enabled,
             authoritative_verification_commands=authoritative_verify_commands,
             effective_verification_commands=effective_verification_commands,
@@ -1571,6 +1717,9 @@ def create_session(
             get_active_workdir_relpath=_get_active_workdir_relpath,
             set_active_workdir_callback=_set_active_workdir,
             create_session_factory=create_session,
+            execution_deadline=execution_deadline,
+            crash_diagnostic_log_path=resolved_crash_diagnostic_log_path,
+            crash_diagnostics=crash_diagnostics,
         )
         if mcp_manager is not None and mcp_manager.resolved_config.has_any_config:
             store.append("mcp_catalog_snapshot", mcp_manager.catalog_snapshot_metadata())
@@ -1817,6 +1966,7 @@ def create_session(
             runtime_kind=resolved_runtime_kind,
             mcp_manager=mcp_manager,
             terminal_manager=terminal_manager,
+            durable_service_manager=durable_service_manager,
             subagents_enabled=resolved_subagents_enabled,
             enforce_explicit_subagent_requests=bool(enforce_explicit_subagent_requests),
             subagent_depth=subagent_depth,
@@ -1840,6 +1990,9 @@ def create_session(
             router_client=router_client,
             custom_tool_session_state=custom_tool_session_state,
             hook_dispatcher=hook_dispatcher,
+            execution_deadline=execution_deadline,
+            crash_diagnostics=crash_diagnostics,
+            crash_diagnostic_log_path=resolved_crash_diagnostic_log_path,
         )
         active_workdir_state["session"] = session
         return session

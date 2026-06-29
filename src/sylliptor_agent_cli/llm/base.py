@@ -12,6 +12,7 @@ class ChatClient(Protocol):
 
     base_url: str
     model: str
+    supports_forced_tool_choice: bool
 
     def chat(
         self,

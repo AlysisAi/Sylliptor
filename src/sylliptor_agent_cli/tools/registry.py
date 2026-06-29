@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
 from .availability import is_tool_unavailable_result
 
 ToolFormatter = Callable[[dict[str, Any]], str]
+ToolAliasTransform = Callable[[dict[str, Any]], dict[str, Any]]
 _PATH_BASE_ENUM = ["active_workdir", "workspace_root"]
+_UNKNOWN_TOOL_SUGGESTION_THRESHOLD = 0.72
+_UNKNOWN_TOOL_MAX_SUGGESTIONS = 3
 
 
 def _path_base_property(*, description: str | None = None) -> dict[str, Any]:
@@ -30,6 +35,29 @@ def _cwd_base_property() -> dict[str, Any]:
             "workspace_root."
         )
     )
+
+
+def _service_readiness_property() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "description": (
+            "Optional bounded readiness probe. type=process_alive, tcp, unix_socket, or command. "
+            "tcp uses host+port; unix_socket uses path; command uses a policy-checked command."
+        ),
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["process_alive", "tcp", "unix_socket", "command"],
+                "default": "process_alive",
+            },
+            "host": {"type": "string", "default": "127.0.0.1"},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "path": {"type": "string"},
+            "command": {"type": "string"},
+            "timeout_s": {"type": "number", "default": 5.0, "minimum": 0, "maximum": 30},
+            "interval_s": {"type": "number", "default": 0.1, "minimum": 0.02, "maximum": 2},
+        },
+    }
 
 
 def _truncate_inline(text: str, *, max_chars: int = 96) -> str:
@@ -56,6 +84,10 @@ def _preview_shell_output(args: dict[str, Any]) -> str:
 
 def _preview_shell_kill(args: dict[str, Any]) -> str:
     return _truncate_inline(str(args.get("process_id") or "").strip(), max_chars=120) or "-"
+
+
+def _preview_shell_service_id(args: dict[str, Any]) -> str:
+    return _truncate_inline(str(args.get("service_id") or "").strip(), max_chars=120) or "-"
 
 
 def _preview_fs_read_lines(args: dict[str, Any]) -> str:
@@ -396,6 +428,16 @@ def _summary_shell_output(parsed: dict[str, Any]) -> str:
     return f'Read {line_count} new line(s) from "{process_id}" (status={status}{drop_note}).'
 
 
+def _summary_shell_wait(parsed: dict[str, Any]) -> str:
+    process_id = str(parsed.get("process_id") or "?")
+    status = str(parsed.get("status") or "?")
+    lines = parsed.get("lines")
+    line_count = len(lines) if isinstance(lines, list) else 0
+    timed_out = bool(parsed.get("timed_out"))
+    timeout_note = ", timed out" if timed_out else ""
+    return f'Waited for "{process_id}" and read {line_count} new line(s) (status={status}{timeout_note}).'
+
+
 def _summary_shell_kill(parsed: dict[str, Any]) -> str:
     process_id = str(parsed.get("process_id") or "?")
     status = str(parsed.get("status") or "?")
@@ -415,6 +457,14 @@ def _summary_shell_list(parsed: dict[str, Any]) -> str:
         if isinstance(process, dict) and process.get("status") == "running"
     )
     return f"Listed {count} background process(es) ({running} running)."
+
+
+def _summary_shell_service(parsed: dict[str, Any]) -> str:
+    service_id = str(parsed.get("service_id") or "?")
+    status = str(parsed.get("status") or "?")
+    readiness = parsed.get("readiness") if isinstance(parsed.get("readiness"), dict) else {}
+    readiness_status = str(readiness.get("status") or "?")
+    return f'Durable service "{service_id}" status={status}, readiness={readiness_status}.'
 
 
 def _summary_session_set_workdir(parsed: dict[str, Any]) -> str:
@@ -1039,8 +1089,9 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
         name="shell_output",
         description=(
             "Read accumulated stdout/stderr from a background process started with shell_background. "
-            "Pass since=<next_seq> from the previous read to get only new lines. Output is "
-            "ring-buffered; very chatty processes may report dropped_lines > 0."
+            "Pass since=<next_seq> from the previous read to get only new lines. For a quiet "
+            "long-running process, prefer shell_wait instead of repeatedly polling shell_output. "
+            "Output is ring-buffered; very chatty processes may report dropped_lines > 0."
         ),
         parameters={
             "type": "object",
@@ -1058,6 +1109,38 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
             fallback_hint="If process_id is unknown, list active processes with shell_list first.",
             input_preview_formatter=_preview_shell_output,
             output_summary_formatter=_summary_shell_output,
+        ),
+    ),
+    BuiltinToolMetadata(
+        name="shell_wait",
+        description=(
+            "Wait inside one bounded tool call for a background process to emit new output, exit, "
+            "or either condition. Use this instead of repeatedly polling shell_output when no new "
+            "output is available."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "process_id": {"type": "string"},
+                "since": {"type": "integer", "default": 0},
+                "wait_seconds": {"type": "number", "default": 5.0, "minimum": 0, "maximum": 60},
+                "until": {
+                    "type": "string",
+                    "enum": ["output_available", "process_exited", "either"],
+                    "default": "either",
+                },
+                "max_bytes": {"type": "integer", "default": 12000, "minimum": 1},
+            },
+            "required": ["process_id"],
+        },
+        categories=("shell", "background", "read"),
+        rich=RichToolMetadata(
+            display_name="Wait For Background Output",
+            reasoning_hint="Block briefly for useful output or process completion without busy polling.",
+            action_hint="Wait for new output, exit, or either; returns the same cursor/status fields as shell_output.",
+            fallback_hint="If the process_id is unknown, list active processes with shell_list first.",
+            input_preview_formatter=_preview_shell_output,
+            output_summary_formatter=_summary_shell_wait,
         ),
     ),
     BuiltinToolMetadata(
@@ -1099,6 +1182,82 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
             action_hint="Enumerate active and recently-terminated bg processes.",
             fallback_hint="If empty, no bg processes are tracked in this session.",
             output_summary_formatter=_summary_shell_list,
+        ),
+    ),
+    BuiltinToolMetadata(
+        name="shell_service_start",
+        description=(
+            "Start an explicit durable service under the working root. Unlike shell_background, "
+            "this service is not reaped by AgentSession.close and must be stopped with "
+            "shell_service_stop when no longer needed. Provide readiness when the task requires "
+            "a server or daemon to remain available after finalization."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "cmd": {"type": "string"},
+                "cwd": {"type": "string"},
+                "cwd_base": _cwd_base_property(),
+                "readiness": _service_readiness_property(),
+            },
+            "required": ["cmd"],
+        },
+        categories=("shell", "background", "service"),
+        rich=RichToolMetadata(
+            display_name="Start Durable Service",
+            reasoning_hint="Use only when the task explicitly requires service persistence.",
+            action_hint="Start the service and check the returned readiness/status fields.",
+            fallback_hint=(
+                "For ordinary temporary dev servers, use shell_background so session close reaps it."
+            ),
+            input_preview_formatter=_preview_shell_run,
+            output_summary_formatter=_summary_shell_service,
+        ),
+    ),
+    BuiltinToolMetadata(
+        name="shell_service_status",
+        description=(
+            "Check a durable service by service_id and re-run its readiness probe. Use before "
+            "finalization for tasks that require a persistent server or daemon."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "service_id": {"type": "string"},
+            },
+            "required": ["service_id"],
+        },
+        categories=("shell", "background", "service", "read"),
+        rich=RichToolMetadata(
+            display_name="Check Durable Service",
+            reasoning_hint="Verify a durable service is still alive and ready.",
+            action_hint="Re-check status/readiness for a previously started durable service.",
+            fallback_hint="If the service is stale or unknown, start it explicitly with readiness.",
+            input_preview_formatter=_preview_shell_service_id,
+            output_summary_formatter=_summary_shell_service,
+        ),
+    ),
+    BuiltinToolMetadata(
+        name="shell_service_stop",
+        description=(
+            "Stop a durable service by service_id. Uses stored PID/PGID identity metadata to avoid "
+            "killing unrelated processes if the PID has been reused."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "service_id": {"type": "string"},
+            },
+            "required": ["service_id"],
+        },
+        categories=("shell", "background", "service"),
+        rich=RichToolMetadata(
+            display_name="Stop Durable Service",
+            reasoning_hint="Clean up a durable service once persistence is no longer required.",
+            action_hint="Terminate the durable service and remove its runtime metadata.",
+            fallback_hint="If the service is unknown, inspect status or runtime logs first.",
+            input_preview_formatter=_preview_shell_service_id,
+            output_summary_formatter=_summary_shell_service,
         ),
     ),
     BuiltinToolMetadata(
@@ -1262,7 +1421,9 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
             "`subagent_session_id`, `exit_code`, `usage`, and `final_text` (best-effort partial "
             "output). Common causes: unknown name, subagents disabled for the session, nested "
             "delegation attempted (subagents cannot themselves call `subagent_run`), no tools "
-            "remained after sandbox filtering, or the nested session raised.\n"
+            "remained after sandbox filtering, the nested session raised, or the subagent ended "
+            "without an authoritative final-report signal. Plain assistant transcript text "
+            "without that final signal is treated as degraded rather than success.\n"
             "\n"
             "Sandboxing facts\n"
             "- Each subagent definition declares an allow-list and/or deny-list of tools; "
@@ -1406,6 +1567,177 @@ def tool_input_preview(tool_name: str, args: dict[str, Any]) -> str:
     if spec is None or spec.rich.input_preview_formatter is None:
         return "-"
     return spec.rich.input_preview_formatter(args)
+
+
+@dataclass(frozen=True)
+class CompatibilityToolAlias:
+    alias: str
+    target: str
+    transform: ToolAliasTransform
+    description: str
+
+
+def _identity_alias_transform(args: dict[str, Any]) -> dict[str, Any]:
+    return copy.deepcopy(args)
+
+
+_COMPATIBILITY_TOOL_ALIASES: dict[str, CompatibilityToolAlias] = {
+    "read_file": CompatibilityToolAlias(
+        alias="read_file",
+        target="fs_read",
+        transform=_identity_alias_transform,
+        description="read_file is a schema-compatible alias for fs_read.",
+    ),
+}
+_AMBIGUOUS_TOOL_ALIASES: dict[str, tuple[str, ...]] = {
+    "read": ("fs_read", "fs_read_lines", "web_fetch"),
+    "write": ("fs_write", "fs_edit", "shell_run"),
+    "search": ("search_rg", "web_search"),
+}
+
+
+def build_unknown_tool_recovery_payload(
+    *,
+    requested_tool_name: str,
+    arguments: dict[str, Any],
+    available_tool_names: Collection[str],
+) -> dict[str, Any]:
+    requested = str(requested_tool_name or "").strip()
+    available = _safe_available_tool_names(available_tool_names)
+    alias = compatibility_tool_alias_for(
+        requested_tool_name=requested,
+        arguments=arguments,
+        available_tool_names=available,
+    )
+    ambiguous_targets = _AMBIGUOUS_TOOL_ALIASES.get(_normalize_tool_alias_name(requested), ())
+    suggestions = nearest_tool_name_suggestions(
+        requested_tool_name=requested,
+        available_tool_names=available,
+    )
+    guidance = _unknown_tool_guidance(
+        requested=requested,
+        available=available,
+        suggestions=suggestions,
+        alias=alias,
+        ambiguous_targets=ambiguous_targets,
+    )
+    payload: dict[str, Any] = {
+        "error": f"Unknown tool: {requested}",
+        "error_code": "unknown_tool",
+        "requested_tool_name": requested,
+        "available_tool_names": available,
+        "nearest_tool_suggestions": suggestions,
+        "safe_compatibility_alias": alias is not None,
+        "guidance": guidance,
+    }
+    if alias is not None:
+        payload["compatibility_alias"] = {
+            "alias": alias.alias,
+            "target": alias.target,
+            "description": alias.description,
+        }
+    if ambiguous_targets:
+        payload["ambiguous_alias_targets"] = [
+            target for target in ambiguous_targets if target in available
+        ]
+        payload["alias_ambiguous"] = True
+    return payload
+
+
+def compatibility_tool_alias_for(
+    *,
+    requested_tool_name: str,
+    arguments: dict[str, Any],
+    available_tool_names: Collection[str],
+) -> CompatibilityToolAlias | None:
+    normalized = _normalize_tool_alias_name(requested_tool_name)
+    alias = _COMPATIBILITY_TOOL_ALIASES.get(normalized)
+    if alias is None:
+        return None
+    available = set(_safe_available_tool_names(available_tool_names))
+    if alias.target not in available:
+        return None
+    try:
+        transformed = alias.transform(arguments)
+    except Exception:  # noqa: BLE001 - bad alias input should stay non-executing.
+        return None
+    if not isinstance(transformed, dict):
+        return None
+    return alias
+
+
+def transform_compatibility_tool_alias(
+    alias: CompatibilityToolAlias,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    transformed = alias.transform(arguments)
+    if not isinstance(transformed, dict):
+        raise ValueError(f"Compatibility alias {alias.alias!r} did not return arguments.")
+    return transformed
+
+
+def nearest_tool_name_suggestions(
+    *,
+    requested_tool_name: str,
+    available_tool_names: Collection[str],
+) -> list[str]:
+    requested = _normalize_tool_alias_name(requested_tool_name)
+    scored: list[tuple[float, str]] = []
+    for name in _safe_available_tool_names(available_tool_names):
+        normalized = _normalize_tool_alias_name(name)
+        if not requested or not normalized:
+            continue
+        score = SequenceMatcher(a=requested, b=normalized).ratio()
+        if requested in normalized or normalized in requested:
+            score = max(score, 0.8)
+        if score >= _UNKNOWN_TOOL_SUGGESTION_THRESHOLD:
+            scored.append((score, name))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [name for _score, name in scored[:_UNKNOWN_TOOL_MAX_SUGGESTIONS]]
+
+
+def _safe_available_tool_names(available_tool_names: Collection[str]) -> list[str]:
+    return sorted(
+        {str(name or "").strip() for name in available_tool_names if str(name or "").strip()}
+    )
+
+
+def _normalize_tool_alias_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(name or "").strip().casefold()).strip("_")
+
+
+def _unknown_tool_guidance(
+    *,
+    requested: str,
+    available: list[str],
+    suggestions: list[str],
+    alias: CompatibilityToolAlias | None,
+    ambiguous_targets: tuple[str, ...],
+) -> str:
+    if alias is not None:
+        return (
+            f"Tool {requested!r} is not registered, but a reviewed compatibility alias "
+            f"can run {alias.target!r} with the same argument schema."
+        )
+    if ambiguous_targets:
+        valid_targets = [target for target in ambiguous_targets if target in available]
+        target_text = ", ".join(valid_targets) if valid_targets else ", ".join(ambiguous_targets)
+        return (
+            f"Tool {requested!r} is ambiguous. Retry with one exact available tool name "
+            f"and its schema; possible targets include: {target_text}."
+        )
+    if suggestions:
+        return (
+            f"Tool {requested!r} is unavailable. Retry with one available tool schema; "
+            f"nearest valid name: {suggestions[0]}."
+        )
+    preview = ", ".join(available[:8])
+    if len(available) > 8:
+        preview += ", ..."
+    return (
+        f"Tool {requested!r} is unavailable. Retry with one exact available tool name "
+        f"and required arguments. Available tools: {preview or '(none)'}."
+    )
 
 
 def summarize_tool_output_chunk(tool_name: str, chunk: str) -> str:

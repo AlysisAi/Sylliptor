@@ -253,6 +253,9 @@ class CodexCliRuntimeAdapter:
                 exit_code=_INVALID_REQUEST_EXIT_CODE,
                 error=f"Delegated runtime cwd is not a directory: {cwd}",
             )
+        # Reject unsafe resume identifiers before probing the executable. This
+        # keeps request validation consistent even when Codex is not installed.
+        _validated_session_id(request.session_id)
         executable = _resolve_executable(settings.executable)
         if executable is None:
             return RuntimeTurnResult(

@@ -86,7 +86,7 @@ exclude = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--capture=sys"
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 
 [tool.ruff]
 line-length = 100

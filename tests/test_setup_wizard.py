@@ -1961,8 +1961,9 @@ def test_setup_typer_command_runs_wizard(monkeypatch) -> None:
 
     def fake_wizard() -> bool:
         called.append(True)
-        return True
+        return False
 
+    monkeypatch.setattr(cli_mod, "_try_setup_tui", lambda **_k: None)
     monkeypatch.setattr(setup_wizard_mod, "run_setup_wizard", fake_wizard)
 
     result = CliRunner().invoke(sylliptor_app, ["setup"])
@@ -1974,7 +1975,8 @@ def test_setup_typer_command_runs_wizard(monkeypatch) -> None:
 def test_setup_command_launches_chat_after_interactive_tui(monkeypatch) -> None:
     chat_calls: list[bool] = []
     monkeypatch.setattr(cli_mod, "_try_setup_tui", lambda **_k: True)  # TUI saved
-    monkeypatch.setattr(cli_mod, "_provider_auth_ready_for_chat", lambda: True)
+    monkeypatch.setattr(cli_mod, "load_config", lambda: AppConfig())
+    monkeypatch.setattr(cli_mod, "_maybe_run_startup_config_menu", lambda: None)
     monkeypatch.setattr(cli_mod, "_run_chat_after_setup", lambda: chat_calls.append(True))
 
     result = CliRunner().invoke(sylliptor_app, ["setup"])

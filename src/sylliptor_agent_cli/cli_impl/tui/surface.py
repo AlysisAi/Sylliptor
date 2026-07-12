@@ -18,6 +18,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 
+from ...llm_error_display import friendly_llm_error_message
 from ...surface.types import (
     ApprovalDecision,
     ApprovalRequest,
@@ -37,6 +38,12 @@ from .transcript import TuiTranscript
 # waiting on a slow model) can never paint into the transcript after the interrupt.
 # It is thread-local, so a *new* turn on a fresh worker is unaffected.
 _worker_ctx = threading.local()
+_TRACE_LEVELS = frozenset({"off", "compact", "full"})
+
+
+def _normalize_trace_level(value: object, *, fallback: str = "compact") -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in _TRACE_LEVELS else fallback
 
 
 def set_active_cancellation(token: object | None) -> None:
@@ -55,6 +62,28 @@ def _tool_label(name: str) -> str:
         return tool_display_name(name)
     except Exception:
         return name
+
+
+def _tool_detail(name: str, args: object) -> str:
+    """Short argument preview (search query, fetched URL, file path) so repeated
+    lines of the same tool stay distinguishable in the transcript. Shell-category
+    tools are excluded: full command lines can carry secrets and are not shown at
+    the default trace level."""
+    try:
+        from ...tools.registry import get_builtin_tool_metadata, tool_input_preview
+
+        spec = get_builtin_tool_metadata(name)
+        if spec is not None and "shell" in spec.categories:
+            return ""
+        detail = tool_input_preview(name, args if isinstance(args, dict) else {})
+    except Exception:
+        return ""
+    clean = " ".join(str(detail or "").split())
+    if clean in {"", "-"}:
+        return ""
+    if len(clean) > 64:
+        clean = clean[:63] + "…"
+    return clean
 
 
 def _format_ms(elapsed_ms: int) -> str:
@@ -84,8 +113,12 @@ _FORGE_FAIL_SET = {
     "merge_conflict",
     "blocked_integration",
     "blocked",
+    "interrupted",
+    "cancelled",
 }
+_FORGE_DONE_SET = {"done", "already_satisfied"}
 _FORGE_OBSOLETE_SET = {"superseded", "invalidated"}
+_FORGE_RUNNING_SET = {"in_progress", "running", "executing", "active"}
 
 
 class TuiSurface:
@@ -104,6 +137,14 @@ class TuiSurface:
         self._t = transcript
         self._auto_approve = auto_approve
         self._approval_ui = request_approval_ui
+        self._trace_level = "compact"
+        # Argument previews captured at tool start, keyed by call id, so the
+        # committed "✓ …" line can show what the tool actually worked on.
+        self._tool_details: dict[str, str] = {}
+        # Name of the tool whose "✓/↳" line was committed last, so consecutive
+        # runs of the same tool group as continuation rows instead of repeating
+        # the tool name (e.g. four "Search Web" lines).
+        self._last_tool_trace_name: str | None = None
         # Live footer HUD (context/tokens/cost) refresh. The agent runtime drives
         # the surface from the SAME worker thread that runs ``run_turn``, so this
         # callback reads session state at quiescent points (tool-end / message-done)
@@ -120,6 +161,27 @@ class TuiSurface:
         self._forge_last_refresh: float = 0.0
         self._forge_token: object | None = None
         self._forge_run_id: str = ""
+
+    @property
+    def trace_level(self) -> str:
+        return self._trace_level
+
+    @property
+    def reasoning_trace_enabled(self) -> bool:
+        """Safe provider summaries are requested only while trace is visible."""
+
+        return self._trace_level != "off"
+
+    def set_trace_level(self, level: str) -> str:
+        self._trace_level = _normalize_trace_level(level, fallback=self._trace_level)
+        self._t.set_trace_level(self._trace_level)
+        if self._trace_level == "off":
+            # A level change is display-only: close already-visible transient
+            # reasoning/status without touching the model request or transcript
+            # accounting state.
+            self._t.end_reasoning()
+            self._t.set_status(None)
+        return self._trace_level
 
     def _maybe_refresh_hud(self) -> None:
         """Refresh the footer HUD mid-turn (throttled), so context/tokens/cost tick
@@ -145,19 +207,33 @@ class TuiSurface:
         # The app echoes the user's line instantly on submit; here we just open a
         # fresh assistant block for the turn that is starting.
         self._t.begin_turn()
+        # Turn boundary: drop argument previews stranded by an interrupted turn
+        # (a cancelled turn's on_tool_end returns before popping its entry).
+        self._tool_details.clear()
 
     def on_assistant_token(self, delta: str) -> None:
         if _worker_cancelled():
             return
         self._t.stream_assistant(delta)
 
+    def on_reasoning_start(self, block_id: str) -> None:
+        """Open one provider-call-scoped safe-summary block."""
+
+        if _worker_cancelled() or self._trace_level == "off":
+            return
+        self._t.begin_reasoning(block_id)
+
     def on_reasoning_token(self, delta: str) -> None:
-        # Opt-in live reasoning channel (the agent runtime calls this only when
-        # the surface defines it). Streams the model's thinking into a dim block
-        # that collapses once the answer arrives.
-        if _worker_cancelled():
+        # Provider adapters route only safe, provider-generated summaries here;
+        # raw, encrypted, and redacted reasoning never reaches the surface.
+        if _worker_cancelled() or self._trace_level == "off":
             return
         self._t.stream_reasoning(delta)
+
+    def on_reasoning_end(self, block_id: str) -> None:
+        if _worker_cancelled():
+            return
+        self._t.end_reasoning(block_id)
 
     def on_assistant_message_done(self, text: str) -> None:
         if _worker_cancelled():
@@ -168,7 +244,7 @@ class TuiSurface:
         self._maybe_refresh_hud()
 
     def on_progress_update(self, message: str) -> None:
-        if _worker_cancelled():
+        if _worker_cancelled() or self._trace_level == "off":
             return
         self._t.set_status(_truncate(message, limit=80) or None)
 
@@ -235,7 +311,7 @@ class TuiSurface:
         done = failed = remaining = 0
         for _tid, _title, status in tasks:
             sl = status.strip().lower()
-            if sl == "done":
+            if sl in _FORGE_DONE_SET:
                 done += 1
             elif sl in _FORGE_FAIL_SET:
                 failed += 1
@@ -255,6 +331,49 @@ class TuiSurface:
                     parts.append(f"{remaining} remaining")
                 summary = "Done · " + " · ".join(parts) if ok else "Finished · " + " · ".join(parts)
         self._t.forge_finish({tid: status for tid, _title, status in tasks}, summary, ok=ok)
+        self._forge_paths = None
+        self._forge_token = None
+        self._forge_run_id = ""
+
+    def interrupt_forge(self, summary: str = "Interrupted.") -> None:
+        """Mark any live in-progress Forge tasks interrupted and freeze the view."""
+        path = getattr(self._forge_paths, "plan_json_path", None)
+        updated: dict[str, str] = {}
+        if path is not None:
+            try:
+                import json
+                from datetime import datetime, timezone
+
+                data = json.loads(path.read_text(encoding="utf-8"))
+                changed = False
+                for task in data.get("tasks") or []:
+                    if not isinstance(task, dict):
+                        continue
+                    status = str(task.get("status") or "").strip().lower()
+                    task_id = str(task.get("id") or "").strip()
+                    if not task_id or status not in _FORGE_RUNNING_SET:
+                        continue
+                    task["status"] = "interrupted"
+                    task["last_error"] = "Interrupted by user."
+                    updated[task_id] = "interrupted"
+                    changed = True
+                if changed:
+                    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    path.write_text(
+                        json.dumps(data, indent=2, sort_keys=False) + "\n",
+                        encoding="utf-8",
+                    )
+            except Exception:
+                updated = {}
+        tasks = self._read_plan_tasks()
+        if tasks:
+            self._t.forge_sync_tasks(tasks)
+            status_map = {tid: status for tid, _title, status in tasks}
+        else:
+            status_map = dict(updated)
+            if status_map:
+                self._t.forge_update_statuses(status_map)
+        self._t.forge_finish(status_map, summary, ok=False)
         self._forge_paths = None
         self._forge_token = None
         self._forge_run_id = ""
@@ -333,20 +452,62 @@ class TuiSurface:
         if _worker_cancelled():
             return
         label = _tool_label(event.name)
+        arg_detail = _tool_detail(event.name, event.args)
         self._t.end_reasoning()
-        self._t.set_status(f"{label}…")
+        if self._trace_level == "off":
+            self._t.set_status("Working…")
+            return
+        if arg_detail and event.tool_call_id:
+            # Stale-entry backstop: evict oldest first, never in-flight wholesale.
+            while len(self._tool_details) > 256:
+                self._tool_details.pop(next(iter(self._tool_details)))
+            self._tool_details[event.tool_call_id] = arg_detail
+        if self._trace_level == "full":
+            detail = f" · {arg_detail}" if arg_detail else ""
+            self._t.append("trace", f"▸ {label}{detail}")
+            self._last_tool_trace_name = None
+        # Keep the transient status short so it stays on one row on narrow
+        # terminals; the committed "✓" line carries the fuller preview.
+        status_detail = arg_detail if len(arg_detail) <= 40 else arg_detail[:39] + "…"
+        self._t.set_status(f"{label} · {status_detail}…" if status_detail else f"{label}…")
 
     def on_tool_output(self, event: ToolOutputEvent) -> None:
         return
 
     def on_tool_end(self, event: ToolEndEvent) -> None:
+        # Pop before the cancellation check so an interrupted turn cannot strand
+        # the entry (and a reused call id can never show a stale preview).
+        arg_detail = self._tool_details.pop(event.tool_call_id, "")
         if _worker_cancelled():
             return
         label = _tool_label(event.name)
+        if arg_detail:
+            label = f"{label} · {arg_detail}"
         elapsed = _format_ms(event.elapsed_ms)
         suffix = f" ({elapsed})" if elapsed else ""
-        if event.status == "done":
-            self._t.append("trace", f"✓ {label}{suffix}")
+        if event.status == "done" and self._trace_level != "off":
+            # Consecutive successes of the SAME tool group under one header:
+            #   ✓ Search Web · current date today (1.5s)
+            #     ↳ today's date (352ms)
+            # The adjacency check keeps grouping honest — anything else appended
+            # in between (a message, an error, another tool) restarts a full line.
+            entries = self._t.entries
+            grouped = (
+                arg_detail != ""
+                and self._last_tool_trace_name == event.name
+                and bool(entries)
+                and entries[-1][0] == "trace"
+                and (entries[-1][1].startswith("✓") or entries[-1][1].startswith("  ↳"))
+            )
+            if grouped:
+                self._t.append("trace", f"  ↳ {arg_detail}{suffix}")
+            else:
+                self._t.append("trace", f"✓ {label}{suffix}")
+            self._last_tool_trace_name = event.name
+        elif isinstance(event.meta, dict) and event.meta.get("approval_declined"):
+            err = str(event.meta.get("error") or "")
+            detail = f": {_truncate(err)}" if err else ""
+            self._t.append("error", f"✗ {label} approval declined{suffix}{detail}")
         else:
             err = ""
             if isinstance(event.meta, dict):
@@ -360,18 +521,18 @@ class TuiSurface:
 
     # --------------------------------------------------------------- subagents
     def on_subagent_start(self, event: SubagentStartEvent) -> None:
-        if _worker_cancelled():
+        if _worker_cancelled() or self._trace_level == "off":
             return
         self._t.append("trace", f"↪ {event.name} · {event.mode}")
 
     def on_subagent_end(self, event: SubagentEndEvent) -> None:
-        if _worker_cancelled():
+        if _worker_cancelled() or self._trace_level == "off":
             return
         status = "finished" if event.status == "success" else event.status
         self._t.append("trace", f"↩ {event.name} · {status} · {event.steps_completed} steps")
 
     def on_patch_generated(self, event: PatchEvent) -> None:
-        if _worker_cancelled():
+        if _worker_cancelled() or self._trace_level == "off":
             return
         files = ", ".join(event.files[:5]) or "patch"
         self._t.append("trace", f"✎ patch · {files}")
@@ -380,7 +541,7 @@ class TuiSurface:
     def on_error(self, err: str) -> None:
         if _worker_cancelled():
             return
-        self._t.append("error", _truncate(str(err), limit=480) or "error")
+        self._t.append("error", _truncate(friendly_llm_error_message(err), limit=480) or "error")
         self._t.set_status(None)
 
     def on_warning(self, warning: str) -> None:
@@ -407,7 +568,11 @@ class TuiSurface:
             if isinstance(decision, ApprovalDecision):
                 return decision
         # No interactive approver reachable → fail closed.
-        self._t.append("warn", f"Denied {request.kind}: approval required (auto-approve is off).")
+        self._t.append(
+            "warn",
+            f"Denied {request.kind}: approval required "
+            "(approvals are set to ask, but no approval UI is available).",
+        )
         return ApprovalDecision(allow=False)
 
     # ----------------------------------------------------------------- emit path

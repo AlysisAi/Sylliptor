@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import subprocess
 from pathlib import Path
@@ -233,6 +234,74 @@ def test_durable_service_bwrap_launch_removes_die_with_parent(
 
     assert launch["popen_args"] == ["bwrap", "sentinel"]
     assert launch["env"] == {"BASE": "1"}
+
+
+def test_durable_service_docker_tcp_requires_explicit_networking(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(durable_service_manager_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        durable_service_manager_mod.shutil,
+        "which",
+        lambda name: "/usr/local/bin/docker" if name == "docker" else None,
+    )
+    manager = DurableServiceManager(
+        root=tmp_path,
+        state_dir=tmp_path / "services",
+        settings=ShellSandboxSettings(mode="strict", backend="docker", network="off"),
+    )
+
+    with pytest.raises(RuntimeError, match="workspace_preview_start"):
+        manager._build_launch(
+            cmd="python -m http.server 4173",
+            cwd=tmp_path,
+            service_id="svc_test",
+            readiness={"type": "tcp", "host": "127.0.0.1", "port": 4173},
+        )
+
+
+def test_durable_service_docker_tcp_publishes_loopback_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(durable_service_manager_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        durable_service_manager_mod.shutil,
+        "which",
+        lambda name: "/usr/local/bin/docker" if name == "docker" else None,
+    )
+
+    def fake_build_docker_argv(**kwargs: object) -> tuple[list[str], dict[str, str]]:
+        captured.update(kwargs)
+        return ["docker", "sentinel"], {}
+
+    monkeypatch.setattr(
+        durable_service_manager_mod,
+        "_build_docker_argv",
+        fake_build_docker_argv,
+    )
+    manager = DurableServiceManager(
+        root=tmp_path,
+        state_dir=tmp_path / "services",
+        settings=ShellSandboxSettings(mode="strict", backend="docker", network="on"),
+    )
+
+    launch = manager._build_launch(
+        cmd="python -m http.server 4173 --bind 0.0.0.0",
+        cwd=tmp_path,
+        service_id="svc_test",
+        readiness={"type": "tcp", "host": "127.0.0.1", "port": 4173},
+    )
+
+    assert launch["backend"] == "docker"
+    published_ports = captured["published_ports"]
+    assert isinstance(published_ports, tuple)
+    assert len(published_ports) == 1
+    publish_host, host_port, container_port = published_ports[0]
+    assert ipaddress.ip_address(publish_host).is_loopback
+    assert (host_port, container_port) == (4173, 4173)
 
 
 def test_bwrap_background_runner_resolves_cgroup_support_outside_argv_helper(

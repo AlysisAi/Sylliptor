@@ -79,6 +79,54 @@ def test_first_party_compatibility_presets_are_explicit_legacy_fallbacks() -> No
     assert gemini.web_search_adapter == "gemini_grounding"
 
 
+def test_provider_presets_select_documented_hosted_search_adapters() -> None:
+    expected = {
+        "sylliptor": "openrouter_web",
+        "openai": "openai_responses",
+        "openai-responses": "openai_responses",
+        "anthropic": "anthropic_messages",
+        "anthropic-compat": "anthropic_messages",
+        "anthropic-native": "anthropic_messages",
+        "gemini": "gemini_grounding",
+        "gemini-compat": "gemini_grounding",
+        "gemini-native": "gemini_grounding",
+        "qwen-intl": "dashscope_chat",
+        "qwen-us": "dashscope_chat",
+        "qwen-cn": "dashscope_chat",
+        "zhipu": "zhipu_web_search",
+        "moonshot": "moonshot_kimi",
+        "minimax": "minimax_coding_plan",
+        "bytedance": "volcengine_web_search",
+        "groq": "groq_compound",
+        "mistral": "mistral_conversations",
+        "xai": "xai_responses",
+        "cohere": "cohere_web_search",
+        "openrouter": "openrouter_web",
+        "perplexity": "perplexity_sonar",
+    }
+
+    actual = {key: get_preset(key).web_search_adapter for key in expected}  # type: ignore[union-attr]
+
+    assert actual == expected
+
+
+def test_presets_without_provider_hosted_search_remain_model_independent() -> None:
+    for key in (
+        "deepseek",
+        "01ai",
+        "cerebras",
+        "together",
+        "fireworks",
+        "ollama",
+        "lm-studio",
+        "vllm",
+        "custom",
+    ):
+        preset = get_preset(key)
+        assert preset is not None
+        assert preset.web_search_adapter == "auto"
+
+
 def test_compatibility_presets_stay_openai_compatible() -> None:
     for preset in PROFILE_PRESETS:
         if preset.key in {

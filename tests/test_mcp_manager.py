@@ -2315,7 +2315,7 @@ def test_create_session_persists_runtime_kind_and_mcp_startup_metadata(
 
     assert session_start["runtime_kind"] == "swarm_worker"
     assert payload["runtime_kind"] == "swarm_worker"
-    assert payload["step_budget_policy"] == "fixed"
+    assert payload["step_budget_policy"] == "limited"
     assert payload["task_max_steps"] == 41
     assert payload["subagent_max_steps"] == 9
     assert payload["enable_chat_turn_step_budget"] is True

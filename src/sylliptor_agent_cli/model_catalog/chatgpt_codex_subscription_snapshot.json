@@ -1,0 +1,248 @@
+{
+  "client_version": "0.144.0",
+  "endpoint": "https://chatgpt.com/backend-api/codex/models",
+  "fetched_at_utc": "2026-07-11T13:47:30Z",
+  "input_sha256": "5537417f270222e326397566202e7673687a0ff207503264c495fd664c805555",
+  "models": [
+    {
+      "context_window_tokens": 372000,
+      "default_reasoning_effort": "medium",
+      "description": "Latest frontier agentic coding model.",
+      "id": "gpt-5.6-sol",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "label": "GPT-5.6-Sol",
+      "max_output_tokens": null,
+      "priority": 1,
+      "reasoning_efforts": [
+        {
+          "description": "Fast responses with lighter reasoning",
+          "id": "low"
+        },
+        {
+          "description": "Balances speed and reasoning depth for everyday tasks",
+          "id": "medium"
+        },
+        {
+          "description": "Greater reasoning depth for complex problems",
+          "id": "high"
+        },
+        {
+          "description": "Extra high reasoning depth for complex problems",
+          "id": "xhigh"
+        },
+        {
+          "description": "Maximum reasoning depth for the hardest problems",
+          "id": "max"
+        },
+        {
+          "description": "Maximum reasoning with automatic task delegation",
+          "id": "ultra"
+        }
+      ]
+    },
+    {
+      "context_window_tokens": 372000,
+      "default_reasoning_effort": "medium",
+      "description": "Balanced agentic coding model for everyday work.",
+      "id": "gpt-5.6-terra",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "label": "GPT-5.6-Terra",
+      "max_output_tokens": null,
+      "priority": 2,
+      "reasoning_efforts": [
+        {
+          "description": "Fast responses with lighter reasoning",
+          "id": "low"
+        },
+        {
+          "description": "Balances speed and reasoning depth for everyday tasks",
+          "id": "medium"
+        },
+        {
+          "description": "Greater reasoning depth for complex problems",
+          "id": "high"
+        },
+        {
+          "description": "Extra high reasoning depth for complex problems",
+          "id": "xhigh"
+        },
+        {
+          "description": "Maximum reasoning depth for the hardest problems",
+          "id": "max"
+        },
+        {
+          "description": "Maximum reasoning with automatic task delegation",
+          "id": "ultra"
+        }
+      ]
+    },
+    {
+      "context_window_tokens": 372000,
+      "default_reasoning_effort": "medium",
+      "description": "Fast and affordable agentic coding model.",
+      "id": "gpt-5.6-luna",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "label": "GPT-5.6-Luna",
+      "max_output_tokens": null,
+      "priority": 3,
+      "reasoning_efforts": [
+        {
+          "description": "Fast responses with lighter reasoning",
+          "id": "low"
+        },
+        {
+          "description": "Balances speed and reasoning depth for everyday tasks",
+          "id": "medium"
+        },
+        {
+          "description": "Greater reasoning depth for complex problems",
+          "id": "high"
+        },
+        {
+          "description": "Extra high reasoning depth for complex problems",
+          "id": "xhigh"
+        },
+        {
+          "description": "Maximum reasoning depth for the hardest problems",
+          "id": "max"
+        }
+      ]
+    },
+    {
+      "context_window_tokens": 272000,
+      "default_reasoning_effort": "medium",
+      "description": "Frontier model for complex coding, research, and real-world work.",
+      "id": "gpt-5.5",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "label": "GPT-5.5",
+      "max_output_tokens": null,
+      "priority": 7,
+      "reasoning_efforts": [
+        {
+          "description": "Fast responses with lighter reasoning",
+          "id": "low"
+        },
+        {
+          "description": "Balances speed and reasoning depth for everyday tasks",
+          "id": "medium"
+        },
+        {
+          "description": "Greater reasoning depth for complex problems",
+          "id": "high"
+        },
+        {
+          "description": "Extra high reasoning depth for complex problems",
+          "id": "xhigh"
+        }
+      ]
+    },
+    {
+      "context_window_tokens": 272000,
+      "default_reasoning_effort": "medium",
+      "description": "Strong model for everyday coding.",
+      "id": "gpt-5.4",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "label": "GPT-5.4",
+      "max_output_tokens": null,
+      "priority": 16,
+      "reasoning_efforts": [
+        {
+          "description": "Fast responses with lighter reasoning",
+          "id": "low"
+        },
+        {
+          "description": "Balances speed and reasoning depth for everyday tasks",
+          "id": "medium"
+        },
+        {
+          "description": "Greater reasoning depth for complex problems",
+          "id": "high"
+        },
+        {
+          "description": "Extra high reasoning depth for complex problems",
+          "id": "xhigh"
+        }
+      ]
+    },
+    {
+      "context_window_tokens": 272000,
+      "default_reasoning_effort": "medium",
+      "description": "Small, fast, and cost-efficient model for simpler coding tasks.",
+      "id": "gpt-5.4-mini",
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "label": "GPT-5.4-Mini",
+      "max_output_tokens": null,
+      "priority": 23,
+      "reasoning_efforts": [
+        {
+          "description": "Fast responses with lighter reasoning",
+          "id": "low"
+        },
+        {
+          "description": "Balances speed and reasoning depth for everyday tasks",
+          "id": "medium"
+        },
+        {
+          "description": "Greater reasoning depth for complex problems",
+          "id": "high"
+        },
+        {
+          "description": "Extra high reasoning depth for complex problems",
+          "id": "xhigh"
+        }
+      ]
+    },
+    {
+      "context_window_tokens": 128000,
+      "default_reasoning_effort": "high",
+      "description": "Ultra-fast coding model.",
+      "id": "gpt-5.3-codex-spark",
+      "input_modalities": [
+        "text"
+      ],
+      "label": "GPT-5.3-Codex-Spark",
+      "max_output_tokens": null,
+      "priority": 26,
+      "reasoning_efforts": [
+        {
+          "description": "Fast responses with lighter reasoning",
+          "id": "low"
+        },
+        {
+          "description": "Balances speed and reasoning depth for everyday tasks",
+          "id": "medium"
+        },
+        {
+          "description": "Greater reasoning depth for complex problems",
+          "id": "high"
+        },
+        {
+          "description": "Extra high reasoning depth for complex problems",
+          "id": "xhigh"
+        }
+      ]
+    }
+  ],
+  "refresh_policy": "manual_reviewed_only",
+  "schema_version": 1,
+  "source": "bundled_chatgpt_codex_subscription_snapshot",
+  "usage": "capacity_and_capability_fallback_only_not_entitlement"
+}

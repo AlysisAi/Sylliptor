@@ -11,6 +11,7 @@ from ...config import (
     clear_persisted_api_key,
     config_path,
     credentials_path,
+    ensure_subscription_menu_managed_key,
     load_config,
     resolve_api_key,
     save_config,
@@ -64,6 +65,7 @@ def config_set(
     console = _console()
     cfg = _patchable("load_config", load_config)()
     try:
+        ensure_subscription_menu_managed_key(cfg, key)
         cfg = set_config_value(cfg, key, value)
         save_config(cfg)
     except ConfigError as e:

@@ -18,6 +18,8 @@ _SAME_BATCH_READ_CACHE_SAFE_TOOL_NAMES = {
     "web_fetch",
     "web_search",
     "symbol_search",
+    "test_discover",
+    "repo_map",
     "search_rg",
     "history_search",
     "skill_read",

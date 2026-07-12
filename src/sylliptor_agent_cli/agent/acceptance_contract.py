@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import re
 import shlex
@@ -13,6 +14,10 @@ from typing import Any
 from ..config import normalize_verify_command_list
 from ..repo_scan import RepoScanResult
 from ..runtime_artifacts import is_runtime_artifact_path
+from ..verification_command_analysis import (
+    CheckerEntrypointFingerprint,
+    analyze_verification_command,
+)
 from .verification_commands import _matching_effective_verification_commands
 
 
@@ -206,6 +211,7 @@ class AcceptanceWorkspaceSnapshot:
     preexisting_paths: frozenset[str] = frozenset()
     preexisting_test_paths: frozenset[str] = frozenset()
     preexisting_checker_paths: frozenset[str] = frozenset()
+    preexisting_checker_fingerprints: tuple[CheckerEntrypointFingerprint, ...] = tuple()
     preexisting_verify_commands: tuple[str, ...] = tuple()
 
     def as_payload(self) -> dict[str, Any]:
@@ -213,6 +219,9 @@ class AcceptanceWorkspaceSnapshot:
             "preexisting_paths": sorted(self.preexisting_paths)[:200],
             "preexisting_test_paths": sorted(self.preexisting_test_paths)[:200],
             "preexisting_checker_paths": sorted(self.preexisting_checker_paths)[:200],
+            "preexisting_checker_fingerprints": [
+                item.as_payload() for item in self.preexisting_checker_fingerprints[:200]
+            ],
             "preexisting_verify_commands": list(self.preexisting_verify_commands),
         }
 
@@ -408,7 +417,12 @@ def build_acceptance_contract(
     repo_scan: RepoScanResult | None = None,
     planning_constraints: Any | None = None,
 ) -> AcceptanceContract:
-    snapshot = capture_acceptance_workspace_snapshot(root=root, repo_scan=repo_scan)
+    snapshot = capture_acceptance_workspace_snapshot(
+        root=root,
+        repo_scan=repo_scan,
+        authoritative_verification_commands=authoritative_verification_commands,
+        effective_verification_commands=effective_verification_commands,
+    )
     texts = [str(instruction or "").strip(), str(task_brief or "").strip()]
     texts = [item for item in texts if item]
     criteria: list[AcceptanceCriterion] = []
@@ -621,6 +635,8 @@ def capture_acceptance_workspace_snapshot(
     *,
     root: Path,
     repo_scan: RepoScanResult | None = None,
+    authoritative_verification_commands: list[str] | None = None,
+    effective_verification_commands: list[str] | None = None,
 ) -> AcceptanceWorkspaceSnapshot:
     preexisting_paths: set[str] = set()
     preexisting_test_paths: set[str] = set()
@@ -647,10 +663,28 @@ def capture_acceptance_workspace_snapshot(
             preexisting_test_paths.add(candidate)
         if _is_checker_path(candidate):
             preexisting_checker_paths.add(candidate)
+    for command in normalize_verify_command_list(
+        [
+            *normalize_verify_command_list(authoritative_verification_commands or []),
+            *normalize_verify_command_list(effective_verification_commands or []),
+        ]
+    ):
+        analysis = analyze_verification_command(command, trusted=True, workspace_root=root)
+        for path in analysis.checker_entrypoint_paths:
+            normalized_path = _normalize_rel_path(path)
+            if normalized_path and (root / normalized_path).exists():
+                preexisting_checker_paths.add(normalized_path)
+                preexisting_test_paths.add(normalized_path)
+                preexisting_paths.add(normalized_path)
+    checker_fingerprints = tuple(
+        _fingerprint_checker_path(root=root, relpath=path)
+        for path in sorted(preexisting_checker_paths)
+    )
     return AcceptanceWorkspaceSnapshot(
         preexisting_paths=frozenset(preexisting_paths),
         preexisting_test_paths=frozenset(preexisting_test_paths),
         preexisting_checker_paths=frozenset(preexisting_checker_paths),
+        preexisting_checker_fingerprints=checker_fingerprints,
         preexisting_verify_commands=tuple(
             normalize_verify_command_list(
                 repo_scan.likely_test_commands if repo_scan is not None else []
@@ -680,6 +714,7 @@ def record_acceptance_tool_effect(
     command_passed = _command_passed(status=status, result=result)
     origin = classify_evidence_origin(
         contract=contract,
+        root=root,
         command=command,
         touched_paths=touched_paths,
         known_verification_commands=known_verification_commands,
@@ -704,7 +739,11 @@ def record_acceptance_tool_effect(
             status=status,
         )
     )
-    if normalized_tool in {"shell_service_start", "shell_service_status"}:
+    if normalized_tool in {
+        "shell_service_start",
+        "shell_service_status",
+        "workspace_preview_start",
+    }:
         criterion_ids.extend(
             _update_durable_service_criteria(
                 contract=contract,
@@ -812,10 +851,17 @@ def classify_evidence_origin(
     contract: AcceptanceContract,
     command: str,
     touched_paths: set[str],
+    root: Path | None = None,
     known_verification_commands: list[str] | None = None,
     verification_authoritative: bool = False,
 ) -> EvidenceOrigin:
     command = _normalize_command(command)
+    if command and _command_references_mutable_preexisting_checker(
+        command,
+        contract=contract,
+        root=root,
+    ):
+        return EvidenceOrigin.SELF_AUTHORED
     if command and verification_authoritative:
         matches = _matching_effective_verification_commands(
             observed_command=command,
@@ -1403,6 +1449,75 @@ def _command_references_preexisting_checker(command: str, contract: AcceptanceCo
     )
 
 
+def _command_references_mutable_preexisting_checker(
+    command: str,
+    *,
+    contract: AcceptanceContract,
+    root: Path | None,
+) -> bool:
+    if root is None:
+        return False
+    fingerprints = {
+        _normalize_rel_path(item.display_path): item
+        for item in contract.snapshot.preexisting_checker_fingerprints
+    }
+    for path in _command_path_tokens(command):
+        if path not in contract.snapshot.preexisting_checker_paths:
+            continue
+        before = fingerprints.get(path)
+        if before is None:
+            return True
+        after = _fingerprint_checker_path(root=root, relpath=path)
+        if (
+            before.resolved_path != after.resolved_path
+            or before.is_regular_file != after.is_regular_file
+            or before.size != after.size
+            or before.sha256 != after.sha256
+        ):
+            return True
+    return False
+
+
+def _fingerprint_checker_path(
+    *,
+    root: Path,
+    relpath: str,
+    max_bytes: int = 2_000_000,
+) -> CheckerEntrypointFingerprint:
+    display_path = _normalize_rel_path(relpath)
+    candidate = (root / display_path).resolve(strict=False)
+    try:
+        resolved = candidate.resolve(strict=True)
+        stat = resolved.stat()
+    except OSError:
+        return CheckerEntrypointFingerprint(
+            display_path=display_path,
+            resolved_path=str(candidate),
+            is_regular_file=False,
+            size=None,
+            sha256=None,
+        )
+    if not resolved.is_file() or stat.st_size > max_bytes:
+        return CheckerEntrypointFingerprint(
+            display_path=display_path,
+            resolved_path=str(resolved),
+            is_regular_file=resolved.is_file(),
+            size=int(stat.st_size),
+            sha256=None,
+        )
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return CheckerEntrypointFingerprint(
+        display_path=display_path,
+        resolved_path=str(resolved),
+        is_regular_file=True,
+        size=int(stat.st_size),
+        sha256=digest.hexdigest(),
+    )
+
+
 def _command_path_tokens(command: str) -> list[str]:
     try:
         parts = shlex.split(command)
@@ -1600,7 +1715,8 @@ def _update_repo_surface_criteria(
         if origin == EvidenceOrigin.SELF_AUTHORED:
             criterion.status = AcceptanceCriterionStatus.BLOCKED
             criterion.failure_summary = (
-                "Self-authored test evidence is supplemental for this criterion"
+                "Self-authored or mutable_authoritative_checker evidence is supplemental "
+                "for this criterion"
             )
         elif evidence_allowed is False:
             criterion.status = AcceptanceCriterionStatus.BLOCKED

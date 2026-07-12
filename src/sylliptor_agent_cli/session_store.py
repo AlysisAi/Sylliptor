@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import getpass
 import json
 import os
+import platform
 import re
 import threading
 from collections.abc import Iterable
@@ -37,11 +39,59 @@ def resolve_sessions_dir(cfg: AppConfig) -> Path:
     return default_sessions_dir()
 
 
+def local_session_owner() -> str | None:
+    """Deterministic identity (``os-user@hostname``) of the local account.
+
+    Session logs are stamped with their creator's identity so listing surfaces
+    (``/resume``, "latest session" defaults) can hide conversations that were
+    not created by this account — regardless of how a foreign log file arrived
+    in the sessions directory (copied archive, baked disk image, shared host
+    with distinct accounts). Purely local and deterministic: no network, no
+    model/provider involvement. Returns ``None`` when neither component can be
+    resolved; callers must treat that as "no local identity established".
+    """
+    try:
+        user = getpass.getuser().strip()
+    except (KeyError, OSError, ImportError):
+        # No passwd entry / no LOGNAME-USER-USERNAME env; on py<=3.12 the
+        # env-less fallback is a bare ``import pwd`` which raises
+        # ModuleNotFoundError on Windows-family hosts (3.13+ maps it to
+        # OSError) — this function must degrade to None, never crash startup.
+        user = ""
+    try:
+        host = platform.node().strip()
+    except OSError:
+        host = ""
+    if not user and not host:
+        return None
+    return f"{user}@{host}"
+
+
 @dataclass
 class SessionInfo:
     session_id: str
     path: Path
     mtime: float
+    # Log-derived scoping/recency metadata (all optional so any existing
+    # ``SessionInfo(session_id=..., path=..., mtime=...)`` construction keeps
+    # working). ``workspace_root``/``git_root`` come from the session log's own
+    # events (not the filesystem) and let ``/resume`` show only the current
+    # workspace's chats. ``last_event_ts`` is the log's own UTC ISO timestamp of
+    # the most recent event, used for the displayed "when" instead of file mtime
+    # (which drifts after copies/extracts).
+    # ``owner`` is the log-recorded creator identity (see
+    # :func:`local_session_owner`); listings hide sessions stamped by a
+    # different account so one user's conversations never surface for another.
+    # ``last_owner`` is the identity stamped on the log's newest event — the
+    # account that most recently used the session. Matching either lets an
+    # explicit ``/resume <id>`` re-adopt a session whose recorded identity
+    # drifted (e.g. after a hostname rename): the resume appends fresh events
+    # with the current identity, so the session self-heals into the listing.
+    workspace_root: str | None = None
+    git_root: str | None = None
+    last_event_ts: str | None = None
+    owner: str | None = None
+    last_owner: str | None = None
 
 
 class SessionStore:
@@ -65,6 +115,7 @@ class SessionStore:
         runtime_kind: str | None = None,
         active_workdir: str | None = None,
         active_workdir_relpath: str | None = None,
+        owner: str | None = None,
     ) -> None:
         self.enabled = enabled
         self.sessions_dir = sessions_dir
@@ -72,6 +123,8 @@ class SessionStore:
         self.cwd = cwd
         self.repo_root = repo_root
         self.workspace_root = workspace_root
+        # Stamp every log with its creator so listings can scope per account.
+        self.owner = owner if owner is not None else local_session_owner()
         self.focus_dir = focus_dir
         self.git_root = git_root
         self.workspace_kind = workspace_kind
@@ -140,6 +193,8 @@ class SessionStore:
         }
         if self.workspace_root is not None:
             event["workspace_root"] = self.workspace_root
+        if self.owner is not None:
+            event["owner"] = self.owner
         if self.focus_dir is not None:
             event["focus_dir"] = self.focus_dir
         if self.git_root is not None:
@@ -275,6 +330,227 @@ class SessionStore:
             self._fh = None
 
 
+def _nonempty_str(value: Any) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            return text
+    return None
+
+
+def canonical_workspace_path(raw: str | Path | None) -> Path | None:
+    """Canonicalize a workspace/git-root path for identity comparison.
+
+    Uses ``Path.resolve()`` so trailing slashes, ``.``/``..`` segments, and the
+    OS's own case rules are absorbed (case-insensitive on Windows via the
+    resolved canonical casing, case-sensitive on POSIX) without any per-platform
+    special-casing. Returns ``None`` for empty/unresolvable input. This is
+    deterministic and provider/model-agnostic by construction.
+    """
+    text = _nonempty_str(raw if isinstance(raw, str) else (str(raw) if raw is not None else None))
+    if text is None:
+        return None
+    try:
+        return Path(text).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def session_belongs_to_workspace(
+    info: SessionInfo,
+    current_workspace_root: Path | None,
+    current_git_root: Path | None = None,
+) -> bool:
+    """Return True if ``info`` (a session log) belongs to the current workspace.
+
+    Primary identity is the log's recorded ``workspace_root``. When that is
+    absent (a legacy log predating workspace_root recording) we fall back to
+    ``git_root``. When neither yields a deterministic match we return False:
+    such strays are hidden from the scoped picker but remain reachable by an
+    explicit ``/resume <id>``. ``current_workspace_root``/``current_git_root``
+    must already be canonicalized via :func:`canonical_workspace_path`.
+    """
+    if info.workspace_root is not None:
+        if current_workspace_root is None:
+            return False
+        session_ws = canonical_workspace_path(info.workspace_root)
+        return session_ws is not None and session_ws == current_workspace_root
+    if info.git_root is not None and current_git_root is not None:
+        session_git = canonical_workspace_path(info.git_root)
+        return session_git is not None and session_git == current_git_root
+    return False
+
+
+def session_belongs_to_owner(info: SessionInfo, current_owner: str | None) -> bool:
+    """Return True if ``info`` (a session log) may be listed for this account.
+
+    A log stamped with an owner is only listed when the current identity
+    matches either the creator stamp (``owner``, from the log's first events)
+    or the newest event's stamp (``last_owner``) — compared case-insensitively,
+    since Windows usernames and DNS hostnames are not case-significant. The
+    ``last_owner`` leg is the self-heal path: when a user's identity drifts
+    (hostname rename, WSL vs native), one explicit ``/resume <id>`` appends
+    fresh events under the new identity and the session lists again. A foreign
+    log stays hidden either way — both its stamps are foreign.
+
+    Legacy logs with no recorded owner on either end stay visible so an
+    upgrade never empties a user's own list (workspace scoping still applies
+    to them). When the log records an owner but the local identity cannot be
+    established, the log is hidden: a foreign-stamped conversation must never
+    surface on an unidentifiable account. Hidden logs remain reachable by an
+    explicit ``/resume <id>`` on the machine that holds them.
+    """
+    recorded_first = _nonempty_str(info.owner)
+    recorded_last = _nonempty_str(info.last_owner)
+    if recorded_first is None and recorded_last is None:
+        return True
+    current = _nonempty_str(current_owner)
+    if current is None:
+        return False
+    current_folded = current.casefold()
+    if recorded_first is not None and recorded_first.casefold() == current_folded:
+        return True
+    return recorded_last is not None and recorded_last.casefold() == current_folded
+
+
+def filter_sessions_to_local_owner(infos: list[SessionInfo]) -> list[SessionInfo]:
+    """Drop sessions stamped by a different account than the local one."""
+    current_owner = local_session_owner()
+    return [info for info in infos if session_belongs_to_owner(info, current_owner)]
+
+
+def read_session_first_event_workspace(path: Path) -> tuple[str | None, str | None]:
+    """Read the session log's recorded (workspace_root, git_root)."""
+    workspace_root, git_root, _owner = read_session_first_event_scope(path)
+    return workspace_root, git_root
+
+
+def read_session_first_event_scope(path: Path) -> tuple[str | None, str | None, str | None]:
+    """Read the log's recorded (workspace_root, git_root, owner).
+
+    Every event carries these at top level (see :meth:`SessionStore._build_event`)
+    and the ``session_start`` payload also records the workspace fields; we scan
+    the first few events and return the first non-empty values found. Bounded so
+    we never read a whole (possibly large) log. Any read/parse error yields
+    ``(None, None, None)``.
+    """
+    workspace_root: str | None = None
+    git_root: str | None = None
+    owner: str | None = None
+    events = read_session_events(path)
+    try:
+        checked = 0
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            checked += 1
+            if workspace_root is None:
+                workspace_root = _nonempty_str(event.get("workspace_root"))
+            if git_root is None:
+                git_root = _nonempty_str(event.get("git_root"))
+            if owner is None:
+                owner = _nonempty_str(event.get("owner"))
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                if workspace_root is None:
+                    workspace_root = _nonempty_str(payload.get("workspace_root"))
+                if git_root is None:
+                    git_root = _nonempty_str(payload.get("git_root"))
+                if owner is None:
+                    owner = _nonempty_str(payload.get("owner"))
+            # Keep scanning (within the bound) until the owner stamp is found
+            # too: a pre-upgrade log resumed post-upgrade carries its owner
+            # only on later events, and classifying it as legacy would leave
+            # it visible to every account.
+            if workspace_root is not None and git_root is not None and owner is not None:
+                break
+            if checked >= 5:
+                break
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, None, None
+    finally:
+        close = getattr(events, "close", None)
+        if callable(close):
+            close()
+    return workspace_root, git_root, owner
+
+
+def read_session_last_event_ts(path: Path) -> str | None:
+    """Return the UTC ISO ``ts`` of the log's most recent event."""
+    ts, _owner = read_session_last_event_fields(path)
+    return ts
+
+
+def read_session_last_event_fields(path: Path) -> tuple[str | None, str | None]:
+    """Return the (``ts``, ``owner``) recorded at the tail of the log.
+
+    Tail-scans the last chunk of the file (events are append-only and flushed,
+    so the final parseable line is the newest event) rather than parsing the
+    whole log. ``ts`` comes from the newest event that carries one; ``owner``
+    comes from the newest parseable event — the account that most recently
+    used the session. Returns ``(None, None)`` on empty/corrupt/unreadable
+    logs so callers fall back to file mtime / creator-stamp semantics.
+    """
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            file_size = fh.tell()
+            if file_size <= 0:
+                return None, None
+            read_size = min(file_size, 16384)
+            fh.seek(file_size - read_size)
+            data = fh.read()
+    except OSError:
+        return None, None
+    owner: str | None = None
+    seen_event = False
+    for raw_line in reversed(data.split(b"\n")):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(obj, dict):
+            if not seen_event:
+                owner = _nonempty_str(obj.get("owner"))
+                seen_event = True
+            ts = _nonempty_str(obj.get("ts"))
+            if ts is not None:
+                return ts, owner
+    return None, owner
+
+
+def _epoch_from_iso(raw: str | None) -> float | None:
+    text = _nonempty_str(raw)
+    if text is None:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    try:
+        return parsed.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _session_recency_sort_key(info: SessionInfo) -> float:
+    # Prefer the log's own last-event timestamp (immune to copy/extract mtime
+    # resets); fall back to filesystem mtime. Both are absolute epoch seconds,
+    # so they order correctly even when mixed.
+    epoch = _epoch_from_iso(info.last_event_ts)
+    if epoch is not None:
+        return epoch
+    try:
+        return float(info.mtime)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def list_sessions(sessions_dir: Path) -> list[SessionInfo]:
     if not sessions_dir.exists():
         return []
@@ -284,8 +560,27 @@ def list_sessions(sessions_dir: Path) -> list[SessionInfo]:
             st = p.stat()
         except OSError:
             continue
-        out.append(SessionInfo(session_id=p.stem, path=p, mtime=st.st_mtime))
-    out.sort(key=lambda x: x.mtime, reverse=True)
+        try:
+            workspace_root, git_root, owner = read_session_first_event_scope(p)
+        except OSError:
+            workspace_root, git_root, owner = None, None, None
+        try:
+            last_event_ts, last_owner = read_session_last_event_fields(p)
+        except OSError:
+            last_event_ts, last_owner = None, None
+        out.append(
+            SessionInfo(
+                session_id=p.stem,
+                path=p,
+                mtime=st.st_mtime,
+                workspace_root=workspace_root,
+                git_root=git_root,
+                last_event_ts=last_event_ts,
+                owner=owner,
+                last_owner=last_owner,
+            )
+        )
+    out.sort(key=_session_recency_sort_key, reverse=True)
     return out
 
 

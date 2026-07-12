@@ -154,10 +154,8 @@ def test_thinking_pick_uses_inline_picker(monkeypatch, tmp_path: Path) -> None:
 def test_router_section_persists_changes(monkeypatch, tmp_path: Path) -> None:
     _seed_config(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
-    prompt = PromptScript(["4", "", "144", "12", "s"])
-    inline = InlineChoiceScript(
-        [config_menu_mod._INHERIT_DEFAULT_MODEL_VALUE, "code_only", "fixed"]
-    )
+    prompt = PromptScript(["6", "s"])
+    inline = InlineChoiceScript([config_menu_mod._INHERIT_DEFAULT_MODEL_VALUE, "code_only"])
     monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
     monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
 
@@ -166,18 +164,18 @@ def test_router_section_persists_changes(monkeypatch, tmp_path: Path) -> None:
 
     assert result.saved is True
     assert cfg.routing_mode == "code_only"
-    assert cfg.step_budget_policy == "fixed"
+    assert cfg.step_budget_policy == "autonomous"
     assert cfg.max_steps == AppConfig().max_steps
-    assert cfg.task_max_steps == 144
-    assert cfg.subagent_max_steps == 12
+    assert cfg.task_max_steps == AppConfig().task_max_steps
+    assert cfg.subagent_max_steps == AppConfig().subagent_max_steps
     assert "router" not in cfg.extra_fields.get("role_models", {})
 
 
 def test_router_section_persists_router_model(monkeypatch, tmp_path: Path) -> None:
     _seed_config(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
-    prompt = PromptScript(["4", "cheap-router-model", "", "100", "10", "s"])
-    inline = InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE, "auto", "fixed"])
+    prompt = PromptScript(["6", "cheap-router-model", "s"])
+    inline = InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE, "auto"])
     monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
     monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
 
@@ -197,8 +195,8 @@ def test_router_section_preserves_unexposed_role_model_keys(
     cfg.extra_fields["forge_role_models"] = {"comprehension": "forge-vision-reader-model"}
     save_config(cfg)
     _patch_console(monkeypatch)
-    prompt = PromptScript(["4", "cheap-router-model", "", "100", "10", "s"])
-    inline = InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE, "auto", "fixed"])
+    prompt = PromptScript(["6", "cheap-router-model", "s"])
+    inline = InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE, "auto"])
     monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
     monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
 
@@ -218,7 +216,7 @@ def test_router_section_preserves_unexposed_role_model_keys(
 def test_subagent_role_override(monkeypatch, tmp_path: Path) -> None:
     _seed_config(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
-    answers: list[str] = ["5"]
+    answers: list[str] = ["7"]
     for role in ROLE_ORDER:
         answers.append("anthropic/claude-sonnet-4-6" if role == "coding" else "")
         if role in config_menu_mod._ROLE_TEMPERATURE_FIELDS:
@@ -238,7 +236,7 @@ def test_subagent_role_override(monkeypatch, tmp_path: Path) -> None:
 def test_forge_role_override(monkeypatch, tmp_path: Path) -> None:
     _seed_config(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
-    answers = ["6"]
+    answers = ["8"]
     answers.extend(
         "anthropic/claude-opus-4-7" if role == "planner" else ""
         for role in config_menu_mod.FORGE_ROLE_ORDER
@@ -270,9 +268,24 @@ def test_router_override_stays_out_of_subagent_summary() -> None:
         for value, label, summary in config_menu_mod._top_level_menu_rows(state)
     }
 
-    assert rows["router"][0] == "Routing & Limits"
+    assert rows["router"][0] == "Routing"
     assert "router cheap-router-model" in rows["router"][1]
     assert rows["subagents"][1] == base_rows["subagents"][1]
+
+
+def test_web_search_section_updates_policy_and_backend(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    state = config_menu_mod.ConfigMenuState.from_cfg(AppConfig(model="default"))
+    picker = InlineChoiceScript(["off", "external"])
+    monkeypatch.setattr(config_menu_mod, "_run_config_picker", picker)
+
+    config_menu_mod._run_web_search_section(state, console)
+
+    assert state.fields["web_search_policy"] == "off"
+    assert state.fields["web_search_mode"] == "external"
+    assert [call["title"] for call in picker.calls] == ["Web Search", "Web Search Backend"]
+    assert "updated" in output.getvalue()
 
 
 def test_cancel_with_dirty_prompts_confirm(monkeypatch, tmp_path: Path) -> None:
@@ -341,11 +354,18 @@ def test_config_menu_preset_rows_explain_compatibility_and_native_modes() -> Non
     advanced = config_menu_mod._advanced_profile_presets_for_setup()
     advanced_keys = [preset.key for preset in advanced]
 
-    assert keys == ["openai-responses", "anthropic", "gemini"]
+    # The /config "add preset" picker mirrors setup: the MiMo trial + native
+    # first-party providers lead, every other hosted provider follows, and only
+    # compatibility/local/custom/legacy presets stay behind the advanced picker.
+    assert keys[:4] == ["sylliptor", "openai-responses", "anthropic", "gemini"]
+    assert "deepseek" in keys
     assert "anthropic-compat" not in keys
     assert "gemini-compat" not in keys
+    assert "ollama" not in keys
+    assert "deepseek" not in advanced_keys
     assert "anthropic-compat" in advanced_keys
     assert "gemini-compat" in advanced_keys
+    assert "ollama" in advanced_keys
     assert "Compatibility protocol" in config_menu_mod._preset_description(
         next(preset for preset in advanced if preset.key == "anthropic-compat")
     )
@@ -383,7 +403,9 @@ def test_config_menu_add_preset_surfaces_provider_diagnostic_warnings(monkeypatc
 
     config_menu_mod._run_profile_add_preset(state, console)
 
-    assert picker.calls[0]["current_value"] == "openai-responses"
+    # The picker highlights the first primary row (the hosted MiMo trial) by
+    # default; the diagnostic warnings below are what this test actually guards.
+    assert picker.calls[0]["current_value"] == "sylliptor"
     rendered = output.getvalue()
     assert "Provider diagnostic:" in rendered
     assert "web_search_mode=external is incompatible" in rendered
@@ -543,6 +565,7 @@ def test_profile_edit_accepts_env_var_name(monkeypatch) -> None:
             "",
             "",
             "",
+            "",
             "production profile",
         ]
     )
@@ -572,6 +595,7 @@ def test_profile_edit_reprompts_invalid_web_search_adapter(monkeypatch) -> None:
             "",
             "",
             "",
+            "",
             "bad_adapter",
             "groq_compound",
             "",
@@ -585,8 +609,8 @@ def test_profile_edit_reprompts_invalid_web_search_adapter(monkeypatch) -> None:
 
     profile = ProfileSpec.from_dict("anthropic", state.profiles["anthropic"])
     assert profile.web_search_adapter == "groq_compound"
-    assert prompt.calls[3][0] == "Web search adapter"
     assert prompt.calls[4][0] == "Web search adapter"
+    assert prompt.calls[5][0] == "Web search adapter"
     rendered = output.getvalue()
     assert "web_search_adapter must be one of:" in rendered
     assert "Allowed adapters:" in rendered
@@ -602,6 +626,7 @@ def test_profile_edit_env_var_secret_paste_warns_and_reprompts(monkeypatch) -> N
             "",
             pasted_secret,
             "ANTHROPIC_API_KEY",
+            "",
             "",
             "",
             "",
@@ -636,6 +661,7 @@ def test_profile_edit_env_var_secret_paste_force_accepts_with_warning(monkeypatc
             "",
             "",
             "",
+            "",
         ]
     )
     monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
@@ -659,6 +685,7 @@ def test_profile_edit_extra_headers_whole_secret_warns_and_reprompts(monkeypatch
             "",
             "",
             "",
+            "",
             pasted_secret,
             "X-Trace=1",
             "",
@@ -669,8 +696,8 @@ def test_profile_edit_extra_headers_whole_secret_warns_and_reprompts(monkeypatch
     config_menu_mod._run_profile_edit_current(state, console)
 
     profile = ProfileSpec.from_dict("anthropic", state.profiles["anthropic"])
-    assert profile.extra_headers == {"X-Trace": "1"}
-    assert prompt.calls[6][0] == "Re-enter Extra headers (or 'force' to keep this value)"
+    assert profile.extra_headers == {"x-trace": "1"}
+    assert prompt.calls[7][0] == "Re-enter Extra headers (or 'force' to keep this value)"
     assert "That looks like an API key, not a Extra headers." in output.getvalue()
 
 
@@ -687,6 +714,7 @@ def test_profile_edit_notes_secret_paste_warns_and_reprompts(monkeypatch) -> Non
             "",
             "",
             "",
+            "",
             pasted_secret,
             "safe notes",
         ]
@@ -697,7 +725,7 @@ def test_profile_edit_notes_secret_paste_warns_and_reprompts(monkeypatch) -> Non
 
     profile = ProfileSpec.from_dict("anthropic", state.profiles["anthropic"])
     assert profile.notes == "safe notes"
-    assert prompt.calls[7][0] == "Re-enter Notes (or 'force' to keep this value)"
+    assert prompt.calls[8][0] == "Re-enter Notes (or 'force' to keep this value)"
     assert "That looks like an API key, not a Notes." in output.getvalue()
 
 

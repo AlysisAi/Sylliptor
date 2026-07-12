@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from sylliptor_agent_cli.config import ConfigError
 from sylliptor_agent_cli.llm.protocols import (
     ANTHROPIC_MESSAGES_PROTOCOL,
@@ -9,8 +11,11 @@ from sylliptor_agent_cli.llm.protocols import (
     OPENAI_RESPONSES_PROTOCOL,
     SUPPORTED_LLM_PROTOCOLS,
     UnsupportedProtocolError,
+    default_usage_contract_for_protocol,
     get_provider_protocol_capabilities,
+    resolve_reasoning_trace_capability,
 )
+from sylliptor_agent_cli.llm.types import ReasoningOutputKind
 
 
 def test_supported_llm_protocols_include_native_foundation_values() -> None:
@@ -25,6 +30,21 @@ def test_supported_llm_protocols_include_native_foundation_values() -> None:
 
 def test_unsupported_protocol_error_is_config_error() -> None:
     assert issubclass(UnsupportedProtocolError, ConfigError)
+
+
+def test_unknown_provider_routes_keep_protocol_specific_counting_strategy() -> None:
+    expected = {
+        OPENAI_COMPAT_PROTOCOL: "openai_compat_provider_payload",
+        OPENAI_RESPONSES_PROTOCOL: "openai_responses",
+        ANTHROPIC_MESSAGES_PROTOCOL: "anthropic_messages",
+        GEMINI_GENERATE_CONTENT_PROTOCOL: "gemini_count_tokens",
+        GEMINI_INTERACTIONS_PROTOCOL: "gemini_count_tokens_projection",
+    }
+
+    for protocol, strategy in expected.items():
+        contract = default_usage_contract_for_protocol(protocol)
+        assert contract.input_token_count_strategy == strategy
+        assert contract.response_usage_confidence.value == "reported"
 
 
 def test_provider_protocol_capabilities_describe_native_web_search_adapters() -> None:
@@ -69,7 +89,7 @@ def test_provider_protocol_capabilities_describe_native_web_search_adapters() ->
     assert anthropic.supports_native_web_search is True
     assert anthropic.supports_provider_hosted_web_search_adapter is True
     assert anthropic.default_web_search_adapter == "anthropic_messages"
-    assert "reasoning_effort" in anthropic.unsupported_parameters
+    assert "reasoning_effort" not in anthropic.unsupported_parameters
     assert any("Native Anthropic Messages chat supports" in q for q in anthropic.quirks)
 
     assert gemini is not None
@@ -90,3 +110,124 @@ def test_provider_protocol_capabilities_describe_native_web_search_adapters() ->
     assert interactions.default_web_search_adapter == "gemini_grounding"
     assert "tools" in interactions.unsupported_parameters
     assert any("Experimental Gemini Interactions prototype" in q for q in interactions.quirks)
+
+
+def test_reasoning_trace_capabilities_only_mark_safe_summaries_as_displayable() -> None:
+    openai = resolve_reasoning_trace_capability(
+        provider_key="openai",
+        protocol=OPENAI_RESPONSES_PROTOCOL,
+    )
+    anthropic = resolve_reasoning_trace_capability(
+        provider_key="anthropic",
+        protocol=ANTHROPIC_MESSAGES_PROTOCOL,
+    )
+    gemini = resolve_reasoning_trace_capability(
+        provider_key="gemini",
+        protocol=GEMINI_GENERATE_CONTENT_PROTOCOL,
+    )
+    interactions = resolve_reasoning_trace_capability(
+        provider_key="gemini",
+        protocol=GEMINI_INTERACTIONS_PROTOCOL,
+    )
+    deepseek = resolve_reasoning_trace_capability(
+        provider_key="deepseek",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+    )
+    mistral = resolve_reasoning_trace_capability(
+        provider_key="mistral",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+    )
+    unknown = resolve_reasoning_trace_capability(
+        provider_key="custom",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+    )
+
+    assert openai.has_safe_summary is True
+    assert anthropic.has_safe_summary is True
+    assert gemini.has_safe_summary is True
+    assert interactions.adapter == "gemini_interactions_summary"
+    assert interactions.has_safe_summary is True
+    assert interactions.supports_buffered is True
+    assert interactions.supports_streaming is False
+    assert deepseek.output_kind == ReasoningOutputKind.PROVIDER_REASONING
+    assert deepseek.has_safe_summary is False
+    assert deepseek.requestable is False
+    assert mistral.has_safe_summary is False
+    assert mistral.continuation_state == "sensitive"
+    assert unknown.adapter == "openai_compat_passive"
+    assert unknown.has_safe_summary is False
+
+
+def test_custom_profile_can_select_a_safe_structured_summary_adapter() -> None:
+    capability = resolve_reasoning_trace_capability(
+        provider_key="custom",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+        adapter_override="openrouter_reasoning",
+    )
+
+    assert capability.adapter == "openrouter_reasoning"
+    assert capability.has_safe_summary is True
+    assert capability.requestable is False
+
+
+def test_auto_trace_capability_respects_explicit_model_reasoning_metadata() -> None:
+    native = resolve_reasoning_trace_capability(
+        provider_key="openai",
+        protocol=OPENAI_RESPONSES_PROTOCOL,
+        model_supports_reasoning=False,
+        model_capability_source="catalog",
+    )
+    compatible = resolve_reasoning_trace_capability(
+        provider_key="deepseek",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+        model_supports_reasoning=False,
+        model_capability_source="catalog",
+    )
+    unknown = resolve_reasoning_trace_capability(
+        provider_key="custom",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+        model_supports_reasoning=True,
+        model_capability_source="catalog",
+    )
+
+    assert native.adapter == "none"
+    assert native.model_supports_reasoning is False
+    assert native.resolution_source == "model_metadata:catalog"
+    assert compatible.adapter == "openai_compat_passive"
+    assert compatible.has_safe_summary is False
+    assert unknown.adapter == "openai_compat_passive"
+    assert unknown.has_safe_summary is False
+
+
+def test_explicit_trace_adapter_override_wins_over_model_metadata() -> None:
+    capability = resolve_reasoning_trace_capability(
+        provider_key="custom",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+        adapter_override="openrouter_reasoning",
+        model_supports_reasoning=False,
+        model_capability_source="catalog",
+    )
+
+    assert capability.adapter == "openrouter_reasoning"
+    assert capability.has_safe_summary is True
+    assert capability.model_supports_reasoning is False
+    assert capability.resolution_source == "profile_override"
+
+
+def test_gemini_interactions_summary_adapter_is_protocol_scoped() -> None:
+    capability = resolve_reasoning_trace_capability(
+        provider_key="gemini",
+        protocol=GEMINI_INTERACTIONS_PROTOCOL,
+        adapter_override="gemini_interactions_summary",
+    )
+
+    assert capability.has_safe_summary is True
+    assert capability.supports_streaming is False
+    assert capability.supports_buffered is True
+
+    with pytest.raises(ConfigError, match="not valid for protocol"):
+        resolve_reasoning_trace_capability(
+            provider_key="gemini",
+            protocol=GEMINI_GENERATE_CONTENT_PROTOCOL,
+            adapter_override="gemini_interactions_summary",
+        )

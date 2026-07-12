@@ -44,7 +44,13 @@ def test_transcript_load_history_keeps_user_assistant_drops_tools():
     t.load_history(
         [
             {"role": "user", "content": "first question"},
-            {"role": "assistant", "content": "first answer"},
+            {
+                "role": "assistant",
+                "content": "first answer",
+                "reasoning_content": "raw provider reasoning must stay out of the transcript",
+                "reasoning": "opaque provider continuation state",
+                "_sylliptor_provider_metadata": {"provider": {"encrypted_content": "opaque-state"}},
+            },
             {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
             {"role": "tool", "tool_call_id": "1", "content": "tool output"},
             {"role": "user", "content": "second question"},
@@ -137,6 +143,97 @@ def test_surface_renders_tool_trace():
     assert t.status is None
 
 
+def test_surface_tool_trace_shows_argument_detail():
+    # Repeated tool lines must stay distinguishable: a web search shows its
+    # query in both the live status and the committed "✓" line, so four
+    # searches don't render as four identical "Search Web" rows.
+    t = TuiTranscript()
+    s = TuiSurface(t, auto_approve=lambda: True)
+    s.on_tool_start(
+        ToolStartEvent(
+            tool_call_id="1",
+            name="web_search",
+            args={"query": "world cup bracket"},
+            step=1,
+        )
+    )
+    assert t.status is not None
+    assert "world cup bracket" in t.status
+    s.on_tool_end(ToolEndEvent(tool_call_id="1", name="web_search", status="done", elapsed_ms=1400))
+    assert any(
+        role == "trace" and text.startswith("✓") and "world cup bracket" in text
+        for role, text in t.entries
+    )
+    # The stashed detail is consumed on completion.
+    assert s._tool_details == {}
+
+
+def test_surface_groups_consecutive_same_tool_traces():
+    # Four searches must not render four "✓ Search Web · …" rows: the first is
+    # a full line, consecutive same-tool successes become "  ↳ <query>" rows.
+    t = TuiTranscript()
+    s = TuiSurface(t, auto_approve=lambda: True)
+    for i, query in enumerate(["current date today", "today's date"], start=1):
+        s.on_tool_start(
+            ToolStartEvent(tool_call_id=str(i), name="web_search", args={"query": query}, step=i)
+        )
+        s.on_tool_end(
+            ToolEndEvent(tool_call_id=str(i), name="web_search", status="done", elapsed_ms=100 * i)
+        )
+    trace_lines = [text for role, text in t.entries if role == "trace"]
+    assert len(trace_lines) == 2
+    assert trace_lines[0].startswith("✓ Search Web · current date today")
+    assert trace_lines[1].startswith("  ↳ today's date")
+
+
+def test_surface_tool_trace_grouping_breaks_on_interleaved_output():
+    # Anything committed between two same-tool successes (an assistant message,
+    # a different tool) restarts a full "✓" line — grouping is adjacency-only.
+    t = TuiTranscript()
+    s = TuiSurface(t, auto_approve=lambda: True)
+    s.on_tool_start(
+        ToolStartEvent(tool_call_id="1", name="web_search", args={"query": "first"}, step=1)
+    )
+    s.on_tool_end(ToolEndEvent(tool_call_id="1", name="web_search", status="done", elapsed_ms=10))
+    s.on_assistant_message_done("let me refine that")
+    s.on_tool_start(
+        ToolStartEvent(tool_call_id="2", name="web_search", args={"query": "second"}, step=2)
+    )
+    s.on_tool_end(ToolEndEvent(tool_call_id="2", name="web_search", status="done", elapsed_ms=10))
+    trace_lines = [text for role, text in t.entries if role == "trace"]
+    assert len(trace_lines) == 2
+    assert all(line.startswith("✓ Search Web · ") for line in trace_lines)
+
+
+def test_surface_tool_trace_hides_shell_command_detail():
+    # Shell command lines can carry secrets; they are never previewed on the
+    # trace lines (unlike web/search/file tools).
+    t = TuiTranscript()
+    s = TuiSurface(t, auto_approve=lambda: True)
+    s.on_tool_start(
+        ToolStartEvent(
+            tool_call_id="1",
+            name="shell_run",
+            args={"cmd": "export API_KEY=hunter2 && ./deploy.sh"},
+            step=1,
+        )
+    )
+    assert t.status is not None
+    assert "hunter2" not in t.status
+    s.on_tool_end(ToolEndEvent(tool_call_id="1", name="shell_run", status="done", elapsed_ms=10))
+    assert not any("hunter2" in text for _r, text in t.entries)
+
+
+def test_surface_tool_trace_without_preview_keeps_plain_label():
+    # Tools without an input preview (unknown/custom names) keep the bare label.
+    t = TuiTranscript()
+    s = TuiSurface(t, auto_approve=lambda: True)
+    s.on_tool_start(ToolStartEvent(tool_call_id="1", name="custom_tool", args={"x": 1}, step=1))
+    assert t.status == "custom_tool…"
+    s.on_tool_end(ToolEndEvent(tool_call_id="1", name="custom_tool", status="done", elapsed_ms=10))
+    assert any(role == "trace" and text == "✓ custom_tool (10ms)" for role, text in t.entries)
+
+
 def test_surface_refreshes_hud_mid_turn():
     # The footer HUD (context/tokens/cost) must advance DURING a long multi-step
     # turn, not only when it ends: the surface calls on_hud_refresh at safe points
@@ -186,6 +283,24 @@ def test_surface_renders_failed_tool_as_error():
     assert any(role == "error" and "boom" in text for role, text in t.entries)
 
 
+def test_surface_renders_approval_declined_tool_as_declined():
+    t = TuiTranscript()
+    s = TuiSurface(t, auto_approve=lambda: True)
+    s.on_tool_end(
+        ToolEndEvent(
+            tool_call_id="1",
+            name="fs_edit",
+            status="failed",
+            elapsed_ms=50,
+            meta={"approval_declined": True, "error": "User declined: fs_edit"},
+        )
+    )
+    assert any(
+        role == "error" and "approval declined" in text and "failed" not in text
+        for role, text in t.entries
+    )
+
+
 def test_surface_auto_approve_allows():
     t = TuiTranscript()
     s = TuiSurface(t, auto_approve=lambda: True)
@@ -203,6 +318,9 @@ def test_surface_denies_when_auto_off_and_no_ui():
     )
     assert decision.allow is False
     assert any(role == "warn" for role, _ in t.entries)
+    warning_text = "\n".join(text for role, text in t.entries if role == "warn")
+    assert "approvals are set to ask" in warning_text
+    assert "auto-approve is off" not in warning_text
 
 
 def test_surface_emit_error_warning_delegate_to_render():
@@ -291,6 +409,57 @@ def test_headless_runs_agent_turn():
     assert ("assistant", "Echo: hi there") in transcript
     assert completed["n"] == 1
     assert sessions and sessions[0].surface is not None
+
+
+def test_headless_plan_approval_picker_digit_executes_without_chat_echo(tmp_path):
+    state = TuiState(model_name="test-model", username="t")
+    run_turns: list[str] = []
+
+    class _PlanSession:
+        def __init__(self, surface: TuiSurface) -> None:
+            self.surface = surface
+
+        def run_turn(self, text: str, *, cancellation_token=None) -> int:
+            run_turns.append(text)
+            (tmp_path / "note.txt").write_text("# planned note\n", encoding="utf-8")
+            self.surface.on_user_message(text)
+            self.surface.on_assistant_message_done("executed")
+            return 0
+
+    def _builder(surface: TuiSurface) -> _PlanSession:
+        return _PlanSession(surface)
+
+    def _command_runner(sess, text, width):
+        _ = width
+        if text.strip() == "/plan add note":
+            sess.surface.defer_plan_mode_approval(
+                user_message="add note",
+                draft="1. Create note.txt",
+                approved_instruction="APPROVED PLAN INSTRUCTION",
+            )
+            return (
+                "handled",
+                "Plan (draft)\n1. Create note.txt\nSelect option [1/2/3]:",
+                None,
+                None,
+            )
+        if text.strip() == "/exit":
+            return ("exit", "", None, None)
+        return ("run", "", text, {})
+
+    _result, transcript = _run_headless(
+        state,
+        "/plan add note\r1\r/exit\r",
+        session_builder=_builder,
+        command_runner=_command_runner,
+        background_turns=False,
+    )
+
+    assert run_turns == ["APPROVED PLAN INSTRUCTION"]
+    assert (tmp_path / "note.txt").read_text(encoding="utf-8") == "# planned note\n"
+    assert ("user", "/plan add note") in transcript
+    assert ("user", "1") not in transcript
+    assert any(role == "system" and "Select option [1/2/3]" in text for role, text in transcript)
 
 
 def test_user_band_rows_full_width_with_prompt():
@@ -392,6 +561,244 @@ def test_scroll_target_clamps_and_reports_follow():
     assert _scroll_target(0, 0, -10) == (0, True)  # content fits → always tail
 
 
+def test_wheel_scroll_speed_defaults_and_clamps_environment_values(monkeypatch):
+    from sylliptor_agent_cli.cli_impl.tui.app import _resolve_wheel_step_rows
+
+    assert _resolve_wheel_step_rows("") == 3
+    assert _resolve_wheel_step_rows("invalid") == 3
+    assert _resolve_wheel_step_rows("4") == 4
+    assert _resolve_wheel_step_rows("0") == 1
+    assert _resolve_wheel_step_rows("200") == 20
+    monkeypatch.setenv("SYLLIPTOR_SCROLL_SPEED", "7")
+    assert _resolve_wheel_step_rows() == 7
+
+
+def test_tui_input_prefers_controlling_terminal_when_input_is_implicit(monkeypatch):
+    from sylliptor_agent_cli.cli_impl.tui import app as app_module
+
+    created = object()
+    calls: list[bool] = []
+
+    def _create_input(*, always_prefer_tty: bool):
+        calls.append(always_prefer_tty)
+        return created
+
+    monkeypatch.setattr(app_module, "create_input", _create_input)
+
+    resolved, owned = app_module._resolve_tui_input(None)
+
+    assert resolved is created
+    assert owned is created
+    assert calls == [True]
+
+
+def test_tui_input_preserves_explicit_pipe_input(monkeypatch):
+    from sylliptor_agent_cli.cli_impl.tui import app as app_module
+
+    explicit = object()
+    monkeypatch.setattr(
+        app_module,
+        "create_input",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not create input")),
+    )
+
+    resolved, owned = app_module._resolve_tui_input(explicit)
+
+    assert resolved is explicit
+    assert owned is None
+
+
+def test_prompt_toolkit_decodes_wsl_style_sgr_wheel_packets():
+    from prompt_toolkit.input.vt100_parser import Vt100Parser
+    from prompt_toolkit.keys import Keys
+
+    decoded = []
+    parser = Vt100Parser(decoded.append)
+    parser.feed("\x1b[<64;10;10M\x1b[<65;10;10M")
+    parser.flush()
+
+    assert [key_press.key for key_press in decoded] == [
+        Keys.Vt100MouseEvent,
+        Keys.Vt100MouseEvent,
+    ]
+    assert [key_press.data for key_press in decoded] == [
+        "\x1b[<64;10;10M",
+        "\x1b[<65;10;10M",
+    ]
+
+
+def test_transcript_selection_extracts_forward_and_reverse_multiline_text():
+    from prompt_toolkit.data_structures import Point
+
+    from sylliptor_agent_cli.cli_impl.tui.app import _selected_text
+
+    rows = ["alpha beta   ", "second line", "third"]
+    expected = "beta\nsecond line\nthi"
+
+    assert _selected_text(rows, Point(x=6, y=0), Point(x=2, y=2)) == expected
+    assert _selected_text(rows, Point(x=2, y=2), Point(x=6, y=0)) == expected
+    assert _selected_text(rows, Point(x=2, y=1), Point(x=2, y=1)) == ""
+
+
+def test_transcript_selection_omits_visual_message_markers_and_outer_padding():
+    from prompt_toolkit.data_structures import Point
+
+    from sylliptor_agent_cli.cli_impl.tui.app import _selected_text
+
+    rows = [
+        "                                        ",
+        "› hello mate                            ",
+        "                                        ",
+        "✦ Hey mate — how can I help?             ",
+        "▸ thought                                ",
+        "│ internal detail                        ",
+        "                                        ",
+    ]
+
+    copied = _selected_text(
+        rows,
+        Point(x=0, y=0),
+        Point(x=len(rows[-1]) - 1, y=len(rows) - 1),
+    )
+
+    assert copied == ("hello mate\n\nHey mate — how can I help?\nthought\ninternal detail")
+
+
+def test_transcript_selection_preserves_content_that_resembles_markup():
+    from prompt_toolkit.data_structures import Point
+
+    from sylliptor_agent_cli.cli_impl.tui.app import _selected_text
+
+    rows = ["› > quoted content", "✦ ✦ literal star", "  indented code"]
+
+    copied = _selected_text(
+        rows,
+        Point(x=0, y=0),
+        Point(x=len(rows[-1]) - 1, y=len(rows) - 1),
+    )
+
+    assert copied == "> quoted content\n✦ literal star\n  indented code"
+
+
+def test_transcript_semantic_copy_excludes_reasoning_and_tool_chrome():
+    from prompt_toolkit.data_structures import Point
+
+    from sylliptor_agent_cli.cli_impl.tui.app import _selected_text
+
+    raw_reasoning_sentinel = "private-chain-of-thought"
+    rows = [
+        "› question",
+        "",
+        "▾ reasoning summary",
+        f"│ {raw_reasoning_sentinel}",
+        "",
+        "▸ Read File · README.md",
+        "✓ Read File (5ms)",
+        "",
+        "✦ answer",
+        "",
+        "✗ Write File failed: disk full",
+    ]
+    row_roles = [
+        "user",
+        "spacer",
+        "reasoning",
+        "reasoning",
+        "chrome",
+        "trace",
+        "trace",
+        "chrome",
+        "assistant",
+        "spacer",
+        "error",
+    ]
+
+    copied = _selected_text(
+        rows,
+        Point(x=0, y=0),
+        Point(x=len(rows[-1]) - 1, y=len(rows) - 1),
+        row_roles=row_roles,
+    )
+
+    assert copied == "question\n\nanswer\n\nWrite File failed: disk full"
+    assert raw_reasoning_sentinel not in copied
+    assert "Read File" not in copied
+
+
+def test_transcript_semantic_copy_of_only_reasoning_is_empty():
+    from prompt_toolkit.data_structures import Point
+
+    from sylliptor_agent_cli.cli_impl.tui.app import _selected_text
+
+    rows = ["▾ reasoning summary", "│ safe summary that is display-only"]
+
+    assert (
+        _selected_text(
+            rows,
+            Point(x=0, y=0),
+            Point(x=len(rows[-1]) - 1, y=1),
+            row_roles=["reasoning", "reasoning"],
+        )
+        == ""
+    )
+
+
+def test_transcript_selection_highlights_only_selected_characters():
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.formatted_text import fragment_list_to_text
+
+    from sylliptor_agent_cli.cli_impl.tui.app import _highlight_selection_in_row
+
+    row = [("class:a", "hello "), ("class:b", "world")]
+    highlighted = _highlight_selection_in_row(
+        row,
+        row_index=0,
+        anchor=Point(x=3, y=0),
+        active=Point(x=7, y=0),
+    )
+
+    assert fragment_list_to_text(highlighted) == "hello world"
+    selected = "".join(text for style, text in highlighted if "selection" in style)
+    assert selected == "lo wo"
+
+
+def test_copying_transcript_selection_uses_system_clipboard(monkeypatch):
+    from sylliptor_agent_cli.cli_impl.tui import app as app_module
+
+    copied: list[str] = []
+    monkeypatch.setattr(app_module, "copy_text_to_clipboard", copied.append)
+
+    notice = app_module._copy_selection_notice("selected text")
+
+    assert copied == ["selected text"]
+    assert notice == "Copied 13 characters"
+
+
+def test_completed_transcript_selection_reports_unavailable_clipboard(monkeypatch):
+    from sylliptor_agent_cli.cli_impl.tui import app as app_module
+
+    def _fail(_text: str) -> None:
+        raise app_module.ClipboardError("unavailable")
+
+    monkeypatch.setattr(app_module, "copy_text_to_clipboard", _fail)
+
+    assert app_module._copy_selection_notice("selected") == (
+        "Selected text · clipboard unavailable"
+    )
+
+
+def test_completion_menu_size_stays_above_bottom_chrome():
+    from sylliptor_agent_cli.cli_impl.tui.app import (
+        _completion_menu_height,
+        _completion_menu_width,
+    )
+
+    assert _completion_menu_height(32) == 8
+    assert _completion_menu_height(12) == 2
+    assert _completion_menu_width(120) == 84
+    assert _completion_menu_width(45) == 37
+
+
 def test_scrollable_control_routes_wheel_events():
     from prompt_toolkit.mouse_events import MouseEventType
 
@@ -408,6 +815,31 @@ def test_scrollable_control_routes_wheel_events():
     assert ctrl.mouse_handler(_Evt(MouseEventType.SCROLL_DOWN)) is None
     assert ctrl.mouse_handler(_Evt(MouseEventType.MOUSE_UP)) is NotImplemented
     assert seen == [-1, 1]
+
+
+def test_scrollable_control_routes_drag_events_without_disabling_wheel():
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+
+    from sylliptor_agent_cli.cli_impl.tui.app import _ScrollableControl
+
+    scrolls: list[int] = []
+    mouse_events: list[MouseEventType] = []
+    ctrl = _ScrollableControl(
+        lambda: [],
+        on_scroll=scrolls.append,
+        on_mouse_event=lambda event: mouse_events.append(event.event_type),
+    )
+
+    down = MouseEvent(Point(x=1, y=2), MouseEventType.MOUSE_DOWN, MouseButton.LEFT, frozenset())
+    move = MouseEvent(Point(x=4, y=2), MouseEventType.MOUSE_MOVE, MouseButton.LEFT, frozenset())
+    wheel = MouseEvent(Point(x=4, y=2), MouseEventType.SCROLL_DOWN, MouseButton.NONE, frozenset())
+
+    assert ctrl.mouse_handler(down) is None
+    assert ctrl.mouse_handler(move) is None
+    assert ctrl.mouse_handler(wheel) is None
+    assert mouse_events == [MouseEventType.MOUSE_DOWN, MouseEventType.MOUSE_MOVE]
+    assert scrolls == [1]
 
 
 def test_headless_pageup_pagedown_do_not_crash():
@@ -540,9 +972,9 @@ def test_headless_status_panel_opens_via_provider_not_routed_to_runner():
     assert not any(text.strip().lower() == "/status" for text, _w in calls)
 
 
-def test_slash_completer_lists_commands_and_excludes_removed_stream():
-    # The dropdown content: typing "/" lists commands; "/stream" was deleted so it
-    # must not appear; prefix filtering narrows the list.
+def test_slash_completer_lists_commands_including_stream():
+    # The dropdown content includes the restored /stream control, while prefix
+    # filtering still narrows the list.
     from prompt_toolkit.document import Document
 
     from sylliptor_agent_cli.cli_impl.chat_slash_completer import ChatSlashCompleter
@@ -555,7 +987,7 @@ def test_slash_completer_lists_commands_and_excludes_removed_stream():
     top = comps("/")
     assert "/status" in top
     assert "/help" in top
-    assert "/stream" not in top  # deleted command must not surface in the dropdown
+    assert "/stream" in top
     narrowed = comps("/st")
     assert "/status" in narrowed
     assert all(c.startswith("/st") for c in narrowed)

@@ -29,6 +29,7 @@ def _cfg(
     mode: str = "off",
     backend: str = "auto",
     network: str = "off",
+    preview_access: str = "auto",
     docker_image: str = TEST_DOCKER_IMAGE,
     clear_env: bool = False,
     docker_pids_limit: int | None = None,
@@ -44,6 +45,7 @@ def _cfg(
             "mode": mode,
             "backend": backend,
             "network": network,
+            "preview_access": preview_access,
             "docker_image": docker_image,
             "clear_env": clear_env,
             "docker_pids_limit": docker_pids_limit,
@@ -228,6 +230,7 @@ def test_resolve_shell_sandbox_settings_env_overrides_config(
         mode="warn",
         backend="docker",
         network="on",
+        preview_access="local",
         clear_env=False,
         docker_pids_limit=128,
         docker_memory="512m",
@@ -238,6 +241,7 @@ def test_resolve_shell_sandbox_settings_env_overrides_config(
     monkeypatch.setenv("SYLLIPTOR_SHELL_SANDBOX_MODE", "strict")
     monkeypatch.setenv("SYLLIPTOR_SHELL_SANDBOX_BACKEND", "bwrap")
     monkeypatch.setenv("SYLLIPTOR_SHELL_SANDBOX_NETWORK", "off")
+    monkeypatch.setenv("SYLLIPTOR_SHELL_SANDBOX_PREVIEW_ACCESS", "lan")
     monkeypatch.setenv("SYLLIPTOR_SHELL_SANDBOX_DOCKER_IMAGE", "sandbox:test")
     monkeypatch.setenv("SYLLIPTOR_SHELL_SANDBOX_CLEAR_ENV", "1")
     monkeypatch.setenv("SYLLIPTOR_SHELL_SANDBOX_DOCKER_PIDS_LIMIT", "256")
@@ -251,6 +255,7 @@ def test_resolve_shell_sandbox_settings_env_overrides_config(
     assert settings.mode == "strict"
     assert settings.backend == "bwrap"
     assert settings.network == "off"
+    assert settings.preview_access == "lan"
     assert settings.docker_image == "sandbox:test"
     assert settings.clear_env is True
     assert settings.docker_pids_limit == 256
@@ -266,6 +271,7 @@ def test_resolve_shell_sandbox_settings_defaults_from_plain_app_config() -> None
     assert settings.mode == "strict"
     assert settings.backend == "auto"
     assert settings.network == "off"
+    assert settings.preview_access == "auto"
     assert settings.bwrap_profile == "hardened"
     assert settings.clear_env is True
     assert settings.protect_repo_meta is True
@@ -274,6 +280,12 @@ def test_resolve_shell_sandbox_settings_defaults_from_plain_app_config() -> None
 def test_resolve_shell_sandbox_settings_invalid_value_raises() -> None:
     cfg = _cfg(mode="invalid")
     with pytest.raises(ConfigError, match="shell_sandbox.mode"):
+        resolve_shell_sandbox_settings(cfg)
+
+
+def test_resolve_shell_sandbox_settings_invalid_preview_access_raises() -> None:
+    cfg = _cfg(preview_access="internet")
+    with pytest.raises(ConfigError, match="shell_sandbox.preview_access"):
         resolve_shell_sandbox_settings(cfg)
 
 

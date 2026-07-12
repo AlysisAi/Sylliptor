@@ -25,8 +25,10 @@ from .safety import SafeHttpError, safe_http_request
 
 PYPI_JSON_URL = f"https://pypi.org/pypi/{PYTHON_PACKAGE_NAME}/json"
 UPDATE_CACHE_SCHEMA_VERSION = 1
+UPDATE_PROMPT_STATE_SCHEMA_VERSION = 1
 DEFAULT_UPDATE_CHECK_INTERVAL_HOURS = 24
 DEFAULT_UPDATE_CHECK_TIMEOUT_S = 3.0
+DEFAULT_UPDATE_PROMPT_SNOOZE_HOURS = 24
 UPDATE_CACHE_MAX_BYTES = 512 * 1024
 _update_refresh_lock = threading.Lock()
 _update_refresh_started = False
@@ -104,6 +106,30 @@ class UpdateStatus:
             "from_cache": self.from_cache,
             "state": self.state,
             "update_available": self.update_available,
+        }
+
+
+@dataclass(frozen=True)
+class UpdatePromptState:
+    """Per-user memory of the startup update prompt.
+
+    Lives next to ``update_check.json`` in the data dir (its own file, so the
+    background cache refresh can never wipe it).
+    """
+
+    skipped_version: str | None = None
+    last_prompted_version: str | None = None
+    last_prompted_at: datetime | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "schema_version": UPDATE_PROMPT_STATE_SCHEMA_VERSION,
+            "package": PYTHON_PACKAGE_NAME,
+            "skipped_version": self.skipped_version,
+            "last_prompted_version": self.last_prompted_version,
+            "last_prompted_at": (
+                self.last_prompted_at.astimezone(UTC).isoformat() if self.last_prompted_at else None
+            ),
         }
 
 
@@ -446,6 +472,123 @@ def passive_update_notice(
         f"Sylliptor {status.latest_version} is available; you have {status.current_version}. "
         "Run `sylliptor update`."
     )
+
+
+def update_prompt_state_path() -> Path:
+    override = os.environ.get("SYLLIPTOR_UPDATE_PROMPT_STATE_PATH")
+    if override:
+        return Path(override)
+    data_override = os.environ.get("SYLLIPTOR_DATA_DIR")
+    data_dir = Path(data_override) if data_override else canonical_user_data_dir()
+    return data_dir / "update_prompt.json"
+
+
+def resolve_update_prompt_enabled(cfg: AppConfig | None) -> bool:
+    env_value = env_get("SYLLIPTOR_UPDATE_PROMPT_ENABLED")
+    if env_value is not None:
+        return _parse_bool(env_value, key="SYLLIPTOR_UPDATE_PROMPT_ENABLED")
+    if cfg is None:
+        return True
+    return bool(getattr(cfg, "update_prompt_enabled", True))
+
+
+def read_update_prompt_state(path: Path | None = None) -> UpdatePromptState:
+    state_path = path or update_prompt_state_path()
+    if not state_path.exists():
+        return UpdatePromptState()
+    try:
+        if state_path.stat().st_size > UPDATE_CACHE_MAX_BYTES:
+            return UpdatePromptState()
+    except OSError:
+        return UpdatePromptState()
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return UpdatePromptState()
+    if not isinstance(raw, dict):
+        return UpdatePromptState()
+    try:
+        schema_version = int(raw.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        return UpdatePromptState()
+    if schema_version != UPDATE_PROMPT_STATE_SCHEMA_VERSION:
+        return UpdatePromptState()
+    package = str(raw.get("package") or "").strip()
+    if package != PYTHON_PACKAGE_NAME:
+        return UpdatePromptState()
+    return UpdatePromptState(
+        skipped_version=_optional_non_empty_string(raw.get("skipped_version")),
+        last_prompted_version=_optional_non_empty_string(raw.get("last_prompted_version")),
+        last_prompted_at=_parse_datetime(raw.get("last_prompted_at")),
+    )
+
+
+def write_update_prompt_state(state: UpdatePromptState, path: Path | None = None) -> None:
+    atomic_write_json(path or update_prompt_state_path(), state.to_json())
+
+
+def record_update_prompt_shown(
+    latest_version: str,
+    *,
+    path: Path | None = None,
+    now: datetime | None = None,
+) -> None:
+    state = read_update_prompt_state(path)
+    write_update_prompt_state(
+        UpdatePromptState(
+            skipped_version=state.skipped_version,
+            last_prompted_version=latest_version,
+            last_prompted_at=_utcnow() if now is None else _ensure_utc(now),
+        ),
+        path,
+    )
+
+
+def record_update_skipped(
+    latest_version: str,
+    *,
+    path: Path | None = None,
+    now: datetime | None = None,
+) -> None:
+    state = read_update_prompt_state(path)
+    write_update_prompt_state(
+        UpdatePromptState(
+            skipped_version=latest_version,
+            last_prompted_version=state.last_prompted_version,
+            last_prompted_at=state.last_prompted_at,
+        ),
+        path,
+    )
+
+
+def should_prompt_for_update(
+    *,
+    status: UpdateStatus,
+    state: UpdatePromptState,
+    cfg: AppConfig | None,
+    now: datetime | None = None,
+) -> bool:
+    """Pure gate for the startup update prompt.
+
+    True only when a newer release is known from the cache and the user has
+    neither skipped that release nor been prompted about it within the snooze
+    window.
+    """
+    if not resolve_update_check_enabled(cfg):
+        return False
+    if not resolve_update_prompt_enabled(cfg):
+        return False
+    if not status.update_available or not status.latest_version:
+        return False
+    latest = status.latest_version
+    if state.skipped_version == latest:
+        return False
+    if state.last_prompted_version == latest and state.last_prompted_at is not None:
+        current = _utcnow() if now is None else _ensure_utc(now)
+        age = current - state.last_prompted_at
+        if timedelta(0) <= age < timedelta(hours=DEFAULT_UPDATE_PROMPT_SNOOZE_HOURS):
+            return False
+    return True
 
 
 def detect_installer_plan(

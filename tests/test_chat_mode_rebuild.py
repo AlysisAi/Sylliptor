@@ -153,11 +153,11 @@ def test_rebuild_session_tools_preserves_effective_verification_commands(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[str] = []
+    calls: list[Any] = []
 
     def fake_run(cmd, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
-        calls.append(str(cmd))
-        return subprocess.CompletedProcess(args=str(cmd), returncode=0, stdout="ok\n", stderr="")
+        calls.append(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok\n", stderr="")
 
     monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
 
@@ -172,7 +172,13 @@ def test_rebuild_session_tools_preserves_effective_verification_commands(
         cli_mod._rebuild_session_tools_for_mode(session=session, mode="auto")
         result = session.tools["verify_run"].run({})
 
-        assert calls == ["pytest -q"]
+        # Verification commands execute as shell strings; the verify pipeline
+        # may additionally shell out to git (argv lists) for its internal
+        # workspace scans, which must not replace or add verify commands.
+        executed_verify_commands = [cmd for cmd in calls if isinstance(cmd, str)]
+        internal_calls = [cmd for cmd in calls if not isinstance(cmd, str)]
+        assert executed_verify_commands == ["pytest -q"]
+        assert all(cmd and cmd[0] == "git" for cmd in internal_calls)
         assert result["commands"] == ["pytest -q"]
     finally:
         session.store.close()

@@ -1,11 +1,85 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Any
+
+from ..error_text import sanitize_error_text_for_output
 
 
 class LLMError(RuntimeError):
-    pass
+    """Provider/model error whose public message is safe to persist and display."""
+
+    def __init__(self, message: object = "") -> None:
+        super().__init__(sanitize_error_text_for_output(message))
+
+
+class UsageConfidence(StrEnum):
+    AUTHORITATIVE = "authoritative"
+    REPORTED = "reported"
+    ESTIMATED = "estimated"
+
+
+class UsageSource(StrEnum):
+    PROVIDER_RESPONSE = "provider_response"
+    PROVIDER_COUNT = "provider_count"
+    LOCAL_ESTIMATE = "local_estimate"
+    MIXED = "mixed"
+
+
+class ReasoningOutputKind(StrEnum):
+    """Visibility class for provider-produced reasoning output.
+
+    ``SUMMARY`` is safe, provider-generated explanatory text intended for
+    display. ``PROVIDER_REASONING`` is a provider-visible reasoning channel
+    that may contain a much more detailed chain and must not be rendered by
+    the default chat trace.
+    """
+
+    SUMMARY = "summary"
+    PROVIDER_REASONING = "provider_reasoning"
+
+
+@dataclass(frozen=True)
+class ReasoningOutput:
+    """Normalized reasoning material returned alongside an assistant answer."""
+
+    text: str
+    kind: ReasoningOutputKind
+    provider: str | None = None
+
+
+@dataclass(frozen=True)
+class UsageContract:
+    """Protocol-level guarantees after provider usage has been normalized."""
+
+    response_usage_confidence: UsageConfidence = UsageConfidence.REPORTED
+    normalized_output_includes_reasoning: bool = True
+    input_token_count_strategy: str = "none"
+
+    @property
+    def response_usage_authoritative(self) -> bool:
+        return self.response_usage_confidence == UsageConfidence.AUTHORITATIVE
+
+    @property
+    def supports_input_token_count(self) -> bool:
+        return self.input_token_count_strategy != "none"
+
+
+@dataclass(frozen=True)
+class InputTokenCount:
+    input_tokens: int
+    source: UsageSource = UsageSource.PROVIDER_COUNT
+    confidence: UsageConfidence = UsageConfidence.AUTHORITATIVE
+    raw_provider_usage: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.input_tokens, bool)
+            or not isinstance(self.input_tokens, int)
+            or self.input_tokens < 0
+        ):
+            raise ValueError("input token count must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -22,6 +96,52 @@ class LLMUsage:
     completion_tokens: int | None
     total_tokens: int | None
     cached_prompt_tokens: int | None = None
+    input_tokens_uncached: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_creation_5m_input_tokens: int | None = None
+    cache_creation_1h_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    raw_provider_usage: dict[str, Any] | None = None
+    source: UsageSource = UsageSource.PROVIDER_RESPONSE
+    confidence: UsageConfidence = UsageConfidence.REPORTED
+    output_includes_reasoning: bool = True
+    total_includes_reasoning: bool = True
+
+    def normalized(self) -> LLMUsage:
+        """Return the provider-independent invariant used by accounting.
+
+        After normalization, completion/output and total include reasoning,
+        while ``reasoning_tokens`` remains an informational subset.
+        """
+        reasoning = self.reasoning_tokens
+        if reasoning is None or reasoning <= 0:
+            return replace(
+                self,
+                output_includes_reasoning=True,
+                total_includes_reasoning=True,
+            )
+        completion = self.completion_tokens
+        total = self.total_tokens
+        if completion is not None and not self.output_includes_reasoning:
+            completion += reasoning
+        if total is not None and not self.total_includes_reasoning:
+            total += reasoning
+        return replace(
+            self,
+            completion_tokens=completion,
+            total_tokens=total,
+            output_includes_reasoning=True,
+            total_includes_reasoning=True,
+        )
+
+    @property
+    def cache_read_tokens(self) -> int | None:
+        return (
+            self.cache_read_input_tokens
+            if self.cache_read_input_tokens is not None
+            else self.cached_prompt_tokens
+        )
 
 
 @dataclass(frozen=True)
@@ -32,3 +152,4 @@ class LLMResponse:
     response_model: str | None = None
     usage: LLMUsage | None = None
     provider_metadata: dict[str, Any] | None = None
+    reasoning: tuple[ReasoningOutput, ...] = ()

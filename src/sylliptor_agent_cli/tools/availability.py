@@ -16,6 +16,33 @@ class ToolUnavailableResult(TypedDict):
     reason: str
 
 
+WEB_TOOL_NAMES = frozenset({"web_fetch", "web_search"})
+WEB_UNAVAILABLE_OBSERVATION = (
+    "Web tools are unavailable for the rest of this turn — "
+    "continue with the information already gathered."
+)
+
+# A web-tool failure is *recoverable* when the model can fix it by changing its own
+# arguments (input validation, provenance rejection with retry guidance). Those are
+# returned to the model as plain errors; only unrecoverable failures (backend
+# connectivity/availability after fallback exhaustion) disable web tools for the turn.
+_WEB_RECOVERY_HINT_KEYS = ("guidance", "error_code", "fetchable_urls", "recoverable")
+
+
+def is_recoverable_web_tool_error(error: BaseException) -> bool:
+    """True when the exception marks itself as fixable by a corrected retry."""
+
+    return bool(getattr(error, "recoverable", False))
+
+
+def is_recoverable_web_error_result(value: Any) -> bool:
+    """True for structured web-tool error dicts that carry retry/recovery guidance."""
+
+    if not isinstance(value, dict) or "error" not in value:
+        return False
+    return any(key in value for key in _WEB_RECOVERY_HINT_KEYS)
+
+
 @dataclass(frozen=True)
 class ToolAvailability:
     name: str
@@ -118,6 +145,19 @@ def unavailable_tool_result(name: str) -> ToolUnavailableResult | None:
         "status": "tool_unavailable",
         "tool": state.name,
         "reason": state.unavailable_reason,
+    }
+
+
+def web_unavailable_result(name: str) -> ToolUnavailableResult:
+    """Return a non-error observation for a failed optional web tool."""
+
+    clean_name = _clean_tool_name(name)
+    if clean_name.casefold() not in WEB_TOOL_NAMES:
+        raise ValueError(f"not a web tool: {clean_name}")
+    return {
+        "status": "tool_unavailable",
+        "tool": clean_name,
+        "reason": WEB_UNAVAILABLE_OBSERVATION,
     }
 
 

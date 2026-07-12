@@ -92,12 +92,20 @@ def _chat_usage_panel_spec(*, session: Any) -> PanelSpec:
             known_cost=_known_cost_value(row), unknown_calls=unknown
         )
         source = _format_usage_source_for_display(row)
+        cache_bits = ""
+        cache_read = int(row.get("cache_read_input_tokens") or 0)
+        cache_write = int(row.get("cache_creation_input_tokens") or 0)
+        if cache_read or cache_write:
+            cache_bits = (
+                f"  cache r:{_format_exact_token_count(cache_read)}"
+                f" w:{_format_exact_token_count(cache_write)}"
+            )
         value = (
             f"{row.get('model') or '-'}   "
             f"↓ {_format_exact_token_count(row.get('prompt_tokens'))}  "
             f"↑ {_format_exact_token_count(row.get('completion_tokens'))}  "
             f"Σ {_format_exact_token_count(row.get('total_tokens'))}   "
-            f"{cost}  ({source})"
+            f"{cost}{cache_bits}  ({source})"
         )
         model_rows.append((str(idx), value, "plain"))
 
@@ -116,6 +124,12 @@ def _chat_usage_panel_spec(*, session: Any) -> PanelSpec:
     total_rows: list[tuple[str, str, str]] = [
         ("tokens", _format_exact_token_count(totals.get("total_tokens")), "accent"),
         ("input", _format_exact_token_count(totals.get("prompt_tokens")), "plain"),
+        ("cache read", _format_exact_token_count(totals.get("cache_read_input_tokens")), "plain"),
+        (
+            "cache write",
+            _format_exact_token_count(totals.get("cache_creation_input_tokens")),
+            "plain",
+        ),
         ("output", _format_exact_token_count(totals.get("completion_tokens")), "plain"),
         ("cost", total_cost, cost_tone),
     ]
@@ -123,11 +137,37 @@ def _chat_usage_panel_spec(*, session: Any) -> PanelSpec:
         total_rows.append(
             ("note", f"{unknown_total} call(s) unmetered (missing pricing metadata)", "warn")
         )
+    cache_cost_unknown = int(totals.get("cache_cost_pricing_missing_calls") or 0)
+    if cache_cost_unknown > 0:
+        total_rows.append(
+            (
+                "note",
+                f"{cache_cost_unknown} cached call(s) need provider-specific cache pricing",
+                "warn",
+            )
+        )
     corrected_total = int(totals.get("corrected_usage_calls") or 0)
     if corrected_total > 0:
         total_rows.append(
             ("note", f"{corrected_total} provider usage record(s) corrected before display", "warn")
         )
+    request_estimate = totals.get("request_token_estimate")
+    if isinstance(request_estimate, dict):
+        schema_over_calls = int(request_estimate.get("tool_schema_budget_exceeded_calls") or 0)
+        if schema_over_calls > 0:
+            schema_overage = int(request_estimate.get("tool_schema_budget_overage_tokens") or 0)
+            largest_tool = int(request_estimate.get("tool_schema_largest_tool_tokens") or 0)
+            total_rows.append(
+                (
+                    "note",
+                    (
+                        f"{schema_over_calls} call(s) exceeded tool schema shadow budget "
+                        f"(+{_format_exact_token_count(schema_overage)}; "
+                        f"largest tool {_format_exact_token_count(largest_tool)})"
+                    ),
+                    "warn",
+                )
+            )
     return {
         "title": "Usage",
         "sections": [("Per model", model_rows), ("Total", total_rows)],
@@ -159,6 +199,14 @@ def _chat_context_panel_spec(*, session: Any) -> PanelSpec:
     )
     percent = getattr(ctx, "context_window_percent_left", getattr(ctx, "percent_left", None))
     used = getattr(ctx, "used_input_tokens", "n/a")
+    effective_budget = getattr(ctx, "effective_input_budget", None)
+    effective_remaining = getattr(ctx, "effective_remaining_tokens", None)
+    effective_percent = getattr(ctx, "effective_percent_left", None)
+    startup_baseline = getattr(ctx, "startup_baseline_tokens", None)
+    dynamic_budget = getattr(ctx, "dynamic_context_budget_tokens", None)
+    dynamic_used = getattr(ctx, "dynamic_context_used_tokens", None)
+    dynamic_remaining = getattr(ctx, "dynamic_context_remaining_tokens", None)
+    dynamic_percent = getattr(ctx, "dynamic_context_percent_left", None)
 
     # Colour the percent from the SAME metric we display (the context-window
     # percent), not the dynamic-budget percent — otherwise a healthy 60%-left
@@ -182,19 +230,87 @@ def _chat_context_panel_spec(*, session: Any) -> PanelSpec:
         pct_tone = "accent"
     percent_display = _format_chat_context_percent(displayed_percent)
 
-    rows: list[tuple[str, str, str]] = [
+    context_rows: list[tuple[str, str, str]] = [
         ("model", str(getattr(ctx, "model_name", "-")), "plain"),
-        ("source", str(getattr(ctx, "source", "-")), "dim"),
+        ("metadata source", str(getattr(ctx, "source", "-")), "dim"),
+        (
+            "capacity route",
+            str(getattr(ctx, "capacity_provider_key", None) or "-"),
+            "dim",
+        ),
+        ("token source", str(getattr(ctx, "token_count_source", "-")), "dim"),
+        ("confidence", str(getattr(ctx, "token_count_confidence", "-")), "dim"),
         ("context window", str(context_window), "plain"),
-        ("used (est.)", str(used), "plain"),
+        ("used (projected)", str(used), "plain"),
         ("left tokens", str(remaining), "plain"),
         ("left %", percent_display, pct_tone),
     ]
+    anchor_source = getattr(ctx, "anchor_token_count_source", None)
+    if anchor_source:
+        context_rows.insert(
+            4,
+            ("request anchor", str(anchor_source), "dim"),
+        )
+    budget_rows: list[tuple[str, str, str]] = [
+        ("input budget", _context_metric_display(effective_budget), "plain"),
+        ("budget left", _context_metric_display(effective_remaining), "plain"),
+        (
+            "budget left %",
+            _format_chat_context_percent(_context_float(effective_percent)),
+            _context_percent_tone(effective_percent),
+        ),
+    ]
+    conversation_rows: list[tuple[str, str, str]] = [
+        ("startup baseline", _context_metric_display(startup_baseline), "plain"),
+        ("conversation budget", _context_metric_display(dynamic_budget), "plain"),
+        ("conversation used", _context_metric_display(dynamic_used), "plain"),
+        ("conversation left", _context_metric_display(dynamic_remaining), "plain"),
+        (
+            "conversation left %",
+            _format_chat_context_percent(_context_float(dynamic_percent)),
+            _context_percent_tone(dynamic_percent),
+        ),
+    ]
+    sections: list[tuple[str, list[tuple[str, str, str]]]] = [("Context", context_rows)]
+    if any(row[1] != "n/a" for row in budget_rows):
+        sections.append(("Effective Input Budget", budget_rows))
+    if any(row[1] != "n/a" for row in conversation_rows):
+        sections.append(("Conversation Context", conversation_rows))
     return {
         "title": "Context Window",
-        "sections": [("Context", rows)],
+        "sections": sections,
         "hint": "/compact to reduce context · Esc close",
     }
+
+
+def _context_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _context_percent_tone(value: Any) -> str:
+    percent = _context_float(value)
+    if percent is None:
+        return "plain"
+    if percent < 10.0:
+        return "err"
+    if percent < 25.0:
+        return "warn"
+    return "accent"
+
+
+def _context_metric_display(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return str(max(0, parsed))
 
 
 # ----------------------------------------------------------------- /model-info
@@ -509,7 +625,8 @@ def _short_subagent_desc(text: str, limit: int = 46) -> str:
 # --------------------------------------------------------------------- Forge
 # Task-status buckets — kept EXACTLY in sync with cli_common._forge_task_status_counts
 # (the authority for the done/failed/remaining summary) so a row's tone never
-# contradicts the count: done = "done", failure = the same 7 states, obsolete = 2.
+# contradicts the count: done = completed/satisfied states, failure = terminal blocked states, obsolete = 2.
+_FORGE_DONE_STATES = {"done", "already_satisfied"}
 _FORGE_FAILURE_STATES = {
     "failed",
     "verify_failed",
@@ -518,13 +635,15 @@ _FORGE_FAILURE_STATES = {
     "merge_conflict",
     "blocked_integration",
     "blocked",
+    "interrupted",
+    "cancelled",
 }
 _FORGE_OBSOLETE_STATES = {"superseded", "invalidated"}
 
 
 def _forge_status_tone(canonical: str) -> str:
     """Map a canonical task status to a panel value tone (accent/err/dim/plain)."""
-    if canonical == "done":
+    if canonical in _FORGE_DONE_STATES:
         return "accent"
     if canonical in _FORGE_FAILURE_STATES:
         return "err"
@@ -559,7 +678,7 @@ it task by task. You stay in control — nothing is built until you say so.
 - `/execute plan` — run the build
 - `/done` · `/back` — leave Forge
 
-Press **Enter** to start a planning session, or **Esc** to stay in chat."""
+Press **Enter** to choose your planner and begin, or **Esc** to stay in chat."""
 
 
 def _chat_forge_intro_panel_spec() -> PanelSpec:

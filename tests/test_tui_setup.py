@@ -20,7 +20,14 @@ import sylliptor_agent_cli.sandbox_doctor as sandbox_doctor
 from sylliptor_agent_cli.cli_impl.tui import setup_flow as flow_mod
 from sylliptor_agent_cli.cli_impl.tui.setup_app import run_setup_tui
 from sylliptor_agent_cli.cli_impl.tui.setup_flow import SetupFlow
-from sylliptor_agent_cli.config import ConfigError, load_config, load_persisted_profile_keys
+from sylliptor_agent_cli.config import (
+    AppConfig,
+    ConfigError,
+    load_config,
+    load_persisted_profile_keys,
+    save_config,
+)
+from sylliptor_agent_cli.provider_auth import ProviderAccountStatus, ProviderModel
 
 # --------------------------------------------------------------------------- helpers
 
@@ -61,6 +68,81 @@ def _drive_busy(flow: SetupFlow) -> None:
         assert guard < 20, "busy chain did not converge"
 
 
+def _start_native(flow: SetupFlow) -> None:
+    flow.advance_message()
+    assert flow.stage == "execution"
+    flow.choose(flow_mod._wiz._NATIVE_EXECUTION_VALUE)
+    assert flow.stage == "provider"
+
+
+def _start_subscription(flow: SetupFlow, runtime_id: str = "openai-codex") -> None:
+    flow.advance_message()
+    assert flow.stage == "execution"
+    flow.choose(flow_mod._wiz._SUBSCRIPTION_EXECUTION_VALUE)
+    assert flow.stage == "runtime"
+    flow.choose(f"{flow_mod._wiz._RUNTIME_EXECUTION_PREFIX}{runtime_id}")
+    assert flow.stage == "workspace"
+
+
+def _inherit_router_model(flow: SetupFlow) -> None:
+    assert flow.stage == "router_model"
+    flow.choose(flow_mod._wiz._INHERIT_DEFAULT_MODEL_VALUE)
+    assert flow.stage == "workspace"
+
+
+class FakeSubscriptionAdapter:
+    provider_id = "openai-codex"
+    display_name = "ChatGPT Codex subscription"
+    description = "test"
+    profile_name = "chatgpt-codex"
+    auth_hint = "test"
+    base_url = "https://chatgpt.com/backend-api/codex"
+    protocol = "openai_responses"
+    supports_previous_response_id = False
+
+    def __init__(
+        self,
+        *,
+        connected: bool,
+        account_label: str | None = None,
+        detail: str | None = None,
+        login_error: Exception | None = None,
+    ) -> None:
+        self.connected = connected
+        self.account_label = account_label
+        self.detail = detail
+        self.login_error = login_error
+        self.login_calls: list[str] = []
+
+    def account_status(self) -> ProviderAccountStatus:
+        return ProviderAccountStatus(
+            connected=self.connected,
+            account_label=self.account_label,
+            detail=self.detail,
+        )
+
+    def login(self, method: str = "browser", **_kwargs: Any) -> ProviderAccountStatus:
+        self.login_calls.append(method)
+        if self.login_error is not None:
+            raise self.login_error
+        self.connected = True
+        return self.account_status()
+
+    def list_models(self, *, refresh: bool = False) -> tuple[ProviderModel, ...]:
+        assert refresh is True
+        return (ProviderModel(id="gpt-test", label="GPT Test", is_default=True),)
+
+
+def _patch_subscription_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: FakeSubscriptionAdapter,
+) -> None:
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.provider_auth.create_provider_auth",
+        lambda _provider_id: adapter,
+    )
+
+
 # --------------------------------------------------------------------------- flow: happy path
 
 
@@ -73,14 +155,17 @@ def test_flow_full_happy_path_persists(monkeypatch, tmp_path):
 
     flow = SetupFlow()
     assert flow.screen().stage == "welcome"
-    flow.advance_message()  # -> provider
+    _start_native(flow)
     flow.choose("openai")  # compat OpenAI (requires a key)
     assert flow.stage == "api_key"
     flow.submit_input("sk-test-123")
     _drive_busy(flow)  # validate key -> model
     assert flow.stage == "model"
     flow.choose("gpt-5.5")
-    _drive_busy(flow)  # validate model -> workspace
+    _drive_busy(flow)  # validate default model -> router model
+    assert flow.stage == "router_model"
+    flow.choose("gpt-5.4-nano")
+    _drive_busy(flow)  # validate router model -> workspace
     assert flow.stage == "workspace"
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)  # commit -> diagnose -> complete
@@ -88,6 +173,7 @@ def test_flow_full_happy_path_persists(monkeypatch, tmp_path):
 
     cfg = load_config()
     assert cfg.model == "gpt-5.5"
+    assert cfg.extra_fields["role_models"]["router"] == "gpt-5.4-nano"
     assert load_persisted_profile_keys().get("openai") == "sk-test-123"
     # Summary reflects a validated key + ready sandbox.
     summary = " ".join(text for text, _tone in flow._summary_lines())
@@ -107,12 +193,217 @@ def test_flow_optional_key_provider_skips_validation(monkeypatch, tmp_path):
     )
 
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("ollama")  # local: api_key_env is None
     assert flow.stage == "api_key"
     flow.submit_input("")  # empty key is allowed for this provider
     assert flow.stage == "model"
     assert flow.api_key_result is not None and flow.api_key_result.validation_status == "skipped"
+
+
+def test_flow_subscription_skips_api_key_provider_steps(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+    _patch_subscription_adapter(
+        monkeypatch,
+        FakeSubscriptionAdapter(connected=False, detail="Not logged in."),
+    )
+
+    flow = SetupFlow()
+    flow.advance_message()
+    assert flow.stage == "execution"
+    connection_screen = flow.screen()
+    assert connection_screen.title == "Connection Method"
+    assert [row.label for row in connection_screen.rows] == [
+        "Use an API key",
+        "Use an AI subscription",
+    ]
+    assert all("Codex" not in row.label for row in connection_screen.rows)
+
+    flow.choose(flow_mod._wiz._SUBSCRIPTION_EXECUTION_VALUE)
+    assert flow.stage == "runtime"
+    runtime_value = f"{flow_mod._wiz._RUNTIME_EXECUTION_PREFIX}openai-codex"
+    runtime_rows = {row.value: row for row in flow.screen().rows}
+    assert runtime_value in runtime_rows
+    assert runtime_rows[runtime_value].label == "ChatGPT Codex subscription"
+    assert all(value.startswith(flow_mod._wiz._RUNTIME_EXECUTION_PREFIX) for value in runtime_rows)
+
+    flow.back()
+    assert flow.stage == "execution"
+    flow.choose(flow_mod._wiz._SUBSCRIPTION_EXECUTION_VALUE)
+    assert flow.stage == "runtime"
+
+    flow.choose(runtime_value)
+    assert flow.stage == "workspace"
+    assert flow.screen().progress.startswith("Step 4 of 4")
+    flow.back()
+    assert flow.stage == "runtime"
+    flow.choose(runtime_value)
+    assert flow.stage == "workspace"
+    assert flow.profile_result is None
+    assert flow.api_key_result is None
+    assert flow.model_result is None
+    assert flow.router_model_result is None
+
+    flow.submit_input(os.fspath(tmp_path))
+    _drive_busy(flow)
+    assert flow.stage == "runtime_login_confirm"
+    connect_screen = flow.screen()
+    assert connect_screen.confirm_default is True
+    assert "immediate external side effect" in " ".join(text for text, _ in connect_screen.lines)
+    flow.request_cancel()
+    cancel_copy = " ".join(text for text, _tone in flow.screen().lines)
+    assert "settings are already saved" in cancel_copy
+    assert "No changes will be saved" not in cancel_copy
+    flow.confirm(False)
+    assert flow.stage == "runtime_login_confirm"
+    flow.confirm(False)
+    assert flow.stage == "complete"
+    assert flow.sandbox_result is None
+
+    cfg = load_config()
+    assert cfg.execution.backend == "native"
+    assert cfg.execution.runtime is None
+    assert cfg.agent_runtimes == {}
+    assert cfg.extra_fields["profiles"]["chatgpt-codex"]["auth_provider"] == "openai-codex"
+    summary = " ".join(text for text, _tone in flow._summary_lines())
+    assert "Connection  AI subscription" in summary
+    assert "Provider    ChatGPT Codex subscription" in summary
+    assert "Sign-in     not connected" in summary
+    assert "(delegated)" not in summary
+    assert "delegated run" not in summary.lower()
+    assert "sylliptor auth login openai-codex" in summary
+
+
+def test_flow_subscription_reuses_existing_provider_auth(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+    adapter = FakeSubscriptionAdapter(
+        connected=True,
+        detail="Logged in using ChatGPT",
+    )
+    _patch_subscription_adapter(monkeypatch, adapter)
+    monkeypatch.setattr(
+        sandbox_doctor,
+        "diagnose_sandbox",
+        lambda _cfg, **_kwargs: _fake_diag(ready=True),
+    )
+
+    flow = SetupFlow()
+    _start_subscription(flow)
+    flow.submit_input(os.fspath(tmp_path))
+    _drive_busy(flow)
+
+    assert flow.stage == "complete"
+    assert flow.runtime_auth_connected is True
+    assert adapter.login_calls == []
+    summary = " ".join(text for text, _tone in flow._summary_lines())
+    assert "Sign-in     connected (Logged in using ChatGPT)" in summary
+
+
+def test_flow_subscription_browser_login_runs_in_terminal(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+    adapter = FakeSubscriptionAdapter(
+        connected=False,
+        account_label="developer@example.test",
+    )
+    _patch_subscription_adapter(monkeypatch, adapter)
+    monkeypatch.setattr(
+        sandbox_doctor,
+        "diagnose_sandbox",
+        lambda _cfg, **_kwargs: _fake_diag(ready=True),
+    )
+
+    flow = SetupFlow()
+    _start_subscription(flow)
+    flow.submit_input(os.fspath(tmp_path))
+    _drive_busy(flow)
+    assert flow.stage == "runtime_login_confirm"
+    flow.confirm(True)
+    assert flow.stage == "runtime_logging_in"
+    assert flow.busy_kind() == "terminal"
+    assert flow.screen().busy_kind == "terminal"
+    _drive_busy(flow)
+
+    assert flow.stage == "complete"
+    assert adapter.login_calls == ["browser"]
+    assert flow.runtime_auth_connected is True
+    assert "connected as developer@example.test" in flow.runtime_auth_summary
+
+
+def test_flow_subscription_login_failure_is_non_fatal(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+    _patch_subscription_adapter(
+        monkeypatch,
+        FakeSubscriptionAdapter(
+            connected=False,
+            login_error=RuntimeError("browser login closed"),
+        ),
+    )
+
+    flow = SetupFlow()
+    _start_subscription(flow)
+    flow.submit_input(os.fspath(tmp_path))
+    _drive_busy(flow)
+    flow.confirm(True)
+    _drive_busy(flow)
+
+    assert flow.stage == "complete"
+    assert flow.runtime_auth_connected is False
+    assert "browser login closed" in flow.runtime_auth_summary
+    assert "sylliptor auth login openai-codex" in " ".join(
+        text for text, _tone in flow._summary_lines()
+    )
+    assert flow.success is None
+
+
+def test_provider_screen_surfaces_hosted_providers_with_advanced_branch():
+    # The TUI setup provider screen surfaces the MiMo trial + native first-party
+    # providers AND every other hosted provider (DeepSeek, OpenRouter, …)
+    # directly, so users aren't limited to the big-three brands. Only local,
+    # compatibility, custom, and legacy presets stay behind the "Advanced" branch.
+    # Asserts the *displayed rows*, not just handler behaviour.
+    flow = SetupFlow()
+    _start_native(flow)
+    assert flow.stage == "provider"
+
+    values = [r.value for r in flow.screen().rows]
+    assert values[0] == "sylliptor"
+    labels = [r.label for r in flow.screen().rows]
+    assert any("free trial" in label for label in labels)
+    assert sum("recommended" in label.lower() for label in labels) == 0
+    assert "deepseek" in values  # hosted providers now sit on the primary screen…
+    assert "openrouter" in values
+    assert "ollama" not in values  # …local endpoints stay behind the advanced branch
+    assert flow_mod._wiz._ADVANCED_PROVIDER_PRESETS_VALUE in values
+
+    # The advanced branch holds the local / compatibility / custom / legacy presets.
+    flow.choose(flow_mod._wiz._ADVANCED_PROVIDER_PRESETS_VALUE)
+    assert flow.stage == "provider_advanced"
+    advanced_values = [r.value for r in flow.screen().rows]
+    assert "sylliptor" not in advanced_values
+    assert "deepseek" not in advanced_values  # promoted to the primary screen
+    assert "ollama" in advanced_values
+    assert "custom" in advanced_values
+    assert flow.screen().progress.startswith("Step 3 of 8")
+    assert "Provider (advanced)" in flow.screen().progress
+
+    flow.back()
+    assert flow.stage == "provider"
+
+    # Choosing a hosted provider directly (no advanced hop) proceeds to the key step.
+    flow.choose("deepseek")
+    assert flow.stage == "api_key"
+    assert flow.profile_result is not None
+    assert flow.profile_result.preset is not None
+    assert flow.profile_result.preset.key == "deepseek"
+
+
+def test_provider_advanced_back_returns_to_provider():
+    flow = SetupFlow()
+    _start_native(flow)
+    flow.choose(flow_mod._wiz._ADVANCED_PROVIDER_PRESETS_VALUE)
+    assert flow.stage == "provider_advanced"
+    flow.back()
+    assert flow.stage == "provider"
 
 
 # --------------------------------------------------------------------------- flow: validation
@@ -123,7 +414,7 @@ def test_flow_key_validation_failure_retries_then_continues(monkeypatch, tmp_pat
     _patch_validate(monkeypatch, status="failed", message="bad key")
 
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("openai")
     for _ in range(flow_mod._MAX_KEY_ATTEMPTS - 1):
         flow.submit_input("sk-bad")
@@ -154,7 +445,7 @@ def test_flow_custom_model_not_found_confirm(monkeypatch, tmp_path):
     monkeypatch.setattr(flow_mod._wiz, "_validate_api_key", _validate)
 
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("openai")
     flow.submit_input("sk-test")
     _drive_busy(flow)  # -> model
@@ -164,8 +455,189 @@ def test_flow_custom_model_not_found_confirm(monkeypatch, tmp_path):
     _drive_busy(flow)
     assert flow.stage == "model_not_found_confirm"
     flow.confirm(True)  # use it anyway
+    assert flow.stage == "router_model"
+    assert flow.api_key_result.validation_status == "inconclusive"
+    _inherit_router_model(flow)
+
+
+def test_validated_router_does_not_erase_unconfirmed_default_warning(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+
+    def _validate(**kwargs: Any):
+        if kwargs.get("model") == "unconfirmed-default":
+            return flow_mod._wiz._ApiKeyValidationResult(
+                status="model_not_found",
+                message="default model was not found",
+            )
+        return flow_mod._wiz._ApiKeyValidationResult(status="validated")
+
+    monkeypatch.setattr(flow_mod._wiz, "_validate_api_key", _validate)
+
+    flow = SetupFlow()
+    _start_native(flow)
+    flow.choose("openai")
+    flow.submit_input("sk-test")
+    _drive_busy(flow)
+    flow.choose(flow_mod._wiz._CUSTOM_MODEL_VALUE)
+    flow.submit_input("unconfirmed-default")
+    _drive_busy(flow)
+    flow.confirm(True)
+
+    assert flow.stage == "router_model"
+    assert flow.api_key_result.validation_status == "inconclusive"
+    flow.choose("gpt-5.4-mini")
+    _drive_busy(flow)
+
     assert flow.stage == "workspace"
     assert flow.api_key_result.validation_status == "inconclusive"
+    assert "unconfirmed-default" in flow.api_key_result.validation_message
+    assert flow.status_tone == "warn"
+
+
+def test_flow_router_model_inherit_clears_override_and_navigates(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+    cfg = AppConfig()
+    cfg.extra_fields = {"role_models": {"coding": "coding-model", "router": "old-router-model"}}
+    save_config(cfg)
+    monkeypatch.setattr(
+        sandbox_doctor,
+        "diagnose_sandbox",
+        lambda _cfg, **_kwargs: _fake_diag(ready=True),
+    )
+
+    flow = SetupFlow()
+    _start_native(flow)
+    flow.choose("ollama")
+    flow.submit_input("")
+    flow.choose("llama3.3")
+    _drive_busy(flow)
+
+    assert flow.stage == "router_model"
+    screen = flow.screen()
+    assert screen.progress.startswith("Step 6 of 8")
+    assert screen.rows[0].value == flow_mod._wiz._INHERIT_DEFAULT_MODEL_VALUE
+    assert "llama3.3" in screen.rows[0].description
+
+    flow.back()
+    assert flow.stage == "model"
+    flow.choose("llama3.3")
+    _drive_busy(flow)
+    assert flow.stage == "router_model"
+
+    flow.request_cancel()
+    assert flow.stage == "cancel_confirm"
+    flow.confirm(False)
+    assert flow.stage == "router_model"
+
+    _inherit_router_model(flow)
+    assert flow.router_model_result == flow_mod._wiz._RouterModelStepResult()
+    flow.back()
+    assert flow.stage == "router_model"
+    _inherit_router_model(flow)
+    flow.submit_input(os.fspath(tmp_path))
+    _drive_busy(flow)
+
+    assert flow.stage == "complete"
+    role_models = load_config().extra_fields["role_models"]
+    assert role_models == {"coding": "coding-model"}
+    assert "Router     inherits default" in " ".join(text for text, _tone in flow._summary_lines())
+
+
+def test_flow_custom_router_model_not_found_can_retry_or_accept(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+    validated_models: list[str | None] = []
+
+    def _validate(**kwargs: Any):
+        model = kwargs.get("model")
+        validated_models.append(model)
+        if model == "router-missing":
+            return flow_mod._wiz._ApiKeyValidationResult(
+                status="model_not_found",
+                message="no such router model",
+            )
+        return flow_mod._wiz._ApiKeyValidationResult(status="validated")
+
+    monkeypatch.setattr(flow_mod._wiz, "_validate_api_key", _validate)
+
+    flow = SetupFlow()
+    _start_native(flow)
+    flow.choose("openai")
+    flow.submit_input("sk-test")
+    _drive_busy(flow)
+    flow.choose("gpt-5.5")
+    _drive_busy(flow)
+    assert flow.stage == "router_model"
+
+    router_values = [row.value for row in flow.screen().rows]
+    assert router_values[0] == flow_mod._wiz._INHERIT_DEFAULT_MODEL_VALUE
+    assert "gpt-5.4-mini" in router_values
+    assert router_values[-1] == flow_mod._wiz._CUSTOM_MODEL_VALUE
+
+    flow.choose(flow_mod._wiz._CUSTOM_MODEL_VALUE)
+    assert flow.stage == "custom_router_model"
+    flow.submit_input("")
+    assert flow.stage == "custom_router_model"
+    assert flow.status_tone == "err"
+    flow.back()
+    assert flow.stage == "router_model"
+
+    flow.choose(flow_mod._wiz._CUSTOM_MODEL_VALUE)
+    flow.submit_input("router-missing")
+    _drive_busy(flow)
+    assert flow.stage == "router_model_not_found_confirm"
+    assert flow.screen().progress.startswith("Step 6 of 8")
+    flow.confirm(False)
+    assert flow.stage == "router_model"
+
+    flow.choose(flow_mod._wiz._CUSTOM_MODEL_VALUE)
+    assert flow.screen().input_default == "router-missing"
+    flow.submit_input("router-missing")
+    _drive_busy(flow)
+    flow.confirm(True)
+
+    assert flow.stage == "workspace"
+    assert flow.router_model_result == flow_mod._wiz._RouterModelStepResult(
+        model="router-missing",
+        custom=True,
+        inherited=False,
+    )
+    assert flow.api_key_result.validation_status == "inconclusive"
+    assert validated_models == [None, "gpt-5.5", "router-missing", "router-missing"]
+    flow.back()
+    assert flow.stage == "router_model"
+    assert flow.screen().rows[flow.screen().index].value == "router-missing"
+
+
+def test_flow_preset_router_model_not_found_returns_to_picker(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+
+    def _validate(**kwargs: Any):
+        if kwargs.get("model") == "gpt-5.4-mini":
+            return flow_mod._wiz._ApiKeyValidationResult(
+                status="model_not_found",
+                message="router model unavailable",
+            )
+        return flow_mod._wiz._ApiKeyValidationResult(status="validated")
+
+    monkeypatch.setattr(flow_mod._wiz, "_validate_api_key", _validate)
+
+    flow = SetupFlow()
+    _start_native(flow)
+    flow.choose("openai")
+    flow.submit_input("sk-test")
+    _drive_busy(flow)
+    flow.choose("gpt-5.5")
+    _drive_busy(flow)
+    flow.choose("gpt-5.4-mini")
+    _drive_busy(flow)
+
+    assert flow.stage == "router_model"
+    assert flow.status_tone == "err"
+    # Declining an unavailable router choice preserves the successful default-model
+    # validation; choosing inherit must not leave a stale router error on the key.
+    assert flow.api_key_result.validation_status == "validated"
+    _inherit_router_model(flow)
+    assert flow.api_key_result.validation_status == "validated"
 
 
 def test_flow_workspace_invalid_path_stays(monkeypatch, tmp_path):
@@ -173,17 +645,50 @@ def test_flow_workspace_invalid_path_stays(monkeypatch, tmp_path):
     _patch_validate(monkeypatch)
 
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("ollama")
     flow.submit_input("")  # skip key
     flow.choose("llama3.3")
     _drive_busy(flow)
-    assert flow.stage == "workspace"
+    _inherit_router_model(flow)
     target_file = tmp_path / "afile.txt"
     target_file.write_text("x", encoding="utf-8")
     flow.submit_input(os.fspath(target_file))  # not a directory
     assert flow.stage == "workspace"
     assert flow.status_tone == "err"
+
+
+def test_flow_workspace_missing_folder_confirms_and_creates(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+    _patch_validate(monkeypatch)
+
+    flow = SetupFlow()
+    flow.stage = "workspace"
+    missing = tmp_path / "new-project"
+    flow.submit_input(os.fspath(missing))
+
+    assert flow.stage == "workspace_create_confirm"
+    screen = flow.screen()
+    assert screen.progress.startswith("Step 7 of 8")
+    assert "create_if_missing" not in screen.subtitle
+    assert any(os.fspath(missing.resolve()) in text for text, _tone in screen.lines)
+
+    flow.confirm(True)
+
+    assert missing.is_dir()
+    assert flow.stage == "committing"
+    assert flow.workspace_result is not None
+    assert flow.workspace_result.workspace == os.fspath(missing.resolve())
+
+
+def test_flow_progress_counts_sandbox_as_setup_step():
+    flow = SetupFlow()
+    assert flow._progress("router_model").startswith("Step 6 of 8")
+    flow.stage = "workspace"
+    assert flow.screen().progress.startswith("Step 7 of 8")
+    flow.stage = "sandbox_choice"
+    assert flow.screen().progress.startswith("Step 8 of 8")
+    assert "Sandbox" in flow.screen().progress
 
 
 # --------------------------------------------------------------------------- flow: custom profile
@@ -194,7 +699,7 @@ def test_flow_custom_profile_builds_openai_compat(monkeypatch, tmp_path):
     _patch_validate(monkeypatch)
 
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("custom")
     assert flow.stage == "custom_name"
     flow.submit_input("myco")
@@ -218,7 +723,7 @@ def test_flow_custom_profile_builds_openai_compat(monkeypatch, tmp_path):
 def test_flow_custom_profile_malformed_headers_reprompt(monkeypatch, tmp_path):
     _config_env(tmp_path, monkeypatch)
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("custom")
     flow.submit_input("")  # name defaults to "custom"
     flow.submit_input("https://api.example.com/v1")
@@ -235,11 +740,12 @@ def test_flow_custom_profile_malformed_headers_reprompt(monkeypatch, tmp_path):
 
 
 def _to_sandbox(flow: SetupFlow, tmp_path: Path) -> None:
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("ollama")
     flow.submit_input("")
     flow.choose("llama3.3")
     _drive_busy(flow)
+    _inherit_router_model(flow)
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)  # commit -> diagnose (-> next sandbox screen)
 
@@ -301,11 +807,12 @@ def test_flow_hosted_mimo_offers_login(monkeypatch, tmp_path):
     )
 
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("sylliptor")  # hosted MiMo trial (no key)
     flow.submit_input("")  # optional key skipped
     flow.choose("mimo")
-    _drive_busy(flow)  # validate (skipped) -> workspace
+    _drive_busy(flow)  # validate (skipped) -> router model
+    _inherit_router_model(flow)
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)  # commit -> diagnose -> login_confirm
     assert flow.stage == "login_confirm"
@@ -333,11 +840,13 @@ def test_flow_cancel_at_welcome(monkeypatch):
 def test_flow_back_navigation(monkeypatch):
     _patch_validate(monkeypatch)
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("openai")
     assert flow.stage == "api_key"
     flow.back()
     assert flow.stage == "provider"
+    flow.back()
+    assert flow.stage == "execution"
     flow.back()
     assert flow.stage == "welcome"
 
@@ -358,14 +867,14 @@ def _headless(keys: str, **kwargs: Any) -> bool:
 
 def test_headless_cancel_returns_false(tmp_path, monkeypatch):
     _config_env(tmp_path, monkeypatch)
-    # welcome Enter -> provider; Ctrl+C exits immediately (no confirm to get stuck on).
+    # welcome Enter -> execution; Ctrl+C exits immediately (no confirm to get stuck on).
     assert _headless("\r\x03") is False
 
 
 def test_headless_ctrl_c_exits_from_input_step(tmp_path, monkeypatch):
     _config_env(tmp_path, monkeypatch)
-    # welcome -> provider(idx0) -> api_key input; Ctrl+C must still exit.
-    assert _headless("\r\r\x03") is False
+    # welcome -> native execution -> provider(idx0) -> api_key input; Ctrl+C must still exit.
+    assert _headless("\r\r\r\x03") is False
 
 
 def test_headless_full_path_saves(tmp_path, monkeypatch):
@@ -375,9 +884,9 @@ def test_headless_full_path_saves(tmp_path, monkeypatch):
         sandbox_doctor, "diagnose_sandbox", lambda _cfg, **_k: _fake_diag(ready=True)
     )
 
-    # welcome -> provider(idx0 openai-responses, key required) -> type key ->
-    # model(idx0) -> workspace(default home, Enter) -> complete -> done.
-    keys = "\r" + "\r" + "sk-xyz" + "\r" + "\r" + "\r" + "\r"
+    # welcome -> native execution -> provider(row 1 openai-responses, key required) -> type key ->
+    # model(idx0) -> router(inherit) -> workspace(default home, Enter) -> complete -> done.
+    keys = "\r" + "\r" + "\x1b[B" + "\r" + "sk-xyz" + "\r" + "\r" + "\r" + "\r" + "\r"
     assert _headless(keys) is True
     cfg = load_config()
     assert cfg.model  # a default model was persisted
@@ -397,7 +906,7 @@ def test_flow_preset_model_not_found_bounces_to_picker(monkeypatch, tmp_path):
     monkeypatch.setattr(flow_mod._wiz, "_validate_api_key", _validate)
 
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("openai")
     flow.submit_input("sk-test")
     _drive_busy(flow)
@@ -425,11 +934,12 @@ def test_flow_fatal_commit_error(monkeypatch, tmp_path):
     monkeypatch.setattr(flow_mod._wiz, "_commit_setup", _boom)
 
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("ollama")
     flow.submit_input("")
     flow.choose("llama3.3")
     _drive_busy(flow)
+    _inherit_router_model(flow)
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)  # committing -> fatal (NOT complete)
     assert flow.stage == "fatal"
@@ -452,11 +962,12 @@ def test_flow_hosted_mimo_login_failure_is_non_fatal(monkeypatch, tmp_path):
     monkeypatch.setattr(account_login, "login", _login_boom)
 
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("sylliptor")
     flow.submit_input("")
     flow.choose("mimo")
     _drive_busy(flow)
+    _inherit_router_model(flow)
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)  # -> login_confirm
     assert flow.stage == "login_confirm"
@@ -563,7 +1074,7 @@ def test_flow_api_key_keep_current_on_return(monkeypatch, tmp_path):
     _patch_validate(monkeypatch)
 
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("openai")  # key-required provider
     flow.submit_input("sk-keep")
     _drive_busy(flow)  # -> model
@@ -579,7 +1090,7 @@ def test_flow_api_key_keep_current_on_return(monkeypatch, tmp_path):
 def test_flow_empty_required_key_does_not_consume_retry_budget(monkeypatch, tmp_path):
     _config_env(tmp_path, monkeypatch)
     flow = SetupFlow()
-    flow.advance_message()
+    _start_native(flow)
     flow.choose("openai")  # key required, none entered yet
     flow.submit_input("")
     assert flow.stage == "api_key"

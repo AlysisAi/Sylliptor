@@ -416,11 +416,15 @@ def test_web_fetch_http_error_status_is_explicit(monkeypatch: pytest.MonkeyPatch
         )
 
     monkeypatch.setattr(web_mod, "_resolve_host_addresses", fake_resolver)
-    with pytest.raises(web_mod.WebFetchError, match="HTTP error 404"):
+    with pytest.raises(web_mod.WebFetchError, match="HTTP error 404") as excinfo:
         web_mod.web_fetch(
             url="https://docs.example.com/missing",
             transport=httpx.MockTransport(handler),
         )
+    # The site answered, so the failure is URL-specific: the model must be able
+    # to recover by picking a different source instead of losing web tools for
+    # the rest of the turn.
+    assert excinfo.value.recoverable is True
 
 
 def test_web_fetch_read_timeout_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -434,11 +438,35 @@ def test_web_fetch_read_timeout_is_explicit(monkeypatch: pytest.MonkeyPatch) -> 
     with pytest.raises(
         web_mod.WebFetchError,
         match=r"timed out during response read .*overall=10s",
-    ):
+    ) as excinfo:
         web_mod.web_fetch(
             url="https://docs.example.com/slow",
             transport=httpx.MockTransport(handler),
         )
+    # No response arrived — a genuine connectivity signal stays unrecoverable.
+    assert excinfo.value.recoverable is False
+
+
+def test_web_fetch_oversized_body_is_recoverable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_resolver(_host: str, _port: int) -> list[str]:
+        return ["93.184.216.34"]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"x" * 1_100_000,
+        )
+
+    monkeypatch.setattr(web_mod, "_resolve_host_addresses", fake_resolver)
+    with pytest.raises(web_mod.WebFetchError, match="exceeded max_bytes") as excinfo:
+        web_mod.web_fetch(
+            url="https://docs.example.com/huge",
+            transport=httpx.MockTransport(handler),
+        )
+    # The site responded; an oversized page is URL-specific and must not
+    # disable web tools for the rest of the turn.
+    assert excinfo.value.recoverable is True
 
 
 def test_web_fetch_cloudflare_challenge_status_is_explicit(
@@ -459,11 +487,12 @@ def test_web_fetch_cloudflare_challenge_status_is_explicit(
         )
 
     monkeypatch.setattr(web_mod, "_resolve_host_addresses", fake_resolver)
-    with pytest.raises(web_mod.WebFetchError, match="anti-bot/challenge protection"):
+    with pytest.raises(web_mod.WebFetchError, match="anti-bot/challenge protection") as excinfo:
         web_mod.web_fetch(
             url="https://chatgpt.com/",
             transport=httpx.MockTransport(handler),
         )
+    assert excinfo.value.recoverable is True
 
 
 def test_web_fetch_rejects_hostname_with_mixed_safe_and_blocked_dns_answers(

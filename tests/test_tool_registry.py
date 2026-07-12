@@ -10,8 +10,10 @@ import pytest
 from rich.console import Console
 
 import sylliptor_agent_cli.agent_loop as agent_loop_mod
+from sylliptor_agent_cli.agent.tools_assembly import _BUILTIN_MODEL_DESCRIPTIONS
 from sylliptor_agent_cli.agent_loop import build_tools
 from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.llm.metadata import endpoint_descriptor
 from sylliptor_agent_cli.session_store import SessionStore, read_session_events
 from sylliptor_agent_cli.subagents import built_in_subagents
 from sylliptor_agent_cli.tools.availability import (
@@ -32,6 +34,11 @@ from sylliptor_agent_cli.tools.registry import (
     summarize_tool_output_chunk,
 )
 from sylliptor_agent_cli.web_research import build_web_research_artifact_from_events
+
+
+@pytest.fixture(autouse=True)
+def _clear_generic_web_search_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_API_KEY", raising=False)
 
 
 def _store(root: Path, *, enabled: bool = False) -> SessionStore:
@@ -103,6 +110,39 @@ def test_shell_background_family_in_shell_category() -> None:
         "shell_kill",
         "shell_list",
     } <= shell_tools
+
+
+def test_process_lifetime_is_visible_in_model_and_registry_descriptions() -> None:
+    background = _BUILTIN_MODEL_DESCRIPTIONS["shell_background"]
+    service = _BUILTIN_MODEL_DESCRIPTIONS["shell_service_start"]
+    preview = _BUILTIN_MODEL_DESCRIPTIONS["workspace_preview_start"]
+
+    assert "session lifetime" in background[:140]
+    assert "killed when this session ends" in background[:140]
+    assert "durable lifetime" in service[:140]
+    assert "durable service" in service[:140]
+    assert "keeps running after this session ends" in service[:140]
+    assert "keeps running after this session ends" not in background
+    assert "killed when this session ends" not in service
+    assert "semantic access" in preview
+    assert "free port" in preview
+    assert "without Docker" in preview
+
+    status = _BUILTIN_MODEL_DESCRIPTIONS["shell_service_status"]
+    stop = _BUILTIN_MODEL_DESCRIPTIONS["shell_service_stop"]
+    assert "outlives the session" in status[:140]
+    assert "keep running after the session ends" in stop[:140]
+
+    registry_background = get_builtin_tool_metadata("shell_background").description
+    registry_service = get_builtin_tool_metadata("shell_service_start").description
+    registry_preview = get_builtin_tool_metadata("workspace_preview_start").description
+    assert "terminated when the session closes" in registry_background
+    assert "dev servers you only need while this session is running" in registry_background
+    assert "keeps running after the session ends" in registry_service
+    assert "AgentSession.close" not in registry_service
+    assert "auto, local, or lan" in registry_preview
+    assert "allocates a free port" in registry_preview
+    assert "does not require Docker" in registry_preview
 
 
 def test_build_tools_registers_all_non_optional_catalogued_builtin_tools(tmp_path: Path) -> None:
@@ -440,6 +480,31 @@ def test_fs_read_schema_sets_bounded_default_max_bytes() -> None:
     assert max_bytes["default"] == 12000
 
 
+def test_fs_edit_schema_requires_operation_specific_fields() -> None:
+    fs_edit_spec = next(spec for spec in iter_builtin_tool_metadata() if spec.name == "fs_edit")
+    edit_variants = fs_edit_spec.parameters["properties"]["edits"]["items"]["anyOf"]
+
+    variants_by_ops = {
+        tuple(variant["properties"]["op"]["enum"]): variant for variant in edit_variants
+    }
+
+    replace_variant = variants_by_ops[("replace", "replace_exact")]
+    assert replace_variant["required"] == ["op", "target", "replacement"]
+    assert "content" not in replace_variant["properties"]
+
+    insert_variant = variants_by_ops[("insert_before_exact", "insert_after_exact")]
+    assert insert_variant["required"] == ["op", "target", "content"]
+    assert "replacement" not in insert_variant["properties"]
+
+    append_variant = variants_by_ops[("append", "prepend")]
+    assert append_variant["required"] == ["op", "content"]
+    assert "target" not in append_variant["properties"]
+    assert "replacement" not in append_variant["properties"]
+
+    assert fs_edit_spec.parameters["properties"]["edits"]["minItems"] == 1
+    assert all(variant["additionalProperties"] is False for variant in edit_variants)
+
+
 def test_chat_path_tools_default_to_active_workdir_with_workspace_root_escape_hatch() -> None:
     fs_read_spec = next(spec for spec in iter_builtin_tool_metadata() if spec.name == "fs_read")
     fs_write_spec = next(spec for spec in iter_builtin_tool_metadata() if spec.name == "fs_write")
@@ -508,8 +573,7 @@ def test_build_tools_web_fetch_preserves_explicit_max_chars_value(
 
     result = tools["web_fetch"].run({"url": "https://example.com/spec", "max_chars": 0})
 
-    assert result["ok"] is True
-    assert result["provenance_classification"] == "user_provided"
+    assert result == {"ok": True}
     assert observed["url"] == "https://example.com/spec"
     assert observed["max_chars"] == 0
 
@@ -1330,12 +1394,39 @@ def test_build_tools_does_not_register_web_search_when_mode_is_off(
     assert "web_search" not in tools
 
 
+def test_build_tools_does_not_register_web_search_when_policy_is_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    tools = build_tools(
+        root=tmp_path,
+        console=Console(file=io.StringIO()),
+        store=_store(tmp_path),
+        mode="auto",
+        yes=True,
+        cfg=AppConfig(
+            model="test-model",
+            web_search_mode="auto",
+            web_search_policy="off",
+        ),
+        api_key="main-key",
+        non_interactive=True,
+        verification_enabled=True,
+        subagents_enabled=True,
+        subagent_registry={},
+    )
+
+    assert "web_search" not in tools
+
+
 def test_build_tools_does_not_register_web_search_in_auto_mode_when_runtime_is_not_ready(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", "0")
     unconfigured_tools = build_tools(
         root=tmp_path,
         console=Console(file=io.StringIO()),
@@ -1354,6 +1445,34 @@ def test_build_tools_does_not_register_web_search_in_auto_mode_when_runtime_is_n
         subagent_registry={},
     )
     assert "web_search" not in unconfigured_tools
+
+
+def test_build_tools_registers_web_search_via_keyless_ddgs_without_any_search_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", raising=False)
+    tools = build_tools(
+        root=tmp_path,
+        console=Console(file=io.StringIO()),
+        store=_store(tmp_path),
+        mode="auto",
+        yes=True,
+        cfg=AppConfig(
+            model="deepseek-chat",
+            base_url="https://api.deepseek.com/v1",
+            web_search_mode="auto",
+        ),
+        api_key="main-key",
+        non_interactive=True,
+        verification_enabled=True,
+        subagents_enabled=True,
+        subagent_registry={},
+    )
+
+    assert "web_search" in tools
 
 
 def test_build_tools_registers_web_search_in_auto_mode_when_openai_runtime_is_ready(
@@ -1438,6 +1557,35 @@ def test_build_tools_registers_web_search_in_auto_mode_when_tavily_runtime_is_re
     assert "web_search" in tools
 
 
+def test_build_tools_registers_external_web_search_for_deepseek_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+
+    tools = build_tools(
+        root=tmp_path,
+        console=Console(file=io.StringIO()),
+        store=_store(tmp_path),
+        mode="auto",
+        yes=True,
+        cfg=AppConfig(
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+            web_search_mode="auto",
+            web_search_policy="auto",
+        ),
+        api_key="deepseek-key",
+        non_interactive=True,
+        verification_enabled=True,
+        subagents_enabled=True,
+        subagent_registry={},
+    )
+
+    assert "web_search" in tools
+
+
 def test_build_tools_registers_web_tools_in_top_level_readonly_when_search_ready(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1508,7 +1656,11 @@ def test_build_tools_emits_web_search_runtime_unavailable_event_for_auto_mode(
 ) -> None:
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", "0")
     store = _store(tmp_path, enabled=True)
+    secret_base_url = (
+        "https://search-user:search-password@example-proxy.invalid/private/search-token"
+    )
 
     tools = build_tools(
         root=tmp_path,
@@ -1518,7 +1670,7 @@ def test_build_tools_emits_web_search_runtime_unavailable_event_for_auto_mode(
         yes=True,
         cfg=AppConfig(
             model="test-model",
-            base_url="https://example-proxy.invalid/v1",
+            base_url=secret_base_url,
             web_search_mode="auto",
         ),
         api_key="main-key",
@@ -1541,7 +1693,12 @@ def test_build_tools_emits_web_search_runtime_unavailable_event_for_auto_mode(
     assert payload["provider"] is None
     assert payload["registration_ready"] is False
     assert payload["api_key_available"] is True
-    assert payload["base_url"] == "https://example-proxy.invalid/v1"
+    assert payload["base_url_descriptor"] == endpoint_descriptor(secret_base_url)
+    assert "base_url" not in payload
+    serialized_payload = json.dumps(payload, sort_keys=True)
+    assert "search-user" not in serialized_payload
+    assert "search-password" not in serialized_payload
+    assert "private/search-token" not in serialized_payload
     assert any(
         "OpenAI auto readiness requires explicit web_search_base_url" in note
         for note in payload["notes"]
@@ -1555,6 +1712,7 @@ def test_build_tools_does_not_emit_web_search_runtime_unavailable_event_by_defau
 ) -> None:
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", "0")
     store = _store(tmp_path, enabled=True)
 
     tools = build_tools(

@@ -14,6 +14,9 @@ from sylliptor_agent_cli.cli_impl.tui.app import _activity_rows, _reasoning_rows
 from sylliptor_agent_cli.cli_impl.tui.surface import TuiSurface
 from sylliptor_agent_cli.cli_impl.tui.transcript import TuiTranscript
 from sylliptor_agent_cli.llm.openai_compat import OpenAICompatClient
+from sylliptor_agent_cli.llm.openai_responses import OpenAIResponsesClient
+from sylliptor_agent_cli.llm.types import ReasoningOutputKind
+from sylliptor_agent_cli.surface import ToolEndEvent, ToolStartEvent
 
 
 def _row_text(row: list[tuple[str, str]]) -> str:
@@ -23,7 +26,7 @@ def _row_text(row: list[tuple[str, str]]) -> str:
 # ----------------------------- LLM stream layer -----------------------------
 
 
-def test_openai_compat_streams_reasoning_to_callback():
+def test_openai_compat_does_not_stream_raw_reasoning_to_callback():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -51,9 +54,44 @@ def test_openai_compat_streams_reasoning_to_callback():
         on_reasoning_delta=reasoning.append,
         on_text_delta=content.append,
     )
-    assert "".join(reasoning) == "Let me think."
+    assert reasoning == []
     assert "".join(content) == "Answer"
     assert resp.content == "Answer"
+    assert resp.reasoning == ()
+
+
+def test_openai_compat_streams_structured_summary_but_not_raw_reasoning():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b'data: {"choices":[{"delta":{"reasoning_content":"private",'
+                b'"reasoning_details":[{"type":"reasoning.summary",'
+                b'"summary":"Checked the constraints."}]}}]}\n\n'
+                b'data: {"choices":[{"delta":{"content":"Answer"}}]}\n\n'
+                b"data: [DONE]\n\n"
+            ),
+        )
+
+    client = OpenAICompatClient(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+    )
+    reasoning: list[str] = []
+    response = client.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        on_reasoning_delta=reasoning.append,
+    )
+
+    assert reasoning == ["Checked the constraints."]
+    assert [(item.kind, item.text) for item in response.reasoning] == [
+        (ReasoningOutputKind.SUMMARY, "Checked the constraints.")
+    ]
+    assert "private" not in "".join(reasoning)
 
 
 def test_non_repo_turn_streams_reasoning_to_callback():
@@ -100,6 +138,75 @@ def test_non_repo_turn_streams_reasoning_to_callback():
     )
     assert "".join(reasoning) == "Let me consider this."
     assert str(result) == "Sure!"
+
+
+def test_tool_assisted_non_repo_turn_keeps_stream_callbacks_enabled():
+    from sylliptor_agent_cli.agent.routing import _respond_non_repo_turn
+    from sylliptor_agent_cli.agent.tools_assembly import ToolDef
+    from sylliptor_agent_cli.llm.types import LLMResponse, ToolCall
+
+    class _Client:
+        base_url = "x"
+        model = "m"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.stream_values: list[bool] = []
+
+        def chat(
+            self,
+            *,
+            messages,
+            tools=None,
+            stream=False,
+            on_text_delta=None,
+            on_reasoning_delta=None,
+            temperature=None,
+            **_kw,
+        ):
+            self.calls += 1
+            self.stream_values.append(stream)
+            if on_reasoning_delta:
+                on_reasoning_delta("searching" if self.calls == 1 else "answering")
+            if self.calls == 1:
+                return LLMResponse(
+                    content="",
+                    tool_calls=[ToolCall(id="call-1", name="lookup", arguments={})],
+                    raw={},
+                )
+            if on_text_delta:
+                on_text_delta("Found it.")
+            return LLMResponse(content="Found it.", tool_calls=[], raw={})
+
+    client = _Client()
+    reasoning: list[str] = []
+    text: list[str] = []
+    lookup = ToolDef(
+        name="lookup",
+        description="Look up current information",
+        parameters={"type": "object", "properties": {}},
+        run=lambda _args: {"result": "ok"},
+    )
+
+    result = _respond_non_repo_turn(
+        client=client,
+        instruction="look this up",
+        route="tool",
+        language="en",
+        script="latin",
+        explicit_language_override=False,
+        temperature=0.0,
+        tool_defs={"lookup": lookup},
+        tool_list=[lookup.as_openai_tool()],
+        stream=True,
+        on_text_delta=text.append,
+        on_reasoning_delta=reasoning.append,
+    )
+
+    assert client.stream_values == [True, True]
+    assert reasoning == ["searching", "answering"]
+    assert text == ["Found it."]
+    assert str(result) == "Found it."
 
 
 def test_non_repo_chat_falls_back_when_client_lacks_reasoning_param():
@@ -154,6 +261,59 @@ def test_openai_compat_reasoning_callback_is_optional():
     assert resp.content == "ok"
 
 
+def test_responses_reasoning_summary_and_answer_reach_tui_transcript():
+    def event(event_type: str, payload: str) -> bytes:
+        return f"event: {event_type}\ndata: {payload}\n\n".encode()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        content = b"".join(
+            [
+                event(
+                    "response.reasoning_summary_text.delta",
+                    '{"type":"response.reasoning_summary_text.delta",'
+                    '"item_id":"rs_1","output_index":0,"summary_index":0,'
+                    '"delta":"I will answer briefly."}',
+                ),
+                event(
+                    "response.output_text.delta",
+                    '{"type":"response.output_text.delta","item_id":"msg_1",'
+                    '"output_index":1,"content_index":0,"delta":"Hello!"}',
+                ),
+                event(
+                    "response.completed",
+                    '{"type":"response.completed","response":{"id":"resp_1",'
+                    '"status":"completed","output_text":"Hello!","output":[]}}',
+                ),
+            ]
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=content,
+        )
+
+    transcript = TuiTranscript()
+    transcript.begin_turn()
+    surface = TuiSurface(transcript, auto_approve=lambda: True)
+    client = OpenAIResponsesClient(
+        base_url="https://api.openai.com/v1",
+        api_key="test",
+        model="gpt-test",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        stream=True,
+        on_reasoning_delta=surface.on_reasoning_token,
+        on_text_delta=surface.on_assistant_token,
+    )
+    surface.on_assistant_message_done(response.content)
+
+    assert ("reasoning", "I will answer briefly.") in transcript.entries
+    assert ("assistant", "Hello!") in transcript.entries
+
+
 # ------------------------------ transcript model ------------------------------
 
 
@@ -202,6 +362,39 @@ def test_reasoning_supports_multiple_blocks_per_turn():
     assert len(reasoning_entries) == 2
 
 
+def test_reasoning_lifecycle_keeps_provider_calls_in_stable_separate_blocks():
+    t = TuiTranscript()
+
+    t.begin_reasoning("call-1")
+    t.stream_reasoning("first summary")
+    t.end_reasoning("call-1")
+    t.begin_reasoning("call-2")
+    t.stream_reasoning("second summary")
+    t.end_reasoning("call-2")
+
+    assert t.entries == [
+        ("reasoning", "first summary"),
+        ("reasoning", "second summary"),
+    ]
+    assert t.reasoning_block_ids() == {0: "call-1", 1: "call-2"}
+    active, elapsed = t.reasoning_snapshot()
+    assert active is None
+    assert set(elapsed) == {0, 1}
+
+
+def test_reasoning_lifecycle_ignores_stale_end_event():
+    t = TuiTranscript()
+    t.begin_reasoning("current")
+    t.stream_reasoning("still live")
+
+    t.end_reasoning("stale")
+
+    active, _elapsed = t.reasoning_snapshot()
+    assert active == 0
+    t.end_reasoning("current")
+    assert t.reasoning_snapshot()[0] is None
+
+
 def test_clear_resets_reasoning():
     t = TuiTranscript()
     t.stream_reasoning("x")
@@ -223,15 +416,108 @@ def test_surface_routes_reasoning_token():
     assert t.entries[idx] == ("reasoning", "hmm, let me see")
 
 
+def test_surface_routes_reasoning_lifecycle():
+    t = TuiTranscript()
+    surface = TuiSurface(t, auto_approve=lambda: True)
+
+    surface.on_reasoning_start("provider-call")
+    surface.on_reasoning_token("safe summary")
+    surface.on_reasoning_end("provider-call")
+
+    assert t.entries == [("reasoning", "safe summary")]
+    assert t.reasoning_block_ids() == {0: "provider-call"}
+    assert t.reasoning_snapshot()[0] is None
+
+
+def test_surface_trace_off_suppresses_reasoning_without_changing_other_levels():
+    off_transcript = TuiTranscript()
+    off_surface = TuiSurface(off_transcript, auto_approve=lambda: True)
+    assert off_surface.set_trace_level("off") == "off"
+    off_surface.on_reasoning_token("hidden reasoning")
+    assert not any(role == "reasoning" for role, _text in off_transcript.entries)
+
+    for level in ("compact", "full"):
+        transcript = TuiTranscript()
+        surface = TuiSurface(transcript, auto_approve=lambda: True)
+        assert surface.set_trace_level(level) == level
+        surface.on_reasoning_token(f"{level} reasoning")
+        assert ("reasoning", f"{level} reasoning") in transcript.entries
+
+
+def test_switching_trace_off_closes_live_reasoning_and_status():
+    transcript = TuiTranscript()
+    surface = TuiSurface(transcript, auto_approve=lambda: True)
+    surface.on_reasoning_token("active reasoning")
+    surface.on_progress_update("active status")
+
+    surface.set_trace_level("off")
+
+    reasoning_index, _elapsed = transcript.reasoning_snapshot()
+    assert reasoning_index is None
+    assert transcript.status is None
+
+
+def test_trace_off_hides_successful_tool_trace_but_keeps_failures_visible():
+    transcript = TuiTranscript()
+    surface = TuiSurface(transcript, auto_approve=lambda: True)
+    surface.set_trace_level("off")
+
+    surface.on_tool_end(ToolEndEvent("ok", "fs_read", "done", 5))
+    surface.on_tool_end(ToolEndEvent("failed", "fs_write", "error", 8, meta={"error": "disk full"}))
+
+    assert not any(role == "trace" for role, _text in transcript.entries)
+    assert any(role == "error" and "disk full" in text for role, text in transcript.entries)
+
+
+def test_full_trace_adds_tool_start_detail_while_compact_keeps_milestones_only():
+    compact_transcript = TuiTranscript()
+    compact = TuiSurface(compact_transcript, auto_approve=lambda: True)
+    compact.set_trace_level("compact")
+    compact.on_tool_start(
+        ToolStartEvent(
+            tool_call_id="call-1",
+            name="fs_read",
+            args={"path": "README.md"},
+            step=1,
+        )
+    )
+    compact.on_tool_end(
+        ToolEndEvent(tool_call_id="call-1", name="fs_read", status="done", elapsed_ms=5)
+    )
+
+    full_transcript = TuiTranscript()
+    full = TuiSurface(full_transcript, auto_approve=lambda: True)
+    full.set_trace_level("full")
+    full.on_tool_start(
+        ToolStartEvent(
+            tool_call_id="call-2",
+            name="fs_read",
+            args={"path": "README.md"},
+            step=1,
+        )
+    )
+    full.on_tool_end(
+        ToolEndEvent(tool_call_id="call-2", name="fs_read", status="done", elapsed_ms=5)
+    )
+
+    compact_trace = [text for role, text in compact_transcript.entries if role == "trace"]
+    full_trace = [text for role, text in full_transcript.entries if role == "trace"]
+    assert len(compact_trace) == 1
+    assert compact_trace[0].startswith("✓")
+    assert len(full_trace) == 2
+    assert full_trace[0].startswith("▸")
+    assert full_trace[1].startswith("✓")
+
+
 # ------------------------------ _reasoning_rows ------------------------------
 
 
 def test_reasoning_rows_collapsed_summary():
-    rows = _reasoning_rows("a long inner monologue", 60, live=False, secs=12, expanded=False)
+    rows = _reasoning_rows("safe provider summary", 60, live=False, secs=12, expanded=False)
     assert len(rows) == 1  # just the chevron header, no body
     text = _row_text(rows[0])
     assert text.startswith("▸ ")  # collapsed chevron
-    assert "thought for 12s" in text
+    assert "safe provider summary" in text
 
 
 def test_reasoning_rows_live_shows_full_text():
@@ -249,7 +535,7 @@ def test_reasoning_rows_live_header_animates_with_spinner_and_elapsed():
     )
     header = _row_text(rows[0])
     assert header.startswith("⠋ ")  # the spinner leads the live header
-    assert "thinking… 3s" in header
+    assert "reasoning summary… 3s" in header
 
 
 def test_activity_indicator_under_question():
@@ -267,8 +553,10 @@ def test_activity_indicator_under_question():
 def test_reasoning_rows_expanded_shows_full_when_closed():
     collapsed = _reasoning_rows("detail here", 60, live=False, secs=5, expanded=False)
     expanded = _reasoning_rows("detail here", 60, live=False, secs=5, expanded=True)
-    assert "detail here" not in "\n".join(_row_text(r) for r in collapsed)
+    assert len(collapsed) == 1
+    assert not any(_row_text(row).startswith("│ ") for row in collapsed)
     assert "detail here" in "\n".join(_row_text(r) for r in expanded)
+    assert any(_row_text(row).startswith("│ ") for row in expanded)
 
 
 # --------------------------- headless integration ---------------------------

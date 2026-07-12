@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -9,6 +10,10 @@ from ..failure_category import FailureCategory, is_infra_unavailable_error
 from ..language_policy import normalize_language_name
 from ..runtime_kind import RuntimeKind
 from ..tools.availability import is_tool_unavailable_result
+from ..verification_command_analysis import (
+    analyze_verification_command,
+    is_benign_non_execution_reason,
+)
 from ..verify_gate import (
     ResolvedVerifyCommands,
     assess_verification_command_execution,
@@ -33,7 +38,6 @@ from .completion_certificate import (
 from .completion_gate import CompletionGateControllerState
 from .mutation_classification import classify_mutation_paths, material_mutation_paths
 from .prompt_context import (
-    MAX_POST_EXPLORE_ANCHOR_PATHS,
     _extract_workspace_relation_paths_from_text,
     _normalize_repo_relative_hint_path,
     _paths_require_verification,
@@ -41,10 +45,12 @@ from .prompt_context import (
     _session_task_brief_content,
     _session_verify_command_selection,
     _task_brief_lines_from_text,
+    _verification_commands_apply_to_paths,
     refresh_session_environment_context_message,
 )
 from .verification_commands import (
     _matching_effective_verification_commands,
+    _normalize_shell_command_for_match,
 )
 from .verification_evidence import (
     VerificationEvidence,
@@ -66,6 +72,7 @@ _MATERIAL_EDIT_TOOL_NAMES = {
     "fs_delete",
     "fs_mkdir",
     "shell_service_start",
+    "workspace_preview_start",
 }
 _VERIFICATION_SHELL_MARKERS = (
     "pytest",
@@ -87,6 +94,55 @@ _VERIFICATION_SHELL_MARKERS = (
     "make test",
     "make check",
 )
+_TEST_EXECUTION_COMMAND_RE = re.compile(
+    r"(?:^|\s)(?:pytest|py\.test|tox|nox)(?:\s|$)|"
+    r"\b(?:python(?:3)?|py)\s+-m\s+(?:pytest|unittest)\b|"
+    r"\b(?:python(?:3)?|py)\b[^\n]*\bmanage\.py\s+test\b|"
+    r"\b(?:python(?:3)?|py)\b[^\n]*\b(?:runtests?|test_[^\s/]+|[^\s/]+_test)\.py\b|"
+    r"(?:^|\s)(?:\./)?(?:bin/)?(?:runtests?|test)(?:\s|$)|"
+    r"\b(?:go|cargo)\s+test\b|"
+    r"\b(?:npm|pnpm|yarn)\s+test\b|"
+    r"\b(?:vitest|jest|rspec|phpunit|ctest)\b|"
+    r"\b(?:mvn|mvnw|maven|gradle|gradlew|dotnet|bazel|mix)\b[^\n]*\btest\b|"
+    r"\b(?:make|just)\s+(?:test|check)\b",
+    re.IGNORECASE,
+)
+_TEST_SUCCESS_CLAIM_RE = re.compile(
+    r"\b(?:all\s+)?(?:\d+\s+)?tests?(?:\s+suite)?\s+"
+    r"(?:(?:is|are|was|were)\s+)?"
+    r"(?:pass(?:ed|es|ing)?|succeed(?:ed|s)?|green)\b|"
+    r"\btests?\s*:\s*[^\n]{0,120}\b(?:pass(?:ed|es|ing)?|succeed(?:ed|s)?)\b|"
+    r"\b(?:pass(?:ed|es|ing)?|green)\s+(?:all\s+)?tests?\b",
+    re.IGNORECASE,
+)
+_GENERIC_VERIFICATION_SUCCESS_CLAIM_RE = re.compile(
+    r"\bverified\b|"
+    r"\bverification\s+(?:passed|succeeded|completed|was\s+successful)\b|"
+    r"\b(?:validation|checks?)\s+(?:passed|succeeded)\b",
+    re.IGNORECASE,
+)
+_NEGATED_CLAIM_PREFIX_RE = re.compile(
+    r"(?:\b(?:not|never|no|without)\b[^.!?\n]{0,32}|"
+    r"\b(?:cannot|can't|could\s+not|couldn't|did\s+not|didn't|wasn't|isn't|"
+    r"unable\s+to|failed\s+to)(?:\s+be)?)\s*$",
+    re.IGNORECASE,
+)
+_SAFE_LEADING_CD_RE = re.compile(
+    r"^\s*cd(?:\s+/d)?\s+(?:\"[^\"]*\"|'[^']*'|[^\s]+)\s*&&\s*",
+    re.IGNORECASE,
+)
+_UNSAFE_CLAIM_EVIDENCE_SHELL_RE = re.compile(
+    r"\|\||(?<![&])\|(?![&])|;|[\r\n]|&&|(?:^|\s)&(?:\s|$)",
+)
+_SHELL_REDIRECTION_RE = re.compile(
+    r"\s+(?:\d*>&\d+|\d*(?:>>?|<)\s*[^\s]+)(?=\s|$)",
+)
+SUPPLEMENTAL_VERIFICATION_ADVISORY = (
+    "Note: every passing check so far was authored during this session. "
+    "Self-written tests verify your interpretation, not the task's. Re-read the "
+    "task's exact requirements (output path, format, names, values) and confirm "
+    "your deliverable against the spec itself before finalizing."
+)
 _COMPLETION_GATE_PROBLEM_LABELS = {
     "empty_final_response": "empty final response",
     "clarification_requested": "clarification requested instead of action",
@@ -99,70 +155,6 @@ _COMPLETION_GATE_PROBLEM_LABELS = {
     "acceptance_evidence_insufficient": "acceptance evidence insufficient",
     "unexpected_scope_changes": "unexpected scope changes",
 }
-_COMPLETION_GATE_REPAIR_MESSAGES = {
-    "empty_final_response": (
-        "The previous assistant response was empty. Do not finalize with empty text; "
-        "continue with the next concrete tool action, or report a specific evidence-backed blocker."
-    ),
-    "clarification_requested": (
-        "This execute-intent task already has enough direction for a safe best effort. "
-        "Do not ask a generic clarification question; inspect the repo, make the requested change, "
-        "verify it, or report a concrete safety-critical blocker."
-    ),
-    "no_material_edits": (
-        "You have not completed material work yet. Do not finalize or summarize yet. "
-        "Your next step must be an implementation or deliverable-creation action "
-        "using a mutation tool (for example fs_edit, fs_write, git_apply_patch, "
-        "fs_move, fs_copy, or shell_run only when it actually performs implementation "
-        "or creates the requested deliverable), or a concrete evidence-backed blocker "
-        "report. Verification alone cannot satisfy a task that lacks implementation "
-        "or a deliverable; run verification after material work exists."
-    ),
-    "verification_not_attempted": (
-        "Run the session's configured verification now. Prefer verify_run with no arguments. "
-        "Do not use piped, grepped, help/list/build-only, or otherwise filtered shell commands as verification."
-    ),
-    "verification_incomplete": (
-        "Run the remaining commands required by the session's effective verification contract exactly. "
-        "Do not substitute a different build system or a different test command."
-    ),
-    "verification_failed": (
-        "Your latest verification attempt failed. Inspect the observed failure, edit or fix "
-        "the implementation, and rerun verification until it passes, or report a concrete "
-        "blocker such as a missing wrapper or incompatible host toolchain. "
-        "Do not claim success based on an alternate command that is outside the configured verification contract."
-    ),
-    "acceptance_criteria_unverified": (
-        "The acceptance contract still has required criteria without direct evidence. "
-        "Materialize required outputs, run the exact user/host check, or report a concrete blocker."
-    ),
-    "acceptance_criteria_failed": (
-        "A required acceptance criterion has failed. Fix the underlying artifact or behavior, "
-        "then rerun the relevant direct check instead of relying on unrelated passing tests."
-    ),
-    "acceptance_evidence_insufficient": (
-        "The available evidence is supplemental or low-confidence for a required criterion. "
-        "Use independent pre-existing, user-explicit, host, or direct black-box evidence."
-    ),
-    "unexpected_scope_changes": (
-        "The task included preservation or scope constraints and an unexpected material path changed. "
-        "Undo or justify the scope violation before finalizing."
-    ),
-}
-_COMPLETION_GATE_REPAIR_MESSAGES_BY_LOCALE = {
-    "english": _COMPLETION_GATE_REPAIR_MESSAGES,
-}
-_COMPLETION_GATE_REPAIR_STAGE_LIMITS = {
-    "generic": 2,
-    "empty_final_response": 2,
-    "clarification_requested": 2,
-    "no_material_edits": 2,
-    "verification_not_attempted": 2,
-    "verification_incomplete": 2,
-    "verification_failed": 2,
-    "acceptance_failed": 2,
-    "acceptance_unverified": 2,
-}
 _ONE_SHOT_COMPLETION_GATE_NUDGE_PREFIX = (
     "Completion gate: this one-shot execution run cannot finalize yet."
 )
@@ -170,7 +162,7 @@ _RUNTIME_DEFAULT_LANGUAGE = "english"
 _RUNTIME_MESSAGE_CATALOG: dict[str, dict[str, str]] = {
     "english": {
         "phase_understanding_request": "Understanding your request.",
-        "phase_drafting_response": "Drafting response.",
+        "phase_drafting_response": "Contacting model provider.",
         "phase_compacted_history": "Compacted conversation history.",
         "phase_retrying_step": "Retrying with higher temperature for this step.",
         "phase_running_tool_steps": "Running {count} tool step(s): {names}.",
@@ -221,11 +213,11 @@ _RUNTIME_MESSAGE_CATALOG: dict[str, dict[str, str]] = {
         ),
         "one_shot_post_explore_bootstrap_targets": ("Likely repo-root-relative targets: {joined}."),
         "one_shot_edit_strategy_nudge": (
-            "Edit strategy is stuck. Switch approach now: fs_edit ops are replace_exact, "
-            "insert_before_exact, insert_after_exact, append, prepend (replace is tolerated as "
-            "alias of replace_exact). Re-read the target file before retrying. If localized "
-            "fs_edit is a poor fit, use git_apply_patch or fs_write. Do not repeat the same "
-            "failing edit call."
+            "Edit strategy is stuck. Switch approach now: re-read the target lines, then use "
+            "fs_edit replace_lines/insert_before_line/insert_after_line with expected_old when "
+            "possible, or exact ops replace_exact/insert_before_exact/insert_after_exact when "
+            "matching known text. If localized fs_edit is a poor fit, use git_apply_patch or "
+            "fs_write. Do not repeat the same failing edit call."
         ),
         "one_shot_non_final_progress_stopped": (
             "One-shot run stopped: model returned repeated/non-final progress text "
@@ -270,25 +262,6 @@ _RUNTIME_MESSAGE_CATALOG: dict[str, dict[str, str]] = {
         "interactive_completion_gate_nudge_prefix": (
             "Completion gate: this interactive execution turn cannot finalize yet."
         ),
-        "completion_gate_fallback_suffix": (
-            "Use the next required tool action to complete the requested work."
-        ),
-        "completion_gate_first_reported_error": "First reported error: {snippet}.",
-        "completion_gate_fix_then_rerun": (
-            "Inspect the failure, fix the implementation, rerun verification, then summarize."
-        ),
-        "completion_gate_terminal_failure": (
-            "One-shot run stopped: completion gate requirements were not met ({problem_summary})."
-        ),
-        "interactive_completion_gate_terminal_failure": (
-            "Execution turn stopped: completion gate requirements were not met ({problem_summary})."
-        ),
-        "completion_gate_step_budget_exhausted": (
-            "One-shot run stopped: completion gate repair attempt consumed the step budget."
-        ),
-        "interactive_completion_gate_step_budget_exhausted": (
-            "Execution turn stopped: completion gate repair attempt consumed the step budget."
-        ),
         "max_steps_exceeded": "max_steps exceeded",
     },
 }
@@ -301,8 +274,10 @@ class TurnExecutionState:
     covered_verification_commands: set[str] = field(default_factory=set)
     covered_verification_command_generations: dict[str, int] = field(default_factory=dict)
     material_edit_count: int = 0
+    material_edit_generation: int = 0
     material_edit_tools: set[str] = field(default_factory=set)
     touched_repo_paths: set[str] = field(default_factory=set)
+    last_diff_review_generation: int | None = None
     verification_attempt_count: int = 0
     verification_tools: set[str] = field(default_factory=set)
     last_verification_passed: bool | None = None
@@ -317,6 +292,7 @@ class TurnExecutionState:
     accepted_verification_evidence: list[dict[str, Any]] = field(default_factory=list)
     supplemental_verification_evidence: list[dict[str, Any]] = field(default_factory=list)
     rejected_verification_evidence: list[dict[str, Any]] = field(default_factory=list)
+    executed_verification_evidence: list[dict[str, Any]] = field(default_factory=list)
     verification_evidence_generation: int = 0
     completion_gate_repair_attempts: int = 0
     completion_gate_no_material_edits_repair_attempts: int = 0
@@ -338,6 +314,19 @@ class TurnExecutionState:
     def note_verification_relevant_edit(self) -> None:
         self.verification_relevant_edit_generation += 1
         self.refresh_verification_coverage()
+
+    def note_material_edit(self) -> None:
+        self.material_edit_count += 1
+        self.material_edit_generation += 1
+
+    def record_diff_review(self) -> None:
+        self.last_diff_review_generation = self.material_edit_generation
+
+    def diff_review_is_stale(self) -> bool:
+        return self.material_edit_count > 0 and (
+            self.last_diff_review_generation is None
+            or self.last_diff_review_generation < self.material_edit_generation
+        )
 
     def record_verification_coverage(self, commands: set[str]) -> None:
         if not commands:
@@ -363,6 +352,8 @@ class TurnExecutionState:
         evidence: VerificationEvidence,
         *,
         accepted: bool,
+        observed_exit_code: int | None = None,
+        observed_output: bool = False,
     ) -> None:
         category = evidence.category.value
         self.verification_evidence_counts[category] = (
@@ -373,6 +364,11 @@ class TurnExecutionState:
         payload = evidence.as_payload()
         payload["accepted"] = bool(accepted)
         payload["generation"] = self.verification_relevant_edit_generation
+        payload["observed_exit_code"] = observed_exit_code
+        payload["observed_output"] = bool(observed_output)
+        if evidence.real_execution is True:
+            self.executed_verification_evidence.append(payload)
+            self.executed_verification_evidence[:] = self.executed_verification_evidence[-20:]
         if accepted:
             self.verification_evidence_generation += 1
             self.accepted_verification_evidence.append(payload)
@@ -385,6 +381,30 @@ class TurnExecutionState:
         else:
             self.rejected_verification_evidence.append(payload)
             self.rejected_verification_evidence[:] = self.rejected_verification_evidence[-10:]
+
+    def record_executed_command_evidence(
+        self,
+        *,
+        normalized_command: str,
+        observed_exit_code: int,
+        observed_output: bool,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "evidence_category": "COMMAND_EXECUTION",
+            "normalized_command": normalized_command,
+            "matched_command": None,
+            "real_execution": True,
+            "allowed_to_satisfy_contract": False,
+            "reason": "observed_shell_verification_execution",
+            "covered_verification_commands": [],
+            "supplemental_only": False,
+            "accepted": False,
+            "generation": self.verification_relevant_edit_generation,
+            "observed_exit_code": observed_exit_code,
+            "observed_output": bool(observed_output),
+        }
+        self.executed_verification_evidence.append(payload)
+        self.executed_verification_evidence[:] = self.executed_verification_evidence[-20:]
 
     def missing_verification_commands(self) -> set[str]:
         return self.expected_verification_commands - self.covered_verification_commands
@@ -436,8 +456,11 @@ class TurnExecutionState:
             "covered_verification_commands": sorted(self.covered_verification_commands),
             "missing_verification_commands": sorted(self.missing_verification_commands()),
             "material_edit_count": self.material_edit_count,
+            "material_edit_generation": self.material_edit_generation,
             "material_edit_tools": sorted(self.material_edit_tools),
             "touched_repo_paths": sorted(self.touched_repo_paths),
+            "last_diff_review_generation": self.last_diff_review_generation,
+            "diff_review_stale": self.diff_review_is_stale(),
             "verification_attempt_count": self.verification_attempt_count,
             "verification_tools": sorted(self.verification_tools),
             "last_verification_passed": self.last_verification_passed,
@@ -453,15 +476,13 @@ class TurnExecutionState:
             "accepted_verification_evidence": list(self.accepted_verification_evidence),
             "supplemental_verification_evidence": list(self.supplemental_verification_evidence),
             "rejected_verification_evidence": list(self.rejected_verification_evidence),
+            "executed_verification_evidence": list(self.executed_verification_evidence),
             "verification_evidence_generation": self.verification_evidence_generation,
             "completion_gate_repair_attempts": self.completion_gate_repair_attempts,
             "completion_gate_no_material_edits_repair_attempts": self.completion_gate_no_material_edits_repair_attempts,
             "completion_gate_missing_verify_repair_attempts": self.completion_gate_missing_verify_repair_attempts,
             "completion_gate_failed_verify_repair_attempts": self.completion_gate_failed_verify_repair_attempts,
             "completion_gate_controller": self.completion_gate_controller_state.as_payload(),
-            "completion_gate_episode_id": self.completion_gate_controller_state.last_episode_id,
-            "completion_gate_stagnant_attempt_count": self.completion_gate_controller_state.stagnant_attempt_count,
-            "completion_gate_consecutive_no_progress_rejections": self.completion_gate_controller_state.consecutive_no_progress_rejections,
             "completion_gate_last_decision_kind": self.completion_gate_controller_state.last_decision_kind,
             "completion_certificate": dict(self.latest_completion_certificate),
             **acceptance_contract_problem_payload(self.acceptance_contract),
@@ -492,6 +513,55 @@ class TurnExecutionState:
             )
             for criterion in self.acceptance_contract.criteria
         )
+
+
+def _successful_verification_claim_kind(final_text: str) -> str | None:
+    text = str(final_text or "")
+    for kind, pattern in (
+        ("tests", _TEST_SUCCESS_CLAIM_RE),
+        ("verification", _GENERIC_VERIFICATION_SUCCESS_CLAIM_RE),
+    ):
+        for match in pattern.finditer(text):
+            prefix = text[max(0, match.start() - 48) : match.start()]
+            if _NEGATED_CLAIM_PREFIX_RE.search(prefix):
+                continue
+            return kind
+    return None
+
+
+def _fresh_executed_evidence_for_claim(
+    state: TurnExecutionState,
+    *,
+    claim_kind: str,
+) -> list[dict[str, Any]]:
+    required_generation = state.verification_relevant_edit_generation
+    evidence: list[dict[str, Any]] = []
+    for raw_item in state.executed_verification_evidence:
+        if not isinstance(raw_item, dict):
+            continue
+        item = dict(raw_item)
+        try:
+            generation = int(item.get("generation"))
+        except (TypeError, ValueError):
+            continue
+        if generation < required_generation:
+            continue
+        if item.get("real_execution") is not True:
+            continue
+        if item.get("reason") == "mutated_material_paths":
+            continue
+        if item.get("observed_exit_code") != 0 or item.get("observed_output") is not True:
+            continue
+        command = str(item.get("normalized_command") or "").strip()
+        if not command:
+            continue
+        if claim_kind == "tests":
+            analysis = analyze_verification_command(command, trusted=True)
+            family = str(analysis.command_family or "").casefold()
+            if "test" not in family and _TEST_EXECUTION_COMMAND_RE.search(command) is None:
+                continue
+        evidence.append(item)
+    return evidence
 
 
 def _runtime_message_locale(
@@ -596,7 +666,7 @@ def _verification_attempt_passed(
                     checks.append(False)
                     continue
                 real_execution = item.get("real_execution")
-                if real_execution is False:
+                if real_execution is not True:
                     checks.append(False)
                     continue
                 ok = item.get("ok")
@@ -624,7 +694,7 @@ def _verification_attempt_passed(
             exit_code=exit_code,
             output=output,
         )
-        return assessment.real_execution is not False
+        return assessment.real_execution is True
     return False
 
 
@@ -634,9 +704,19 @@ def _verification_relevant_material_paths(paths: set[str]) -> set[str]:
     return set(paths)
 
 
+def _verification_command_result_is_benign_skip(item: dict[str, Any]) -> bool:
+    return (
+        item.get("status") == "skipped"
+        and item.get("ok") is True
+        and is_benign_non_execution_reason(str(item.get("non_execution_reason") or ""))
+    )
+
+
 def _verification_command_result_passed(item: dict[str, Any]) -> bool:
+    if _verification_command_result_is_benign_skip(item):
+        return True
     real_execution = item.get("real_execution")
-    if real_execution is False:
+    if real_execution is not True:
         return False
     ok = item.get("ok")
     if isinstance(ok, bool):
@@ -841,6 +921,36 @@ def _aggregate_verification_evidence(
     )
 
 
+def _verification_evidence_note(
+    evidence: VerificationEvidence,
+    *,
+    result: dict[str, Any] | None = None,
+) -> str:
+    if evidence.category == VerificationEvidenceCategory.NOT_VERIFICATION:
+        return ""
+    if evidence.supplemental_only:
+        return (
+            "evidence origin: SELF_AUTHORED "
+            "(supplemental - cannot independently confirm spec compliance)"
+        )
+    result_payload = result if isinstance(result, dict) else {}
+    command_specs = result_payload.get("verification_command_specs")
+    if isinstance(command_specs, list) and any(
+        isinstance(item, dict) and item.get("provenance") == "PREEXISTING_REPO_NATIVE"
+        for item in command_specs
+    ):
+        return "evidence origin: PREEXISTING_REPO_NATIVE (independent)"
+    if result_payload.get("verification_contract_type") == "repo_native":
+        return "evidence origin: PREEXISTING_REPO_NATIVE (independent)"
+    if evidence.category == VerificationEvidenceCategory.AUTHORITATIVE:
+        return "evidence origin: USER_EXPLICIT (independent)"
+    if evidence.category == VerificationEvidenceCategory.REPO_NATIVE:
+        return "evidence origin: PREEXISTING_REPO_NATIVE (independent)"
+    if evidence.category == VerificationEvidenceCategory.TASK_ACCEPTANCE:
+        return "evidence origin: DIRECT_BLACK_BOX (independent)"
+    return ""
+
+
 def _verify_run_evidence_records(
     *,
     result: dict[str, Any],
@@ -863,23 +973,32 @@ def _verify_run_evidence_records(
                 continue
             exit_code_raw = item.get("exit_code")
             exit_code = exit_code_raw if isinstance(exit_code_raw, int) else None
-            records.append(
-                classify_verification_evidence(
-                    command,
-                    known_verification_commands=known_verification_commands,
-                    authoritative=verification_authoritative,
-                    material_touched_paths=verification_relevant_touched_paths,
-                    exit_code=exit_code,
-                    output=_verification_output_text(item),
-                    real_execution=(
-                        item.get("real_execution")
-                        if isinstance(item.get("real_execution"), bool)
-                        or item.get("real_execution") is None
-                        else None
-                    ),
-                    root=root,
-                )
+            record = classify_verification_evidence(
+                command,
+                known_verification_commands=known_verification_commands,
+                authoritative=verification_authoritative,
+                material_touched_paths=verification_relevant_touched_paths,
+                exit_code=exit_code,
+                output=_verification_output_text(item),
+                real_execution=(
+                    item.get("real_execution")
+                    if isinstance(item.get("real_execution"), bool)
+                    or item.get("real_execution") is None
+                    else None
+                ),
+                root=root,
             )
+            if (
+                _verification_command_result_is_benign_skip(item)
+                and record.category != VerificationEvidenceCategory.NOT_VERIFICATION
+                and record.covered_verification_commands
+            ):
+                record = replace(
+                    record,
+                    allowed_to_satisfy_contract=True,
+                    reason=str(item.get("non_execution_reason") or "verification_skipped"),
+                )
+            records.append(record)
         return records
 
     commands = result.get("commands")
@@ -924,6 +1043,74 @@ def _shell_verification_evidence(
         output=_verification_output_text(result),
         root=root,
     )
+
+
+def _verification_evidence_observation(
+    *,
+    tool_name: str,
+    evidence: VerificationEvidence,
+    result: dict[str, Any],
+) -> tuple[int | None, bool]:
+    def _has_output(payload: dict[str, Any]) -> bool:
+        if any(
+            str(payload.get(key) or "").strip()
+            for key in ("output", "output_preview", "stdout", "stderr")
+        ):
+            return True
+        output_chars = payload.get("output_chars")
+        return isinstance(output_chars, int) and output_chars > 0
+
+    normalized_tool = tool_name.strip().casefold()
+    if normalized_tool == "shell_run":
+        exit_code = result.get("exit_code")
+        return (
+            exit_code if isinstance(exit_code, int) else None,
+            _has_output(result),
+        )
+
+    if normalized_tool == "verify_run":
+        command_results = result.get("command_results")
+        if isinstance(command_results, list):
+            evidence_command = _normalize_shell_command_for_match(evidence.normalized_command)
+            for raw_item in command_results:
+                if not isinstance(raw_item, dict):
+                    continue
+                command = str(raw_item.get("command") or raw_item.get("effective_command") or "")
+                effective_command = str(
+                    raw_item.get("effective_command") or raw_item.get("command") or ""
+                )
+                normalized_candidates = {
+                    _normalize_shell_command_for_match(command),
+                    _normalize_shell_command_for_match(effective_command),
+                }
+                if evidence_command not in normalized_candidates:
+                    continue
+                exit_code = raw_item.get("exit_code")
+                return (
+                    exit_code if isinstance(exit_code, int) else None,
+                    _has_output(raw_item),
+                )
+        all_passed = result.get("all_passed")
+        exit_code = 0 if all_passed is True else 1 if all_passed is False else None
+        return (
+            exit_code,
+            _has_output(result),
+        )
+
+    return None, False
+
+
+def _unmasked_shell_verification_command(command: str) -> str:
+    candidate = str(command or "").strip()
+    while match := _SAFE_LEADING_CD_RE.match(candidate):
+        candidate = candidate[match.end() :].strip()
+    if not candidate or _UNSAFE_CLAIM_EVIDENCE_SHELL_RE.search(candidate):
+        return ""
+    analysis_candidate = _SHELL_REDIRECTION_RE.sub("", candidate).strip()
+    analysis = analyze_verification_command(analysis_candidate, trusted=True)
+    if analysis.command_family is None:
+        return ""
+    return _normalize_shell_command_for_match(analysis_candidate)
 
 
 def _record_tool_effect(
@@ -972,17 +1159,19 @@ def _record_tool_effect(
         )
 
     if status != "failed" and normalized_tool in _MATERIAL_EDIT_TOOL_NAMES:
-        state.material_edit_count += 1
+        state.note_material_edit()
         state.material_edit_tools.add(normalized_tool)
         state.touched_repo_paths.update(touched_paths)
         if _paths_require_verification(touched_paths):
             state.note_verification_relevant_edit()
     elif normalized_tool in _COMMAND_LIKE_MUTATION_TOOL_NAMES and touched_paths:
-        state.material_edit_count += 1
+        state.note_material_edit()
         state.material_edit_tools.add(normalized_tool)
         state.touched_repo_paths.update(touched_paths)
         if _paths_require_verification(touched_paths):
             state.note_verification_relevant_edit()
+    elif status != "failed" and normalized_tool == "git_diff":
+        state.record_diff_review()
 
     verification_attempt = False
     evidence_records: list[VerificationEvidence] = []
@@ -1018,6 +1207,11 @@ def _record_tool_effect(
         result["verification_evidence_reason"] = evidence.reason
         result["verification_evidence_allowed"] = evidence.allowed_to_satisfy_contract
         result["verification_evidence_supplemental_only"] = evidence.supplemental_only
+        verification_note = _verification_evidence_note(evidence, result=result)
+        if verification_note:
+            result["verification_note"] = verification_note
+        if evidence.supplemental_only:
+            result["verification_supplemental_only_note"] = SUPPLEMENTAL_VERIFICATION_ADVISORY
     record_acceptance_tool_effect(
         contract=state.acceptance_contract,
         root=root,
@@ -1031,6 +1225,22 @@ def _record_tool_effect(
         evidence_category=evidence.category.value,
         evidence_allowed=evidence.allowed_to_satisfy_contract,
     )
+    if normalized_tool == "shell_run" and not verification_attempt:
+        raw_command = str(
+            result.get("effective_cmd") or result.get("cmd") or arguments.get("cmd") or ""
+        )
+        normalized_command = _unmasked_shell_verification_command(raw_command)
+        observed_exit_code, observed_output = _verification_evidence_observation(
+            tool_name=normalized_tool,
+            evidence=evidence,
+            result=result,
+        )
+        if normalized_command and observed_exit_code == 0 and observed_output:
+            state.record_executed_command_evidence(
+                normalized_command=normalized_command,
+                observed_exit_code=observed_exit_code,
+                observed_output=observed_output,
+            )
     if not verification_attempt:
         return
 
@@ -1043,11 +1253,18 @@ def _record_tool_effect(
         evidence=evidence,
     )
     for record in evidence_records:
+        observed_exit_code, observed_output = _verification_evidence_observation(
+            tool_name=normalized_tool,
+            evidence=record,
+            result=result,
+        )
         state.record_verification_evidence(
             record,
             accepted=(
                 state.last_verification_passed is True and record.allowed_to_satisfy_contract
             ),
+            observed_exit_code=observed_exit_code,
+            observed_output=observed_output,
         )
     if normalized_tool == "verify_run":
         _record_verify_run_command_outcomes(
@@ -1090,6 +1307,8 @@ def _verification_expected_for_turn(
     blocked: bool,
     touched_repo_paths: set[str],
     verification_contract_requires_execution: bool = False,
+    verification_contract_available: bool = True,
+    effective_verification_commands: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> bool:
     if turn_intent != "execute":
         return False
@@ -1097,7 +1316,12 @@ def _verification_expected_for_turn(
         return True
     if blocked:
         return False
-    return _paths_require_verification(touched_repo_paths)
+    if not verification_contract_available:
+        return False
+    return _verification_commands_apply_to_paths(
+        touched_repo_paths,
+        effective_verification_commands,
+    )
 
 
 def _completion_gate_blocker_allows_final(
@@ -1158,10 +1382,12 @@ def _completion_gate_problem_summary(problems: list[str]) -> str:
 def _completion_gate_repair_stage(problems: list[str]) -> str:
     if "no_material_edits" in problems:
         return "no_material_edits"
-    if "clarification_requested" in problems:
-        return "clarification_requested"
     if "verification_failed" in problems:
         return "verification_failed"
+    if "verification_incomplete" in problems:
+        return "verification_incomplete"
+    if "verification_not_attempted" in problems:
+        return "verification_not_attempted"
     if "acceptance_criteria_failed" in problems or "unexpected_scope_changes" in problems:
         return "acceptance_failed"
     if (
@@ -1169,34 +1395,33 @@ def _completion_gate_repair_stage(problems: list[str]) -> str:
         or "acceptance_evidence_insufficient" in problems
     ):
         return "acceptance_unverified"
-    if "verification_incomplete" in problems:
-        return "verification_incomplete"
-    if "verification_not_attempted" in problems:
-        return "verification_not_attempted"
+    if "clarification_requested" in problems:
+        return "clarification_requested"
     if "empty_final_response" in problems:
         return "empty_final_response"
     return "generic"
 
 
-def _completion_gate_stage_attempt_limit(stage: str) -> int:
-    return int(_COMPLETION_GATE_REPAIR_STAGE_LIMITS.get(stage, 2))
+_LIVE_BACKGROUND_PROCESS_FINALIZATION_LINE = (
+    "- You have {n} background process(es) started with shell_background; they are "
+    "terminated when this run ends. If the task requires a server/daemon to still "
+    "be running after you finish, start it with shell_service_start (durable) instead, "
+    "and re-verify."
+)
 
 
-def _completion_gate_repair_message(
-    problem: str,
+def _live_background_process_finalization_advisory_line(
     *,
-    language: str = "",
-    explicit_language_override: bool = False,
+    one_shot_execution: bool,
+    live_background_processes: int = 0,
 ) -> str:
-    locale = _runtime_message_locale(
-        language=language,
-        explicit_language_override=explicit_language_override,
-    )
-    messages = _COMPLETION_GATE_REPAIR_MESSAGES_BY_LOCALE.get(
-        locale,
-        _COMPLETION_GATE_REPAIR_MESSAGES,
-    )
-    return messages.get(problem, "")
+    try:
+        count = int(live_background_processes)
+    except (TypeError, ValueError):
+        count = 0
+    if not one_shot_execution or count <= 0:
+        return ""
+    return _LIVE_BACKGROUND_PROCESS_FINALIZATION_LINE.format(n=count)
 
 
 def _completion_gate_nudge_message(
@@ -1207,150 +1432,70 @@ def _completion_gate_nudge_message(
     missing_verification_commands: list[str] | None = None,
     verification_coverage_stale: bool = False,
     anchor_paths: list[str] | None = None,
+    has_material_edits: bool = False,
+    all_verification_evidence_self_authored: bool = False,
+    diff_review_stale: bool = False,
     language: str = "",
     explicit_language_override: bool = False,
+    one_shot_execution: bool = False,
+    live_background_processes: int = 0,
 ) -> str:
-    details: list[str] = []
-    defer_verification_until_material_work = "no_material_edits" in problems
-    for item in problems:
-        if defer_verification_until_material_work and item in {
-            "verification_not_attempted",
-            "verification_incomplete",
-        }:
-            continue
-        detail = _completion_gate_repair_message(
-            item,
-            language=language,
-            explicit_language_override=explicit_language_override,
-        )
-        if detail:
-            details.append(detail)
-    suffix = (
-        " ".join(details)
-        if details
-        else _runtime_message(
-            "completion_gate_fallback_suffix",
-            language=language,
-            explicit_language_override=explicit_language_override,
-        )
-    )
-    snippet = extract_actionable_failure_snippet(verification_failure_snippet)
-    if snippet and "verification_failed" in problems:
-        suffix = " ".join(
-            [
-                suffix,
-                _runtime_message(
-                    "completion_gate_first_reported_error",
-                    language=language,
-                    explicit_language_override=explicit_language_override,
-                    snippet=snippet,
-                ),
-                _runtime_message(
-                    "completion_gate_fix_then_rerun",
-                    language=language,
-                    explicit_language_override=explicit_language_override,
-                ),
-            ]
-        )
-    if missing_verification_commands and "verification_incomplete" in problems:
-        locale = _runtime_message_locale(
-            language=language,
-            explicit_language_override=explicit_language_override,
-        )
-        stale_detail = (
-            "Later verification-relevant edits invalidated earlier verification coverage."
-            if verification_coverage_stale and locale == "english"
-            else (
-                "Μεταγενέστερες αλλαγές που απαιτούν verification ακύρωσαν το προηγούμενο verification."
-                if verification_coverage_stale
-                else ""
-            )
-        )
-        missing_label = (
-            "Missing verification commands:"
-            if locale == "english"
-            else "Λείπουν verification commands:"
-        )
-        suffix = " ".join(
-            [
-                item
-                for item in (
-                    suffix,
-                    stale_detail,
-                    missing_label,
-                    ", ".join(missing_verification_commands) + ".",
-                )
-                if item
-            ]
-        )
-    if anchor_paths and "no_material_edits" in problems:
-        suffix = " ".join(
-            [
-                suffix,
-                _runtime_message(
-                    "one_shot_post_explore_bootstrap_targets",
-                    language=language,
-                    explicit_language_override=explicit_language_override,
-                    joined=", ".join(anchor_paths[:MAX_POST_EXPLORE_ANCHOR_PATHS]),
-                ),
-            ]
-        )
-    prefix = _runtime_message(
+    _ = (
         prefix_key,
-        language=language,
-        explicit_language_override=explicit_language_override,
+        verification_coverage_stale,
+        anchor_paths,
+        language,
+        explicit_language_override,
     )
-    return f"{prefix} {suffix}"
-
-
-def _completion_gate_terminal_failure_message(
-    *,
-    problem_summary: str,
-    stage: str,
-    message_key: str = "completion_gate_terminal_failure",
-    verification_failure_snippet: str = "",
-    language: str = "",
-    explicit_language_override: bool = False,
-) -> str:
-    snippet = extract_actionable_failure_snippet(verification_failure_snippet)
-    message = _runtime_message(
-        message_key,
-        language=language,
-        explicit_language_override=explicit_language_override,
-        problem_summary=problem_summary,
-    )
-    if snippet and stage == "verification_failed":
-        message += " " + _runtime_message(
-            "completion_gate_first_reported_error",
-            language=language,
-            explicit_language_override=explicit_language_override,
-            snippet=snippet,
+    problem_set = set(problems)
+    lines = ["Finalization check - one pass before you finish:"]
+    if "no_material_edits" in problem_set:
+        lines.append(
+            "- No file changes are recorded yet. If the task required creating/modifying "
+            "something, do it now; if you concluded no change is needed, say so explicitly "
+            "with your reasoning."
         )
-    return message
-
-
-def _completion_gate_step_budget_exhausted_message(
-    *,
-    stage: str,
-    message_key: str = "completion_gate_step_budget_exhausted",
-    verification_failure_snippet: str = "",
-    language: str = "",
-    explicit_language_override: bool = False,
-) -> str:
     snippet = extract_actionable_failure_snippet(verification_failure_snippet)
-    message = _runtime_message(
-        message_key,
-        language=language,
-        explicit_language_override=explicit_language_override,
-    )
-    if snippet and stage == "verification_failed":
-        message += " " + _runtime_message(
-            "completion_gate_first_reported_error",
-            language=language,
-            explicit_language_override=explicit_language_override,
-            snippet=snippet,
+    if "verification_failed" in problem_set:
+        failure_detail = snippet or "the latest verification attempt did not pass"
+        lines.append(
+            f"- Your last verification failed: {failure_detail}. Fix and re-run, or explain "
+            "why the failure is expected/out of scope."
         )
-    return message
+    if missing_verification_commands and (
+        "verification_not_attempted" in problem_set or "verification_incomplete" in problem_set
+    ):
+        lines.append(
+            "- Expected verification not yet run: "
+            + ", ".join(missing_verification_commands)
+            + ". Run them, or state why they don't apply."
+        )
+    elif "verification_not_attempted" in problem_set or "verification_incomplete" in problem_set:
+        lines.append(
+            "- Expected verification has not been completed. Run it, or state why it does not apply."
+        )
+    if all_verification_evidence_self_authored:
+        lines.append(f"- {SUPPLEMENTAL_VERIFICATION_ADVISORY}")
+    if has_material_edits and diff_review_stale:
+        lines.append(
+            "- Consider reviewing the current diff for accidental scope or quality issues before "
+            "finalizing."
+        )
+    live_background_process_line = _live_background_process_finalization_advisory_line(
+        one_shot_execution=one_shot_execution,
+        live_background_processes=live_background_processes,
+    )
+    if live_background_process_line:
+        lines.append(live_background_process_line)
+    lines.append(
+        "- Re-read the task statement once and confirm every explicitly named output "
+        "(paths, formats, values) exists exactly as requested."
+    )
+    lines.append(
+        "Then give your final answer. If you are confident the work is complete as-is, "
+        "finalize - this checklist is advisory."
+    )
+    return "\n".join(lines)
 
 
 def _build_interactive_turn_verify_task(

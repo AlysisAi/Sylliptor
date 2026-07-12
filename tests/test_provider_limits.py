@@ -42,7 +42,7 @@ def _public_resolver(_host: str, _port: int) -> list[str]:
     return ["93.184.216.34"]
 
 
-def test_qwen35_plus_resolves_to_canonical_qwen_cap() -> None:
+def test_route_identity_prevents_model_name_from_borrowing_qwen_cap() -> None:
     cfg = AppConfig(base_url="https://api.deepseek.com", model="deepseek-v4-pro")
 
     provider_key = resolve_model_provider_key(
@@ -53,9 +53,9 @@ def test_qwen35_plus_resolves_to_canonical_qwen_cap() -> None:
     canonical_key = canonical_provider_key(provider_key)
     cap = resolve_provider_concurrency_cap(cfg.provider_concurrency_caps, canonical_key)
 
-    assert provider_key == "dashscope"
-    assert canonical_key == "qwen"
-    assert cap == 4
+    assert provider_key == "deepseek"
+    assert canonical_key == "deepseek"
+    assert cap is None
 
 
 def test_qwen_aliases_fold_to_single_canonical_key() -> None:
@@ -285,6 +285,66 @@ def test_backoff_success_after_transient_provider_unavailable_error() -> None:
     assert sleeps == [1.0, 2.0]
 
 
+def test_default_provider_retry_schedule_makes_six_attempts_over_about_five_minutes() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def call() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 6:
+            raise LLMError("LLM error 503: service unavailable")
+        return "ok"
+
+    result = run_provider_limited_call(
+        call=call,
+        provider_key="openai",
+        provider_concurrency_caps={},
+        operation="default_retry_schedule",
+        sleep_fn=sleeps.append,
+        random_fn=lambda: 0.5,
+    )
+
+    assert result == "ok"
+    assert attempts == 6
+    assert sleeps == [10.0, 20.0, 40.0, 80.0, 120.0]
+    assert sum(sleeps) == 270.0
+
+
+def test_provider_unavailable_retry_wall_clock_cap_blocks_backoff() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+    clock_values = iter((0.0, 0.25))
+
+    def clock() -> float:
+        return next(clock_values)
+
+    def call() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise LLMError("LLM request failed: The read operation timed out")
+
+    with pytest.raises(LLMError, match="timed out"):
+        run_provider_limited_call(
+            call=call,
+            provider_key=None,
+            provider_concurrency_caps={},
+            retry_settings=ProviderRetrySettings(
+                max_retries=3,
+                base_delay_seconds=1.0,
+                max_delay_seconds=30.0,
+            ),
+            operation="test_retry_cap",
+            sleep_fn=sleeps.append,
+            random_fn=lambda: 0.5,
+            retry_wall_clock_cap_seconds=0.5,
+            clock_fn=clock,
+        )
+
+    assert attempts == 1
+    assert sleeps == []
+
+
 def test_marked_non_retryable_error_is_not_retried_despite_retryable_message() -> None:
     attempts = 0
     sleeps: list[float] = []
@@ -334,7 +394,11 @@ def test_typed_remote_protocol_truncation_is_retryable() -> None:
         call=call,
         provider_key="openrouter",
         provider_concurrency_caps={},
-        retry_settings=ProviderRetrySettings(max_retries=1),
+        retry_settings=ProviderRetrySettings(
+            max_retries=1,
+            base_delay_seconds=1.0,
+            max_delay_seconds=30.0,
+        ),
         operation="typed_truncation",
         sleep_fn=sleeps.append,
         random_fn=lambda: 0.5,
@@ -445,7 +509,7 @@ def test_deadline_callback_prevents_unsafe_provider_retry() -> None:
     assert sleeps == []
 
 
-def test_openai_compat_retries_429_rate_limit_but_not_500() -> None:
+def test_openai_compat_retries_429_rate_limit_and_500() -> None:
     attempts = 0
     sleeps: list[float] = []
 
@@ -468,29 +532,35 @@ def test_openai_compat_retries_429_rate_limit_but_not_500() -> None:
 
     assert client.chat(messages=[{"role": "user", "content": "hi"}]).content == "ok"
     assert attempts == 3
-    assert sleeps == [1.0, 2.0]
+    assert sleeps == [10.0, 20.0]
 
-    non_retry_attempts = 0
+    server_error_attempts = 0
+    server_error_sleeps: list[float] = []
 
-    def non_retry_handler(_request: httpx.Request) -> httpx.Response:
-        nonlocal non_retry_attempts
-        non_retry_attempts += 1
-        return httpx.Response(500, text="internal error")
+    def server_error_handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal server_error_attempts
+        server_error_attempts += 1
+        if server_error_attempts <= 2:
+            return httpx.Response(500, text="internal error")
+        return httpx.Response(200, json=_chat_ok())
 
-    non_retry_client = OpenAICompatClient(
+    server_error_client = OpenAICompatClient(
         base_url="https://coding-intl.dashscope.aliyuncs.com/v1",
         api_key="k",
         model="qwen3.5-plus",
-        transport=httpx.MockTransport(non_retry_handler),
-        provider_retry_settings=ProviderRetrySettings(max_retries=5),
-        provider_sleep_fn=lambda _seconds: (_ for _ in ()).throw(
-            AssertionError("500 responses should not back off")
+        transport=httpx.MockTransport(server_error_handler),
+        provider_retry_settings=ProviderRetrySettings(
+            max_retries=2,
+            base_delay_seconds=1.0,
+            max_delay_seconds=30.0,
         ),
+        provider_sleep_fn=server_error_sleeps.append,
+        provider_random_fn=lambda: 0.5,
     )
 
-    with pytest.raises(LLMError, match="LLM error 500"):
-        non_retry_client.chat(messages=[{"role": "user", "content": "hi"}])
-    assert non_retry_attempts == 1
+    assert server_error_client.chat(messages=[{"role": "user", "content": "hi"}]).content == "ok"
+    assert server_error_attempts == 3
+    assert server_error_sleeps == [1.0, 2.0]
 
 
 def test_dashscope_web_search_shares_qwen_semaphore_with_planner_call() -> None:

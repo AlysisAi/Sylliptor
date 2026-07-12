@@ -5,10 +5,14 @@ import math
 import os
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from .error_text import sanitize_error_summary
+from .failure_category import classify_failure_category, extract_status_code
 
 CRASH_DIAGNOSTIC_SCHEMA_VERSION = 1
 
@@ -30,11 +34,14 @@ _ALLOWED_FIELDS = {
     "deadline_start_decision",
     "duration_ms",
     "elapsed_seconds",
+    "error_summary",
+    "error_type",
     "exit_code",
     "failure_category",
     "max_steps",
     "model",
     "operation",
+    "provider_status_code",
     "reason",
     "remaining_seconds",
     "runtime_kind",
@@ -139,6 +146,7 @@ class CrashDiagnosticLogger:
     session_id: str
     runtime_kind: str = ""
     _started_at_monotonic: float = field(default_factory=time.monotonic)
+    write_failures: int = 0
 
     @classmethod
     def disabled(cls) -> CrashDiagnosticLogger:
@@ -192,7 +200,19 @@ class CrashDiagnosticLogger:
                     fh.flush()
                     if durable:
                         os.fsync(fh.fileno())
-        except Exception:
+        except Exception as exc:
+            # A broken diagnostic sink must not crash the run, but it must not be
+            # silent either: an autonomous fix-loop that "captured nothing" while
+            # believing it captured everything is worse than a loud one-time warning.
+            self.write_failures += 1
+            if self.write_failures == 1:
+                warnings.warn(
+                    f"crash diagnostic write to {self.path} failed "
+                    f"({type(exc).__name__}: {exc}); subsequent write failures are counted "
+                    "in write_failures but not re-warned.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             return
 
 
@@ -212,3 +232,38 @@ def build_crash_diagnostic_logger(
         session_id=session_id,
         runtime_kind=runtime_kind,
     )
+
+
+def build_error_event_fields(
+    error: BaseException | str | None,
+    *,
+    operation: str | None = None,
+    step: int | None = None,
+) -> dict[str, Any]:
+    """Build the redacted, joinable error block for a terminal/diagnostic event.
+
+    The block answers the question an autonomous fix-loop actually needs after a
+    failed build — *why* did it die — without ever persisting a secret:
+
+    - ``error_type``: the exception class name (e.g. ``LLMError``),
+    - ``error_summary``: the message, secret-redacted and length-bounded via the
+      shared :func:`sanitize_error_summary`,
+    - ``failure_category``: a real :class:`FailureCategory` (never the legacy
+      ``"llm_error"`` literal) so the cause joins across chat/run and Forge artifacts,
+    - ``provider_status_code``: the HTTP status when one can be recovered.
+
+    Safe to call from inside a failure path: it never raises.
+    """
+    fields: dict[str, Any] = {
+        "error_type": type(error).__name__,
+        "error_summary": sanitize_error_summary(str(error or "")),
+        "failure_category": classify_failure_category(error).value,
+    }
+    status_code = extract_status_code(error)
+    if status_code is not None:
+        fields["provider_status_code"] = status_code
+    if operation:
+        fields["operation"] = str(operation)
+    if step is not None:
+        fields["step"] = int(step)
+    return fields

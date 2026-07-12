@@ -41,6 +41,7 @@ from .runtime_artifacts import (
 from .serialized_paths import safe_serialized_path
 from .session_store import resolve_sessions_dir, sanitize_session_id
 from .step_budget import (
+    AUTONOMOUS_STEP_BUDGET_POLICY,
     DEFAULT_TASK_MAX_STEPS,
     StepBudgetRequest,
     StepBudgetResolution,
@@ -854,7 +855,10 @@ def resolve_managed_task_step_budget(
     selected_assets = select_relevant_assets(plan, task)
     request = StepBudgetRequest(
         kind=str(kind or "managed_task").strip() or "managed_task",
-        policy=str(getattr(cfg, "step_budget_policy", "adaptive") or "adaptive"),
+        policy=str(
+            getattr(cfg, "step_budget_policy", AUTONOMOUS_STEP_BUDGET_POLICY)
+            or AUTONOMOUS_STEP_BUDGET_POLICY
+        ),
         hard_cap=int(
             max_steps_override
             if max_steps_override is not None

@@ -18,7 +18,16 @@ from .http_timeout import build_http_timeout_budget, format_http_timeout_error
 
 
 class WebFetchError(RuntimeError):
-    pass
+    """Raised for any web_fetch failure.
+
+    ``recoverable=True`` marks failures the calling model can fix by adjusting its
+    own tool arguments (input validation). The agent loop returns those to the
+    model as plain errors instead of disabling web tools for the rest of the turn.
+    """
+
+    def __init__(self, message: str, *, recoverable: bool = False) -> None:
+        super().__init__(message)
+        self.recoverable = recoverable
 
 
 _DEFAULT_MAX_CHARS = 20_000
@@ -169,28 +178,37 @@ def _coerce_max_chars(raw: Any) -> int:
     try:
         value = int(raw)
     except (TypeError, ValueError) as e:
-        raise WebFetchError(f"max_chars must be between 1 and {_MAX_MAX_CHARS}.") from e
+        raise WebFetchError(
+            f"max_chars must be between 1 and {_MAX_MAX_CHARS}.",
+            recoverable=True,
+        ) from e
     if value <= 0 or value > _MAX_MAX_CHARS:
-        raise WebFetchError(f"max_chars must be between 1 and {_MAX_MAX_CHARS}.")
+        raise WebFetchError(
+            f"max_chars must be between 1 and {_MAX_MAX_CHARS}.",
+            recoverable=True,
+        )
     return value
 
 
 def _split_url(raw_url: str) -> tuple[str, Any]:
     url = str(raw_url or "").strip()
     if not url:
-        raise WebFetchError("url must be a non-empty string.")
+        raise WebFetchError("url must be a non-empty string.", recoverable=True)
     split = urlsplit(url)
     scheme = split.scheme.lower()
     if scheme not in {"http", "https"}:
-        raise WebFetchError(f"Unsupported URL scheme: {split.scheme or '(missing)'}")
+        raise WebFetchError(
+            f"Unsupported URL scheme: {split.scheme or '(missing)'}",
+            recoverable=True,
+        )
     if split.hostname is None:
-        raise WebFetchError("URL must include a valid host.")
+        raise WebFetchError("URL must include a valid host.", recoverable=True)
     if split.username is not None or split.password is not None:
-        raise WebFetchError("Embedded URL credentials are not allowed.")
+        raise WebFetchError("Embedded URL credentials are not allowed.", recoverable=True)
     try:
         _ = split.port
     except ValueError as e:
-        raise WebFetchError("URL has an invalid port value.") from e
+        raise WebFetchError("URL has an invalid port value.", recoverable=True) from e
     return url, split
 
 
@@ -358,7 +376,10 @@ def web_fetch(
             )
         )
     except SafeHttpError as e:
-        raise WebFetchError(str(e)) from e
+        # safe_http classifies URL-/host-specific failures (oversized body,
+        # redirect problems, blocked or invalid hosts) as recoverable; propagate
+        # that so one bad target does not disable web tools for the whole turn.
+        raise WebFetchError(str(e), recoverable=getattr(e, "recoverable", False)) from e
     except httpx.TimeoutException as e:
         raise WebFetchError(
             format_http_timeout_error(
@@ -382,6 +403,10 @@ def web_fetch(
     decoded = _decode_bytes(
         body, raw_content_type=raw_content_type, fallback_encoding=response_encoding
     )
+    # The site responded, so the web itself is reachable: an HTTP error status or
+    # unusable payload is specific to this URL and the model can recover by
+    # choosing a different source. Only genuine connectivity signals (DNS
+    # resolution outage, connect failures, timeouts) remain unrecoverable.
     if status_code >= 400:
         raise WebFetchError(
             _http_status_error_message(
@@ -389,16 +414,21 @@ def web_fetch(
                 final_url=final_url,
                 response_headers=response_headers,
                 decoded_body=decoded,
-            )
+            ),
+            recoverable=True,
         )
 
     if content_type and not _is_text_like_content_type(content_type):
         raise WebFetchError(
             f"Unsupported content type for web_fetch: '{content_type}'. Only text-like responses "
-            "are supported."
+            "are supported.",
+            recoverable=True,
         )
     if not content_type and _looks_binary(body):
-        raise WebFetchError("Unsupported binary response without a text-like content type.")
+        raise WebFetchError(
+            "Unsupported binary response without a text-like content type.",
+            recoverable=True,
+        )
 
     title = ""
     if content_type in _HTML_CONTENT_TYPES or (not content_type and _looks_like_html(decoded)):

@@ -426,6 +426,205 @@ def _extract_chat_annotations(
     return sources, citations
 
 
+def _minimax_coding_plan_search_url(base_url: str) -> str:
+    normalized = normalize_provider_base_url(base_url)
+    if normalized.endswith("/v1"):
+        return f"{normalized}/coding_plan/search"
+    return f"{normalized}/v1/coding_plan/search"
+
+
+def minimax_coding_plan_search(
+    *,
+    query: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    max_results: int,
+    allowed_domains: list[str] | None,
+    timeout_s: float,
+    transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
+    provider_concurrency_caps: dict[str, int] | None = None,
+    provider_retry_settings: ProviderRetrySettings | None = None,
+) -> dict[str, Any]:
+    data = _post_json(
+        provider_label="MiniMax Token Plan",
+        url=_minimax_coding_plan_search_url(base_url),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "MM-API-Source": "Minimax-MCP",
+            "Content-Type": "application/json",
+            "User-Agent": "sylliptor-agent-cli/0.1.0",
+        },
+        payload={"q": query},
+        timeout_s=timeout_s,
+        transport=transport,
+        resolver=resolver,
+        provider_key="minimax",
+        provider_concurrency_caps=provider_concurrency_caps,
+        provider_retry_settings=provider_retry_settings,
+        operation="minimax_coding_plan_search",
+    )
+    base_response = data.get("base_resp")
+    if isinstance(base_response, dict):
+        status_code = base_response.get("status_code")
+        if status_code not in (None, 0, "0"):
+            status_message = str(base_response.get("status_msg") or "search failed").strip()
+            raise ProviderWebSearchError(
+                f"MiniMax Token Plan error {status_code}: {status_message}"
+            )
+
+    organic = data.get("organic")
+    if not isinstance(organic, list) and isinstance(data.get("data"), dict):
+        organic = data["data"].get("organic")
+    raw_sources = [item for item in organic or [] if isinstance(item, dict)]
+    sources, sources_truncated = _dedupe_sources(
+        raw_sources,
+        allowed_domains=allowed_domains,
+        max_sources=max_results,
+    )
+    if not sources:
+        raise ProviderWebSearchError("MiniMax Token Plan web_search did not return sources")
+
+    related = data.get("related_searches")
+    if not isinstance(related, list) and isinstance(data.get("data"), dict):
+        related = data["data"].get("related_searches")
+    queries = [query]
+    for item in related or []:
+        related_query = (
+            str(item.get("query") or "").strip()
+            if isinstance(item, dict)
+            else str(item or "").strip()
+        )
+        if related_query and related_query not in queries:
+            queries.append(related_query)
+
+    return {
+        "query": query,
+        "answer": str(data.get("answer") or "").strip(),
+        "citations": _citations_from_sources(sources),
+        "sources": sources,
+        "queries": queries,
+        "model": model,
+        "backend": "minimax_coding_plan",
+        "allowed_domains": allowed_domains or [],
+        "external_web_access": True,
+        "response_id": str(data.get("id") or data.get("request_id") or "").strip() or None,
+        "sources_truncated": sources_truncated,
+    }
+
+
+def _cohere_v1_chat_url(base_url: str) -> str:
+    split = urlsplit(str(base_url or "").strip())
+    host = (split.hostname or "").rstrip(".").lower()
+    if host in {"api.cohere.ai", "api.cohere.com"}:
+        return urlunsplit(("https", "api.cohere.com", "/v1/chat", "", ""))
+    normalized = normalize_provider_base_url(base_url)
+    if normalized.endswith("/compatibility/v1"):
+        normalized = normalized.removesuffix("/compatibility/v1")
+    elif normalized.endswith("/v1"):
+        normalized = normalized.removesuffix("/v1")
+    return f"{normalized}/v1/chat"
+
+
+def cohere_web_search(
+    *,
+    query: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    max_results: int,
+    allowed_domains: list[str] | None,
+    timeout_s: float,
+    transport: httpx.BaseTransport | None = None,
+    resolver: Resolver | None = None,
+    provider_concurrency_caps: dict[str, int] | None = None,
+    provider_retry_settings: ProviderRetrySettings | None = None,
+) -> dict[str, Any]:
+    data = _post_json(
+        provider_label="Cohere",
+        url=_cohere_v1_chat_url(base_url),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "sylliptor-agent-cli/0.1.0",
+        },
+        payload={
+            "model": model,
+            "message": f"{query}{_domain_prompt_suffix(allowed_domains)}",
+            "connectors": [{"id": "web-search"}],
+            "prompt_truncation": "AUTO",
+        },
+        timeout_s=timeout_s,
+        transport=transport,
+        resolver=resolver,
+        provider_key="cohere",
+        provider_concurrency_caps=provider_concurrency_caps,
+        provider_retry_settings=provider_retry_settings,
+        operation="cohere_web_search",
+    )
+
+    documents = data.get("documents")
+    raw_documents = [item for item in documents or [] if isinstance(item, dict)]
+    source_by_document_id: dict[str, dict[str, Any]] = {}
+    for document in raw_documents:
+        source = _normalize_source(document)
+        document_id = str(document.get("id") or "").strip()
+        if source is not None and document_id:
+            source_by_document_id[document_id] = source
+    sources, sources_truncated = _dedupe_sources(
+        raw_documents,
+        allowed_domains=allowed_domains,
+        max_sources=max_results,
+    )
+    if not sources:
+        raise ProviderWebSearchError("Cohere web-search connector did not return sources")
+
+    citations: list[dict[str, Any]] = []
+    raw_citations = data.get("citations")
+    for citation in raw_citations or []:
+        if not isinstance(citation, dict):
+            continue
+        document_ids = citation.get("document_ids")
+        for document_id in document_ids if isinstance(document_ids, list) else []:
+            source = source_by_document_id.get(str(document_id or "").strip())
+            if source is None:
+                continue
+            citations.append(
+                {
+                    "title": str(source.get("title") or "").strip(),
+                    "url": str(source.get("url") or "").strip(),
+                    "start_index": citation.get("start"),
+                    "end_index": citation.get("end"),
+                }
+            )
+    citations = _finalize_citations(citations, sources, max_results=max_results)
+
+    queries: list[str] = []
+    raw_queries = data.get("search_queries")
+    for item in raw_queries or []:
+        raw_query = item.get("text") if isinstance(item, dict) else item
+        query_text = str(raw_query or "").strip()
+        if query_text and query_text not in queries:
+            queries.append(query_text)
+
+    return {
+        "query": query,
+        "answer": str(data.get("text") or "").strip(),
+        "citations": citations,
+        "sources": sources,
+        "queries": queries or [query],
+        "model": model,
+        "backend": "cohere_web_search",
+        "allowed_domains": allowed_domains or [],
+        "external_web_access": True,
+        "response_id": (
+            str(data.get("response_id") or data.get("generation_id") or "").strip() or None
+        ),
+        "sources_truncated": sources_truncated,
+    }
+
+
 def moonshot_kimi_search(
     *,
     query: str,
@@ -564,34 +763,22 @@ def zhipu_web_search(
     provider_concurrency_caps: dict[str, int] | None = None,
     provider_retry_settings: ProviderRetrySettings | None = None,
 ) -> dict[str, Any]:
-    web_search_options: dict[str, Any] = {
-        "enable": True,
+    provider_query = query[:70].rsplit(" ", 1)[0].strip() if len(query) > 70 else query
+    if not provider_query:
+        provider_query = query[:70]
+    payload: dict[str, Any] = {
+        "search_query": provider_query,
         "search_engine": "search_pro",
-        "search_query": query,
-        "search_result": True,
-        "count": min(max_results, 10),
+        "search_intent": False,
+        "count": min(max_results, 50),
         "search_recency_filter": "noLimit",
         "content_size": "medium",
     }
     if allowed_domains and len(allowed_domains) == 1:
-        web_search_options["search_domain_filter"] = allowed_domains[0]
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    "Use web search for current information, cite source URLs, and answer "
-                    f"the query.\n\n{query}{_domain_prompt_suffix(allowed_domains)}"
-                ),
-            }
-        ],
-        "tools": [{"type": "web_search", "web_search": web_search_options}],
-        "stream": False,
-    }
+        payload["search_domain_filter"] = allowed_domains[0]
     data = _post_json(
         provider_label="Zhipu",
-        url=f"{base_url.rstrip('/')}/chat/completions",
+        url=f"{base_url.rstrip('/')}/web_search",
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -606,9 +793,14 @@ def zhipu_web_search(
         provider_retry_settings=provider_retry_settings,
         operation="zhipu_web_search",
     )
-    answer = _chat_completion_answer(data)
+    raw_results = data.get("search_result")
+    raw_sources = (
+        [item for item in raw_results if isinstance(item, dict)]
+        if isinstance(raw_results, list)
+        else []
+    )
     sources, sources_truncated = _dedupe_sources(
-        [*_collect_source_dicts(data), *_sources_from_answer_urls(answer)],
+        raw_sources,
         allowed_domains=allowed_domains,
         max_sources=max_results,
     )
@@ -616,11 +808,11 @@ def zhipu_web_search(
         raise ProviderWebSearchError("Zhipu web_search did not return sources")
     return {
         "query": query,
-        "answer": answer,
+        "answer": "",
         "citations": _citations_from_sources(sources),
         "sources": sources,
-        "queries": _collect_queries(data) or [query],
-        "model": str(data.get("model") or model),
+        "queries": _collect_queries(data) or [provider_query],
+        "model": model,
         "backend": "zhipu_web_search",
         "allowed_domains": allowed_domains or [],
         "external_web_access": True,

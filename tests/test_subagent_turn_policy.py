@@ -179,7 +179,51 @@ def test_explicit_subagent_request_gets_repair_nudge_before_finalizing(tmp_path)
     assert _event_payloads(session_path, "subagent_required_nudge")
 
 
-def test_explicit_subagent_request_fails_fast_when_subagents_disabled(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_explicit_subagent_request_accepts_final_after_required_nudge_cap(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    (tmp_path / "README.md").write_text("repo notes\n", encoding="utf-8")
+    sessions_dir = tmp_path / "sessions"
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="code_only"),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=5,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=sessions_dir,
+        enable_chat_turn_step_budget=True,
+    )
+    subagent_calls = _replace_subagent_run_with_fake(session)
+    final_text = "I inspected directly and will proceed without delegating."
+    client = _ScriptedClient(
+        [
+            LLMResponse(content=final_text, tool_calls=[], raw={}),
+            LLMResponse(content=final_text, tool_calls=[], raw={}),
+            LLMResponse(content=final_text, tool_calls=[], raw={}),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn(
+            "Please use a subagent to read README.md and tell me what it says. Do not modify files."
+        )
+        session_path = session.store.path
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert subagent_calls == []
+    assert len(client.calls) == 3
+    nudge_events = _event_payloads(session_path, "subagent_required_nudge")
+    assert len(nudge_events) == 2
+    not_honored_events = _event_payloads(session_path, "subagent_required_not_honored")
+    assert not_honored_events
+    assert not_honored_events[-1]["content"] == final_text
+    assert _event_payloads(session_path, "subagent_required_incomplete_after_retries") == []
+
+
+def test_explicit_subagent_request_proceeds_when_subagents_disabled(tmp_path) -> None:  # type: ignore[no-untyped-def]
     sessions_dir = tmp_path / "sessions"
     session = create_session(
         cfg=AppConfig(model="test-model", routing_mode="code_only", subagents_enabled=False),
@@ -193,7 +237,15 @@ def test_explicit_subagent_request_fails_fast_when_subagents_disabled(tmp_path) 
         enable_chat_turn_step_budget=True,
         subagents_enabled=False,
     )
-    client = _UnexpectedClient()
+    client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="I inspected directly because subagent delegation is unavailable.",
+                tool_calls=[],
+                raw={},
+            )
+        ]
+    )
     session.client = client  # type: ignore[assignment]
 
     try:
@@ -202,11 +254,18 @@ def test_explicit_subagent_request_fails_fast_when_subagents_disabled(tmp_path) 
     finally:
         session.close()
 
-    assert exit_code == 1
-    assert client.calls == 0
+    assert exit_code == 0
+    assert len(client.calls) == 1
+    first_call_messages = "\n".join(
+        str(message.get("content") or "") for message in client.calls[0]["messages"]
+    )
+    assert "subagent_run is unavailable in this session (subagents_disabled)" in first_call_messages
     events = _event_payloads(session_path, "subagent_request_unavailable")
     assert events
     assert events[-1]["reason"] == "subagents_disabled"
+    proceeding_events = _event_payloads(session_path, "subagent_request_unavailable_proceeding")
+    assert proceeding_events
+    assert proceeding_events[-1]["reason"] == "subagents_disabled"
 
 
 def test_interactive_repo_exploration_gets_subagent_nudge(tmp_path) -> None:  # type: ignore[no-untyped-def]

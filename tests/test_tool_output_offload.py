@@ -14,8 +14,8 @@ from sylliptor_agent_cli.session_store import read_session_events
 def test_compaction_settings_default_to_lighter_tool_output_retention() -> None:
     settings = resolve_compaction_settings(AppConfig(model="gpt-5-nano"))
 
-    assert settings.tool_output_offload_threshold_chars == 2500
-    assert settings.tool_output_preview_chars == 400
+    assert settings.tool_output_offload_threshold_chars == 6000
+    assert settings.tool_output_preview_chars == 2000
 
 
 def test_offloader_does_not_offload_small_output(tmp_path: Path) -> None:
@@ -47,15 +47,15 @@ def test_offloader_does_not_offload_small_output(tmp_path: Path) -> None:
     assert not session_artifact_root.exists()
 
 
-def test_offloader_shapes_medium_output_without_artifact(tmp_path: Path) -> None:
+def test_offloader_shows_old_dead_band_output_in_full(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspace"
     session_artifact_root = tmp_path / "session-store" / "session-shaped"
     workspace_root.mkdir()
     offloader = ToolOutputOffloader(
         artifact_layout=SessionArtifactLayout(filesystem_root=session_artifact_root),
         workspace_root=workspace_root,
-        threshold_chars=2500,
-        preview_chars=400,
+        threshold_chars=6000,
+        preview_chars=2000,
     )
     payload = {"path": "README.md", "content": "A" * 1800, "truncated": False}
     content_json = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
@@ -69,26 +69,13 @@ def test_offloader_shapes_medium_output_without_artifact(tmp_path: Path) -> None
     )
 
     assert result.offloaded is False
-    assert result.transcript_shaped is True
+    assert result.transcript_shaped is False
     assert result.artifact_locator is None
     assert result.artifact_fs_path is None
     assert result.artifact_readable_via_fs is False
-    assert result.message_chars < result.original_chars
+    assert result.message_chars == result.original_chars
+    assert result.content_for_message == content_json
     assert not session_artifact_root.exists()
-
-    stub = json.loads(result.content_for_message)
-    assert stub["transcript_shaped"] is True
-    assert stub["tool"] == "fs_read"
-    assert stub["tool_call_id"] == "call-shaped"
-    assert stub["step"] == 2
-    assert stub["summary"] == 'Loaded "README.md" (1800 chars).'
-    assert stub["preview_chars"] == 400
-    assert stub["original_chars"] == len(content_json)
-    assert stub["content_truncated"] is True
-    assert stub["raw_saved_in_session_log"] is True
-    assert len(stub["preview"]) <= 400 + len("...(truncated)")
-    assert "artifact_locator" not in stub
-    assert "A" * 800 not in result.content_for_message
 
 
 def test_offloader_offloads_large_output_and_writes_artifact_in_session_root(
@@ -117,12 +104,15 @@ def test_offloader_offloads_large_output_and_writes_artifact_in_session_root(
 
     assert result.offloaded is True
     assert result.transcript_shaped is True
-    assert result.artifact_locator == "session_artifacts/tool_outputs/step3_shell_run_call_abc.json"
+    assert result.artifact_locator == ".sylliptor/tool_outputs/step3_shell_run_call_abc.json"
     assert result.artifact_fs_path is not None
     assert not str(result.artifact_locator).startswith("/")
+    assert result.artifact_readable_via_fs is True
+    assert result.artifact_location == "workspace_root"
     artifact_path = Path(result.artifact_fs_path)
     assert artifact_path.exists()
     assert artifact_path.is_absolute()
+    assert artifact_path.is_relative_to(workspace_root.resolve())
 
     saved = json.loads(artifact_path.read_text(encoding="utf-8"))
     assert saved["tool_name"] == "shell/run"
@@ -135,8 +125,13 @@ def test_offloader_offloads_large_output_and_writes_artifact_in_session_root(
     assert stub["artifact_locator"] == result.artifact_locator
     assert "artifact_path" not in stub
     assert stub["artifact_saved"] is True
-    assert stub["artifact_readable_via_fs"] is False
-    assert stub["artifact_location"] == "external_session_store"
+    assert stub["artifact_readable_via_fs"] is True
+    assert stub["artifact_location"] == "workspace_root"
+    assert stub["fs_read_path"] == result.artifact_locator
+    assert stub["full_output"] == (
+        f"Truncated to 40 of {result.original_chars} chars. Full output saved to "
+        f"workspace_root at {result.artifact_locator} - use fs_read on that path to view all of it."
+    )
     assert stub["raw_saved_in_session_log"] is True
     assert "summary" in stub
     assert "preview" in stub
@@ -185,6 +180,37 @@ def test_offloader_write_failure_returns_json_stub(tmp_path: Path, monkeypatch) 
     assert "preview" in stub
     assert "summary" in stub
     assert "error" in stub
+    assert "the rest is not readable via fs" in stub["full_output"]
+    assert "Re-run the command narrowed" in stub["full_output"]
+
+
+def test_offloader_non_fs_readable_stub_guides_to_narrow_rerun(tmp_path: Path) -> None:
+    session_artifact_root = tmp_path / "session-store" / "session-external"
+    offloader = ToolOutputOffloader(
+        artifact_layout=SessionArtifactLayout(filesystem_root=session_artifact_root),
+        workspace_root=None,
+        threshold_chars=50,
+        preview_chars=40,
+    )
+    payload = {"stdout": "x" * 500}
+    content_json = json.dumps(payload, ensure_ascii=True)
+
+    result = offloader.maybe_offload(
+        tool_name="shell_run",
+        tool_call_id="call-external",
+        step=4,
+        result=payload,
+        content_json=content_json,
+    )
+
+    assert result.offloaded is True
+    assert result.artifact_readable_via_fs is False
+    assert result.artifact_location == "external_session_store"
+    stub = json.loads(result.content_for_message)
+    assert stub["artifact_readable_via_fs"] is False
+    assert stub["artifact_location"] == "external_session_store"
+    assert "the rest is not readable via fs" in stub["full_output"]
+    assert "Re-run the command narrowed" in stub["full_output"]
 
 
 def test_create_session_disable_compaction_does_not_create_offloader(tmp_path: Path) -> None:

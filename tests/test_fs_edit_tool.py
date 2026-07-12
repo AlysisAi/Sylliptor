@@ -90,6 +90,99 @@ def test_fs_edit_insert_before_and_after_exact(tmp_path: Path) -> None:
     assert path.read_text(encoding="utf-8") == "A\nbefore-B-after\n"
 
 
+def test_fs_edit_replace_lines_with_expected_old(tmp_path: Path) -> None:
+    path = tmp_path / "demo.py"
+    path.write_text("def f():\n    return 1\n\nprint(f())\n", encoding="utf-8")
+
+    result = fs_edit(
+        root=tmp_path,
+        path="demo.py",
+        edits=[
+            {
+                "op": "replace_lines",
+                "start_line": 1,
+                "end_line": 2,
+                "expected_old": "def f():\n    return 1\n",
+                "replacement": "def f():\n    return 2\n",
+            }
+        ],
+    )
+
+    assert result["changed"] is True
+    assert path.read_text(encoding="utf-8") == "def f():\n    return 2\n\nprint(f())\n"
+
+
+def test_fs_edit_replace_lines_can_delete_range(tmp_path: Path) -> None:
+    path = tmp_path / "demo.py"
+    path.write_text("keep\nremove-a\nremove-b\nkeep-too\n", encoding="utf-8")
+
+    fs_edit(
+        root=tmp_path,
+        path="demo.py",
+        edits=[{"op": "replace_lines", "start_line": 2, "end_line": 3, "replacement": ""}],
+    )
+
+    assert path.read_text(encoding="utf-8") == "keep\nkeep-too\n"
+
+
+def test_fs_edit_line_inserts_preserve_existing_newlines(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    path.write_bytes(b"A\r\nB\r\n")
+
+    fs_edit(
+        root=tmp_path,
+        path="demo.txt",
+        edits=[
+            {"op": "insert_before_line", "line": 2, "content": "before\r\n"},
+            {"op": "insert_after_line", "line": 3, "content": "after\r\n"},
+        ],
+    )
+
+    assert path.read_bytes() == b"A\r\nbefore\r\nB\r\nafter\r\n"
+
+
+def test_fs_edit_replace_lines_rejects_stale_expected_old(tmp_path: Path) -> None:
+    path = tmp_path / "demo.py"
+    original = "alpha\nbeta\n"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(FsError, match="selected line text did not match expected_old"):
+        fs_edit(
+            root=tmp_path,
+            path="demo.py",
+            edits=[
+                {
+                    "op": "replace_lines",
+                    "start_line": 2,
+                    "end_line": 2,
+                    "expected_old": "gamma\n",
+                    "replacement": "delta\n",
+                }
+            ],
+        )
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_fs_edit_line_operations_reject_invalid_ranges(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    path.write_text("one\n", encoding="utf-8")
+
+    with pytest.raises(FsError, match="end_line 2 is beyond end of file"):
+        fs_edit(
+            root=tmp_path,
+            path="demo.txt",
+            edits=[{"op": "replace_lines", "start_line": 1, "end_line": 2, "replacement": ""}],
+        )
+
+    with pytest.raises(FsError, match="line 2 is beyond end of file"):
+        fs_edit(
+            root=tmp_path,
+            path="demo.txt",
+            edits=[{"op": "insert_after_line", "line": 2, "content": "two\n"}],
+        )
+
+
 def test_fs_edit_append_and_prepend(tmp_path: Path) -> None:
     path = tmp_path / "demo.txt"
     path.write_text("body", encoding="utf-8")
@@ -132,6 +225,24 @@ def test_fs_edit_is_all_or_nothing_on_failure(tmp_path: Path) -> None:
                 {"op": "replace_exact", "target": "alpha", "replacement": "ALPHA"},
                 {"op": "replace_exact", "target": "missing", "replacement": "x"},
             ],
+        )
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_fs_edit_insert_before_requires_content_without_writing(tmp_path: Path) -> None:
+    path = tmp_path / "demo.txt"
+    original = "alpha\nbeta\n"
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(
+        FsError,
+        match="Edit 1 \\(insert_before_exact\\) requires string field: content",
+    ):
+        fs_edit(
+            root=tmp_path,
+            path="demo.txt",
+            edits=[{"op": "insert_before_exact", "target": "beta"}],
         )
 
     assert path.read_text(encoding="utf-8") == original
@@ -206,8 +317,13 @@ def test_build_tools_registers_fs_edit_and_emits_diff_preview(tmp_path: Path) ->
     assert "fs_edit" in tools
     schema = tools["fs_edit"].as_openai_tool()["function"]["parameters"]
     assert schema["required"] == ["path", "edits"]
-    op_enum = schema["properties"]["edits"]["items"]["properties"]["op"].get("enum") or []
-    assert "replace" in op_enum
+    op_enums = [
+        variant["properties"]["op"]["enum"]
+        for variant in schema["properties"]["edits"]["items"]["anyOf"]
+    ]
+    assert ["replace", "replace_exact"] in op_enums
+    assert ["replace_lines"] in op_enums
+    assert ["insert_before_line", "insert_after_line"] in op_enums
 
     result = tools["fs_edit"].run(
         {

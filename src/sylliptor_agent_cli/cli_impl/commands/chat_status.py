@@ -4,9 +4,75 @@ from __future__ import annotations
 
 from .cli_common import *
 from .update import _cached_update_status_summary
+from ...config import resolve_web_search_policy
+from ...llm_error_display import classify_llm_error_display, friendly_llm_error_message
 from ...llm.protocols import OPENAI_COMPAT_PROTOCOL, get_provider_protocol_capabilities
 from ...profiles import get_active_profile, resolve_effective_base_url
 from ...provider_telemetry import last_provider_call_summary, last_web_search_summary
+from ...step_budget import (
+    DEFAULT_CHAT_MAX_STEPS,
+    DEFAULT_SUBAGENT_MAX_STEPS,
+    DEFAULT_TASK_MAX_STEPS,
+    normalize_step_budget_policy,
+)
+
+
+_CHAT_MODE_STATUS_LABELS = {
+    "review": "safe (review)",
+    "auto": "fast (auto)",
+    "readonly": "read (readonly)",
+    "fullaccess": "full (fullaccess)",
+}
+
+
+def _chat_mode_status_label(mode: Any) -> str:
+    normalized = str(mode or "").strip().lower()
+    return _CHAT_MODE_STATUS_LABELS.get(normalized, normalized or "unknown")
+
+
+def _session_execution_policy(session: Any) -> str:
+    return normalize_step_budget_policy(
+        getattr(
+            session,
+            "step_budget_policy",
+            getattr(getattr(session, "cfg", None), "step_budget_policy", "autonomous"),
+        )
+    )
+
+
+def _session_step_limit_label(session: Any, *, scope: str) -> str:
+    policy = _session_execution_policy(session)
+    if scope == "chat":
+        explicit = getattr(session, "chat_turn_fixed_override", None)
+        if isinstance(explicit, int) and explicit > 0:
+            return str(explicit)
+    if policy == "autonomous":
+        return "unlimited"
+    field = {
+        "chat": "max_steps",
+        "task": "task_max_steps",
+        "subagent": "subagent_max_steps",
+    }[scope]
+    default = {
+        "chat": DEFAULT_CHAT_MAX_STEPS,
+        "task": DEFAULT_TASK_MAX_STEPS,
+        "subagent": DEFAULT_SUBAGENT_MAX_STEPS,
+    }[scope]
+    return str(getattr(session, field, getattr(getattr(session, "cfg", None), field, default)))
+
+
+def _active_step_limit_label(session: Any) -> str:
+    runtime = getattr(session, "step_budget_runtime", None)
+    active = getattr(runtime, "active_turn_budget", None)
+    if isinstance(active, int) and active > 0:
+        return str(active)
+    resolution = getattr(runtime, "last_resolution", None)
+    if resolution is not None and bool(getattr(resolution, "unlimited", False)):
+        return "unlimited"
+    resolved = getattr(resolution, "resolved_max_steps", None)
+    if isinstance(resolved, int) and resolved > 0:
+        return str(resolved)
+    return _session_step_limit_label(session, scope="chat")
 
 
 def _print_chat_status(
@@ -37,7 +103,7 @@ def _print_chat_status(
     table = _Table(title="Chat Status")
     table.add_column("setting")
     table.add_column("value", overflow="fold")
-    table.add_row("mode", str(mode))
+    table.add_row("mode", _chat_mode_status_label(mode))
     table.add_row("trace", _chat_trace_level(session))
     table.add_row("model", str(model))
     table.add_row("protocol", active_protocol)
@@ -53,42 +119,13 @@ def _print_chat_status(
         "on" if bool(getattr(session, "subagents_enabled", False)) else "off",
     )
     table.add_row(
-        "step_budget_policy",
-        str(
-            getattr(
-                session,
-                "step_budget_policy",
-                getattr(getattr(session, "cfg", None), "step_budget_policy", "adaptive"),
-            )
-        ),
+        "execution_policy",
+        _session_execution_policy(session),
     )
-    table.add_row("chat_max_steps", str(getattr(session, "max_steps", DEFAULT_CHAT_MAX_STEPS)))
-    table.add_row(
-        "task_max_steps",
-        str(
-            getattr(
-                session,
-                "task_max_steps",
-                getattr(getattr(session, "cfg", None), "task_max_steps", 100),
-            )
-        ),
-    )
-    table.add_row(
-        "subagent_max_steps",
-        str(
-            getattr(
-                session,
-                "subagent_max_steps",
-                getattr(getattr(session, "cfg", None), "subagent_max_steps", 16),
-            )
-        ),
-    )
-    active_turn_budget = getattr(
-        getattr(session, "step_budget_runtime", None), "active_turn_budget", None
-    )
-    table.add_row(
-        "active_turn_budget", str(active_turn_budget if active_turn_budget is not None else "-")
-    )
+    table.add_row("chat_step_limit", _session_step_limit_label(session, scope="chat"))
+    table.add_row("task_step_limit", _session_step_limit_label(session, scope="task"))
+    table.add_row("subagent_step_limit", _session_step_limit_label(session, scope="subagent"))
+    table.add_row("active_step_limit", _active_step_limit_label(session))
     table.add_row("session", str(getattr(getattr(session, "store", None), "session_id", "-")))
     active_workdir = Path(resolve_session_active_workdir_path(session))
     focus_dir = Path(getattr(session, "focus_dir", root) or root)
@@ -104,12 +141,18 @@ def _print_chat_status(
     table.add_row("update", _cached_update_status_summary(resolved_cfg))
     table.add_row("task", "-")
     table.add_row("queued_images", str(len(pending_images)))
-    table.add_row("web_search", web_search_status.availability_label)
+    web_search_policy = resolve_web_search_policy(resolved_cfg)
+    web_search_ready = web_search_status.registration_ready and web_search_policy != "off"
+    web_search_label = (
+        "policy-disabled" if web_search_policy == "off" else web_search_status.availability_label
+    )
+    table.add_row("web_search", web_search_label)
+    table.add_row("web_search_policy", web_search_policy)
     table.add_row("web_search_mode", web_search_status.mode)
     table.add_row("web_search_provider", web_search_status.provider or "(none)")
     table.add_row(
         "web_search_registration",
-        "yes" if web_search_status.registration_ready else "no",
+        "yes" if web_search_ready else "no",
     )
     if web_search_status.provider not in {None, "tavily"}:
         table.add_row("web_search_base_url", web_search_status.base_url or "(missing)")
@@ -119,7 +162,14 @@ def _print_chat_status(
         "available" if web_search_status.api_key_available else "missing",
     )
     table.add_row("web_search_note", web_search_status.summary)
-    table.add_row("web_search_setup", web_search_status.setup_hint)
+    table.add_row(
+        "web_search_setup",
+        (
+            "Set `sylliptor config set web_search_policy auto` to expose search to the model."
+            if web_search_policy == "off"
+            else web_search_status.setup_hint
+        ),
+    )
     last_call = last_provider_call_summary()
     if last_call:
         table.add_row(
@@ -242,7 +292,7 @@ def _chat_status_panel_spec(*, session: Any, pending_images: list[str]) -> dict[
         return getattr(session, name, getattr(getattr(session, "cfg", None), name, default))
 
     session_rows: list[tuple[str, str, str]] = [
-        ("mode", mode, "accent"),
+        ("mode", _chat_mode_status_label(mode), "accent"),
         ("model", str(model), "accent"),
         ("trace", _chat_trace_level(session), "plain"),
         ("session", str(getattr(getattr(session, "store", None), "session_id", "-")), "dim"),
@@ -260,18 +310,19 @@ def _chat_status_panel_spec(*, session: Any, pending_images: list[str]) -> dict[
         ("temperature", str(temperature), "plain"),
         ("stream", "on" if stream else "off", tone(stream)),
         ("subagents", "on" if subagents else "off", tone(subagents)),
-        ("step_budget_policy", str(_attr("step_budget_policy", "adaptive")), "plain"),
-        ("chat_max_steps", str(getattr(session, "max_steps", DEFAULT_CHAT_MAX_STEPS)), "plain"),
-        ("task_max_steps", str(_attr("task_max_steps", 100)), "plain"),
-        ("subagent_max_steps", str(_attr("subagent_max_steps", 16)), "plain"),
+        ("execution_policy", _session_execution_policy(session), "plain"),
+        ("chat_step_limit", _session_step_limit_label(session, scope="chat"), "plain"),
+        ("task_step_limit", _session_step_limit_label(session, scope="task"), "plain"),
+        (
+            "subagent_step_limit",
+            _session_step_limit_label(session, scope="subagent"),
+            "plain",
+        ),
     ]
-    active_turn_budget = getattr(
-        getattr(session, "step_budget_runtime", None), "active_turn_budget", None
-    )
     model_rows.append(
         (
-            "active_turn_budget",
-            str(active_turn_budget if active_turn_budget is not None else "-"),
+            "active_step_limit",
+            _active_step_limit_label(session),
             "plain",
         )
     )
@@ -291,16 +342,20 @@ def _chat_status_panel_spec(*, session: Any, pending_images: list[str]) -> dict[
         ("queued_images", str(len(pending_images)), "plain"),
     ]
 
-    web_unavailable = "unavailable" in str(web.availability_label or "").casefold()
+    web_policy = resolve_web_search_policy(resolved_cfg)
+    web_ready = web.registration_ready and web_policy != "off"
+    web_label = "policy-disabled" if web_policy == "off" else web.availability_label
+    web_unavailable = not web_ready
     web_rows: list[tuple[str, str, str]] = [
         (
             "status",
-            web.availability_label,
-            "err" if web_unavailable else tone(web.registration_ready),
+            web_label,
+            "err" if web_unavailable else tone(web_ready),
         ),
+        ("policy", web_policy, "plain"),
         ("mode", web.mode, "plain"),
         ("provider", web.provider or "(none)", "plain"),
-        ("registration", "yes" if web.registration_ready else "no", tone(web.registration_ready)),
+        ("registration", "yes" if web_ready else "no", tone(web_ready)),
     ]
     if web.provider not in {None, "tavily"}:
         web_rows.append(("base_url", web.base_url or "(missing)", "plain"))
@@ -313,7 +368,17 @@ def _chat_status_panel_spec(*, session: Any, pending_images: list[str]) -> dict[
         )
     )
     web_rows.append(("note", web.summary, "plain"))
-    web_rows.append(("setup", web.setup_hint, "plain"))
+    web_rows.append(
+        (
+            "setup",
+            (
+                "Set `sylliptor config set web_search_policy auto` to expose search to the model."
+                if web_policy == "off"
+                else web.setup_hint
+            ),
+            "plain",
+        )
+    )
 
     sections: list[tuple[str, list[tuple[str, str, str]]]] = [
         ("Session", session_rows),
@@ -413,6 +478,8 @@ def _print_chat_usage(*, console: Console, session: Any) -> None:
     table = _Table(title="Usage")
     table.add_column("model")
     table.add_column("input", justify="right")
+    table.add_column("cache read", justify="right")
+    table.add_column("cache write", justify="right")
     table.add_column("output", justify="right")
     table.add_column("total", justify="right")
     table.add_column("cost", justify="right")
@@ -426,6 +493,8 @@ def _print_chat_usage(*, console: Console, session: Any) -> None:
         table.add_row(
             str(row.get("model") or "-"),
             _format_exact_token_count(row.get("prompt_tokens")),
+            _format_exact_token_count(row.get("cache_read_input_tokens")),
+            _format_exact_token_count(row.get("cache_creation_input_tokens")),
             _format_exact_token_count(row.get("completion_tokens")),
             _format_exact_token_count(row.get("total_tokens")),
             cost_display,
@@ -440,6 +509,8 @@ def _print_chat_usage(*, console: Console, session: Any) -> None:
     table.add_row(
         "TOTAL",
         _format_exact_token_count(totals.get("prompt_tokens")),
+        _format_exact_token_count(totals.get("cache_read_input_tokens")),
+        _format_exact_token_count(totals.get("cache_creation_input_tokens")),
         _format_exact_token_count(totals.get("completion_tokens")),
         _format_exact_token_count(totals.get("total_tokens")),
         total_cost,
@@ -451,6 +522,19 @@ def _print_chat_usage(*, console: Console, session: Any) -> None:
             "[yellow]Total cost is partial:[/yellow] "
             f"{unknown_total} call(s) unmetered because pricing metadata is missing."
         )
+    cache_cost_unknown = int(totals.get("cache_cost_pricing_missing_calls") or 0)
+    if cache_cost_unknown > 0:
+        console.print(
+            "[yellow]Cache pricing omitted:[/yellow] "
+            f"{cache_cost_unknown} cached call(s) need provider-specific read/write prices."
+        )
+    if int(totals.get("cache_read_input_tokens") or 0) or int(
+        totals.get("cache_creation_input_tokens") or 0
+    ):
+        console.print(
+            "[dim]Cache read/write tokens can reduce provider cost or latency, but they still "
+            "occupy the current request context window.[/dim]"
+        )
     corrected_total = int(totals.get("corrected_usage_calls") or 0)
     if corrected_total > 0:
         console.print(
@@ -458,6 +542,18 @@ def _print_chat_usage(*, console: Console, session: Any) -> None:
             f"{corrected_total} provider usage record(s) contained inconsistent or character-like "
             "token fields and were corrected before display."
         )
+    request_estimate = totals.get("request_token_estimate")
+    if isinstance(request_estimate, dict):
+        schema_over_calls = int(request_estimate.get("tool_schema_budget_exceeded_calls") or 0)
+        if schema_over_calls > 0:
+            schema_overage = int(request_estimate.get("tool_schema_budget_overage_tokens") or 0)
+            largest_tool = int(request_estimate.get("tool_schema_largest_tool_tokens") or 0)
+            console.print(
+                "[yellow]Tool schema shadow budget:[/yellow] "
+                f"{schema_over_calls} call(s) exceeded the schema budget by "
+                f"{_format_exact_token_count(schema_overage)} total tokens "
+                f"(largest single tool {_format_exact_token_count(largest_tool)})."
+            )
 
 
 def _print_chat_context(*, console: Console, session: Any) -> None:
@@ -708,6 +804,13 @@ def _chat_turn_usage_line(session: Any) -> tuple[str | None, str | None] | None:
         f"[dim]↓[/dim] {_format_compact_token_count(totals.get('prompt_tokens'))}",
         f"[dim]↑[/dim] {_format_compact_token_count(totals.get('completion_tokens'))}",
     ]
+    cache_read_tokens = int(totals.get("cache_read_input_tokens") or 0)
+    cache_write_tokens = int(totals.get("cache_creation_input_tokens") or 0)
+    if cache_read_tokens or cache_write_tokens:
+        segments.append(
+            f"[dim]cache[/dim] r:{_format_compact_token_count(cache_read_tokens)} "
+            f"w:{_format_compact_token_count(cache_write_tokens)}"
+        )
     if ctx_segment is not None:
         segments.append(ctx_segment)
     return ("   ".join(segments), warning_line)
@@ -959,8 +1062,9 @@ def _truncate_chat_error_text(text: str, *, max_chars: int = _CHAT_LLM_ERROR_MAX
 
 
 def _chat_llm_error_panel(*, message: str) -> Panel:
-    display = classify_llm_error_display(message)
-    body_lines = [_truncate_chat_error_text(message)]
+    friendly_message = friendly_llm_error_message(message)
+    display = classify_llm_error_display(friendly_message)
+    body_lines = [_truncate_chat_error_text(friendly_message)]
     if display.guidance_lines:
         body_lines.append("")
         body_lines.extend(display.guidance_lines)
@@ -968,18 +1072,7 @@ def _chat_llm_error_panel(*, message: str) -> Panel:
 
 
 def _humanized_chat_llm_error_message(error: Exception) -> str:
-    """Prefer Sylliptor MiMo trial friendly copy; fall back to the raw error.
-
-    Turns the proxy's ``LLM error 402: {...trial_expired...}`` into a clear,
-    actionable line. Any non-proxy error (or import hiccup) renders unchanged.
-    """
-    try:
-        from ...llm.openai_compat import sylliptor_trial_error_message
-
-        friendly = sylliptor_trial_error_message(error)  # type: ignore[arg-type]
-    except Exception:  # noqa: BLE001
-        friendly = None
-    return friendly or str(error)
+    return friendly_llm_error_message(error)
 
 
 def _render_chat_llm_error(*, session: Any, console: Console, error: Exception) -> None:

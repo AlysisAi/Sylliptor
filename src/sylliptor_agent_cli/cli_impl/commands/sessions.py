@@ -10,7 +10,12 @@ import typer
 
 from ...config import load_config
 from ...session_metrics import score_session_log
-from ...session_store import list_sessions, read_session_events, resolve_sessions_dir
+from ...session_store import (
+    filter_sessions_to_local_owner,
+    list_sessions,
+    read_session_events,
+    resolve_sessions_dir,
+)
 from ...usage_tracker import aggregate_usage_from_session_logs
 from . import _patchable
 from ._shared import _console, _Table
@@ -28,22 +33,39 @@ def _cli_module() -> Any:
 sessions_app = typer.Typer(add_completion=False, help="Session log commands.")
 
 
+def _usage_source_pair(row: dict[str, Any]) -> str:
+    provider = int(row.get("api_usage_calls") or 0)
+    fallback = int(row.get("estimate_usage_calls") or 0)
+    return f"{provider}/{fallback}"
+
+
 @sessions_app.command("list")
-def sessions_list() -> None:
+def sessions_list(
+    show_all: bool = typer.Option(
+        False,
+        "--all",
+        help="Include sessions recorded by other accounts (hidden by default).",
+    ),
+) -> None:
     console = _console()
     cfg = _patchable("load_config", load_config)()
     sessions_dir = resolve_sessions_dir(cfg)
-    infos = _patchable("list_sessions", list_sessions)(sessions_dir)
+    all_infos = _patchable("list_sessions", list_sessions)(sessions_dir)
+    infos = all_infos if show_all else filter_sessions_to_local_owner(all_infos)
+    hidden_count = len(all_infos) - len(infos)
 
     table = _Table(title=f"Sessions ({sessions_dir})")
     table.add_column("session_id")
     table.add_column("path")
-    if not infos:
-        console.print(table)
-        return
     for info in infos[:200]:
         table.add_row(info.session_id, os.fspath(info.path))
     console.print(table)
+    if hidden_count:
+        suffix = "" if hidden_count == 1 else "s"
+        console.print(
+            f"[dim]{hidden_count} session{suffix} recorded by a different account "
+            "hidden. Use --all to include.[/dim]"
+        )
 
 
 @sessions_app.command("show")
@@ -86,7 +108,7 @@ def sessions_usage(
     table.add_column("total_tokens", justify="right")
     table.add_column("cost_usd", justify="right")
     table.add_column("unknown_pricing", justify="right")
-    table.add_column("usage_source(api/est)", justify="right")
+    table.add_column("usage(provider/fallback)", justify="right")
     for row in rows:
         unknown_count = int(row.get("unknown_cost_count") or 0)
         cost_display = _cli_module()._format_cost_with_unknown(
@@ -101,7 +123,7 @@ def sessions_usage(
             str(int(row.get("total_tokens") or 0)),
             cost_display,
             str(unknown_count),
-            (f"{int(row.get('api_usage_calls') or 0)}/{int(row.get('estimate_usage_calls') or 0)}"),
+            _usage_source_pair(row),
         )
     totals = summary.totals()
     total_cost = _cli_module()._format_cost_with_unknown(
@@ -116,10 +138,7 @@ def sessions_usage(
         str(int(totals.get("total_tokens") or 0)),
         total_cost,
         str(int(totals.get("unknown_cost_calls") or 0)),
-        (
-            f"{int(totals.get('api_usage_calls') or 0)}/"
-            f"{int(totals.get('estimate_usage_calls') or 0)}"
-        ),
+        _usage_source_pair(totals),
     )
     console.print(table)
 
@@ -154,9 +173,11 @@ def sessions_score(
             raise typer.Exit(code=2)
         target_paths = [path]
     else:
-        infos = _patchable("list_sessions", list_sessions)(sessions_dir)
+        infos = filter_sessions_to_local_owner(
+            _patchable("list_sessions", list_sessions)(sessions_dir)
+        )
         if not infos:
-            console.print(f"No sessions found in {sessions_dir}")
+            console.print(f"No sessions owned by this account found in {sessions_dir}")
             return
         count = latest if latest > 0 else 1
         target_paths = [info.path for info in infos[:count]]

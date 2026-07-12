@@ -413,7 +413,8 @@ def test_attempt_auto_resolve_conflict_success_writes_artifacts(
     )
     assert budget_payload["trusted_system_prompt_override_applied"] is True
     assert budget_payload["step_budget"]["kind"] == "conflict_resolution"
-    assert budget_payload["step_budget"]["reason"] == "adaptive_conflict_resolution"
+    assert budget_payload["step_budget"]["reason"] == "autonomous_unbounded"
+    assert budget_payload["step_budget"]["resolved_max_steps"] is None
 
 
 def test_attempt_auto_resolve_conflict_preserves_warning_visibility_for_recording_surface(

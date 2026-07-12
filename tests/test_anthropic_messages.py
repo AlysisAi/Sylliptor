@@ -9,9 +9,16 @@ from sylliptor_agent_cli.llm.anthropic_messages import AnthropicMessagesClient
 from sylliptor_agent_cli.llm.metadata import (
     PROVIDER_METADATA_KEY,
     attach_provider_metadata_to_assistant_message,
+    stamp_provider_metadata_for_route,
     strip_provider_metadata_from_message,
 )
+from sylliptor_agent_cli.llm.provider_limits import ProviderRetrySettings
+from sylliptor_agent_cli.llm.request_plan import LLMRequestPlan, RequestCachePlan
 from sylliptor_agent_cli.llm.types import LLMError
+from sylliptor_agent_cli.provider_telemetry import (
+    last_provider_call_summary,
+    reset_provider_telemetry_for_tests,
+)
 
 
 def _client(transport: httpx.BaseTransport) -> AnthropicMessagesClient:
@@ -44,6 +51,170 @@ def _sse_response(*events: str) -> httpx.Response:
         headers={"content-type": "text/event-stream"},
         stream=httpx.ByteStream("".join(events).encode("utf-8")),
     )
+
+
+class _TruncatedAnthropicSummaryStream(httpx.SyncByteStream):
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        yield (
+            _sse_event(
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_partial",
+                        "role": "assistant",
+                        "model": "claude-sonnet-4-6",
+                        "content": [],
+                    },
+                },
+            )
+            + _sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+            )
+            + _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": "Safe partial summary.",
+                    },
+                },
+            )
+        ).encode("utf-8")
+        raise httpx.RemoteProtocolError("stream closed after partial summary")
+
+
+def test_stream_does_not_retry_after_public_reasoning_summary() -> None:
+    attempts = 0
+    summaries: list[str] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_TruncatedAnthropicSummaryStream(),
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        enable_thinking=True,
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(max_retries=1),
+        provider_sleep_fn=lambda _seconds: None,
+    )
+
+    with pytest.raises(LLMError):
+        client.chat(
+            messages=[{"role": "user", "content": "hello"}],
+            stream=True,
+            on_reasoning_delta=summaries.append,
+        )
+
+    assert attempts == 1
+    assert summaries == ["Safe partial summary."]
+
+
+def test_count_input_tokens_uses_anthropic_count_endpoint() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.anthropic.com/v1/messages/count_tokens"
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"input_tokens": 456})
+
+    result = _client(httpx.MockTransport(handler)).count_input_tokens(
+        messages=[
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Hello"},
+        ]
+    )
+
+    assert result is not None
+    assert result.input_tokens == 456
+    assert result.source.value == "provider_count"
+    assert result.confidence.value == "authoritative"
+    assert captured["model"] == "claude-sonnet-4-6"
+    assert captured["system"] == "Be concise."
+    assert captured["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "Hello"}]}
+    ]
+
+
+def test_count_input_tokens_applies_enabled_cache_control_plan() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"input_tokens": 456})
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        transport=httpx.MockTransport(handler),
+        prompt_cache_control_enabled=True,
+        prompt_cache_control_ttl="1h",
+    )
+    result = client.count_input_tokens(
+        messages=[
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Hello"},
+        ]
+    )
+
+    assert result is not None
+    assert captured["system"] == [
+        {
+            "type": "text",
+            "text": "Be concise.",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }
+    ]
+    assert captured["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_count_input_tokens_mirrors_enabled_thinking_mode() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"input_tokens": 456})
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        enable_thinking=True,
+        transport=httpx.MockTransport(handler),
+    )
+    result = client.count_input_tokens(
+        messages=[{"role": "user", "content": "Hello"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "fs_read",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        tool_choice="required",
+    )
+
+    assert result is not None
+    assert captured["thinking"] == {"type": "adaptive", "display": "omitted"}
+    assert "tool_choice" not in captured
 
 
 def test_chat_maps_messages_tools_tool_choice_and_usage() -> None:
@@ -161,10 +332,669 @@ def test_chat_maps_messages_tools_tool_choice_and_usage() -> None:
     assert captured["tool_choice"] == {"type": "tool", "name": "fs_read"}
     assert response.content == "Done."
     assert response.usage is not None
-    assert response.usage.prompt_tokens == 12
+    assert response.usage.prompt_tokens == 15
     assert response.usage.completion_tokens == 4
-    assert response.usage.total_tokens == 16
+    assert response.usage.total_tokens == 19
     assert response.usage.cached_prompt_tokens == 3
+    assert response.usage.cache_read_input_tokens == 3
+    assert response.usage.input_tokens_uncached == 12
+
+
+def test_chat_omits_temperature_for_anthropic_models_that_deprecated_sampling() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_opus",
+                "model": "claude-opus-4-8",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-opus-4-8",
+        temperature=0.2,
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert response.content == "Done."
+    assert "temperature" not in captured
+    request_plan = response.provider_metadata["anthropic_messages"]["request_plan"]  # type: ignore[index]
+    assert request_plan["temperature_omitted"] is True
+    assert request_plan["temperature_omit_reason"] == ("anthropic_sampling_parameters_deprecated")
+
+
+def test_chat_retries_without_temperature_when_anthropic_rejects_unknown_model() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if "temperature" in body:
+            return httpx.Response(
+                400,
+                json={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "temperature is not supported for this model",
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_future",
+                "model": "claude-future-model",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-future-model",
+        temperature=0.2,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert client.chat(messages=[{"role": "user", "content": "hello"}]).content == "Done."
+    assert len(requests) == 2
+    assert requests[0]["temperature"] == 0.2
+    assert "temperature" not in requests[1]
+
+    assert client.chat(messages=[{"role": "user", "content": "again"}]).content == "Done."
+    assert len(requests) == 3
+    assert "temperature" not in requests[2]
+
+
+def test_chat_parses_anthropic_cache_write_usage() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cache_write",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation_input_tokens": 40,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 12,
+                        "ephemeral_1h_input_tokens": 28,
+                    },
+                },
+            },
+        )
+
+    response = _client(httpx.MockTransport(handler)).chat(
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert response.usage is not None
+    assert response.usage.prompt_tokens == 80
+    assert response.usage.completion_tokens == 2
+    assert response.usage.total_tokens == 82
+    assert response.usage.cached_prompt_tokens == 30
+    assert response.usage.cache_read_input_tokens == 30
+    assert response.usage.cache_creation_input_tokens == 40
+    assert response.usage.cache_creation_5m_input_tokens == 12
+    assert response.usage.cache_creation_1h_input_tokens == 28
+    assert response.usage.input_tokens_uncached == 10
+
+
+def test_chat_omits_anthropic_cache_control_by_default() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert "cache_control" not in body
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_no_cache",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    response = _client(httpx.MockTransport(handler)).chat(
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert response.content == "Done."
+
+
+def test_chat_sends_anthropic_cache_control_when_enabled_default_ttl() -> None:
+    reset_provider_telemetry_for_tests()
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.update(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cache_default",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        prompt_cache_control_enabled=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert captured["cache_control"] == {"type": "ephemeral"}
+    metadata = response.provider_metadata["anthropic_messages"]  # type: ignore[index]
+    assert metadata["cache_policy"] == {
+        "status": "enabled",
+        "strategy": "anthropic_cache_control",
+        "enabled": True,
+        "used": True,
+        "top_level_cache_control_used": True,
+        "explicit_block_used": False,
+        "explicit_block_count": 0,
+        "ttl": "5m",
+        "mode": "automatic",
+    }
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["cache_policy"] == metadata["cache_policy"]
+    assert summary["request_shape"]["cache_control_block_count"] == 0
+    assert summary["request_shape"]["explicit_cache_control_block_count"] == 0
+    assert summary["request_shape"]["top_level_cache_control_present"] is True
+    assert summary["request_shape"]["cache_used"] is True
+    assert summary["token_reconciliation"]["input_estimate_tokens"] > 0
+    assert summary["token_reconciliation"]["sent_input_estimate_tokens"] > 0
+    assert summary["token_reconciliation"]["reported_prompt_tokens"] is None
+
+
+def test_chat_sends_anthropic_cache_control_one_hour_ttl_when_enabled() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.update(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cache_1h",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        prompt_cache_control_enabled=True,
+        prompt_cache_control_ttl="1h",
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert captured["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_chat_sends_anthropic_cache_control_from_request_plan() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.update(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cache_plan",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        prompt_cache_control_enabled=False,
+        transport=httpx.MockTransport(handler),
+    )
+    plan = LLMRequestPlan.from_chat_args(
+        messages=[{"role": "user", "content": "hello"}],
+        cache=RequestCachePlan(
+            strategy="anthropic_cache_control",
+            mode="automatic",
+            anthropic_cache_control_enabled=True,
+            anthropic_cache_control_ttl="1h",
+        ),
+    )
+
+    response = client.chat(messages=[], request_plan=plan)
+
+    assert captured["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    metadata = response.provider_metadata["anthropic_messages"]  # type: ignore[index]
+    assert metadata["cache_policy"] == {
+        "status": "enabled",
+        "strategy": "anthropic_cache_control",
+        "enabled": True,
+        "used": True,
+        "top_level_cache_control_used": True,
+        "explicit_block_used": False,
+        "explicit_block_count": 0,
+        "ttl": "1h",
+        "mode": "automatic",
+    }
+
+
+def test_chat_adds_native_system_cache_control_block_when_enabled() -> None:
+    reset_provider_telemetry_for_tests()
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.update(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cache_system",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        prompt_cache_control_enabled=True,
+        prompt_cache_control_ttl="1h",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(
+        messages=[
+            {"role": "system", "content": "Stable system prompt."},
+            {"role": "user", "content": "hello"},
+        ]
+    )
+
+    system = captured["system"]
+    assert isinstance(system, list)
+    assert system == [
+        {
+            "type": "text",
+            "text": "Stable system prompt.",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }
+    ]
+    assert captured["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    metadata = response.provider_metadata["anthropic_messages"]  # type: ignore[index]
+    assert metadata["cache_policy"]["explicit_block_used"] is True
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["cache_policy"]["explicit_block_used"] is True
+    assert summary["request_shape"]["cache_control_block_count"] == 1
+    assert summary["request_shape"]["explicit_cache_control_block_count"] == 1
+    assert summary["request_shape"]["top_level_cache_control_present"] is True
+
+
+def test_chat_preserves_existing_text_block_cache_control() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.update(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cache_existing",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    response = _client(httpx.MockTransport(handler)).chat(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "cached user prefix",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        ],
+    )
+
+    sent_content = captured["messages"][0]["content"]  # type: ignore[index]
+    assert sent_content == [
+        {
+            "type": "text",
+            "text": "cached user prefix",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    assert response.content == "Done."
+
+
+def test_chat_preserves_system_cache_control_and_skips_conflicting_top_level_ttl() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.update(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cache_ttl_conflict",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        prompt_cache_control_enabled=True,
+        prompt_cache_control_ttl="5m",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(
+        messages=[
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Stable system prompt.",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    }
+                ],
+            },
+            {"role": "user", "content": "hello"},
+        ]
+    )
+
+    assert "cache_control" not in captured
+    assert captured["system"] == [
+        {
+            "type": "text",
+            "text": "Stable system prompt.",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }
+    ]
+    metadata = response.provider_metadata["anthropic_messages"]["cache_policy"]  # type: ignore[index]
+    assert metadata["used"] is True
+    assert metadata["top_level_cache_control_used"] is False
+    assert metadata["explicit_block_count"] == 1
+    assert "anthropic_top_level_cache_control_skipped_ttl_conflict" in metadata["warnings"]
+
+
+def test_chat_skips_top_level_cache_control_at_breakpoint_limit() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.update(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cache_breakpoint_limit",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        prompt_cache_control_enabled=True,
+        transport=httpx.MockTransport(handler),
+    )
+    blocks = [
+        {
+            "type": "text",
+            "text": f"cached block {index}",
+            "cache_control": {"type": "ephemeral"},
+        }
+        for index in range(4)
+    ]
+
+    response = client.chat(messages=[{"role": "user", "content": blocks}])
+
+    assert "cache_control" not in captured
+    metadata = response.provider_metadata["anthropic_messages"]["cache_policy"]  # type: ignore[index]
+    assert metadata["used"] is True
+    assert metadata["top_level_cache_control_used"] is False
+    assert metadata["explicit_block_count"] == 4
+    assert "anthropic_top_level_cache_control_skipped_breakpoint_limit" in metadata["warnings"]
+
+
+def test_chat_retries_without_cache_control_when_anthropic_rejects_it() -> None:
+    reset_provider_telemetry_for_tests()
+    calls: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if len(calls) == 1:
+            return httpx.Response(
+                400,
+                json={"error": {"type": "invalid_request_error", "message": "bad cache_control"}},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cache_fallback",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        prompt_cache_control_enabled=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(
+        messages=[
+            {"role": "system", "content": "Stable system prompt."},
+            {"role": "user", "content": "hello"},
+        ]
+    )
+
+    assert len(calls) == 2
+    assert "cache_control" in calls[0]
+    assert "cache_control" not in calls[1]
+    assert all("cache_control" not in json.dumps(value, sort_keys=True) for value in [calls[1]])
+    metadata = response.provider_metadata["anthropic_messages"]["cache_policy"]  # type: ignore[index]
+    assert metadata["status"] == "fallback"
+    assert metadata["used"] is False
+    assert metadata["fallback"] == "anthropic_cache_control_rejected"
+    assert metadata["disabled_fields"] == ["cache_control"]
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["request_shape"]["cache_used"] is False
+    assert summary["request_shape"]["top_level_cache_control_present"] is False
+    assert summary["request_shape"]["explicit_cache_control_block_count"] == 0
+
+
+def _cache_config_tool() -> dict[str, object]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "cache_config",
+            "description": "Configure caching.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cache_control": {"type": "string", "description": "Cache mode."},
+                },
+                "required": ["cache_control"],
+            },
+        },
+    }
+
+
+def test_chat_ignores_tool_schema_property_named_cache_control() -> None:
+    reset_provider_telemetry_for_tests()
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.update(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cache_schema_property",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        prompt_cache_control_enabled=True,
+        prompt_cache_control_ttl="1h",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(
+        messages=[
+            {"role": "system", "content": "Stable system prompt."},
+            {"role": "user", "content": "hello"},
+        ],
+        tools=[_cache_config_tool()],
+    )
+
+    assert captured["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert captured["system"] == [
+        {
+            "type": "text",
+            "text": "Stable system prompt.",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        }
+    ]
+    assert captured["tools"][0]["input_schema"]["properties"]["cache_control"] == {  # type: ignore[index]
+        "type": "string",
+        "description": "Cache mode.",
+    }
+    metadata = response.provider_metadata["anthropic_messages"]["cache_policy"]  # type: ignore[index]
+    assert metadata["used"] is True
+    assert metadata["top_level_cache_control_used"] is True
+    assert metadata["explicit_block_count"] == 1
+    assert "warnings" not in metadata
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["request_shape"]["explicit_cache_control_block_count"] == 1
+
+
+def test_cache_control_downgrade_keeps_tool_schema_property_named_cache_control() -> None:
+    calls: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if len(calls) == 1:
+            return httpx.Response(
+                400,
+                json={"error": {"type": "invalid_request_error", "message": "bad cache_control"}},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_cache_schema_property_fallback",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        prompt_cache_control_enabled=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(
+        messages=[
+            {"role": "system", "content": "Stable system prompt."},
+            {"role": "user", "content": "hello"},
+        ],
+        tools=[_cache_config_tool()],
+    )
+
+    assert len(calls) == 2
+    assert "cache_control" in calls[0]
+    assert "cache_control" not in calls[1]
+    assert calls[1]["system"] == [{"type": "text", "text": "Stable system prompt."}]
+    assert calls[1]["tools"][0]["input_schema"] == {  # type: ignore[index]
+        "type": "object",
+        "properties": {
+            "cache_control": {"type": "string", "description": "Cache mode."},
+        },
+        "required": ["cache_control"],
+    }
+    metadata = response.provider_metadata["anthropic_messages"]["cache_policy"]  # type: ignore[index]
+    assert metadata["status"] == "fallback"
+    assert metadata["used"] is False
+    assert metadata["fallback"] == "anthropic_cache_control_rejected"
 
 
 def test_chat_parses_multiple_tool_use_blocks() -> None:
@@ -575,9 +1405,10 @@ def test_chat_extracts_web_search_citations_sources_and_queries_metadata() -> No
     assert metadata["citations"][0]["encrypted_index"] == "encrypted-index"
 
 
-def test_chat_streams_text_deltas_usage_and_hidden_thinking_metadata() -> None:
+def test_chat_streams_text_and_provider_summarized_thinking_deltas() -> None:
     captured: dict[str, object] = {}
-    deltas: list[str] = []
+    text_deltas: list[str] = []
+    reasoning_deltas: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.update(json.loads(request.content.decode("utf-8")))
@@ -609,7 +1440,7 @@ def test_chat_streams_text_deltas_usage_and_hidden_thinking_metadata() -> None:
                 {
                     "type": "content_block_delta",
                     "index": 0,
-                    "delta": {"type": "thinking_delta", "thinking": "private reasoning"},
+                    "delta": {"type": "thinking_delta", "thinking": "provider summary"},
                 },
             ),
             _sse_event(
@@ -657,23 +1488,444 @@ def test_chat_streams_text_deltas_usage_and_hidden_thinking_metadata() -> None:
             _sse_event("message_stop", {"type": "message_stop"}),
         )
 
-    response = _client(httpx.MockTransport(handler)).chat(
+    response = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        enable_thinking=True,
+        transport=httpx.MockTransport(handler),
+    ).chat(
         messages=[{"role": "user", "content": "hello"}],
         stream=True,
-        on_text_delta=deltas.append,
+        on_text_delta=text_deltas.append,
+        on_reasoning_delta=reasoning_deltas.append,
     )
 
     assert captured["stream"] is True
+    assert captured["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert "temperature" not in captured
     assert response.content == "Hello world."
-    assert deltas == ["Hello ", "world."]
+    assert text_deltas == ["Hello ", "world."]
+    assert reasoning_deltas == ["provider summary"]
+    assert [item.text for item in response.reasoning] == ["provider summary"]
     assert response.usage is not None
     assert response.usage.prompt_tokens == 11
     assert response.usage.completion_tokens == 4
     assert response.usage.total_tokens == 15
     metadata = response.provider_metadata["anthropic_messages"]  # type: ignore[index]
-    assert metadata["content_blocks"][0]["thinking"] == "private reasoning"
+    assert metadata["content_blocks"][0]["thinking"] == "provider summary"
     assert metadata["content_blocks"][0]["signature"] == "sig-abc"
-    assert "private reasoning" not in response.content
+    assert "provider summary" not in response.content
+
+
+def test_trace_callback_does_not_enable_anthropic_thinking_in_auto_mode() -> None:
+    captured: dict[str, object] = {}
+    reasoning_deltas: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_auto",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        )
+
+    response = _client(httpx.MockTransport(handler)).chat(
+        messages=[{"role": "user", "content": "hello"}],
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+
+    assert response.content == "Done."
+    assert reasoning_deltas == []
+    assert response.reasoning == ()
+    assert "thinking" not in captured
+    assert "output_config" not in captured
+    assert captured["temperature"] == 1.0
+
+
+def test_unrequested_thinking_block_stays_opaque_with_trace_callback() -> None:
+    captured: dict[str, object] = {}
+    reasoning_deltas: list[str] = []
+    opaque_block = {
+        "type": "thinking",
+        "thinking": "Legacy proxy raw thinking that must not be displayed.",
+        "signature": "opaque-signature",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_legacy_raw_thinking",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [opaque_block, {"type": "text", "text": "Done."}],
+            },
+        )
+
+    response = _client(httpx.MockTransport(handler)).chat(
+        messages=[{"role": "user", "content": "hello"}],
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+
+    assert "thinking" not in captured
+    assert reasoning_deltas == []
+    assert response.reasoning == ()
+    assert response.content == "Done."
+    metadata = response.provider_metadata["anthropic_messages"]  # type: ignore[index]
+    assert metadata["content_blocks"][0] == opaque_block
+
+
+def test_trace_callback_only_changes_visibility_when_thinking_is_on_by_default() -> None:
+    captured: dict[str, object] = {}
+    reasoning_deltas: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_default_thinking",
+                "model": "claude-sonnet-5",
+                "role": "assistant",
+                "type": "message",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Provider summary.",
+                        "signature": "opaque-signature",
+                    },
+                    {"type": "text", "text": "Done."},
+                ],
+            },
+        )
+
+    response = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-5",
+        transport=httpx.MockTransport(handler),
+    ).chat(
+        messages=[{"role": "user", "content": "hello"}],
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+
+    assert captured["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert "output_config" not in captured
+    assert "temperature" not in captured
+    assert reasoning_deltas == ["Provider summary."]
+    assert [item.text for item in response.reasoning] == ["Provider summary."]
+
+
+def test_buffered_thinking_uses_summarized_display_and_preserves_opaque_blocks() -> None:
+    captured: dict[str, object] = {}
+    reasoning_deltas: list[str] = []
+    content_blocks = [
+        {
+            "type": "thinking",
+            "thinking": "Provider-produced summary.",
+            "signature": "sig-summary",
+        },
+        {
+            "type": "redacted_thinking",
+            "data": "opaque-redacted-state",
+        },
+        {"type": "text", "text": "Final answer."},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_buffered_thinking",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": content_blocks,
+                "usage": {"input_tokens": 3, "output_tokens": 7},
+            },
+        )
+
+    response = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        reasoning_effort="medium",
+        transport=httpx.MockTransport(handler),
+    ).chat(
+        messages=[{"role": "user", "content": "think"}],
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+
+    assert captured["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert captured["output_config"] == {"effort": "medium"}
+    assert "temperature" not in captured
+    assert reasoning_deltas == ["Provider-produced summary."]
+    assert [item.text for item in response.reasoning] == ["Provider-produced summary."]
+    assert response.content == "Final answer."
+    metadata = response.provider_metadata["anthropic_messages"]  # type: ignore[index]
+    assert metadata["content_blocks"] == content_blocks
+
+
+def test_buffered_summary_display_rejection_falls_back_once_and_caches() -> None:
+    payloads: list[dict[str, object]] = []
+    reasoning_deltas: list[str] = []
+    opaque_block = {
+        "type": "thinking",
+        "thinking": "Raw thinking after summary display was rejected.",
+        "signature": "opaque-signature",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        payloads.append(payload)
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("display") == "summarized":
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "thinking.display summarized is not supported",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_summary_fallback",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [opaque_block, {"type": "text", "text": "Done."}],
+            },
+        )
+
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        reasoning_effort="medium",
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(
+        messages=[{"role": "user", "content": "think"}],
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+    second = client.chat(
+        messages=[{"role": "user", "content": "think again"}],
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+
+    assert len(payloads) == 3
+    assert payloads[0]["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert payloads[0]["output_config"] == {"effort": "medium"}
+    for payload in payloads[1:]:
+        assert payload["thinking"] == {"type": "adaptive"}
+        assert payload["output_config"] == {"effort": "medium"}
+    assert reasoning_deltas == []
+    assert first.reasoning == ()
+    assert second.reasoning == ()
+    first_metadata = first.provider_metadata["anthropic_messages"]  # type: ignore[index]
+    assert first_metadata["content_blocks"][0] == opaque_block
+
+
+def test_streamed_summary_display_rejection_keeps_raw_thinking_opaque() -> None:
+    payloads: list[dict[str, object]] = []
+    reasoning_deltas: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        payloads.append(payload)
+        thinking = payload.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("display") == "summarized":
+            return httpx.Response(
+                422,
+                json={"error": {"message": "thinking display is an unexpected field"}},
+            )
+        return _sse_response(
+            _sse_event(
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_stream_summary_fallback",
+                        "role": "assistant",
+                        "model": "claude-haiku-4-5-20251001",
+                        "content": [],
+                    },
+                },
+            ),
+            _sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+            ),
+            _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": "Raw thinking that must remain opaque.",
+                    },
+                },
+            ),
+            _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            _sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ),
+            _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": "Done."},
+                },
+            ),
+            _sse_event("content_block_stop", {"type": "content_block_stop", "index": 1}),
+            _sse_event(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 4},
+                },
+            ),
+            _sse_event("message_stop", {"type": "message_stop"}),
+        )
+
+    response = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-haiku-4-5-20251001",
+        enable_thinking=True,
+        transport=httpx.MockTransport(handler),
+    ).chat(
+        messages=[{"role": "user", "content": "think"}],
+        stream=True,
+        on_reasoning_delta=reasoning_deltas.append,
+        max_tokens=4096,
+    )
+
+    assert len(payloads) == 2
+    assert payloads[0]["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 3072,
+        "display": "summarized",
+    }
+    assert payloads[1]["thinking"] == {"type": "enabled", "budget_tokens": 3072}
+    assert reasoning_deltas == []
+    assert response.reasoning == ()
+    assert response.content == "Done."
+    metadata = response.provider_metadata["anthropic_messages"]  # type: ignore[index]
+    assert metadata["content_blocks"][0]["thinking"] == ("Raw thinking that must remain opaque.")
+
+
+def test_thinking_without_trace_requests_omitted_display() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_omitted_thinking",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "type": "message",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": "sig-omitted"},
+                    {"type": "text", "text": "Done."},
+                ],
+            },
+        )
+
+    response = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-sonnet-4-6",
+        enable_thinking=True,
+        transport=httpx.MockTransport(handler),
+    ).chat(messages=[{"role": "user", "content": "think"}])
+
+    assert captured["thinking"] == {"type": "adaptive", "display": "omitted"}
+    assert "temperature" not in captured
+    assert response.reasoning == ()
+    metadata = response.provider_metadata["anthropic_messages"]  # type: ignore[index]
+    assert metadata["content_blocks"][0] == {
+        "type": "thinking",
+        "thinking": "",
+        "signature": "sig-omitted",
+    }
+
+
+def test_manual_thinking_uses_safe_budget_and_omits_forced_tool_choice() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_manual_thinking",
+                "model": "claude-haiku-4-5-20251001",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    response = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-haiku-4-5-20251001",
+        enable_thinking=True,
+        transport=httpx.MockTransport(handler),
+    ).chat(
+        messages=[{"role": "user", "content": "read"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "fs_read",
+                    "description": "Read a file.",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        tool_choice={"type": "function", "function": {"name": "fs_read"}},
+        on_reasoning_delta=lambda _delta: None,
+        max_tokens=4096,
+    )
+
+    assert response.content == "Done."
+    assert captured["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 3072,
+        "display": "summarized",
+    }
+    assert "temperature" not in captured
+    assert "tool_choice" not in captured
 
 
 def test_chat_streams_tool_use_from_partial_json_deltas() -> None:
@@ -1050,15 +2302,6 @@ def test_chat_rejects_empty_malformed_refusal_and_unsupported_options() -> None:
             response_format={"type": "json_object"},
         )
 
-    with pytest.raises(LLMError, match="does not support reasoning_effort"):
-        AnthropicMessagesClient(
-            base_url="https://api.anthropic.com/v1",
-            api_key="test-key",
-            model="claude-sonnet-4-6",
-            reasoning_effort="high",
-            transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
-        ).chat(messages=[{"role": "user", "content": "hello"}])
-
     def empty_handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200, json={"id": "msg_empty", "content": [], "stop_reason": "end_turn"}
@@ -1091,3 +2334,85 @@ def test_chat_rejects_empty_malformed_refusal_and_unsupported_options() -> None:
         _client(httpx.MockTransport(refusal_handler)).chat(
             messages=[{"role": "user", "content": "hello"}],
         )
+
+
+def test_anthropic_chat_and_count_strip_state_from_different_credential_route() -> None:
+    sent: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        sent.append(body)
+        if str(request.url).endswith("/messages/count_tokens"):
+            return httpx.Response(200, json={"input_tokens": 12})
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_new",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        )
+
+    producer = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="credential-a",
+        model="claude-sonnet-4-6",
+    )
+    consumer = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="credential-b",
+        model="claude-sonnet-4-6",
+        transport=httpx.MockTransport(handler),
+    )
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": "public answer",
+            PROVIDER_METADATA_KEY: stamp_provider_metadata_for_route(
+                {
+                    "anthropic_messages": {
+                        "content_blocks": [
+                            {
+                                "type": "thinking",
+                                "thinking": "private-thinking-state",
+                                "signature": "private-signature",
+                            },
+                            {"type": "text", "text": "public answer"},
+                        ]
+                    }
+                },
+                producer.route_identity,
+            ),
+        },
+        {"role": "user", "content": "follow up"},
+    ]
+
+    assert consumer.count_input_tokens(messages=messages) is not None
+    assert consumer.chat(messages=messages).content == "ok"
+
+    assert len(sent) == 2
+    assert all("private-" not in json.dumps(body) for body in sent)
+    assert all("public answer" in json.dumps(body) for body in sent)
+
+
+def test_anthropic_extra_headers_override_defaults_case_insensitively() -> None:
+    client = AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="fallback-key",
+        model="claude-sonnet-4-6",
+        extra_headers={
+            "X-Api-Key": "override-key",
+            "Anthropic-Version": "2099-01-01",
+            "Content-Type": "application/custom+json",
+        },
+    )
+
+    headers = client._headers()
+
+    assert headers["x-api-key"] == "override-key"
+    assert headers["anthropic-version"] == "2099-01-01"
+    assert headers["content-type"] == "application/custom+json"
+    assert len({name.casefold() for name in headers}) == len(headers)

@@ -462,7 +462,6 @@ def test_rich_surface_shows_fs_read_lines_trace_and_summary() -> None:
 
     out = buffer.getvalue()
     assert "Step 2: Read File Lines" in out
-    assert "Goal: Inspect a precise file range without rereading the whole file." in out
     assert "Input: README.md:40-42 (max 10)" in out
     assert 'Read File Lines: Loaded "README.md" lines 40-42 (3 lines).' in out
     assert "(7ms)" in out
@@ -508,7 +507,6 @@ def test_rich_surface_shows_fs_edit_trace_and_summary() -> None:
 
     out = buffer.getvalue()
     assert "Step 3: Edit File" in out
-    assert "Goal: Apply deterministic exact-text edits to one file." in out
     assert "Input: src/app.py" in out
     assert 'Edit File: Edited "src/app.py" (2 edit(s), 128 bytes).' in out
     assert "(8ms)" in out
@@ -521,7 +519,6 @@ def test_rich_surface_shows_fs_edit_trace_and_summary() -> None:
         "result",
         "step",
         "expected_title",
-        "expected_goal",
         "expected_input",
         "expected_summary",
     ),
@@ -538,7 +535,6 @@ def test_rich_surface_shows_fs_edit_trace_and_summary() -> None:
             },
             4,
             "Move File",
-            "Goal: Rename or relocate one file without shell commands.",
             "Input: src/old.py -> src/new.py",
             'Move File: Moved "src/old.py" -> "src/new.py" (64 bytes).',
         ),
@@ -554,7 +550,6 @@ def test_rich_surface_shows_fs_edit_trace_and_summary() -> None:
             },
             5,
             "Copy File",
-            "Goal: Duplicate one file without shell commands.",
             "Input: src/old.py -> src/new.py",
             'Copy File: Copied "src/old.py" -> "src/new.py" (64 bytes).',
         ),
@@ -568,7 +563,6 @@ def test_rich_surface_shows_fs_edit_trace_and_summary() -> None:
             },
             6,
             "Delete File",
-            "Goal: Remove one file without shell commands.",
             "Input: src/old.py",
             'Delete File: Deleted "src/old.py" (64 bytes).',
         ),
@@ -580,7 +574,6 @@ def test_rich_surface_shows_file_op_trace_and_summary(
     result: dict[str, object],
     step: int,
     expected_title: str,
-    expected_goal: str,
     expected_input: str,
     expected_summary: str,
 ) -> None:
@@ -615,7 +608,6 @@ def test_rich_surface_shows_file_op_trace_and_summary(
 
     out = buffer.getvalue()
     assert f"Step {step}: {expected_title}" in out
-    assert expected_goal in out
     assert expected_input in out
     assert expected_summary in out
     assert "(10ms)" in out
@@ -670,7 +662,6 @@ def test_rich_surface_shows_verify_run_trace_and_summary() -> None:
 
     out = buffer.getvalue()
     assert "Step 4: Run Verification" in out
-    assert "Goal: Run structured verification before relying on raw shell commands." in out
     assert "Input: pytest -q (+1 more)" in out
     assert "Run Verification: verification failed (1/2); failed: ruff check ." in out
     assert "Hint: F401" in out
@@ -776,7 +767,6 @@ def test_rich_surface_shows_web_fetch_trace_and_summary() -> None:
 
     out = buffer.getvalue()
     assert "Step 6: Fetch Web Page" in out
-    assert "Goal: Read targeted external docs/spec pages without shelling out." in out
     assert "Input: https://docs.python.org/3/library/pathlib.html (max_chars=1200)" in out
     assert "Fetch Web Page: Fetched https://docs.python.org/3/library/pathlib.html" in out
     assert "status=200 type=text/html; charset=utf-8" in out
@@ -870,7 +860,6 @@ def test_rich_surface_shows_git_history_trace_and_summary(
 
     out = buffer.getvalue()
     assert f"Step {step}: Git History" in out
-    assert "Goal: Inspect repository history without dropping to shell commands." in out
     assert expected_input in out
     assert expected_summary in out
     assert "(14ms)" in out
@@ -929,7 +918,6 @@ def test_rich_surface_shows_symbol_search_trace_and_summary() -> None:
 
     out = buffer.getvalue()
     assert "Step 10: Symbol Search" in out
-    assert "Goal: Navigate Python or JS/TS definitions before broad regex search." in out
     assert "Input: build_tools kind=function exact" in out
     assert 'Symbol Search: Found 1 symbol match(es) for "build_tools".' in out
     assert "(11ms)" in out
@@ -981,7 +969,6 @@ def test_rich_surface_shows_history_search_trace_and_summary() -> None:
 
     out = buffer.getvalue()
     assert "Step 11: Search Session History" in out
-    assert "Goal: Inspect current session artifacts" in out
     assert "Input: verify_run" in out
     assert 'Search Session History: Found 1 history match(es) for "verify_run".' in out
     assert "(13ms)" in out
@@ -1027,7 +1014,6 @@ def test_rich_surface_summarizes_subagent_run_output() -> None:
     out = buffer.getvalue()
     assert "Step 3: Run Subagent" in out
     assert 'Subagent "explorer" mode=readonly (tools=2, result=3 chars).' in out
-    assert "Goal: Delegate focused repository analysis to a specialized subagent." in out
 
 
 def test_rich_surface_progress_update_deduplicates_repeated_lines() -> None:
@@ -1123,7 +1109,156 @@ def test_rich_surface_trace_off_hides_reasoning_lines() -> None:
     assert "Read File" not in out
 
 
-def test_rich_surface_trace_full_emits_structured_reasoning() -> None:
+def test_rich_surface_compact_trace_flushes_safe_reasoning_summary_before_answer() -> None:
+    buffer = io.StringIO()
+    surface = RichSurface(console=Console(file=buffer, force_terminal=False, width=240))
+
+    assert surface.reasoning_trace_enabled is True
+    surface.on_reasoning_token("Compare the available options.\n")
+    surface.on_reasoning_token("Choose the smallest safe change.")
+    surface.on_assistant_message_done("Done.")
+
+    out = buffer.getvalue()
+    assert (
+        "Reasoning summary: Compare the available options. Choose the smallest safe change." in out
+    )
+    assert "Done." in out
+    assert out.find("Reasoning summary:") < out.find("Done.")
+    assert "Thinking summary" not in out
+
+
+def test_rich_surface_streams_safe_reasoning_summary_live_on_terminal() -> None:
+    buffer = io.StringIO()
+    surface = RichSurface(
+        console=Console(
+            file=buffer,
+            force_terminal=True,
+            color_system=None,
+            width=240,
+        )
+    )
+
+    surface.on_reasoning_token("Live safe summary.")
+
+    assert surface._reasoning_summary_live is not None
+    assert "Live safe summary." in surface._reasoning_summary_renderable().plain
+    surface.on_assistant_message_done("Done.")
+
+
+def test_rich_surface_compact_trace_redacts_and_truncates_reasoning_summary() -> None:
+    buffer = io.StringIO()
+    surface = RichSurface(console=Console(file=buffer, force_terminal=False, width=240))
+    tail = "tail-marker-should-not-be-rendered"
+
+    surface.on_reasoning_token(f"Bearer super-secret-token {'x' * 220} {tail}")
+    surface.on_warning("fallback warning")
+
+    out = buffer.getvalue()
+    assert "Bearer [REDACTED]" in out
+    assert "super-secret-token" not in out
+    assert tail not in out
+    assert "..." in out
+    assert out.find("Reasoning summary:") < out.find("fallback warning")
+
+
+def test_rich_surface_full_trace_expands_reasoning_summary_before_tool() -> None:
+    buffer = io.StringIO()
+    surface = RichSurface(console=Console(file=buffer, force_terminal=False))
+    surface.set_trace_level("full")
+
+    surface.on_reasoning_token("Inspect the protocol contract.\nPreserve provider defaults.")
+    surface.on_tool_start(
+        ToolStartEvent(
+            tool_call_id="call_summary",
+            name="fs_read",
+            args={"path": "README.md"},
+            step=1,
+        )
+    )
+
+    out = buffer.getvalue()
+    assert "Reasoning summary:" in out
+    assert "Inspect the protocol contract." in out
+    assert "Preserve provider defaults." in out
+    assert out.find("Reasoning summary:") < out.find("Step 1: Read File")
+
+
+def test_rich_surface_reasoning_lifecycle_separates_provider_calls() -> None:
+    buffer = io.StringIO()
+    surface = RichSurface(console=Console(file=buffer, force_terminal=False, width=240))
+
+    surface.on_reasoning_start("call-1")
+    surface.on_reasoning_token("First safe summary.")
+    surface.on_reasoning_start("call-2")
+    surface.on_reasoning_token("Second safe summary.")
+    surface.on_reasoning_end("call-2")
+
+    out = buffer.getvalue()
+    assert out.count("Reasoning summary:") == 2
+    assert out.find("First safe summary.") < out.find("Second safe summary.")
+    assert surface._reasoning_summary_block_id is None
+
+
+def test_rich_surface_reasoning_lifecycle_ignores_stale_end() -> None:
+    buffer = io.StringIO()
+    surface = RichSurface(console=Console(file=buffer, force_terminal=False, width=240))
+
+    surface.on_reasoning_start("current")
+    surface.on_reasoning_token("Keep this live.")
+    surface.on_reasoning_end("stale")
+
+    assert buffer.getvalue() == ""
+    assert surface._reasoning_summary_block_id == "current"
+    surface.on_reasoning_end("current")
+    assert "Keep this live." in buffer.getvalue()
+
+
+def test_rich_surface_trace_off_suppresses_and_clears_reasoning_summary() -> None:
+    buffer = io.StringIO()
+    surface = RichSurface(console=Console(file=buffer, force_terminal=False))
+
+    surface.on_reasoning_token("This pending summary must be discarded.")
+    surface.set_trace_level("off")
+    assert surface.reasoning_trace_enabled is False
+    surface.on_reasoning_token("This disabled summary must be ignored.")
+    surface.on_assistant_message_done("Done.")
+
+    out = buffer.getvalue()
+    assert "Reasoning summary" not in out
+    assert "pending summary" not in out
+    assert "disabled summary" not in out
+    assert "Done." in out
+
+
+def test_rich_surface_trace_off_still_reports_tool_failures() -> None:
+    buffer = io.StringIO()
+    surface = RichSurface(console=Console(file=buffer, force_terminal=False))
+    surface.set_trace_level("off")
+
+    surface.on_tool_start(
+        ToolStartEvent(
+            tool_call_id="call_failed",
+            name="fs_read",
+            args={"path": "missing.txt"},
+            step=1,
+        )
+    )
+    surface.on_tool_end(
+        ToolEndEvent(
+            tool_call_id="call_failed",
+            name="fs_read",
+            status="failed",
+            elapsed_ms=5,
+            meta={"error": "file not found"},
+        )
+    )
+
+    out = buffer.getvalue()
+    assert "Read File failed" in out
+    assert "file not found" in out
+
+
+def test_rich_surface_trace_full_emits_only_observed_tool_details() -> None:
     buffer = io.StringIO()
     surface = RichSurface(console=Console(file=buffer, force_terminal=False))
     surface.set_trace_level("full")
@@ -1155,10 +1290,13 @@ def test_rich_surface_trace_full_emits_structured_reasoning() -> None:
 
     out = buffer.getvalue()
     assert "Step 2: Search Workspace" in out
-    assert "Goal:" in out
-    assert "Action:" in out
-    assert "Fallback:" in out
-    assert "Decision: Accepted tool output and continued to next step." in out
+    assert "Input: main\\(" in out
+    assert "Search Workspace" in out
+    assert "(14ms)" in out
+    assert "Goal:" not in out
+    assert "Action:" not in out
+    assert "Fallback:" not in out
+    assert "Decision:" not in out
 
 
 def test_rich_surface_visually_separates_thinking_and_answer() -> None:
@@ -1540,11 +1678,11 @@ def test_rich_surface_full_trace_shows_nested_subagent_detail_lines() -> None:
     out = buffer.getvalue()
     assert "╭─ reviewer · readonly" in out
     assert "│ Step 2: Search Workspace" in out
-    assert "│ Goal:" in out
-    assert "│ Action:" in out
     assert "│ Input: subagent_run" in out
-    assert "│ Fallback:" in out
-    assert "│ Decision: Accepted tool output and continued to next step." in out
+    assert "│ Goal:" not in out
+    assert "│ Action:" not in out
+    assert "│ Fallback:" not in out
+    assert "│ Decision:" not in out
     assert "[reviewer]" not in out
 
 

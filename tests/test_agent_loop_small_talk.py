@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -18,12 +19,27 @@ from sylliptor_agent_cli.custom_tools.trust import trust_project_tool
 from sylliptor_agent_cli.llm.metadata import (
     GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY,
     PROVIDER_METADATA_KEY,
+    endpoint_descriptor,
 )
 from sylliptor_agent_cli.llm.openai_compat import LLMError, LLMResponse, ToolCall
-from sylliptor_agent_cli.request_estimation import estimate_message_tokens
+from sylliptor_agent_cli.llm.protocols import ReasoningTraceCapability
+from sylliptor_agent_cli.llm.types import ReasoningOutputKind
+from sylliptor_agent_cli.llm_error_display import friendly_llm_error_message
+from sylliptor_agent_cli.request_estimation import (
+    estimate_message_tokens,
+    estimate_request_token_breakdown,
+)
 from sylliptor_agent_cli.runtime_kind import RuntimeKind
 from sylliptor_agent_cli.session_store import read_session_events
+from sylliptor_agent_cli.surface.noop_surface import NoopSurface
+from sylliptor_agent_cli.tools.availability import WEB_UNAVAILABLE_OBSERVATION
+from sylliptor_agent_cli.tools.web_search import WebSearchError
 from sylliptor_agent_cli.turn_intent import looks_like_implicit_repo_improvement_request
+
+
+@pytest.fixture(autouse=True)
+def _clear_generic_web_search_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_API_KEY", raising=False)
 
 
 class _FailClient:
@@ -46,6 +62,13 @@ class _FailClient:
 class _RouterStubClient:
     model = "test-model"
     temperature = 0.0
+    reasoning_trace_capability = ReasoningTraceCapability(
+        adapter="test_safe_summary",
+        output_kind=ReasoningOutputKind.SUMMARY,
+        supports_streaming=True,
+        supports_buffered=True,
+        requestable=True,
+    )
 
     def __init__(
         self,
@@ -60,6 +83,8 @@ class _RouterStubClient:
         script: str = "",
         explicit_language_override: bool = False,
         response_provider_metadata: dict[str, Any] | None = None,
+        response_text_deltas: list[str] | None = None,
+        response_reasoning_deltas: list[str] | None = None,
     ) -> None:
         self.route = route
         self.route_reply = route_reply
@@ -71,6 +96,8 @@ class _RouterStubClient:
         self.script = script
         self.explicit_language_override = explicit_language_override
         self.response_provider_metadata = response_provider_metadata
+        self.response_text_deltas = list(response_text_deltas or [])
+        self.response_reasoning_deltas = list(response_reasoning_deltas or [])
         self.calls = 0
         self.route_calls = 0
         self.response_calls = 0
@@ -88,9 +115,9 @@ class _RouterStubClient:
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
         on_text_delta=None,  # type: ignore[no-untyped-def]
+        on_reasoning_delta=None,  # type: ignore[no-untyped-def]
         temperature: float | None = None,
     ) -> LLMResponse:
-        _ = stream, on_text_delta
         self.calls += 1
         self.last_messages = list(messages)
         self.last_tools = tools
@@ -122,6 +149,12 @@ class _RouterStubClient:
 
         self.response_calls += 1
         self.last_response_temperature = temperature
+        if stream and on_reasoning_delta is not None:
+            for delta in self.response_reasoning_deltas:
+                on_reasoning_delta(delta)
+        if stream and on_text_delta is not None:
+            for delta in self.response_text_deltas:
+                on_text_delta(delta)
         return LLMResponse(
             content=self.response_reply,
             tool_calls=[],
@@ -314,6 +347,17 @@ def _trial_quota_exhausted_error() -> LLMError:
     return LLMError(
         'LLM error 402: {"error":{"message":"Free trial tokens used up.",'
         '"type":"insufficient_quota","code":"quota_exhausted"}}'
+    )
+
+
+def _private_provider_url_error() -> LLMError:
+    return LLMError(
+        "LLM error 401: provider failed at "
+        "https://route-user:route-pa'ssword@api.example.test/"
+        "secret-route-segment<PRIVATE_BOUNDARY_SENTINEL"
+        "?token=PRIVATE_BOUNDARY_SENTINEL#PRIVATE_BOUNDARY_SENTINEL "
+        "api_key='PRIVATE_API_KEY_SENTINEL_123456' "
+        "Authorization: Bearer PRIVATE_BEARER_SENTINEL_123456+/="
     )
 
 
@@ -542,7 +586,12 @@ def _session_event_payload(path: Path, event_type: str) -> dict[str, Any]:
 
 
 def test_how_are_you_routes_to_chat_without_repo_agent_call(tmp_path: Path) -> None:
-    cfg = AppConfig(model="test-model", routing_mode="auto", chat_temperature=0.73)
+    cfg = AppConfig(
+        model="test-model",
+        routing_mode="auto",
+        chat_temperature=0.73,
+        stream=False,
+    )
     session = create_session(
         cfg=cfg,
         root=tmp_path,
@@ -647,7 +696,12 @@ def test_non_repo_text_response_preserves_native_provider_metadata(tmp_path: Pat
 
 
 def test_non_repo_fast_path_uses_router_reply_without_second_llm_call(tmp_path: Path) -> None:
-    cfg = AppConfig(model="test-model", routing_mode="auto", chat_temperature=0.73)
+    cfg = AppConfig(
+        model="test-model",
+        routing_mode="auto",
+        chat_temperature=0.73,
+        stream=False,
+    )
     session = create_session(
         cfg=cfg,
         root=tmp_path,
@@ -683,10 +737,595 @@ def test_non_repo_fast_path_uses_router_reply_without_second_llm_call(tmp_path: 
     assert "non_repo_router_reply_used" in event_types
 
 
+def test_streaming_non_repo_turn_bypasses_buffered_router_reply(tmp_path: Path) -> None:
+    class _CaptureSurface(NoopSurface):
+        def __init__(self) -> None:
+            self.text_deltas: list[str] = []
+            self.reasoning_deltas: list[str] = []
+            self.reasoning_starts: list[str] = []
+            self.reasoning_ends: list[str] = []
+
+        def on_assistant_token(self, delta: str) -> None:
+            self.text_deltas.append(delta)
+
+        def on_reasoning_token(self, delta: str) -> None:
+            self.reasoning_deltas.append(delta)
+
+        def on_reasoning_start(self, block_id: str) -> None:
+            self.reasoning_starts.append(block_id)
+
+        def on_reasoning_end(self, block_id: str) -> None:
+            self.reasoning_ends.append(block_id)
+
+    surface = _CaptureSurface()
+    cfg = AppConfig(model="test-model", routing_mode="auto", stream=True)
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+        surface=surface,
+    )
+    event_path = session.store.path
+    session.client = _FailClient()  # type: ignore[assignment]
+    router = _RouterStubClient(
+        route="chat",
+        route_reply="Buffered router reply.",
+        response_reply="Live response.",
+        response_reasoning_deltas=["Check ", "the request."],
+        response_text_deltas=["Live ", "response."],
+    )
+    session.router_client = router
+
+    try:
+        exit_code = session.run_turn("Hi")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert router.route_calls == 1
+    assert router.response_calls == 1
+    assert surface.reasoning_deltas == ["Check ", "the request."]
+    assert len(surface.reasoning_starts) == 1
+    assert surface.reasoning_ends == surface.reasoning_starts
+    assert surface.text_deltas == ["Live ", "response."]
+    assert session.messages[-1]["content"] == "Live response."
+    event_types = [event.get("type") for event in read_session_events(event_path)]
+    assert "non_repo_router_reply_bypassed_for_streaming" in event_types
+    assert "non_repo_router_reply_used" not in event_types
+
+
+def test_streaming_non_repo_turn_records_llm_usage(tmp_path: Path) -> None:
+    # Regression guard for the non-repo metering leak: an auto-routed, streamed
+    # chat turn must emit "llm_usage" events (for the router classification AND
+    # the non-repo answer call) and fold their tokens into the session usage
+    # summary. Before the fix these turns recorded nothing, so every token/cost
+    # surface read zero for pure-chat sessions.
+    from sylliptor_agent_cli.llm.types import LLMUsage
+
+    class _UsageRouterStubClient(_RouterStubClient):
+        def chat(self, **kwargs: Any) -> LLMResponse:  # type: ignore[override]
+            response = super().chat(**kwargs)
+            # Attach real API usage to the non-repo answer call only; the router
+            # classification call keeps its no-usage response (recorded as an
+            # estimate), mirroring how a real provider reports usage.
+            if response.content == self.response_reply and self.response_reply:
+                return LLMResponse(
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                    raw=response.raw,
+                    provider_metadata=response.provider_metadata,
+                    usage=LLMUsage(
+                        prompt_tokens=123,
+                        completion_tokens=45,
+                        total_tokens=168,
+                    ),
+                )
+            return response
+
+    cfg = AppConfig(model="test-model", routing_mode="auto", stream=True)
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    event_path = session.store.path
+    session.client = _FailClient()  # type: ignore[assignment]
+    router = _UsageRouterStubClient(
+        route="chat",
+        response_reply="Hi there.",
+        response_text_deltas=["Hi ", "there."],
+    )
+    session.router_client = router
+
+    try:
+        assert session.run_turn("Hi") == 0
+    finally:
+        session.close()
+
+    usage_events = [
+        event for event in read_session_events(event_path) if event.get("type") == "llm_usage"
+    ]
+    assert usage_events, "auto-routed non-repo turn recorded no llm_usage events"
+    operations = {
+        str((event.get("payload") or {}).get("operation") or "") for event in usage_events
+    }
+    assert "routing_llm" in operations
+    assert "non_repo_answer" in operations
+
+    answer_payloads = [
+        event["payload"]
+        for event in usage_events
+        if (event.get("payload") or {}).get("operation") == "non_repo_answer"
+    ]
+    assert answer_payloads, "the non-repo answer call was not metered"
+    answer = answer_payloads[-1]
+    assert answer["usage_source"] == "api"
+    assert answer["prompt_tokens"] == 123
+    assert answer["completion_tokens"] == 45
+
+    totals = session.usage_summary.totals()
+    assert totals["total_tokens"] >= 168
+    assert totals["prompt_tokens"] >= 123
+
+
+def test_usage_record_uses_provider_count_when_response_omits_input_usage(
+    tmp_path: Path,
+) -> None:
+    from sylliptor_agent_cli.llm.types import (
+        InputTokenCount,
+        LLMUsage,
+        UsageConfidence,
+        UsageContract,
+    )
+
+    class _CountCapableClient:
+        model = "test-model"
+        usage_contract = UsageContract(
+            response_usage_confidence=UsageConfidence.AUTHORITATIVE,
+            input_token_count_strategy="test_count",
+        )
+
+        def count_input_tokens(self, **_kwargs: Any) -> InputTokenCount:
+            return InputTokenCount(input_tokens=77)
+
+    session = create_session(
+        cfg=AppConfig(model="test-model"),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    try:
+        record = session._record_llm_usage(
+            client=_CountCapableClient(),
+            response=LLMResponse(
+                content="done",
+                tool_calls=[],
+                raw={},
+                usage=LLMUsage(
+                    prompt_tokens=None,
+                    completion_tokens=5,
+                    total_tokens=None,
+                ),
+            ),
+            messages=[{"role": "user", "content": "hello"}],
+            tool_list=None,
+            operation="test_count_fallback",
+        )
+    finally:
+        session.close()
+
+    assert record is not None
+    assert record.prompt_tokens == 77
+    assert record.completion_tokens == 5
+    assert record.total_tokens == 82
+    assert record.usage_source == "api"
+    assert record.usage_source_detail == "provider_count"
+    assert record.prompt_estimate_error_ratio is not None
+
+
+def test_main_hud_keeps_local_preflight_prompt_provenance(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.llm.types import (
+        InputTokenCount,
+        LLMUsage,
+        UsageConfidence,
+        UsageContract,
+        UsageSource,
+    )
+
+    class _EstimatedCountClient:
+        model = "test-model"
+        provider_key = "compat-provider"
+        protocol = "openai_compat"
+        base_url = "https://compat-provider.invalid/v1"
+        usage_contract = UsageContract(
+            response_usage_confidence=UsageConfidence.REPORTED,
+            input_token_count_strategy="openai_compat_provider_payload",
+        )
+
+        def count_input_tokens(self, **_kwargs: Any) -> InputTokenCount:
+            return InputTokenCount(
+                input_tokens=77,
+                source=UsageSource.LOCAL_ESTIMATE,
+                confidence=UsageConfidence.ESTIMATED,
+            )
+
+    session = create_session(
+        cfg=AppConfig(model="test-model"),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    try:
+        client = _EstimatedCountClient()
+        record = session._record_llm_usage(
+            client=client,
+            response=LLMResponse(
+                content="done",
+                tool_calls=[],
+                raw={},
+                usage=LLMUsage(
+                    prompt_tokens=None,
+                    completion_tokens=5,
+                    total_tokens=105,
+                    confidence=UsageConfidence.REPORTED,
+                ),
+            ),
+            messages=[{"role": "user", "content": "hello"}],
+            tool_list=None,
+            operation="main_llm",
+        )
+        session.client.provider_key = client.provider_key
+        session.client.base_url = client.base_url
+        session.messages.append({"role": "assistant", "content": "done"})
+        ctx = session.context_left()
+    finally:
+        session.close()
+
+    assert record is not None
+    assert record.usage_source_detail == "mixed"
+    assert session.request_context_measurement is not None
+    assert session.request_context_measurement.input_tokens == 77
+    assert session.request_context_measurement.source == "local_estimate"
+    assert session.request_context_measurement.confidence == "estimated"
+    assert ctx.token_count_source == "local_estimate"
+    assert ctx.token_count_confidence == "estimated"
+    assert ctx.provider_projection_applied is False
+
+
+def test_context_left_omits_tool_schemas_for_unsupported_protocol(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.llm.types import UsageConfidence, UsageContract
+
+    class _NoToolClient:
+        model = "test-model"
+        provider_key = "gemini"
+        protocol = "gemini_interactions"
+        base_url = "https://generativelanguage.googleapis.com/v1beta"
+        supports_tool_calling = False
+        usage_contract = UsageContract(
+            response_usage_confidence=UsageConfidence.AUTHORITATIVE,
+            input_token_count_strategy="gemini_count_tokens_projection",
+        )
+
+    session = create_session(
+        cfg=AppConfig(model="test-model"),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    try:
+        session.client = _NoToolClient()  # type: ignore[assignment]
+        session.tool_list = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "unused_tool",
+                    "description": "large unused schema " * 500,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        expected = estimate_request_token_breakdown(
+            messages=session.messages,
+            tool_list=None,
+            pinned_prefix_len=session.pinned_prefix_len,
+        ).total_tokens
+        with_tools = estimate_request_token_breakdown(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            pinned_prefix_len=session.pinned_prefix_len,
+        ).total_tokens
+
+        ctx = session.context_left()
+    finally:
+        session.close()
+
+    assert with_tools > expected
+    assert ctx.local_request_estimate_tokens == expected
+    assert ctx.startup_baseline_tokens == expected
+    assert ctx.dynamic_context_used_tokens == 0
+    assert ctx.dynamic_context_percent_left == 100.0
+
+
+def test_context_left_rebases_startup_tools_after_runtime_tool_disable(tmp_path: Path) -> None:
+    class _MutableToolClient:
+        model = "test-model"
+        provider_key = "compat-provider"
+        protocol = "openai_compat"
+        base_url = "https://compat-provider.invalid/v1"
+        supports_tool_calling = True
+
+    session = create_session(
+        cfg=AppConfig(model="test-model"),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    try:
+        client = _MutableToolClient()
+        session.client = client  # type: ignore[assignment]
+        session.tool_list = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "provider_rejected_tool",
+                    "description": "large schema removed after rejection " * 500,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        with_tools = session.context_left()
+        client.supports_tool_calling = False
+        without_tools = session.context_left()
+    finally:
+        session.close()
+
+    assert with_tools.startup_baseline_tokens > without_tools.startup_baseline_tokens
+    assert without_tools.local_request_estimate_tokens == without_tools.startup_baseline_tokens
+    assert without_tools.dynamic_context_used_tokens == 0
+    assert without_tools.dynamic_context_percent_left == 100.0
+
+
+def test_main_usage_anchors_hud_to_provider_visible_request(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.llm.types import LLMUsage, UsageConfidence, UsageContract
+
+    session = create_session(
+        cfg=AppConfig(model="test-model"),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    try:
+        session.client.provider_key = "test-provider"
+        session.client.base_url = "https://provider.invalid/v1"
+        session.client.usage_contract = UsageContract(
+            response_usage_confidence=UsageConfidence.AUTHORITATIVE,
+        )
+        persistent_before = list(session.messages)
+        provider_messages = [
+            *persistent_before,
+            {"role": "system", "content": "ephemeral controller context " * 200},
+            {"role": "user", "content": "ephemeral current instruction " * 50},
+        ]
+        record = session._record_llm_usage(
+            client=session.client,
+            response=LLMResponse(
+                content="done",
+                tool_calls=[],
+                raw={},
+                usage=LLMUsage(
+                    prompt_tokens=7000,
+                    completion_tokens=5,
+                    total_tokens=7005,
+                ),
+            ),
+            messages=provider_messages,
+            tool_list=session.tool_list,
+            operation="main_llm",
+        )
+        assert record is not None
+        session.messages.append({"role": "assistant", "content": "done"})
+
+        ctx = session.context_left()
+    finally:
+        session.close()
+
+    assert session.request_context_measurement is not None
+    assert session.request_context_measurement.input_tokens == 7000
+    assert ctx.used_input_tokens == 7000 + math.ceil(
+        (
+            ctx.local_request_estimate_tokens
+            - session.request_context_measurement.persistent_anchor_estimate_tokens
+        )
+        * (
+            session.request_context_measurement.input_tokens
+            / session.request_context_measurement.anchor_estimate_tokens
+        )
+    )
+    assert ctx.used_input_tokens > 7000
+    assert ctx.token_count_source == "mixed"
+    assert ctx.token_count_confidence == "estimated"
+    assert ctx.anchor_token_count_source == "provider_response"
+
+
+@pytest.mark.parametrize("trace_level", ["off", "compact", "full"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_trace_level_does_not_change_normal_agent_requests_or_usage(
+    tmp_path: Path,
+    trace_level: str,
+    stream: bool,
+) -> None:
+    from sylliptor_agent_cli.cli_impl.tui.surface import TuiSurface
+    from sylliptor_agent_cli.cli_impl.tui.transcript import TuiTranscript
+    from sylliptor_agent_cli.llm.protocols import ReasoningTraceCapability
+    from sylliptor_agent_cli.llm.types import LLMUsage, ReasoningOutputKind
+
+    class _FixedUsageClient(_RouterStubClient):
+        usage_counts_authoritative = True
+        reasoning_trace_capability = ReasoningTraceCapability(
+            adapter="test_summary",
+            output_kind=ReasoningOutputKind.SUMMARY,
+            supports_streaming=True,
+            supports_buffered=True,
+        )
+
+        def chat(self, **kwargs: Any) -> LLMResponse:  # type: ignore[override]
+            is_route_call = bool(kwargs.get("messages")) and (
+                str(kwargs["messages"][0].get("content") or "")
+                == agent_loop_mod._ROUTER_SYSTEM_PROMPT
+            )
+            if not is_route_call:
+                self.summary_callback_supplied = callable(kwargs.get("on_reasoning_delta"))
+                if not kwargs.get("stream") and self.summary_callback_supplied:
+                    for delta in self.response_reasoning_deltas:
+                        kwargs["on_reasoning_delta"](delta)
+            response = super().chat(**kwargs)
+            usage = (
+                LLMUsage(prompt_tokens=100, completion_tokens=10, total_tokens=110)
+                if is_route_call
+                else LLMUsage(
+                    prompt_tokens=200,
+                    completion_tokens=20,
+                    total_tokens=220,
+                    reasoning_tokens=12,
+                )
+            )
+            return LLMResponse(
+                content=response.content,
+                tool_calls=response.tool_calls,
+                raw=response.raw,
+                usage=usage,
+            )
+
+    transcript = TuiTranscript()
+    surface = TuiSurface(transcript, auto_approve=lambda: True)
+    surface.set_trace_level(trace_level)
+    cfg = AppConfig(model="test-model", routing_mode="auto", stream=stream)
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+        surface=surface,
+    )
+    client = _FixedUsageClient(
+        route="chat",
+        response_reply="Hi there.",
+        response_text_deltas=["Hi ", "there."],
+        response_reasoning_deltas=["I should answer briefly."],
+    )
+    session.router_client = client
+
+    try:
+        assert session.run_turn("Hi") == 0
+        totals = session.usage_summary.totals()
+    finally:
+        session.close()
+
+    assert client.calls == 2
+    assert totals["prompt_tokens"] == 300
+    assert totals["completion_tokens"] == 30
+    assert totals["total_tokens"] == 330
+    assert totals["reasoning_tokens"] == 12
+    assert client.summary_callback_supplied is (trace_level != "off")
+    reasoning_entries = [entry for entry in transcript.entries if entry[0] == "reasoning"]
+    assert bool(reasoning_entries) is (trace_level != "off")
+
+
+def test_raw_only_provider_capability_never_receives_display_callback(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.cli_impl.tui.surface import TuiSurface
+    from sylliptor_agent_cli.cli_impl.tui.transcript import TuiTranscript
+    from sylliptor_agent_cli.llm.protocols import ReasoningTraceCapability
+    from sylliptor_agent_cli.llm.types import ReasoningOutputKind
+
+    class _RawOnlyClient(_RouterStubClient):
+        reasoning_trace_capability = ReasoningTraceCapability(
+            adapter="raw_only",
+            output_kind=ReasoningOutputKind.PROVIDER_REASONING,
+            supports_streaming=True,
+            supports_buffered=True,
+        )
+
+        def chat(self, **kwargs: Any) -> LLMResponse:  # type: ignore[override]
+            is_route_call = bool(kwargs.get("messages")) and (
+                str(kwargs["messages"][0].get("content") or "")
+                == agent_loop_mod._ROUTER_SYSTEM_PROMPT
+            )
+            if not is_route_call:
+                self.summary_callback_supplied = callable(kwargs.get("on_reasoning_delta"))
+            return super().chat(**kwargs)
+
+    transcript = TuiTranscript()
+    surface = TuiSurface(transcript, auto_approve=lambda: True)
+    surface.set_trace_level("full")
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="auto", stream=True),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=True,
+        api_key_override="override-key",
+        surface=surface,
+    )
+    client = _RawOnlyClient(
+        route="chat",
+        response_reply="Safe answer.",
+        response_reasoning_deltas=["private chain of thought"],
+    )
+    session.router_client = client
+
+    try:
+        assert session.run_turn("Hi") == 0
+    finally:
+        session.close()
+
+    assert client.summary_callback_supplied is False
+    assert not any(role == "reasoning" for role, _text in transcript.entries)
+
+
 def test_non_repo_chat_follow_up_uses_recent_history_not_router_reply(
     tmp_path: Path,
 ) -> None:
-    cfg = AppConfig(model="test-model", routing_mode="auto", chat_temperature=0.73)
+    cfg = AppConfig(
+        model="test-model",
+        routing_mode="auto",
+        chat_temperature=0.73,
+        stream=False,
+    )
     session = create_session(
         cfg=cfg,
         root=tmp_path,
@@ -802,6 +1441,44 @@ def test_auto_mode_router_auth_error_is_not_masked_as_clarification_fallback(
         assert session.messages == baseline_messages
         error_payload = _session_event_payload(session.store.path, "error")
         assert "invalid_api_key" in str(error_payload.get("error") or "")
+    finally:
+        session.close()
+
+
+def test_turn_error_log_and_display_sanitize_unexpected_provider_url(
+    tmp_path: Path,
+) -> None:
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="auto"),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+    )
+    session.client = _FailClient()  # type: ignore[assignment]
+    session.router_client = _AuthRejectingClient(
+        route_error=True,
+        error_factory=_private_provider_url_error,
+    )
+
+    try:
+        with pytest.raises(LLMError) as exc_info:
+            session.run_turn("How are you?")
+        persisted_error = str(
+            _session_event_payload(session.store.path, "error").get("error") or ""
+        )
+        displayed_error = friendly_llm_error_message(exc_info.value)
+        assert "api.example.test" in persisted_error
+        for rendered in (persisted_error, displayed_error):
+            assert "PRIVATE_BOUNDARY_SENTINEL" not in rendered
+            assert "PRIVATE_BEARER_SENTINEL" not in rendered
+            assert "PRIVATE_API_KEY_SENTINEL" not in rendered
+            assert "route-user" not in rendered
+            assert "route-pa'ssword" not in rendered
+            assert "secret-route-segment" not in rendered
+            assert "token=" not in rendered
     finally:
         session.close()
 
@@ -935,7 +1612,7 @@ def test_router_context_lists_exposed_custom_tools(tmp_path: Path) -> None:
     )
 
 
-def test_general_non_repo_turn_uses_web_tool_assisted_path_when_available(
+def test_general_non_repo_turn_exposes_web_search_for_model_selection(
     tmp_path: Path,
 ) -> None:
     cfg = AppConfig(
@@ -955,6 +1632,19 @@ def test_general_non_repo_turn_uses_web_tool_assisted_path_when_available(
         session_log_dir_override=tmp_path / "sessions",
     )
     event_path = session.store.path
+    web_search_tool = session.tools["web_search"]
+    session.tools["web_search"] = agent_loop_mod.ToolDef(
+        name=web_search_tool.name,
+        description=web_search_tool.description,
+        parameters=web_search_tool.parameters,
+        metadata=web_search_tool.metadata,
+        run=lambda args: {
+            "query": args["query"],
+            "answer": "Live web search is available.",
+            "sources": [{"title": "Python", "url": "https://www.python.org/"}],
+            "backend": "test-search",
+        },
+    )
     session.client = _FailClient()  # type: ignore[assignment]
     router = _RouterStubClient(
         route="general",
@@ -990,6 +1680,125 @@ def test_general_non_repo_turn_uses_web_tool_assisted_path_when_available(
     assert "use the available web tool instead of answering from memory" in system_text
     assert "canned/random example" in system_text
     assert "do not claim browsing is unavailable" in system_text
+
+
+def test_web_search_decision_is_delegated_to_the_model(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(
+        model="qwen3.7-plus",
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        web_search_mode="auto",
+        web_search_policy="auto",
+        routing_mode="auto",
+    )
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    event_path = session.store.path
+    web_search_tool = session.tools["web_search"]
+
+    def _must_be_model_selected(_args: dict[str, Any]) -> dict[str, Any]:
+        raise AssertionError("web_search must not run before the model selects it")
+
+    session.tools["web_search"] = agent_loop_mod.ToolDef(
+        name=web_search_tool.name,
+        description=web_search_tool.description,
+        parameters=web_search_tool.parameters,
+        metadata=web_search_tool.metadata,
+        run=_must_be_model_selected,
+    )
+    session.client = _FailClient()  # type: ignore[assignment]
+    router = _RouterStubClient(
+        route="general",
+        response_reply="The answer requires external evidence.",
+    )
+    session.router_client = router
+
+    try:
+        exit_code = session.run_turn("Assess a claim that depends on current external evidence.")
+    finally:
+        session.close()
+
+    events = read_session_events(event_path)
+    tool_names = {
+        str(tool.get("function", {}).get("name") or "") for tool in (router.last_tools or [])
+    }
+
+    assert exit_code == 0
+    assert "web_search" in tool_names
+    assert router.response_calls == 1
+    assert not any(
+        event.get("type")
+        in {
+            "web_search_policy_decision",
+            "web_search_context_injected",
+            "web_search_required_unavailable",
+        }
+        for event in events
+    )
+
+
+def test_missing_search_backend_does_not_fail_before_model_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "TAVILY_API_KEY",
+        "SYLLIPTOR_WEB_SEARCH_API_KEY",
+        "SYLLIPTOR_WEB_SEARCH_ADAPTER",
+        "SYLLIPTOR_WEB_SEARCH_BASE_URL",
+        "SYLLIPTOR_WEB_SEARCH_MODEL",
+        "SYLLIPTOR_WEB_SEARCH_PROVIDER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", "0")
+    cfg = AppConfig(
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com",
+        web_search_mode="auto",
+        web_search_policy="auto",
+        routing_mode="auto",
+    )
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="deepseek-key",
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    event_path = session.store.path
+    session.client = _FailClient()  # type: ignore[assignment]
+    router = _RouterStubClient(
+        route="general",
+        response_reply="No configured search backend is available.",
+    )
+    session.router_client = router
+
+    try:
+        exit_code = session.run_turn("Assess a claim that requires current external evidence.")
+    finally:
+        session.close()
+
+    events = read_session_events(event_path)
+    tool_names = {
+        str(tool.get("function", {}).get("name") or "") for tool in (router.last_tools or [])
+    }
+
+    assert exit_code == 0
+    assert "web_search" not in tool_names
+    assert router.response_calls == 1
+    assert not any(event.get("type") == "web_search_required_unavailable" for event in events)
 
 
 def test_web_research_with_local_output_routes_to_repo_and_keeps_web_tools(
@@ -1112,7 +1921,9 @@ def test_non_repo_tool_prompt_does_not_advertise_search_when_unregistered(
     session.router_client = router
 
     try:
-        exit_code = session.run_turn("Can you search the internet?")
+        exit_code = session.run_turn(
+            "Describe the non-repository web capabilities in this session."
+        )
     finally:
         session.close()
 
@@ -1167,7 +1978,7 @@ def test_non_repo_tool_prompt_filters_stale_unregistered_web_search_schema(
     session.router_client = router
 
     try:
-        exit_code = session.run_turn("Can you search the internet?")
+        exit_code = session.run_turn("Describe the available non-repository tools.")
     finally:
         session.close()
 
@@ -1209,6 +2020,19 @@ def test_non_repo_tool_assisted_path_ignores_router_reply_for_general_turn(
         session_log_dir_override=tmp_path / "sessions",
     )
     event_path = session.store.path
+    web_search_tool = session.tools["web_search"]
+    session.tools["web_search"] = agent_loop_mod.ToolDef(
+        name=web_search_tool.name,
+        description=web_search_tool.description,
+        parameters=web_search_tool.parameters,
+        metadata=web_search_tool.metadata,
+        run=lambda args: {
+            "query": args["query"],
+            "answer": "Python 3.14 is the latest stable release.",
+            "sources": [{"title": "Python", "url": "https://www.python.org/downloads/"}],
+            "backend": "test-search",
+        },
+    )
     session.client = _FailClient()  # type: ignore[assignment]
     router = _RouterStubClient(
         route="general",
@@ -1237,8 +2061,8 @@ def test_non_repo_tool_assisted_path_ignores_router_reply_for_general_turn(
     assert route_payload["original_route"] == "general"
     assert route_payload["route_selection_source"] == "router"
     assert route_payload["route_override_reason"] is None
-    assert "If the user needs live, current, or external information" in system_text
-    assert "use web_search before answering" in system_text
+    assert "claims depend on unstable/current facts" in system_text
+    assert "available web_search tool" in system_text
 
 
 def test_tool_route_exposes_mcp_tools_in_non_repo_chat(
@@ -1322,6 +2146,221 @@ def test_tool_route_exposes_mcp_tools_in_non_repo_chat(
     assert tool_call_names == ["mcp__alpha__echo_tool"]
     assert "MCP tools/resources are available" in system_text
     assert "filesystem, shell, test, or edit actions" in system_text
+
+
+def _tool_budget_session(tmp_path: Path) -> Any:
+    cfg = AppConfig(model="test-model", routing_mode="auto", chat_temperature=0.5)
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    session.tools["mcp__alpha__echo_tool"] = agent_loop_mod.ToolDef(
+        name="mcp__alpha__echo_tool",
+        description="Echo a short message through the alpha MCP server.",
+        parameters={
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+        run=lambda args: {"marker": f"echo:{args.get('text', '')}"},
+    )
+    session.tool_list = [tool.as_openai_tool() for tool in session.tools.values()]
+    session.client = _FailClient()  # type: ignore[assignment]
+    return session
+
+
+def _echo_probe_call(index: int) -> ToolCall:
+    return ToolCall(
+        id=f"tc{index}",
+        name="mcp__alpha__echo_tool",
+        arguments={"text": f"probe {index}"},
+    )
+
+
+def test_tool_route_step_budget_exhaustion_answers_from_gathered_evidence(
+    tmp_path: Path,
+) -> None:
+    # The non-repo tool loop allows 4 tool steps. When the model is still calling
+    # tools at the cap, the turn must finalize FROM the gathered tool evidence
+    # (one more call, tools disabled, same transcript) — not degrade to the
+    # no-context router fallback that can only ask a generic clarifying question.
+    session = _tool_budget_session(tmp_path)
+    event_path = session.store.path
+    router = _SequentialRouterClient(
+        routes=["tool"],
+        execution_postures=["advisory_non_execution"],
+        response_replies=["", "", "", "", "England beat Australia in the final."],
+        response_tool_calls=[
+            [_echo_probe_call(1)],
+            [_echo_probe_call(2)],
+            [_echo_probe_call(3)],
+            [_echo_probe_call(4)],
+            [],
+        ],
+        tool_family="mcp",
+        tool_candidates=["mcp__alpha__echo_tool"],
+    )
+    session.router_client = router
+
+    try:
+        exit_code = session.run_turn("who won the last world cup match?")
+    finally:
+        session.close()
+
+    events = read_session_events(event_path)
+    final_payload = _session_event_payload(event_path, "final")
+
+    assert exit_code == 0
+    assert router.route_calls == 1  # no second (fallback) router call
+    assert router.response_calls == 5  # 4 tool steps + 1 finalize
+    assert router.last_tools is None  # the finalize call must disable tools
+    # The finalize request carries the full gathered evidence.
+    finalize_tool_messages = [
+        message for message in router.last_messages if message.get("role") == "tool"
+    ]
+    assert len(finalize_tool_messages) == 4
+    # The finalize directive must be a USER message: live-verified that some
+    # providers (DeepSeek) ignore a trailing system message after tool results.
+    assert router.last_messages[-1]["role"] == "user"
+    assert "No further tool calls" in router.last_messages[-1]["content"]
+    assert any(event.get("type") == "non_repo_tool_budget_finalize" for event in events)
+    assert final_payload["content"] == "England beat Australia in the final."
+
+
+def test_tool_route_step_budget_finalize_empty_answer_falls_back(
+    tmp_path: Path,
+) -> None:
+    # If the finalize call produces nothing twice (one corrective retry), the
+    # turn keeps the previous fallback behavior instead of emitting an empty
+    # reply.
+    session = _tool_budget_session(tmp_path)
+    event_path = session.store.path
+    router = _SequentialRouterClient(
+        routes=["tool"],
+        execution_postures=["advisory_non_execution"],
+        route_replies=["", "Could you clarify what you need?"],
+        response_replies=["", "", "", "", "", ""],
+        response_tool_calls=[
+            [_echo_probe_call(1)],
+            [_echo_probe_call(2)],
+            [_echo_probe_call(3)],
+            [_echo_probe_call(4)],
+            [],
+            [],
+        ],
+        tool_family="mcp",
+        tool_candidates=["mcp__alpha__echo_tool"],
+    )
+    session.router_client = router
+
+    try:
+        exit_code = session.run_turn("who won the last world cup match?")
+    finally:
+        session.close()
+
+    events = read_session_events(event_path)
+    final_payload = _session_event_payload(event_path, "final")
+
+    assert exit_code == 0
+    assert router.response_calls == 6  # 4 tool steps + finalize + corrective retry
+    assert any(event.get("type") == "non_repo_tool_budget_finalize" for event in events)
+    discard_warnings = [
+        event.get("payload", {})
+        for event in events
+        if event.get("type") == "warning"
+        and event.get("payload", {}).get("warning") == "non_repo_finalize_discarded"
+    ]
+    assert discard_warnings and discard_warnings[0]["cause"] == "empty"
+    assert str(final_payload["content"]).strip()
+
+
+def test_tool_route_step_budget_finalize_retries_past_tool_call_markup(
+    tmp_path: Path,
+) -> None:
+    # Live-observed with DeepSeek: a model cut off mid-tool-chain answers the
+    # finalize request with raw tool-call markup as text. That markup must never
+    # surface to the user; one corrective retry recovers the real answer.
+    session = _tool_budget_session(tmp_path)
+    event_path = session.store.path
+    markup_reply = (
+        '<|DSML|tool_calls>\n<|DSML|invoke name="mcp__alpha__echo_tool">\n'
+        '<|DSML|parameter name="text" string="true">probe 5</|DSML|parameter>\n'
+        "</|DSML|invoke>\n</|DSML|tool_calls>"
+    )
+    router = _SequentialRouterClient(
+        routes=["tool"],
+        execution_postures=["advisory_non_execution"],
+        response_replies=["", "", "", "", markup_reply, "England beat Australia in the final."],
+        response_tool_calls=[
+            [_echo_probe_call(1)],
+            [_echo_probe_call(2)],
+            [_echo_probe_call(3)],
+            [_echo_probe_call(4)],
+            [],
+            [],
+        ],
+        tool_family="mcp",
+        tool_candidates=["mcp__alpha__echo_tool"],
+    )
+    session.router_client = router
+
+    try:
+        exit_code = session.run_turn("who won the last world cup match?")
+    finally:
+        session.close()
+
+    final_payload = _session_event_payload(event_path, "final")
+
+    assert exit_code == 0
+    assert router.response_calls == 6
+    assert final_payload["content"] == "England beat Australia in the final."
+    assert "DSML" not in final_payload["content"]
+
+
+def test_tool_route_step_budget_finalize_accepts_prose_mentioning_tool_calls(
+    tmp_path: Path,
+) -> None:
+    # The markup veto must not reject a legitimate answer that merely MENTIONS
+    # tool-calling terms (e.g. explaining an API): only replies that ARE markup
+    # (leading bracket) are discarded.
+    session = _tool_budget_session(tmp_path)
+    event_path = session.store.path
+    prose_answer = (
+        "The `tool_calls` field in the response is an array of requested tool "
+        "invocations; each entry has an id, a function name, and arguments."
+    )
+    router = _SequentialRouterClient(
+        routes=["tool"],
+        execution_postures=["advisory_non_execution"],
+        response_replies=["", "", "", "", prose_answer],
+        response_tool_calls=[
+            [_echo_probe_call(1)],
+            [_echo_probe_call(2)],
+            [_echo_probe_call(3)],
+            [_echo_probe_call(4)],
+            [],
+        ],
+        tool_family="mcp",
+        tool_candidates=["mcp__alpha__echo_tool"],
+    )
+    session.router_client = router
+
+    try:
+        exit_code = session.run_turn("what does the tool_calls response field contain?")
+    finally:
+        session.close()
+
+    final_payload = _session_event_payload(event_path, "final")
+
+    assert exit_code == 0
+    assert router.response_calls == 5  # accepted on the first finalize attempt
+    assert final_payload["content"] == prose_answer
 
 
 def test_forge_exec_tool_route_is_promoted_to_repo_execution_for_mcp_write_task(
@@ -1585,6 +2624,81 @@ def test_non_repo_web_tool_one_shot_does_not_require_material_repo_edits(
     assert route_payload["execution_posture"] == "advisory_non_execution"
     assert "tool_call" in event_types
     assert "one_shot_completion_gate_failed" not in event_types
+
+
+def test_non_repo_web_failure_returns_observation_and_continues_without_failed_tool(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(
+        model="qwen3.5-plus",
+        base_url="https://coding-intl.dashscope.aliyuncs.com/v1",
+        web_search_mode="auto",
+        routing_mode="auto",
+    )
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="readonly",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        session_log_dir_override=tmp_path / "sessions",
+    )
+    event_path = session.store.path
+    session.client = _FailClient()  # type: ignore[assignment]
+    router = _SequentialRouterClient(
+        routes=["general"],
+        response_replies=["", "Continued without web access."],
+        response_tool_calls=[
+            [
+                ToolCall(
+                    id="tc1",
+                    name="web_search",
+                    arguments={"query": "latest external docs"},
+                )
+            ],
+            [],
+        ],
+    )
+    session.router_client = router
+    web_search_tool = session.tools["web_search"]
+
+    def _failed_search(_args: dict[str, Any]) -> dict[str, Any]:
+        raise WebSearchError("gateway permission denied")
+
+    session.tools["web_search"] = agent_loop_mod.ToolDef(
+        name=web_search_tool.name,
+        description=web_search_tool.description,
+        parameters=web_search_tool.parameters,
+        metadata=web_search_tool.metadata,
+        run=_failed_search,
+    )
+    session.tool_list = [tool.as_openai_tool() for tool in session.tools.values()]
+
+    try:
+        exit_code = session.run_turn("Search the internet, then answer briefly.")
+    finally:
+        session.close()
+
+    events = list(read_session_events(event_path))
+    result = next(
+        (event.get("payload") or {}).get("result")
+        for event in events
+        if event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == "web_search"
+    )
+    final_tool_names = {
+        str((tool.get("function") or {}).get("name") or "") for tool in (router.last_tools or [])
+    }
+    assert exit_code == 0
+    assert router.response_calls == 2
+    assert isinstance(result, dict)
+    assert "error" not in result
+    assert result.get("reason") == WEB_UNAVAILABLE_OBSERVATION
+    assert "web_search" not in final_tool_names
+    assert session.messages[-1]["content"] == "Continued without web access."
 
 
 @pytest.mark.parametrize(
@@ -3485,6 +4599,16 @@ def test_is_fatal_non_repo_llm_error_classifies_trial_proxy_errors() -> None:
     for code in ("trial_expired", "quota_exhausted", "rate_limit_exceeded", "plan_inactive"):
         err = LLMError("LLM error 402: " + json.dumps({"error": {"code": code}}))
         assert _is_fatal_non_repo_llm_error(err) is True, code
+    assert (
+        _is_fatal_non_repo_llm_error(
+            LLMError(
+                "LLM error 400: invalid_request_error: Your credit balance is too low; "
+                "purchase credits."
+            )
+        )
+        is True
+    )
+    assert _is_fatal_non_repo_llm_error(LLMError("LLM error 429: rate limit")) is True
     # A generic upstream failure stays non-fatal (handled/retried as before).
     assert _is_fatal_non_repo_llm_error(LLMError("LLM error 500: upstream boom")) is False
 
@@ -3705,8 +4829,10 @@ def test_non_repo_turn_honors_explicit_language_override(tmp_path: Path) -> None
 
 
 def test_create_session_uses_role_temperatures_for_clients(tmp_path: Path) -> None:
+    secret_base_url = "https://route-user:route-password@api.example.test/private/token"
     cfg = AppConfig(
         model="test-model",
+        base_url=secret_base_url,
         routing_mode="auto",
         coding_temperature=0.23,
         compactor_temperature=0.31,
@@ -3739,6 +4865,16 @@ def test_create_session_uses_role_temperatures_for_clients(tmp_path: Path) -> No
         assert session.router_client.temperature == 0.0
         session_start_payload = _session_event_payload(session.store.path, "session_start")
         assert session_start_payload["router_model"] == "router-model"
+        assert session_start_payload["base_url_descriptor"] == endpoint_descriptor(secret_base_url)
+        assert session_start_payload["provider_base_url_descriptor"] == endpoint_descriptor(
+            secret_base_url
+        )
+        assert "base_url" not in session_start_payload
+        assert "provider_base_url" not in session_start_payload
+        serialized_session_start = json.dumps(session_start_payload, sort_keys=True)
+        assert "route-user" not in serialized_session_start
+        assert "route-password" not in serialized_session_start
+        assert "private/token" not in serialized_session_start
         assert session.conversation_compactor is not None
         assert session.conversation_compactor.compactor_client.temperature == 0.31
     finally:

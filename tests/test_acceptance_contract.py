@@ -635,3 +635,48 @@ def test_created_checker_path_is_classified_self_authored(tmp_path: Path) -> Non
     )
 
     assert origin == EvidenceOrigin.SELF_AUTHORED
+
+
+def test_authoritative_custom_checker_keeps_preexisting_origin_when_unchanged(
+    tmp_path: Path,
+) -> None:
+    checker = tmp_path / "oracle.sh"
+    checker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    contract = build_acceptance_contract(
+        root=tmp_path,
+        instruction="Implement and verify it.",
+        authoritative_verification_commands=["./oracle.sh"],
+    )
+
+    origin = classify_evidence_origin(
+        contract=contract,
+        root=tmp_path,
+        command="./oracle.sh",
+        touched_paths=set(),
+    )
+
+    assert origin == EvidenceOrigin.PREEXISTING_TASK_CHECKER
+
+
+def test_authoritative_custom_checker_modified_after_snapshot_is_self_authored(
+    tmp_path: Path,
+) -> None:
+    checker = tmp_path / "oracle.sh"
+    checker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    contract = build_acceptance_contract(
+        root=tmp_path,
+        instruction="Implement and verify it.",
+        authoritative_verification_commands=["./oracle.sh"],
+    )
+    checker.write_text("#!/bin/sh\nexit 0 # modified\n", encoding="utf-8")
+
+    origin = classify_evidence_origin(
+        contract=contract,
+        root=tmp_path,
+        command="./oracle.sh",
+        touched_paths=set(),
+        verification_authoritative=True,
+        known_verification_commands=["./oracle.sh"],
+    )
+
+    assert origin == EvidenceOrigin.SELF_AUTHORED

@@ -50,6 +50,9 @@ def test_resolve_integration_verify_commands_prefers_dedicated_then_verify_fallb
     assert resolved.commands == ("python -m pytest tests/integration -q",)
     assert resolved.source == "config.integration_verify_commands"
 
+    # An explicitly configured generic preset is honored when no workspace is
+    # available to scan, but it is labeled as a generic-preset fallback rather
+    # than an authoritative repo-specific configuration.
     fallback = resolve_integration_verify_commands(
         cfg=AppConfig(model="test-model", verify_commands=["pytest -q"]),
         integration_verify_cmd=None,

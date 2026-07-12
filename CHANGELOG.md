@@ -6,6 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-12
+
+### Added
+
+- Added native ChatGPT Codex subscription login through `sylliptor auth`, with
+  browser and device-code flows, encrypted refreshable credentials, live model
+  discovery, and compatible model/reasoning selection in `/config`.
+- Added keyless DDGS web search as the default last-resort backend, alongside a
+  broader set of provider-hosted search adapters and configured external
+  backends such as Tavily.
+- Added a cached startup update prompt for interactive launches with update,
+  24-hour reminder, and per-version skip choices. Editable and non-interactive
+  installs are not prompted.
+- Added owner-scoped session pickers and implicit latest-session operations,
+  with `sylliptor sessions list --all` and explicit resume available for known
+  logs from another local account.
+- Added compact repository mapping, focused test discovery, and constrained
+  static workspace previews with approval-gated authenticated LAN access.
+
+### Improved
+
+- Made autonomous execution the default step-budget policy so chat, one-shot,
+  Forge, and subagent work can continue until completion or a real terminal
+  condition. `--max-steps` and the `limited` policy remain available as explicit
+  safety limits.
+- Added provider-aware prompt-cache controls and usage accounting, preferring
+  provider-reported cache/token data while clearly labeling local fallbacks.
+- Expanded safe provider reasoning-summary support across native transports and
+  kept `/trace` display separate from model reasoning effort.
+- Improved the full-screen TUI with persistent scrollback, mouse-wheel and page
+  navigation, semantic answer selection/copy, clearer grouped tool traces, and
+  background Forge planning that no longer blocks input rendering.
+- Improved recoverable web-tool errors so models can correct arguments or choose
+  another URL/source without losing web access for the entire turn.
+
+### Fixed
+
+- Hardened OpenAI Responses streaming/retry behavior so truncated or empty
+  streams are bounded, retry state is recorded, and reasoning summaries survive
+  supported response sequences without duplicating final answers.
+- Replaced the legacy keyless credential-store fallback with an atomic random
+  per-store key and transparent migration to the current encrypted envelope.
+- Hardened verification command analysis, completion evidence, provider error
+  redaction, and finalization after a tool budget is exhausted.
+
 ## [0.9.8] - 2026-06-29
 
 ### Added

@@ -19,7 +19,13 @@ class _ForgePlannerSessionState:
 @dataclass(frozen=True)
 class _ForgeEnterCommand:
     entry_mode: str
+    initial_goal: str = ""
     usage_error: str | None = None
+    # Explicit plan-assistant choice carried by the ``/forge --planner`` /
+    # ``/forge --no-planner`` forms (emitted by the TUI intro popup's native
+    # "Use the planner?" prompt, and usable directly). ``None`` means "no
+    # explicit choice" — the caller falls back to its own default.
+    planner_assistant_default: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -36,6 +42,7 @@ class _ForgeChatState:
     plan: dict[str, Any] | None = None
     assistant_enabled: bool = False
     entry_request_mode: str = "plain"
+    entry_goal: str = ""
     planner_session: _ForgePlannerSessionState = field(default_factory=_ForgePlannerSessionState)
 
     @property

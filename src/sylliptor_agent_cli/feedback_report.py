@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from . import __version__
 from .config import (
@@ -40,6 +40,7 @@ from .serialized_paths import (
 )
 from .session_metrics import score_session_events, score_session_log
 from .session_store import (
+    filter_sessions_to_local_owner,
     list_sessions,
     read_session_events,
     resolve_sessions_dir,
@@ -58,6 +59,9 @@ class FeedbackReportError(RuntimeError):
 
 
 _SAFE_EXPORT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_HIERARCHICAL_URL_RE = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9+.-]*://\S+",
+)
 _ISSUE_TITLE_MAX_CHARS = 96
 _ISSUE_FEEDBACK_MAX_CHARS = 1400
 _ISSUE_BODY_MAX_CHARS = 3600
@@ -79,6 +83,92 @@ _SECRET_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
         r"\1[REDACTED]",
     ),
 )
+
+# Provider continuation state is required inside a live session but must never
+# leave the private session store through a support bundle. They can contain raw
+# chain-of-thought, encrypted/redacted blocks, provider signatures, response
+# items, and replay tokens. Drop the whole container rather than trying to
+# maintain a provider-by-provider nested denylist.
+_PROVIDER_CONTINUATION_CONTAINER_KEYS = frozenset(
+    {
+        "providermetadata",
+        "sylliptorprovidermetadata",
+    }
+)
+_REASONING_BLOCK_TYPES = frozenset(
+    {
+        "reasoning",
+        "reasoningencrypted",
+        "reasoningsummary",
+        "reasoningtext",
+        "redactedthinking",
+        "thinking",
+        "thinkchunk",
+        "thought",
+    }
+)
+_REASONING_FAMILIES = ("reasoning", "thinking", "thought")
+_REASONING_SENSITIVE_MARKERS = (
+    "block",
+    "chunk",
+    "content",
+    "detail",
+    "encrypted",
+    "monologue",
+    "raw",
+    "redacted",
+    "signature",
+    "summary",
+    "text",
+)
+_REASONING_DIAGNOSTIC_MARKERS = (
+    "active",
+    "adapter",
+    "available",
+    "availability",
+    "budget",
+    "capability",
+    "confidence",
+    "config",
+    "count",
+    "display",
+    "effort",
+    "enabled",
+    "format",
+    "include",
+    "kind",
+    "level",
+    "mode",
+    "policy",
+    "requested",
+    "source",
+    "support",
+    "token",
+    "trace",
+    "type",
+)
+_OPAQUE_CONTINUATION_KEYS = frozenset(
+    {
+        "cachedcontent",
+        "continuation",
+        "continuationdata",
+        "continuationpayload",
+        "continuationstate",
+        "continuationtoken",
+        "encryptedcontent",
+        "encryptedreasoning",
+        "encryptedthinking",
+        "opaquecontinuation",
+        "opaquepayload",
+        "opaquestate",
+        "previousresponseid",
+        "redactedcontent",
+        "redactedthinking",
+    }
+)
+_INVALID_STRUCTURED_EXPORT = {
+    "redacted": "Invalid structured artifact omitted from support bundle."
+}
 
 
 @dataclass(frozen=True)
@@ -643,7 +733,7 @@ def _resolve_session_source(
     sessions_dir = resolve_sessions_dir(cfg)
     target_session_id = _validate_export_id("session id", session_id) if session_id else ""
     if not target_session_id:
-        infos = list_sessions(sessions_dir)
+        infos = filter_sessions_to_local_owner(list_sessions(sessions_dir))
         if infos:
             target_session_id = infos[0].session_id
         elif latest:
@@ -1029,26 +1119,58 @@ def _copy_tree(src: Path, dest: Path, *, workspace_root: Path) -> None:
 def _copy_file(src: Path, dest: Path, *, workspace_root: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     text = _read_text_if_utf8(src)
+    suffix = src.suffix.lower()
     if text is None:
+        if suffix in {".json", ".jsonl"}:
+            _write_invalid_structured_export(dest, jsonl=suffix == ".jsonl")
+            shutil.copystat(src, dest)
+            return
         shutil.copy2(src, dest)
         return
-    if src.suffix.lower() == ".json":
+    if suffix == ".json":
         sanitized_json = _sanitize_json_text(text, workspace_root=workspace_root)
         if sanitized_json is not None:
             dest.write_text(sanitized_json, encoding="utf-8")
             shutil.copystat(src, dest)
             return
-    if src.suffix.lower() == ".jsonl":
+        _write_invalid_structured_export(dest, jsonl=False)
+        shutil.copystat(src, dest)
+        return
+    if suffix == ".jsonl":
         sanitized_jsonl = _sanitize_jsonl_text(text, workspace_root=workspace_root)
         if sanitized_jsonl is not None:
             dest.write_text(sanitized_jsonl, encoding="utf-8")
             shutil.copystat(src, dest)
             return
+        _write_invalid_structured_export(dest, jsonl=True)
+        shutil.copystat(src, dest)
+        return
     dest.write_text(
         _sanitize_exported_freeform_text(text, workspace_root=workspace_root),
         encoding="utf-8",
     )
     shutil.copystat(src, dest)
+
+
+def _write_invalid_structured_export(path: Path, *, jsonl: bool) -> None:
+    """Replace an unreadable/malformed structured artifact instead of copying
+    bytes that could bypass the recursive reasoning/continuation scrubber."""
+
+    if jsonl:
+        serialized = (
+            json.dumps(_INVALID_STRUCTURED_EXPORT, sort_keys=True, ensure_ascii=True) + "\n"
+        )
+    else:
+        serialized = (
+            json.dumps(
+                _INVALID_STRUCTURED_EXPORT,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+            + "\n"
+        )
+    path.write_text(serialized, encoding="utf-8")
 
 
 def _write_json(
@@ -1296,6 +1418,51 @@ def _redact_bundle_text(text: str) -> str:
     return clean
 
 
+def _sanitize_url_match(match: re.Match[str], *, strip_path: bool) -> str:
+    raw = match.group(0)
+    trailing = ""
+    while raw and raw[-1] in ".,;:!?)]":
+        trailing = raw[-1] + trailing
+        raw = raw[:-1]
+    try:
+        parsed = urlsplit(raw)
+        hostname = str(parsed.hostname or "").rstrip(".")
+        safe_host = hostname.encode("idna").decode("ascii").casefold()
+        if not safe_host or any(char.isspace() or char in "/@?#" for char in safe_host):
+            raise ValueError("URL has no safe host")
+        if ":" in safe_host and not safe_host.startswith("["):
+            safe_host = f"[{safe_host}]"
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        netloc = f"{safe_host}:{port}" if port is not None else safe_host
+        sanitized = urlunsplit(
+            (
+                parsed.scheme.casefold(),
+                netloc,
+                "" if strip_path else parsed.path,
+                "",
+                "",
+            )
+        )
+    except (UnicodeError, ValueError):
+        sanitized = "[redacted URL]"
+    return sanitized + trailing
+
+
+def _sanitize_urls_in_text(text: str, *, strip_path: bool = False) -> str:
+    return _HIERARCHICAL_URL_RE.sub(
+        lambda match: _sanitize_url_match(match, strip_path=strip_path),
+        str(text or ""),
+    )
+
+
+def _is_endpoint_url_field(key: object) -> bool:
+    normalized = _normalize_export_key(key)
+    return normalized == "baseurl" or normalized.endswith("baseurl")
+
+
 def _sanitize_exported_freeform_text(
     text: str | Path | None,
     *,
@@ -1305,9 +1472,64 @@ def _sanitize_exported_freeform_text(
     # the surrounding JSON field is not path-shaped (for example payload.content
     # or user-authored feedback text), so bundle serialization must sanitize
     # text values separately from explicit path fields.
-    return _redact_bundle_text(
-        sanitize_paths_in_text(str(text or ""), workspace_root=workspace_root)
-    )
+    without_host_paths = sanitize_paths_in_text(str(text or ""), workspace_root=workspace_root)
+    # Support bundles are shared outside the live session boundary. Keep only
+    # scheme + sanitized host (+ optional port) for hierarchical URLs: signed
+    # path segments can be just as sensitive as userinfo and query values.
+    return _redact_bundle_text(_sanitize_urls_in_text(without_host_paths, strip_path=True))
+
+
+def _normalize_export_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def _is_provider_reasoning_block(value: Any) -> bool:
+    """Return whether a mapping is a provider-owned reasoning/thought block.
+
+    The check intentionally uses protocol-level markers shared by OpenAI,
+    Anthropic, Gemini, OpenRouter, and Mistral rather than provider names, so an
+    unknown compatible provider fails closed too.
+    """
+
+    if not isinstance(value, dict):
+        return False
+    block_type = _normalize_export_key(value.get("type"))
+    if block_type in _REASONING_BLOCK_TYPES:
+        return True
+    if block_type == "signaturedelta":
+        return True
+    if any(family in block_type for family in _REASONING_FAMILIES) and (
+        any(marker in block_type for marker in _REASONING_SENSITIVE_MARKERS)
+        or block_type.endswith(("block", "chunk", "delta", "item", "part"))
+    ):
+        return True
+    return value.get("thought") is True
+
+
+def _is_reasoning_payload_key(key: object) -> bool:
+    normalized = _normalize_export_key(key)
+    if not normalized:
+        return False
+    if normalized in _PROVIDER_CONTINUATION_CONTAINER_KEYS:
+        return True
+    if normalized in _OPAQUE_CONTINUATION_KEYS:
+        return True
+    if "chainofthought" in normalized or "internalmonologue" in normalized:
+        return True
+    if not any(family in normalized for family in _REASONING_FAMILIES):
+        return False
+    # Content-bearing markers always win over diagnostic markers. For example,
+    # `reasoning_summary_tokens` still identifies summary content and is removed,
+    # while `reasoning_tokens` and `reasoning_effort` remain useful diagnostics.
+    if any(marker in normalized for marker in _REASONING_SENSITIVE_MARKERS):
+        return True
+    if normalized in {"reasoning", "thinking", "thought", "thoughts"}:
+        return True
+    if any(marker in normalized for marker in _REASONING_DIAGNOSTIC_MARKERS):
+        return False
+    # Unknown content-like fields fail closed; an explicitly diagnostic field
+    # must carry one of the allowlisted markers above.
+    return True
 
 
 def _redact_jsonable(
@@ -1319,6 +1541,8 @@ def _redact_jsonable(
     if value is None or isinstance(value, (int, float, bool)):
         return value
     if isinstance(value, str):
+        if _is_endpoint_url_field(current_key):
+            return _redact_bundle_text(_sanitize_urls_in_text(value, strip_path=True))
         if looks_like_serialized_path_field(current_key):
             return _redact_bundle_text(
                 safe_serialized_path_field(
@@ -1344,14 +1568,19 @@ def _redact_jsonable(
             )
         return _sanitize_exported_freeform_text(str(value), workspace_root=workspace_root)
     if isinstance(value, dict):
-        return {
-            str(key): _redact_jsonable(
+        if _is_provider_reasoning_block(value):
+            return {}
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if _is_reasoning_payload_key(key_text) or _is_provider_reasoning_block(item):
+                continue
+            sanitized[key_text] = _redact_jsonable(
                 item,
-                current_key=str(key),
+                current_key=key_text,
                 workspace_root=workspace_root,
             )
-            for key, item in value.items()
-        }
+        return sanitized
     if isinstance(value, (list, tuple)):
         return [
             _redact_jsonable(
@@ -1360,6 +1589,7 @@ def _redact_jsonable(
                 workspace_root=workspace_root,
             )
             for item in value
+            if not _is_provider_reasoning_block(item)
         ]
     return _sanitize_exported_freeform_text(str(value), workspace_root=workspace_root)
 

@@ -40,6 +40,19 @@ Unlike `shell_background`, durable services are not reaped when the chat session
 be stopped with `shell_service_stop` when no longer needed. Prefer `shell_background` for ordinary
 dev servers, file watchers, and commands that only need to live during the current session.
 
+Static workspace previews use a dedicated durable tool:
+
+| Tool | Description |
+|---|---|
+| `workspace_preview_start` | Serve HTML/CSS/JS or other static workspace files with constrained local or LAN access. |
+
+## Workspace Previews
+
+Ask the agent to preview a static workspace directory with
+`workspace_preview_start`. Local access binds to loopback; LAN access requires
+approval and uses an authenticated URL. The tool returns a durable `service_id`
+that can be inspected or stopped with the existing service tools.
+
 ## Slash command
 
 The chat UI also provides a direct user command:

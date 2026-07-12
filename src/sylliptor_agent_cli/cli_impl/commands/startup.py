@@ -2,6 +2,8 @@
 # Legacy split module: dependencies are synced by cli_surface.py.
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from .cli_common import *
 from .update import _cached_update_notice
 
@@ -63,7 +65,7 @@ def _run_default_chat_action(
     # Execution-posture flags (mode/yes/no_log/verify_cmd/…) default to the plain
     # launch values, but callers may forward the current session's flags so a
     # relaunch (e.g. /config → switch project) preserves the user's chosen posture
-    # instead of silently resetting auto-approve/mode/logging.
+    # instead of silently resetting approval policy/mode/logging.
     _patchable("chat", chat)(
         path=path or Path("."),
         create_path=False,
@@ -82,6 +84,7 @@ def _run_default_chat_action(
         api_key_stdin=False,
         api_key=None,
         yes=yes,
+        diagnostic_log=None,
     )
 
 
@@ -106,10 +109,167 @@ def _run_chat_after_setup() -> None:
     _run_default_chat_action(path=workspace, allow_broad_workspace=workspace is not None)
 
 
+@dataclass(frozen=True)
+class _SubscriptionAvailability:
+    active: bool = False
+    ready: bool = True
+    provider_id: str = ""
+    message: str = ""
+    is_error: bool = False
+    selection_required: bool = False
+
+
+def _subscription_availability(cfg: AppConfig) -> _SubscriptionAvailability:
+    """Return subscription readiness without deciding whether the UI may open."""
+
+    try:
+        from ...profiles import active_subscription_selection_ready, get_active_profile
+
+        active_profile = get_active_profile(cfg)
+        provider_id = str(active_profile.auth_provider or "").strip()
+    except Exception as exc:
+        return _SubscriptionAvailability(
+            active=True,
+            ready=False,
+            message=f"Model access configuration is invalid: {exc}",
+            is_error=True,
+        )
+    if not provider_id:
+        return _SubscriptionAvailability()
+    try:
+        from ...provider_auth import create_provider_auth
+
+        adapter = create_provider_auth(provider_id)
+        if active_profile.protocol != adapter.protocol or active_profile.base_url.rstrip(
+            "/"
+        ) != adapter.base_url.rstrip("/"):
+            return _SubscriptionAvailability(
+                active=True,
+                ready=False,
+                provider_id=provider_id,
+                message=(
+                    "The subscription connection profile is incompatible with its provider "
+                    "adapter. Reconnect it through `sylliptor setup`."
+                ),
+                is_error=True,
+            )
+        status = adapter.account_status()
+    except Exception as exc:  # noqa: BLE001
+        return _SubscriptionAvailability(
+            active=True,
+            ready=False,
+            provider_id=provider_id,
+            message=f"Subscription status check failed: {exc}",
+            is_error=True,
+        )
+    if status.connected:
+        if active_subscription_selection_ready(cfg):
+            return _SubscriptionAvailability(
+                active=True,
+                ready=True,
+                provider_id=provider_id,
+            )
+        return _SubscriptionAvailability(
+            active=True,
+            ready=False,
+            provider_id=provider_id,
+            message=(
+                "Choose the subscription model and reasoning effort in "
+                "/config → Default Model before sending a message."
+            ),
+            selection_required=True,
+        )
+    detail = f" ({status.detail})" if status.detail else ""
+    if not status.verified:
+        return _SubscriptionAvailability(
+            active=True,
+            ready=False,
+            provider_id=provider_id,
+            message=(
+                "The AI subscription status is temporarily unavailable"
+                f"{detail}. Try again shortly; your saved connection was not removed."
+            ),
+        )
+    return _SubscriptionAvailability(
+        active=True,
+        ready=False,
+        provider_id=provider_id,
+        message=(
+            "The selected AI subscription is not connected"
+            f"{detail}. Type /login in the TUI and choose the connection, or run "
+            f"`sylliptor auth login {provider_id}`; use /config to change model access."
+        ),
+    )
+
+
+def _provider_auth_ready_for_chat() -> bool:
+    """Report whether a model call can start; this must not gate opening the TUI."""
+
+    try:
+        availability = _subscription_availability(_patchable("load_config", load_config)())
+    except Exception as exc:
+        _console().print(f"[red]Model access configuration is invalid:[/red] {exc}")
+        return False
+    if availability.ready:
+        return True
+    style = "red" if availability.is_error else "yellow"
+    _console().print(f"[{style}]{availability.message}[/{style}]")
+    return False
+
+
+def _require_active_subscription_ready(
+    *,
+    model: str | None,
+    base_url: str | None,
+    require_ready: bool = True,
+) -> None:
+    """Apply the subscription selection/account gate to any LLM-facing command."""
+
+    try:
+        from ...profiles import get_active_profile
+
+        auth_profile = get_active_profile(_patchable("load_config", load_config)())
+    except Exception:
+        auth_profile = None
+    if auth_profile is None or not auth_profile.auth_provider:
+        return
+    model_is_override = model is not None and str(model).strip() != auth_profile.default_model
+    base_url_is_override = base_url is not None and (
+        str(base_url).strip().rstrip("/") != auth_profile.base_url.rstrip("/")
+    )
+    if model_is_override or base_url_is_override:
+        _console().print(
+            "[red]Subscription model and endpoint overrides are managed in "
+            "`/config` so model and reasoning stay compatible.[/red]"
+        )
+        raise typer.Exit(code=2)
+    if require_ready and not _provider_auth_ready_for_chat():
+        raise typer.Exit(code=1)
+
+
 def _maybe_run_startup_config_menu() -> None:
     cfg = _patchable("load_config", load_config)()
+    execution = getattr(cfg, "execution", None)
+    if str(getattr(execution, "backend", "native") or "native") == "delegated":
+        runtime_id = str(getattr(execution, "runtime", None) or "").strip()
+        if runtime_id and runtime_id in (getattr(cfg, "agent_runtimes", {}) or {}):
+            return
+        from ..config_menu import run_config_menu
+
+        run_config_menu(cfg=cfg, auto_focus="execution")
+        return
     api_key_present = bool(_patchable("resolve_api_key", resolve_api_key)().key)
-    if cfg.model and api_key_present:
+    provider_auth_present = False
+    try:
+        from ...profiles import get_active_profile
+
+        active_profile = get_active_profile(cfg)
+        provider_auth_present = bool(active_profile.auth_provider)
+    except Exception:
+        provider_auth_present = False
+    if provider_auth_present:
+        return
+    if cfg.model and (api_key_present or provider_auth_present):
         return
     from ..config_menu import run_config_menu
 
@@ -117,11 +277,37 @@ def _maybe_run_startup_config_menu() -> None:
     run_config_menu(cfg=cfg, auto_focus=focus)
 
 
+# Persisted by setup (see setup_wizard._ONBOARDED_KEY) once first-run onboarding
+# completes. The first-run gate keys on this marker rather than on "a model is
+# configured", so a genuine first launch is routed to setup even when a config
+# that already carries a model exists on disk (e.g. a pre-staged or partially
+# written config) — that case used to fall straight through to chat and land the
+# user on the guarded-workspace picker instead of setup.
+_ONBOARDED_KEY = "onboarded"
+
+
+def _is_onboarded() -> bool:
+    """Whether the user has already completed first-run onboarding.
+
+    True when the explicit ``onboarded`` marker is present. For configs that
+    predate the marker we also treat a persisted ``default_workspace_path`` as an
+    equivalent signal: that key is only ever written by a *completed* setup (or by
+    explicitly choosing a default workspace in ``/config``), so existing users who
+    already finished setup are never re-sent through it. A config that merely has a
+    model set (but no completed setup) is intentionally *not* considered onboarded.
+    """
+    try:
+        cfg = _patchable("load_config", load_config)()
+    except Exception:
+        return False
+    extra = cfg.extra_fields or {}
+    if extra.get(_ONBOARDED_KEY):
+        return True
+    return bool(str(extra.get("default_workspace_path") or "").strip())
+
+
 def _should_run_first_run_setup_wizard() -> bool:
-    cfg_exists = config_path().exists()
-    cfg = _patchable("load_config", load_config)()
-    api_key_present = bool(_patchable("resolve_api_key", resolve_api_key)().key)
-    return not cfg_exists or (not cfg.model and not api_key_present)
+    return not _is_onboarded()
 
 
 def _try_setup_tui(*, require_flag: bool = True, announce_fallback: bool = False) -> bool | None:
@@ -202,6 +388,10 @@ def _run_default_run_action(instruction: str) -> None:
         api_key_stdin=False,
         api_key=None,
         yes=False,
+        benchmark=False,
+        deadline_seconds=None,
+        require_deadline=False,
+        diagnostic_log=None,
     )
 
 
@@ -406,7 +596,11 @@ def _chat_context_percent_value(session: Any) -> float | None:
     ctx = getattr(session, "_hud_context_cache", None)
     if ctx is None:
         return None
-    percent = getattr(ctx, "dynamic_context_percent_left", None)
+    # The primary HUD must describe provider-usable capacity. The former
+    # baseline-subtracted conversation percentage always started at 100%, even
+    # when bootstrap prompts and tool schemas already occupied a substantial
+    # part of the model window.
+    percent = getattr(ctx, "effective_percent_left", None)
     if percent is None:
         percent = getattr(ctx, "context_window_percent_left", None)
     if percent is None:
@@ -473,10 +667,10 @@ def _format_usage_cost_for_display(*, known_cost: float | None, unknown_calls: i
 
 
 def _format_usage_source_for_display(row: dict[str, Any]) -> str:
-    api_calls = int(row.get("api_usage_calls") or 0)
-    est_calls = int(row.get("estimate_usage_calls") or 0)
+    provider_calls = int(row.get("api_usage_calls") or 0)
+    fallback_calls = int(row.get("estimate_usage_calls") or 0)
     corrected_calls = int(row.get("corrected_usage_calls") or 0)
-    parts = [f"api {api_calls}", f"est {est_calls}"]
+    parts = [f"provider {provider_calls}", f"fallback {fallback_calls}"]
     if corrected_calls > 0:
         parts.append(f"corrected {corrected_calls}")
     return " | ".join(parts)
@@ -504,6 +698,36 @@ def _chat_trace_level(session: Any) -> str:
     return "compact"
 
 
+def _record_chat_session_setting(*, session: Any, setting: str, value: Any) -> None:
+    store = getattr(session, "store", None)
+    append = getattr(store, "append", None)
+    if not callable(append):
+        return
+    try:
+        append(
+            "session_setting_changed",
+            {"setting": str(setting), "value": value},
+        )
+    except Exception:
+        pass
+
+
+def _set_chat_stream_enabled(*, session: Any, enabled: bool) -> bool:
+    next_value = bool(enabled)
+    previous = bool(getattr(session, "stream", True))
+    session.stream = next_value
+    cfg = getattr(session, "cfg", None)
+    if cfg is not None:
+        cfg.stream = next_value
+    if next_value != previous:
+        _record_chat_session_setting(
+            session=session,
+            setting="stream",
+            value=next_value,
+        )
+    return next_value
+
+
 def _session_skill_listing(session: Any) -> tuple[bool, tuple[Any, ...], tuple[Any, ...]]:
     cfg = getattr(session, "cfg", None)
     enabled = resolve_skills_enabled(cfg) if isinstance(cfg, AppConfig) else True
@@ -523,6 +747,7 @@ def _session_skill_listing(session: Any) -> tuple[bool, tuple[Any, ...], tuple[A
 
 def _set_chat_trace_level(*, session: Any, level: str) -> str:
     normalized = _resolve_trace_level(level) or "compact"
+    previous = _chat_trace_level(session)
     surface = getattr(session, "surface", None)
     if surface is None:
         return normalized
@@ -532,13 +757,26 @@ def _set_chat_trace_level(*, session: Any, level: str) -> str:
         if isinstance(applied, str):
             applied_normalized = _resolve_trace_level(applied)
             if applied_normalized is not None:
+                if applied_normalized != previous:
+                    _record_chat_session_setting(
+                        session=session,
+                        setting="trace_level",
+                        value=applied_normalized,
+                    )
                 return applied_normalized
         return normalized
     try:
         surface.trace_level = normalized
     except Exception:  # noqa: BLE001
         return normalized
-    return _resolve_trace_level(str(getattr(surface, "trace_level", normalized))) or normalized
+    applied = _resolve_trace_level(str(getattr(surface, "trace_level", normalized))) or normalized
+    if applied != previous:
+        _record_chat_session_setting(
+            session=session,
+            setting="trace_level",
+            value=applied,
+        )
+    return applied
 
 
 def _emit_plan_mode_trace(

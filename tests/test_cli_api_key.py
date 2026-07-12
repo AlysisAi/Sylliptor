@@ -26,9 +26,14 @@ from sylliptor_agent_cli.interactive_input_guard import interactive_prompt_guard
 from sylliptor_agent_cli.llm.openai_compat import LLMError
 from sylliptor_agent_cli.model_registry import ModelMeta
 from sylliptor_agent_cli.request_estimation import estimate_request_token_breakdown
+from sylliptor_agent_cli.run_outcome import (
+    AGENT_FAILURE_EXIT_CODE,
+    INFRASTRUCTURE_FAILURE_EXIT_CODE,
+)
 from sylliptor_agent_cli.runtime_kind import RuntimeKind
 from sylliptor_agent_cli.session_store import read_session_events
 from sylliptor_agent_cli.token_budget import compute_input_budget
+from sylliptor_agent_cli.verify_gate import VerifyError
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -500,7 +505,11 @@ def test_create_session_warn_mode_metadata_uses_python_warning_when_surface_lack
         session.close()
 
     assert surface.errors == []
-    assert any("Model metadata warning for unknown-model-xyz" in str(item.message) for item in seen)
+    messages = [str(item.message) for item in seen]
+    assert any("Unknown model unknown-model-xyz" in message for message in messages)
+    assert not any(
+        "Model metadata warning for unknown-model-xyz" in message for message in messages
+    )
 
 
 def test_create_session_warn_mode_metadata_falls_back_for_noop_surface_subclass_without_warning_override(
@@ -531,7 +540,11 @@ def test_create_session_warn_mode_metadata_falls_back_for_noop_surface_subclass_
         session.close()
 
     assert surface.errors == []
-    assert any("Model metadata warning for unknown-model-xyz" in str(item.message) for item in seen)
+    messages = [str(item.message) for item in seen]
+    assert any("Unknown model unknown-model-xyz" in message for message in messages)
+    assert not any(
+        "Model metadata warning for unknown-model-xyz" in message for message in messages
+    )
 
 
 def test_create_session_strict_model_metadata_policy_fails_before_client_construction(
@@ -1709,6 +1722,25 @@ def test_create_session_marks_authoritative_verify_commands_in_managed_sessions(
         session.close()
 
 
+def test_create_session_rejects_vacuous_explicit_verify_command_before_startup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(VerifyError, match="vacuous_verifier"):
+        create_session(
+            cfg=AppConfig(model="test-model", verify_commands=["pytest -q"]),
+            root=tmp_path,
+            mode="auto",
+            yes=False,
+            max_steps=1,
+            no_log=True,
+            api_key_override="override-key",
+            verify_cmd=["true"],
+        )
+
+
 def test_create_session_logs_prompt_hash_and_environment_payload(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1864,12 +1896,84 @@ def test_run_passes_non_interactive_flag_to_run_agent(tmp_path: Path, monkeypatc
     assert captured["non_interactive"] is True
 
 
+def test_run_uses_infrastructure_exit_code_after_transient_llm_retries_exhaust(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_agent(**_kwargs: object) -> int:
+        raise LLMError("LLM request failed: [Errno -2] Name or service not known")
+
+    monkeypatch.setattr(cli_mod, "run_agent", fake_run_agent)
+    env = {
+        "SYLLIPTOR_CONFIG_DIR": os.fspath(tmp_path),
+        "SYLLIPTOR_DATA_DIR": os.fspath(tmp_path),
+    }
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        [
+            "run",
+            "--path",
+            os.fspath(tmp_path),
+            "--allow-broad-workspace",
+            "--model",
+            "test-model",
+            "--api-key",
+            "k",
+            "hi",
+        ],
+        env=env,
+    )
+
+    assert result.exit_code == INFRASTRUCTURE_FAILURE_EXIT_CODE
+    assert "Infrastructure error after retries" in result.output
+
+
+def test_run_keeps_permanent_provider_rejections_as_real_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run_agent(**_kwargs: object) -> int:
+        raise LLMError("LLM error 401: invalid api key")
+
+    monkeypatch.setattr(cli_mod, "run_agent", fake_run_agent)
+    env = {
+        "SYLLIPTOR_CONFIG_DIR": os.fspath(tmp_path),
+        "SYLLIPTOR_DATA_DIR": os.fspath(tmp_path),
+    }
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        [
+            "run",
+            "--path",
+            os.fspath(tmp_path),
+            "--allow-broad-workspace",
+            "--model",
+            "test-model",
+            "--api-key",
+            "k",
+            "hi",
+        ],
+        env=env,
+    )
+
+    assert result.exit_code == AGENT_FAILURE_EXIT_CODE
+    assert "Infrastructure error" not in result.output
+
+
 def test_run_passes_one_shot_execution_flag_to_run_agent(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
-    captured: dict[str, bool] = {}
+    captured: dict[str, object] = {}
 
-    def fake_run_agent(*, one_shot_execution: bool = False, **_kwargs) -> int:  # type: ignore[override]
+    def fake_run_agent(
+        *,
+        one_shot_execution: bool = False,
+        compaction_profile: str = "chat",
+        **_kwargs,
+    ) -> int:  # type: ignore[override]
         captured["one_shot_execution"] = one_shot_execution
+        captured["compaction_profile"] = compaction_profile
         return 0
 
     monkeypatch.setattr(cli_mod, "run_agent", fake_run_agent)
@@ -1885,6 +1989,7 @@ def test_run_passes_one_shot_execution_flag_to_run_agent(tmp_path: Path, monkeyp
     )
     assert result.exit_code == 0
     assert captured["one_shot_execution"] is True
+    assert captured["compaction_profile"] == "execution"
 
 
 def test_run_passes_runtime_kind_to_run_agent(tmp_path: Path, monkeypatch) -> None:
@@ -3281,7 +3386,7 @@ def test_chat_turn_usage_line_formats_compact_totals_and_context_warning() -> No
     )
     assert cli_mod._chat_turn_usage_line(session) == (
         "153.8k [dim]tokens[/dim]   [dim]↓[/dim] 150.3k   "
-        "[dim]↑[/dim] 3,422   [dim]context left:[/dim] 93.3%",
+        "[dim]↑[/dim] 3,422   [dim]context left:[/dim] 8.5%",
         "\u26a0\ufe0e  Critical input budget — run /compact to reduce context",
     )
     assert cli_mod._chat_turn_usage_style(session) == "bold red"
@@ -3295,7 +3400,7 @@ def test_chat_turn_usage_line_formats_compact_totals_and_context_warning() -> No
         "153.8k [dim]tokens[/dim]   "
         "[dim]↓[/dim] 150.3k   "
         "[dim]↑[/dim] 3,422   "
-        "[dim]context left:[/dim] 44.0%",
+        "[dim]context left:[/dim] 15.0%",
         "\u26a0\ufe0e  Low input budget — run /compact to reduce context",
     )
     assert cli_mod._chat_turn_usage_style(session) == "yellow"
@@ -3360,11 +3465,13 @@ def test_chat_compact_command_forces_compaction(tmp_path: Path, monkeypatch) -> 
             messages: list[dict[str, Any]],
             tool_list: list[dict[str, Any]] | None,
             main_model: str,
+            cache_policy: dict[str, Any] | None = None,
             focus: str | None = None,
         ) -> tuple[list[dict[str, Any]], bool]:
             captured["focus"] = focus
             captured["main_model"] = main_model
             captured["tool_list"] = tool_list
+            captured["cache_policy"] = cache_policy
             self.state.history_chunk_index += 1
             self.state.pins = [{"text": "pin"}]
             return messages[:-1], True
@@ -3392,6 +3499,11 @@ def test_chat_compact_command_forces_compaction(tmp_path: Path, monkeypatch) -> 
             {"role": "user", "content": "old"},
             {"role": "assistant", "content": "old reply"},
         ]
+        request_context_measurement: object | None = object()
+
+        def invalidate_request_context(self, *, reason: str) -> None:
+            captured["invalidation_reason"] = reason
+            self.request_context_measurement = None
 
         def context_left(self) -> _DummyContext:
             return _DummyContext()
@@ -3424,6 +3536,7 @@ def test_chat_compact_command_forces_compaction(tmp_path: Path, monkeypatch) -> 
     assert "focus text" in result.output
     assert captured["focus"] == "focus text"
     assert captured["main_model"] == "test-model"
+    assert captured["invalidation_reason"] == "manual_compaction"
     assert "run_turn_called" not in captured
 
 
@@ -3534,10 +3647,11 @@ def test_chat_compact_blocked_in_forge_mode(tmp_path: Path, monkeypatch) -> None
             messages: list[dict[str, Any]],
             tool_list: list[dict[str, Any]] | None,
             main_model: str,
+            cache_policy: dict[str, Any] | None = None,
             focus: str | None = None,
         ) -> tuple[list[dict[str, Any]], bool]:
             captured["compact_called"] = True
-            _ = messages, tool_list, main_model, focus
+            _ = messages, tool_list, main_model, cache_policy, focus
             return messages, False
 
     class _DummyContext:
@@ -3648,9 +3762,10 @@ def test_chat_compact_nothing_to_compact_prints_message(tmp_path: Path, monkeypa
             messages: list[dict[str, Any]],
             tool_list: list[dict[str, Any]] | None,
             main_model: str,
+            cache_policy: dict[str, Any] | None = None,
             focus: str | None = None,
         ) -> tuple[list[dict[str, Any]], bool]:
-            _ = tool_list, main_model, focus
+            _ = tool_list, main_model, cache_policy, focus
             return messages, False
 
     class _DummyContext:
@@ -4627,7 +4742,8 @@ def test_chat_llm_error_is_recoverable_without_traceback(tmp_path: Path, monkeyp
     )
     assert result.exit_code == 0
     assert calls["run_turn"] == 1
-    assert "LLM request failed: connection timed out" in result.output
+    assert "The model provider did not respond before the request timed out." in result.output
+    assert "LLM request failed: connection timed out" not in result.output
     assert "Check base URL, API key, and network connectivity." in result.output
     assert "Traceback" not in result.output
 
@@ -4716,6 +4832,49 @@ def test_chat_llm_error_panel_classifies_tool_transcript_errors() -> None:
         in str(panel.renderable)
     )
     assert "Check base URL, API key, and network connectivity." not in str(panel.renderable)
+
+
+def test_chat_llm_error_panel_humanizes_provider_auth_json() -> None:
+    panel = cli_mod._chat_llm_error_panel(
+        message=(
+            'LLM error 401: {"error":{"message":"Incorrect API key provided: sk-test. '
+            'You can find your API key at https://platform.openai.com/account/api-keys.",'
+            '"type":"invalid_request_error","code":"invalid_api_key"}}'
+        )
+    )
+
+    renderable = str(panel.renderable)
+    assert panel.title == "Network/Model Error"
+    assert "Your API key was rejected (401). Update it with /config." in renderable
+    assert "https://platform.openai.com/account/api-keys" not in renderable
+    assert "LLM error 401" not in renderable
+    assert "sk-test" not in renderable
+    assert '{"error"' not in renderable
+
+
+def test_chat_llm_error_panel_humanizes_unsupported_model_json() -> None:
+    panel = cli_mod._chat_llm_error_panel(
+        message=(
+            'LLM error 400: {"error":{"code":"400","message":"Param Incorrect",'
+            '"param":"Not supported model MiMo-V2-Pro"}}'
+        )
+    )
+
+    renderable = str(panel.renderable)
+    assert "The provider rejected model 'MiMo-V2-Pro' for this request (400)." in renderable
+    assert "Check the model id or provider profile in /config." in renderable
+    assert '{"error"' not in renderable
+
+
+def test_chat_llm_error_panel_humanizes_connection_failures() -> None:
+    panel = cli_mod._chat_llm_error_panel(
+        message="LLM request failed for http://127.0.0.1:1/v1: Connection refused"
+    )
+
+    renderable = str(panel.renderable)
+    assert panel.title == "Network/Model Error"
+    assert "Can't reach the model provider at 127.0.0.1:1." in renderable
+    assert "Check the profile base URL in /config and try again." in renderable
 
 
 def test_chat_turn_interrupt_monitor_restores_terminal_for_nested_prompt(monkeypatch) -> None:

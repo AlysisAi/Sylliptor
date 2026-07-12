@@ -11,7 +11,14 @@ import httpx
 
 
 class SafeHttpError(Exception):
-    pass
+    """``recoverable=True`` marks failures specific to the requested URL or host
+    (a different target can succeed: oversized body, redirect problems, blocked
+    or invalid host). The default ``False`` marks environment-level failures
+    (network/DNS outage, invalid caller arguments)."""
+
+    def __init__(self, message: str, *, recoverable: bool = False) -> None:
+        super().__init__(message)
+        self.recoverable = recoverable
 
 
 _ALLOWED_SCHEMES = {"http", "https"}
@@ -97,7 +104,8 @@ async def safe_http_request(
                 raise SafeHttpError(
                     "Response decompression failed: server or proxy returned invalid "
                     "Content-Encoding bytes. safe_http_request sends "
-                    "Accept-Encoding: identity by default; check upstream compression handling."
+                    "Accept-Encoding: identity by default; check upstream compression handling.",
+                    recoverable=True,
                 ) from exc
             if not allow_redirects or response.status_code not in _REDIRECT_STATUS_CODES:
                 return response
@@ -105,10 +113,11 @@ async def safe_http_request(
             location = str(response.headers.get("location") or "").strip()
             if not location:
                 raise SafeHttpError(
-                    f"Redirect response {response.status_code} missing Location header."
+                    f"Redirect response {response.status_code} missing Location header.",
+                    recoverable=True,
                 )
             if redirects_seen >= max_redirects:
-                raise SafeHttpError(f"Too many redirects (>{max_redirects}).")
+                raise SafeHttpError(f"Too many redirects (>{max_redirects}).", recoverable=True)
             redirects_seen += 1
             current_url = urljoin(current_url, location)
             if response.status_code == 303 or (
@@ -157,7 +166,9 @@ async def _single_request(
             if not chunk:
                 continue
             if len(body) + len(chunk) > max_bytes:
-                raise SafeHttpError(f"Response body exceeded max_bytes={max_bytes}.")
+                raise SafeHttpError(
+                    f"Response body exceeded max_bytes={max_bytes}.", recoverable=True
+                )
             body.extend(chunk)
     return httpx.Response(
         status_code=status_code,
@@ -177,15 +188,17 @@ def _validate_and_resolve_target(
     split = urlsplit(str(url or "").strip())
     scheme = split.scheme.lower()
     if scheme not in _ALLOWED_SCHEMES:
-        raise SafeHttpError(f"Unsupported URL scheme: {split.scheme or '(missing)'}")
+        raise SafeHttpError(
+            f"Unsupported URL scheme: {split.scheme or '(missing)'}", recoverable=True
+        )
     if split.hostname is None:
-        raise SafeHttpError("URL must include a hostname.")
+        raise SafeHttpError("URL must include a hostname.", recoverable=True)
     if split.username is not None or split.password is not None:
-        raise SafeHttpError("Embedded URL credentials are not allowed.")
+        raise SafeHttpError("Embedded URL credentials are not allowed.", recoverable=True)
     try:
         port = split.port
     except ValueError as exc:
-        raise SafeHttpError("URL has an invalid port value.") from exc
+        raise SafeHttpError("URL has an invalid port value.", recoverable=True) from exc
     if port is None:
         port = 443 if scheme == "https" else 80
 
@@ -199,7 +212,8 @@ def _validate_and_resolve_target(
         if reason is not None:
             raise SafeHttpError(
                 f"Blocked URL host '{host}': resolved to denied address(es): "
-                f"{literal_address.compressed} ({reason})."
+                f"{literal_address.compressed} ({reason}).",
+                recoverable=True,
             )
 
     addresses = resolver(host, port)
@@ -211,7 +225,8 @@ def _validate_and_resolve_target(
     ]
     if blocked:
         raise SafeHttpError(
-            f"Blocked URL host '{host}': resolved to denied address(es): {', '.join(blocked)}."
+            f"Blocked URL host '{host}': resolved to denied address(es): {', '.join(blocked)}.",
+            recoverable=True,
         )
 
     host_header = _host_header(host=host, port=split.port, scheme=scheme)
@@ -247,7 +262,7 @@ def _resolve_host_addresses(host: str, port: int) -> list[str]:
             seen.add(address)
             addresses.append(address)
     if not addresses:
-        raise SafeHttpError(f"Host '{host}' did not resolve to any address.")
+        raise SafeHttpError(f"Host '{host}' did not resolve to any address.", recoverable=True)
     return addresses
 
 
@@ -256,7 +271,8 @@ def _parse_ip_address(value: str, *, host: str) -> ipaddress._BaseAddress:
         return ipaddress.ip_address(value)
     except ValueError as exc:
         raise SafeHttpError(
-            f"Resolver returned a non-IP address for host '{host}': {value!r}"
+            f"Resolver returned a non-IP address for host '{host}': {value!r}",
+            recoverable=True,
         ) from exc
 
 

@@ -94,6 +94,29 @@ class AlwaysFailCompactor:
         raise LLMError("context length exceeded")
 
 
+class OverflowThenSuccessClient:
+    def __init__(self, *, model: str) -> None:
+        self.model = model
+        self.temperature = 1.0
+        self.calls = 0
+        self.request_messages: list[list[dict[str, Any]]] = []
+
+    def chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+        on_text_delta=None,  # type: ignore[no-untyped-def]
+    ) -> LLMResponse:
+        _ = tools, stream, on_text_delta
+        self.calls += 1
+        self.request_messages.append(list(messages))
+        if self.calls == 1:
+            raise LLMError("LLM error 400: maximum context length exceeded")
+        return LLMResponse(content="recovered", tool_calls=[], raw={})
+
+
 def _build_cfg() -> AppConfig:
     cfg = AppConfig(
         model="test-model",
@@ -248,6 +271,7 @@ def test_run_turn_compaction_and_offload_creates_artifacts_and_pins(
             "session_artifacts/tool_outputs/step1_fs_read_tc-read.json"
         )
         assert tool_stub.get("artifact_readable_via_fs") is True
+        assert "use fs_read on that path" in str(tool_stub.get("full_output") or "")
 
         pins_data = json.loads(pins_path.read_text(encoding="utf-8"))
         assert any(
@@ -325,7 +349,7 @@ def test_compactor_context_length_retry_then_success_end_to_end(
         session.close()
 
 
-def test_compactor_fails_both_attempts_drop_chunk_still_completes(
+def test_compactor_fails_both_attempts_preserves_chunk_and_still_completes(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -371,29 +395,79 @@ def test_compactor_fails_both_attempts_drop_chunk_still_completes(
         assert failing_compactor.calls >= 2
 
         session_dir = _compaction_session_dir(session)
-        assert list((session_dir / "history").glob("chunk_*.jsonl"))
-        assert (session_dir / "memory" / "summary.json").exists()
-        pins_path = session_dir / "memory" / "pins.json"
-        assert pins_path.exists()
-        pins_data = json.loads(pins_path.read_text(encoding="utf-8"))
-        assert any(
-            (
-                "MUST preserve this requirement" in str(pin.get("text") or "")
-                or "Acceptance criteria" in str(pin.get("text") or "")
-            )
-            for pin in pins_data.get("pins", [])
-        )
-        assert any(
-            str(m.get("content") or "").startswith(PINS_MARKER)
-            for m in session.messages
-            if str(m.get("role")) == "user"
-        )
-        assert any(
-            str(m.get("content") or "").startswith(MEMORY_MARKER)
-            for m in session.messages
-            if str(m.get("role")) == "user"
-        )
+        assert not list((session_dir / "history").glob("chunk_*.jsonl"))
+        assert not (session_dir / "memory" / "summary.json").exists()
+        assert not (session_dir / "memory" / "pins.json").exists()
         serialized_messages = json.dumps(session.messages, ensure_ascii=False)
-        assert high_signal not in serialized_messages
+        assert high_signal in serialized_messages
+    finally:
+        session.close()
+
+
+def test_main_provider_context_overflow_compacts_exact_request_and_retries_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_MODEL_COMPACTOR", "compactor-model")
+    cfg = _build_cfg()
+    models = cfg.extra_fields["model_metadata_overrides"]["models"]  # type: ignore[index]
+    models["test-model"] = {"context_window_tokens": 100_000, "max_output_tokens": 4096}
+    cfg.extra_fields["compaction"].update(  # type: ignore[index]
+        {
+            "recent_user_turns_to_keep": 8,
+            "trigger_ratio": 0.95,
+            "target_ratio": 0.70,
+            "importance_enabled": False,
+            "importance_strategy": "oldest",
+        }
+    )
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="integration-overflow-recovery",
+        enable_compaction=True,
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.conversation_compactor._input_token_counter = None
+        summary = {
+            "goal": "recover safely",
+            "constraints": ["preserve the active turn"],
+            "decisions": [],
+            "work_done": [],
+            "open_threads": [],
+            "next_steps": [],
+        }
+        session.conversation_compactor.compactor_client = ScriptedClient(  # type: ignore[assignment]
+            model="compactor-model",
+            responses=[LLMResponse(content=json.dumps(summary), tool_calls=[], raw={})],
+        )
+        main_client = OverflowThenSuccessClient(model="test-model")
+        session.client = main_client  # type: ignore[assignment]
+        old_turn = "old turn that should be compacted " + ("x" * 4000)
+        session.messages.extend(
+            [
+                {"role": "user", "content": old_turn},
+                {"role": "assistant", "content": "old response"},
+                {"role": "user", "content": "recent turn to preserve"},
+                {"role": "assistant", "content": "recent response"},
+            ]
+        )
+
+        exit_code = session.run_turn("current active instruction")
+
+        assert exit_code == 0
+        assert main_client.calls == 2
+        assert old_turn in json.dumps(main_client.request_messages[0], ensure_ascii=False)
+        assert old_turn not in json.dumps(main_client.request_messages[1], ensure_ascii=False)
+        assert "current active instruction" in json.dumps(
+            main_client.request_messages[1], ensure_ascii=False
+        )
     finally:
         session.close()

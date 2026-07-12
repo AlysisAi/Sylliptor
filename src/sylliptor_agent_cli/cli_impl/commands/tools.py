@@ -280,6 +280,7 @@ def tool_info(
             )
         console.print(table)
         console.print(f"[dim]source_path:[/dim] {entry.source_path.as_posix()}")
+        console.print(f"[dim]workspace_root:[/dim] {workspace_root.as_posix()}")
 
 
 def _select_project_tool_entry_or_exit(

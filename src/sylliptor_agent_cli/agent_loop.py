@@ -18,13 +18,13 @@ if TYPE_CHECKING:
 # errors re-exports
 from .agent.errors import (  # noqa: F401
     AgentRuntimeError,
+    ApprovalDeclinedError,
     SessionWorkdirError,
 )
 
 # prompt_context re-exports
 from .agent.prompt_context import (  # noqa: F401
     _ACTIVE_WORKSPACE_CONTINUITY_FOLLOW_UP_PATTERNS,
-    _DOCS_ONLY_EXTENSIONS,
     _FIRST_TURN_REPO_GROUNDING_NUDGE,
     _IMAGE_ATTACHMENT_TURN_SYSTEM_HINT,
     _INLINE_CODE_SPAN_RE,
@@ -102,7 +102,6 @@ from .agent.prompt_context import (  # noqa: F401
     _normalize_workspace_relpath,
     _normalized_authoritative_verify_commands,
     _normalized_verify_commands,
-    _path_is_docs_only,
     _paths_require_verification,
     _plain_dir_workspace_route_override_reason,
     _PluginActivationIndex,
@@ -317,15 +316,12 @@ from .execution_deadline import (  # noqa: F401
 
 # completion gate controller re-exports
 from .agent.completion_gate import (  # noqa: F401
-    DEFAULT_COMPLETION_GATE_CONSECUTIVE_NO_PROGRESS_LIMIT,
-    DEFAULT_COMPLETION_GATE_STAGNANT_NUDGE_LIMIT,
     NON_FINAL_PROGRESS_PROBLEM,
     NON_FINAL_PROGRESS_STAGE,
     CompletionGateControllerState,
     CompletionGateDecision,
     CompletionGateDecisionKind,
     CompletionGateEvidenceSnapshot,
-    CompletionGateRepairPolicy,
     build_completion_gate_snapshot,
     completion_gate_decision_payload,
     decide_completion_gate,
@@ -337,7 +333,6 @@ from .agent.completion_gate import (  # noqa: F401
 from .agent.turn import (  # noqa: F401
     _ACTION_PROGRESS_FALLBACK_TOOL_NAMES,
     _ACTION_PROGRESS_TOOL_CATEGORIES,
-    _ADAPTIVE_RETRY_TEMPERATURE,
     _EXPLORATION_FALLBACK_TOOL_NAMES,
     _EXPLORATION_TOOL_CATEGORIES,
     _FAILED_EDIT_STAGNATION_TOOL_NAMES,
@@ -352,9 +347,7 @@ from .agent.turn import (  # noqa: F401
     _SUBAGENT_EXPLORATION_NUDGE_TEMPLATE,
     _SUBAGENT_REQUEST_OPT_OUT_PATTERNS,
     _SUBAGENT_REQUEST_PATTERNS,
-    _SUBAGENT_REQUEST_UNAVAILABLE_MESSAGE_TEMPLATE,
     _SUBAGENT_REQUIRED_NUDGE_TEMPLATE,
-    _SUBAGENT_REQUIRED_RETRY_EXHAUSTED_MESSAGE,
     _SAME_BATCH_FS_READ_DEFAULT_MAX_BYTES,
     _SAME_BATCH_FS_READ_LINES_DEFAULT_MAX_LINES,
     _SAME_BATCH_READ_CACHE_SAFE_TOOL_NAMES,
@@ -421,9 +414,6 @@ from .agent.turn import (  # noqa: F401
 from .agent.verification import (  # noqa: F401
     _COMMAND_LIKE_MUTATION_TOOL_NAMES,
     _COMPLETION_GATE_PROBLEM_LABELS,
-    _COMPLETION_GATE_REPAIR_MESSAGES,
-    _COMPLETION_GATE_REPAIR_MESSAGES_BY_LOCALE,
-    _COMPLETION_GATE_REPAIR_STAGE_LIMITS,
     _MATERIAL_EDIT_TOOL_NAMES,
     _ONE_SHOT_COMPLETION_GATE_NUDGE_PREFIX,
     _RUNTIME_DEFAULT_LANGUAGE,
@@ -435,12 +425,9 @@ from .agent.verification import (  # noqa: F401
     _completion_gate_nudge_message,
     _completion_gate_problem_summary,
     _completion_gate_problems,
-    _completion_gate_repair_message,
     _completion_gate_repair_stage,
-    _completion_gate_stage_attempt_limit,
-    _completion_gate_step_budget_exhausted_message,
-    _completion_gate_terminal_failure_message,
     _extract_touched_repo_paths,
+    _fresh_executed_evidence_for_claim,
     _record_shell_verification_command_outcome,
     _record_tool_effect,
     _record_verify_run_command_outcomes,
@@ -449,6 +436,7 @@ from .agent.verification import (  # noqa: F401
     _runtime_message,
     _runtime_message_locale,
     _sorted_missing_verification_commands,
+    _successful_verification_claim_kind,
     _verification_attempt_passed,
     _verification_command_result_passed,
     _verification_command_result_snippet,
@@ -568,7 +556,7 @@ def run_agent(
     image_paths: list[str] | None = None,
     mode: str,
     yes: bool,
-    max_steps: int,
+    max_steps: int | None,
     no_log: bool,
     api_key_override: str | None = None,
     console: Any | None = None,

@@ -26,9 +26,11 @@ from sylliptor_agent_cli.config import (
     load_persisted_profile_keys,
     save_config,
     save_persisted_api_key,
+    save_persisted_profile_key,
 )
 from sylliptor_agent_cli.profile_presets import ProfilePreset, make_profile_from_preset
 from sylliptor_agent_cli.profiles import ProfileSpec
+from sylliptor_agent_cli.provider_auth import ProviderAccountStatus, ProviderModel
 from sylliptor_agent_cli.sandbox_doctor import (
     BubblewrapInstallPlan,
     BubblewrapInstallResult,
@@ -39,6 +41,59 @@ from sylliptor_agent_cli.sandbox_doctor import (
 )
 
 _ORIGINAL_VALIDATE_API_KEY = setup_wizard_mod._validate_api_key
+
+
+class FakeSubscriptionAdapter:
+    provider_id = "openai-codex"
+    display_name = "ChatGPT Codex subscription"
+    description = "test"
+    profile_name = "chatgpt-codex"
+    auth_hint = "test"
+    base_url = "https://chatgpt.com/backend-api/codex"
+    protocol = "openai_responses"
+    supports_previous_response_id = False
+
+    def __init__(
+        self,
+        *,
+        connected: bool,
+        account_label: str | None = None,
+        detail: str | None = None,
+        login_error: Exception | None = None,
+    ) -> None:
+        self.connected = connected
+        self.account_label = account_label
+        self.detail = detail
+        self.login_error = login_error
+        self.login_calls: list[str] = []
+
+    def account_status(self) -> ProviderAccountStatus:
+        return ProviderAccountStatus(
+            connected=self.connected,
+            account_label=self.account_label,
+            detail=self.detail,
+        )
+
+    def login(self, method: str = "browser", **_kwargs: Any) -> ProviderAccountStatus:
+        self.login_calls.append(method)
+        if self.login_error is not None:
+            raise self.login_error
+        self.connected = True
+        return self.account_status()
+
+    def list_models(self, *, refresh: bool = False) -> tuple[ProviderModel, ...]:
+        assert refresh is True
+        return (ProviderModel(id="gpt-test", label="GPT Test", is_default=True),)
+
+
+def _patch_subscription_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: FakeSubscriptionAdapter,
+) -> None:
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.provider_auth.create_provider_auth",
+        lambda _provider_id: adapter,
+    )
 
 
 class PromptScript:
@@ -62,8 +117,21 @@ class PickerScript:
         self.answers = list(answers)
         self.auto_router_inherit = auto_router_inherit
         self.calls: list[dict[str, Any]] = []
+        self.connection_calls: list[dict[str, Any]] = []
 
     def __call__(self, **kwargs: Any) -> str | None:
+        if kwargs.get("title") == "Connection Method":
+            self.connection_calls.append(kwargs)
+            if self.answers and str(self.answers[0] or "").startswith(
+                setup_wizard_mod._RUNTIME_EXECUTION_PREFIX
+            ):
+                return setup_wizard_mod._SUBSCRIPTION_EXECUTION_VALUE
+            return setup_wizard_mod._NATIVE_EXECUTION_VALUE
+        if kwargs.get("title") == "AI Subscription":
+            self.connection_calls.append(kwargs)
+            if not self.answers:
+                raise AssertionError(f"Unexpected picker: {kwargs}")
+            return self.answers.pop(0)
         self.calls.append(kwargs)
         if kwargs.get("title") == "Router Model" and self.auto_router_inherit:
             if not self.answers:
@@ -162,7 +230,7 @@ def _run_basic_wizard(
 
 
 def test_setup_wizard_full_flow_persists_everything(monkeypatch, tmp_path: Path) -> None:
-    result, _output, _picker, _prompt = _run_basic_wizard(monkeypatch, tmp_path)
+    result, output, picker, _prompt = _run_basic_wizard(monkeypatch, tmp_path)
 
     assert result is True
     cfg = load_config()
@@ -171,7 +239,292 @@ def test_setup_wizard_full_flow_persists_everything(monkeypatch, tmp_path: Path)
     assert cfg.model == "gpt-5"
     assert cfg.extra_fields["active_profile"] == "openai"
     assert cfg.extra_fields["default_workspace_path"] == os.fspath(tmp_path.resolve())
+    assert cfg.extra_fields["onboarded"] is True
     assert "router" not in cfg.extra_fields.get("role_models", {})
+    assert cfg.execution.backend == "native"
+    assert cfg.execution.runtime is None
+    assert [row[1] for row in picker.connection_calls[0]["rows"]] == [
+        "Use an API key",
+        "Use an AI subscription",
+    ]
+    assert "OpenAI Codex" not in str(picker.connection_calls[0]["rows"])
+    assert "Connection method selected: Use an API key" in output
+    assert "Execution Backend" not in output
+    assert "Sylliptor native" not in output
+
+
+def test_subscription_picker_back_returns_to_connection_methods(monkeypatch) -> None:
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=120)
+    selections = iter(
+        [
+            setup_wizard_mod._SUBSCRIPTION_EXECUTION_VALUE,
+            None,
+            setup_wizard_mod._NATIVE_EXECUTION_VALUE,
+        ]
+    )
+    calls: list[dict[str, Any]] = []
+
+    def picker(**kwargs: Any) -> str | None:
+        calls.append(kwargs)
+        return next(selections)
+
+    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
+
+    result = setup_wizard_mod._prompt_execution(console)
+
+    assert result.backend == "native"
+    assert result.runtime is None
+    assert [call["title"] for call in calls] == [
+        "Connection Method",
+        "AI Subscription",
+        "Connection Method",
+    ]
+    assert "Connection method selected: Use an API key" in output.getvalue()
+
+
+def test_setup_wizard_subscription_uses_native_profile_and_preserves_api_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    native_profile = ProfileSpec(
+        name="openai",
+        base_url="https://api.openai.com/v1",
+        api_key_env="OPENAI_API_KEY",
+        default_model="native-model",
+    )
+    cfg = AppConfig(model="native-model")
+    cfg.extra_fields = {
+        "profiles": {"openai": native_profile.to_dict()},
+        "active_profile": "openai",
+    }
+    save_config(cfg)
+    save_persisted_profile_key("openai", "sk-native-stays")
+
+    output = _patch_console(monkeypatch)
+    picker = PickerScript(["runtime:openai-codex"])
+    prompt = PromptScript(["", os.fspath(tmp_path), "n"])
+    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
+    monkeypatch.setattr(setup_wizard_mod.typer, "prompt", prompt)
+    _patch_subscription_adapter(
+        monkeypatch,
+        FakeSubscriptionAdapter(connected=False, detail="Not logged in."),
+    )
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+
+    saved = load_config()
+    assert saved.execution.backend == "native"
+    assert saved.execution.runtime is None
+    assert saved.agent_runtimes == {}
+    assert saved.model == ""
+    assert saved.extra_fields["active_profile"] == "chatgpt-codex"
+    assert saved.extra_fields["profiles"]["chatgpt-codex"]["auth_provider"] == "openai-codex"
+    assert "openai" in saved.extra_fields["profiles"]
+    assert load_persisted_profile_keys()["openai"] == "sk-native-stays"
+    assert saved.extra_fields["default_workspace_path"] == os.fspath(tmp_path.resolve())
+    assert saved.extra_fields["onboarded"] is False
+    assert saved.extra_fields["subscription_reconnect_required"] is True
+    assert saved.extra_fields["subscription_model_selection_required"] == "openai-codex"
+    rendered = output.getvalue()
+    assert [call["title"] for call in picker.connection_calls] == [
+        "Connection Method",
+        "AI Subscription",
+    ]
+    assert "OpenAI Codex" not in str(picker.connection_calls[0]["rows"])
+    assert "ChatGPT Codex subscription" in str(picker.connection_calls[1]["rows"])
+    assert "Connection method selected: Use an AI subscription" in rendered
+    assert "Connection:" in rendered
+    assert "AI subscription" in rendered
+    assert "Subscription:" in rendered
+    assert "ChatGPT Codex subscription" in rendered
+    assert "immediate external side effect" in rendered
+    assert "sylliptor auth login openai-codex" in rendered
+    assert "not connected" in rendered
+    assert "Execution Backend" not in rendered
+    assert "Sylliptor native" not in rendered
+    assert "(delegated)" not in rendered
+
+
+def test_subscription_setup_rerun_preserves_config_selected_model_and_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeSubscriptionAdapter(connected=True)
+    _patch_subscription_adapter(monkeypatch, adapter)
+    cfg = AppConfig(model="kept-model", llm_reasoning_effort="high")
+    profile = ProfileSpec(
+        name="chatgpt-codex",
+        protocol="openai_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        auth_provider="openai-codex",
+        default_model="kept-model",
+        reasoning_effort="high",
+        reasoning_trace_adapter="openai_responses_summary",
+    )
+    cfg.extra_fields = {
+        "profiles": {profile.name: profile.to_dict()},
+        "active_profile": profile.name,
+    }
+
+    rebuilt = setup_wizard_mod._direct_subscription_profile(cfg, "openai-codex")
+
+    assert rebuilt.default_model == "kept-model"
+    assert rebuilt.reasoning_effort == "high"
+    assert rebuilt.reasoning_trace_adapter == "openai_responses_summary"
+
+
+def test_subscription_setup_catalog_refresh_does_not_clear_pending_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    adapter = FakeSubscriptionAdapter(connected=True)
+    _patch_subscription_adapter(monkeypatch, adapter)
+    cfg = AppConfig(model="gpt-test", llm_reasoning_effort="high")
+    profile = ProfileSpec(
+        name="chatgpt-codex",
+        protocol="openai_responses",
+        base_url=adapter.base_url,
+        auth_provider="openai-codex",
+        default_model="gpt-test",
+        reasoning_effort="high",
+    )
+    cfg.extra_fields = {
+        "profiles": {profile.name: profile.to_dict()},
+        "active_profile": profile.name,
+        "subscription_model_selection_required": "openai-codex",
+    }
+
+    setup_wizard_mod._sync_direct_subscription_model(
+        cfg,
+        "openai-codex",
+        adapter=adapter,
+    )
+
+    assert cfg.extra_fields["subscription_model_selection_required"] == "openai-codex"
+    assert cfg.extra_fields["onboarded"] is False
+
+
+def test_setup_wizard_subscription_reuses_existing_provider_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    output = _patch_console(monkeypatch)
+    prompt = PromptScript(["", os.fspath(tmp_path)])
+    monkeypatch.setattr(
+        setup_wizard_mod,
+        "_run_wizard_picker",
+        PickerScript(["runtime:openai-codex"]),
+    )
+    monkeypatch.setattr(setup_wizard_mod.typer, "prompt", prompt)
+    adapter = FakeSubscriptionAdapter(
+        connected=True,
+        detail="Logged in using ChatGPT",
+    )
+    _patch_subscription_adapter(monkeypatch, adapter)
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+
+    assert adapter.login_calls == []
+    assert len(prompt.calls) == 2
+    rendered = output.getvalue()
+    assert "Authentication:" in rendered
+    assert "connected (Logged in using ChatGPT)" in rendered
+
+
+def test_setup_wizard_subscription_can_connect_with_browser_login(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    output = _patch_console(monkeypatch)
+    prompt = PromptScript(["", os.fspath(tmp_path), ""])
+    monkeypatch.setattr(
+        setup_wizard_mod,
+        "_run_wizard_picker",
+        PickerScript(["runtime:openai-codex"]),
+    )
+    monkeypatch.setattr(setup_wizard_mod.typer, "prompt", prompt)
+    adapter = FakeSubscriptionAdapter(
+        connected=False,
+        account_label="developer@example.test",
+        detail="Not logged in.",
+    )
+    _patch_subscription_adapter(monkeypatch, adapter)
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+
+    assert adapter.login_calls == ["browser"]
+    rendered = output.getvalue()
+    assert any(text == "Connect now? [Y/n]" for text, _kwargs in prompt.calls)
+    assert "immediate external side effect" in rendered
+    assert "connected as developer@example.test" in rendered
+
+
+def test_setup_wizard_subscription_login_failure_is_non_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    output = _patch_console(monkeypatch)
+    monkeypatch.setattr(
+        setup_wizard_mod,
+        "_run_wizard_picker",
+        PickerScript(["runtime:openai-codex"]),
+    )
+    monkeypatch.setattr(
+        setup_wizard_mod.typer,
+        "prompt",
+        PromptScript(["", os.fspath(tmp_path), ""]),
+    )
+    _patch_subscription_adapter(
+        monkeypatch,
+        FakeSubscriptionAdapter(
+            connected=False,
+            login_error=RuntimeError("browser login closed"),
+        ),
+    )
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+
+    rendered = output.getvalue()
+    assert "not connected (browser login closed)" in rendered
+    assert "sylliptor auth login openai-codex" in rendered
+    assert load_config().execution.backend == "native"
+    assert load_config().execution.runtime is None
+
+
+def test_subscription_login_interrupt_reports_that_settings_are_already_saved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    output = _patch_console(monkeypatch)
+    monkeypatch.setattr(
+        setup_wizard_mod,
+        "_run_wizard_picker",
+        PickerScript(["runtime:openai-codex"]),
+    )
+    monkeypatch.setattr(
+        setup_wizard_mod.typer,
+        "prompt",
+        PromptScript(["", os.fspath(tmp_path), KeyboardInterrupt()]),
+    )
+    _patch_subscription_adapter(
+        monkeypatch,
+        FakeSubscriptionAdapter(connected=False),
+    )
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+
+    rendered = output.getvalue()
+    assert "model access settings are already saved" in rendered
+    assert "provider sign-in was skipped" in rendered
+    assert "sylliptor auth login openai-codex" in rendered
+    assert load_config().execution.backend == "native"
+    assert load_config().execution.runtime is None
 
 
 def test_setup_wizard_router_model_inherits_and_clears_existing_override(
@@ -434,13 +787,26 @@ def test_setup_profile_picker_separates_compatibility_and_native_presets() -> No
     advanced = setup_wizard_mod._advanced_setup_presets()
     advanced_keys = [preset.key for preset in advanced]
 
-    assert keys == ["openai-responses", "anthropic", "gemini"]
+    # The MiMo trial and the native first-party providers lead the primary
+    # picker; every other hosted provider follows so users are not limited to
+    # the big-three brands.
+    assert keys[:4] == ["sylliptor", "openai-responses", "anthropic", "gemini"]
+    assert "deepseek" in keys
+    assert "openrouter" in keys
     assert all(preset.protocol != "gemini_interactions" for preset in presets)
     assert all(preset.protocol != "gemini_interactions" for preset in advanced)
+    # Only compatibility duplicates, local endpoints, custom URLs, and legacy
+    # aliases are held back for the advanced picker.
+    assert "sylliptor" not in advanced_keys
+    assert "deepseek" not in advanced_keys
     assert "anthropic-compat" not in keys
     assert "gemini-compat" not in keys
+    assert "ollama" not in keys
+    assert "custom" not in keys
     assert "anthropic-compat" in advanced_keys
     assert "gemini-compat" in advanced_keys
+    assert "ollama" in advanced_keys
+    assert "custom" in advanced_keys
     assert all(
         "Compatibility protocol" in setup_wizard_mod._preset_description(preset)
         for preset in advanced
@@ -1198,7 +1564,7 @@ def test_setup_wizard_escape_at_welcome_decline_reshows_welcome(
     assert output.getvalue().count("Welcome to Sylliptor") == 2
 
 
-def test_setup_wizard_escape_at_profile_returns_to_welcome(monkeypatch, tmp_path: Path) -> None:
+def test_setup_wizard_escape_at_profile_returns_to_execution(monkeypatch, tmp_path: Path) -> None:
     _config_env(tmp_path, monkeypatch)
     output = _patch_console(monkeypatch)
     picker = PickerScript([None, "openai", "gpt-5"])
@@ -1207,7 +1573,7 @@ def test_setup_wizard_escape_at_profile_returns_to_welcome(monkeypatch, tmp_path
     monkeypatch.setattr(setup_wizard_mod, "_esc_aware_text_input", text_input)
 
     assert setup_wizard_mod.run_setup_wizard() is True
-    assert output.getvalue().count("Welcome to Sylliptor") == 2
+    assert output.getvalue().count("Welcome to Sylliptor") == 1
     assert [call["title"] for call in picker.calls] == [
         "Provider Profile",
         "Provider Profile",
@@ -1420,9 +1786,17 @@ def test_main_callback_triggers_wizard_on_first_run(monkeypatch, tmp_path: Path)
     assert calls == ["wizard", "chat"]
 
 
-def test_main_callback_skips_wizard_on_partial_config(monkeypatch, tmp_path: Path) -> None:
+def test_main_callback_skips_wizard_for_onboarded_partial_config(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # An already-onboarded user (a completed setup persisted ``default_workspace_path``)
+    # whose model is unset is nudged through the config menu, not re-sent through the
+    # full first-run wizard. The onboarded marker — not model/key presence — is what
+    # gates the wizard.
     _config_env(tmp_path, monkeypatch)
-    save_config(AppConfig(model=""))
+    cfg = AppConfig(model="")
+    cfg.extra_fields = {"default_workspace_path": os.fspath(tmp_path)}
+    save_config(cfg)
     save_persisted_api_key("sk-test-1234")
     calls: list[tuple[str, str | None]] = []
 
@@ -1450,6 +1824,138 @@ def test_main_callback_skips_wizard_on_partial_config(monkeypatch, tmp_path: Pat
     assert calls == [("menu", "model"), ("chat", None)]
 
 
+def test_main_callback_migrates_delegated_subscription_and_opens_chat_shell(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    cfg = AppConfig(
+        execution={"backend": "delegated", "runtime": "openai-codex"},
+        agent_runtimes={
+            "openai-codex": {
+                "adapter": "codex-cli",
+                "executable": "codex",
+                "model": "gpt-5.4",
+                "reasoning_effort": "high",
+            },
+        },
+    )
+    cfg.extra_fields = {"onboarded": True, "default_workspace_path": os.fspath(tmp_path)}
+    save_config(cfg)
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli_mod, "_is_non_interactive_terminal", lambda: False)
+    monkeypatch.setattr(
+        config_menu_mod,
+        "run_config_menu",
+        lambda **_kwargs: calls.append("menu"),
+    )
+    monkeypatch.setattr(cli_mod, "_run_default_chat_action", lambda: calls.append("chat"))
+
+    result = CliRunner().invoke(
+        sylliptor_app, [], env={"SYLLIPTOR_CONFIG_DIR": os.environ["SYLLIPTOR_CONFIG_DIR"]}
+    )
+
+    assert result.exit_code == 0
+    assert calls == ["chat"]
+    migrated = load_config()
+    assert migrated.execution.backend == "native"
+    assert migrated.execution.runtime is None
+    assert migrated.extra_fields["active_profile"] == "chatgpt-codex"
+    assert migrated.extra_fields["subscription_model_selection_required"] == "openai-codex"
+
+
+def test_main_callback_runs_wizard_when_config_lacks_onboarding(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # A config that already carries a model + key but was never completed through
+    # setup (no onboarded marker, no default_workspace_path) must still route a
+    # first launch into the setup wizard instead of dropping the user straight into
+    # chat — which is what lands them on the guarded-workspace picker.
+    _config_env(tmp_path, monkeypatch)
+    save_config(AppConfig(model="gpt-5"))
+    save_persisted_api_key("sk-test-1234")
+    calls: list[str] = []
+
+    def fake_wizard() -> bool:
+        calls.append("wizard")
+        return True
+
+    def fake_chat() -> None:
+        calls.append("chat")
+
+    monkeypatch.setattr(cli_mod, "_is_non_interactive_terminal", lambda: False)
+    monkeypatch.setattr(setup_wizard_mod, "run_setup_wizard", fake_wizard)
+    monkeypatch.setattr(cli_mod, "_run_default_chat_action", fake_chat)
+
+    result = CliRunner().invoke(
+        sylliptor_app, [], env={"SYLLIPTOR_CONFIG_DIR": os.environ["SYLLIPTOR_CONFIG_DIR"]}
+    )
+
+    assert result.exit_code == 0
+    assert calls == ["wizard", "chat"]
+
+
+def test_explicit_chat_with_no_model_starts_first_run_setup(monkeypatch, tmp_path: Path) -> None:
+    _config_env(tmp_path, monkeypatch)
+    calls: list[str] = []
+
+    def fake_setup() -> bool:
+        calls.append("setup")
+        return False
+
+    monkeypatch.setattr(cli_mod, "_is_non_interactive_terminal", lambda: False)
+    monkeypatch.setattr(cli_mod, "_should_run_first_run_setup_wizard", lambda: True)
+    monkeypatch.setattr(cli_mod, "_maybe_run_first_run_setup_wizard", fake_setup)
+
+    result = CliRunner().invoke(
+        sylliptor_app, ["chat"], env={"SYLLIPTOR_CONFIG_DIR": os.environ["SYLLIPTOR_CONFIG_DIR"]}
+    )
+
+    assert result.exit_code == 0
+    assert calls == ["setup"]
+    assert "Starting first-run setup" in result.output
+    assert "Model is not set" not in result.output
+
+
+def test_explicit_chat_with_no_model_noninteractive_prints_onboarding_guidance(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+
+    monkeypatch.setattr(cli_mod, "_is_non_interactive_terminal", lambda: True)
+
+    result = CliRunner().invoke(
+        sylliptor_app, ["chat"], env={"SYLLIPTOR_CONFIG_DIR": os.environ["SYLLIPTOR_CONFIG_DIR"]}
+    )
+
+    assert result.exit_code == 2
+    assert "No model is configured yet." in result.output
+    assert "sylliptor setup" in result.output
+    assert "sylliptor login" in result.output
+    assert "Config error" not in result.output
+
+
+def test_is_onboarded_marker_and_back_compat(monkeypatch, tmp_path: Path) -> None:
+    from sylliptor_agent_cli.cli_impl.commands import startup as startup_mod
+
+    _config_env(tmp_path, monkeypatch)
+    # No config at all → not onboarded.
+    assert startup_mod._is_onboarded() is False
+    # A model alone (never completed setup) → still not onboarded (the repro case).
+    save_config(AppConfig(model="gpt-5"))
+    assert startup_mod._is_onboarded() is False
+    # Explicit marker → onboarded.
+    cfg = AppConfig(model="gpt-5")
+    cfg.extra_fields = {"onboarded": True}
+    save_config(cfg)
+    assert startup_mod._is_onboarded() is True
+    # Back-compat: a completed setup recorded default_workspace_path → onboarded.
+    cfg = AppConfig(model="gpt-5")
+    cfg.extra_fields = {"default_workspace_path": os.fspath(tmp_path)}
+    save_config(cfg)
+    assert startup_mod._is_onboarded() is True
+
+
 def test_setup_typer_command_runs_wizard(monkeypatch) -> None:
     called: list[bool] = []
 
@@ -1468,12 +1974,31 @@ def test_setup_typer_command_runs_wizard(monkeypatch) -> None:
 def test_setup_command_launches_chat_after_interactive_tui(monkeypatch) -> None:
     chat_calls: list[bool] = []
     monkeypatch.setattr(cli_mod, "_try_setup_tui", lambda **_k: True)  # TUI saved
+    monkeypatch.setattr(cli_mod, "_provider_auth_ready_for_chat", lambda: True)
     monkeypatch.setattr(cli_mod, "_run_chat_after_setup", lambda: chat_calls.append(True))
 
     result = CliRunner().invoke(sylliptor_app, ["setup"])
 
     assert result.exit_code == 0
     assert chat_calls == [True]  # flows straight into chat
+
+
+def test_setup_command_delegated_tui_finishes_without_launching_native_chat(monkeypatch) -> None:
+    chat_calls: list[bool] = []
+    delegated = AppConfig(
+        execution={"backend": "delegated", "runtime": "openai-codex"},
+        agent_runtimes={
+            "openai-codex": {"adapter": "codex-cli", "executable": "codex"},
+        },
+    )
+    monkeypatch.setattr(cli_mod, "_try_setup_tui", lambda **_k: True)
+    monkeypatch.setattr(cli_mod, "load_config", lambda: delegated)
+    monkeypatch.setattr(cli_mod, "_run_chat_after_setup", lambda: chat_calls.append(True))
+
+    result = CliRunner().invoke(sylliptor_app, ["setup"])
+
+    assert result.exit_code == 0
+    assert chat_calls == []
 
 
 def test_setup_command_tui_cancel_does_not_launch_chat(monkeypatch) -> None:
@@ -1514,7 +2039,7 @@ def test_run_chat_after_setup_uses_configured_workspace(monkeypatch, tmp_path) -
 
 def test_run_default_chat_action_forwards_posture_flags(monkeypatch) -> None:
     """A relaunch (e.g. /config → switch project) must preserve the session's
-    execution-posture flags instead of silently resetting auto-approve/mode/logging."""
+    execution-posture flags instead of silently resetting approval policy/mode/logging."""
     from sylliptor_agent_cli.cli_impl.commands import startup as startup_mod
 
     captured: dict[str, Any] = {}
@@ -1551,16 +2076,31 @@ def test_run_default_chat_action_defaults_unchanged(monkeypatch) -> None:
     assert captured["mode"] is None
     assert captured["no_log"] is False
     assert captured["verify_cmd"] is None
+    assert captured["diagnostic_log"] is None
+
+
+def test_run_default_run_action_passes_concrete_typer_defaults(monkeypatch) -> None:
+    """Direct Python dispatch must never leak Typer OptionInfo objects into run()."""
+    from sylliptor_agent_cli.cli_impl.commands import startup as startup_mod
+
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli_mod, "run", lambda **kw: captured.update(kw))
+
+    startup_mod._run_default_run_action("inspect")
+
+    assert captured["instruction"] == "inspect"
+    assert captured["benchmark"] is False
+    assert captured["deadline_seconds"] is None
+    assert captured["require_deadline"] is False
+    assert captured["diagnostic_log"] is None
 
 
 def _mimo_login_preset() -> ProfilePreset:
     from sylliptor_agent_cli.sylliptor_cloud import PROFILE_KEY
 
-    # The hosted MiMo trial is an OpenAI-compatible gateway preset, so it lives in
-    # the advanced/gateway picker rather than the primary native-provider screen.
-    return next(
-        p for p in setup_wizard_mod.advanced_provider_selection_presets() if p.key == PROFILE_KEY
-    )
+    # The hosted MiMo trial is now a first-class setup option, not buried in the
+    # advanced/gateway picker.
+    return next(p for p in setup_wizard_mod.provider_selection_presets() if p.key == PROFILE_KEY)
 
 
 def _profile_step_for(preset: ProfilePreset) -> Any:

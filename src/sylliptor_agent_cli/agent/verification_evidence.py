@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 
+from ..verification_command_analysis import (
+    VerificationCommandEvidentiaryCapability,
+    analyze_verification_command,
+)
 from ..verification_contract import build_verification_command_specs
 from ..verify_gate import assess_verification_command_execution
 from .verification_commands import (
@@ -106,7 +110,46 @@ def _execution_allows_acceptance(
     exit_code: int | None,
     real_execution: bool | None,
 ) -> bool:
-    if real_execution is False:
+    if real_execution is not True:
+        return False
+    if exit_code is not None and exit_code != 0:
+        return False
+    return True
+
+
+def _invalid_contract_rejection_reason(
+    *,
+    matches: set[str],
+    known_verification_commands: list[str],
+    authoritative: bool,
+) -> str:
+    if not matches:
+        return ""
+    source = (
+        "environment.authoritative_verification_commands"
+        if authoritative
+        else "task_refinement.explicit_user_command"
+    )
+    contract_type = "authoritative_override" if authoritative else "task_acceptance"
+    normalized_matches = {_normalize_shell_command_for_match(command) for command in matches}
+    for spec in build_verification_command_specs(
+        tuple(known_verification_commands),
+        source=source,
+        contract_type=contract_type,
+    ):
+        if _normalize_shell_command_for_match(spec.original_text) not in normalized_matches:
+            continue
+        if spec.validation_status.value == "INVALID":
+            return spec.rejection_reason or "invalid_verification_command"
+    return ""
+
+
+def _contract_execution_allows_acceptance(
+    *,
+    exit_code: int | None,
+    real_execution: bool | None,
+) -> bool:
+    if real_execution is not True:
         return False
     if exit_code is not None and exit_code != 0:
         return False
@@ -282,6 +325,10 @@ def classify_verification_evidence(
         real_execution = assessment.real_execution
 
     known = [str(item) for item in (known_verification_commands or []) if str(item).strip()]
+    analysis = analyze_verification_command(
+        command,
+        trusted=authoritative or bool(known),
+    )
     material_touched = tuple(
         sorted(str(item) for item in (material_touched_paths or []) if str(item).strip())
     )
@@ -296,13 +343,27 @@ def classify_verification_evidence(
         authoritative=authoritative,
     )
     if trusted_shell_matches:
-        allowed = execution_ok and not material_touched
+        contract_execution_ok = _contract_execution_allows_acceptance(
+            exit_code=exit_code,
+            real_execution=real_execution,
+        )
+        capability_ok = (
+            analysis.evidentiary_capability == VerificationCommandEvidentiaryCapability.ASSERTIVE
+            and not analysis.rejection_reason
+        )
+        allowed = contract_execution_ok and capability_ok and not material_touched
         category = (
             VerificationEvidenceCategory.AUTHORITATIVE
             if authoritative
             else VerificationEvidenceCategory.REPO_NATIVE
         )
-        if not execution_ok:
+        if not capability_ok:
+            reason = (
+                analysis.rejection_reason
+                or analysis.inconclusive_reason
+                or "unknown_verification_capability"
+            )
+        elif not contract_execution_ok:
             reason = "non_executing_or_failed_contract_command"
         elif mutation_reason:
             reason = mutation_reason
@@ -323,7 +384,7 @@ def classify_verification_evidence(
             category=VerificationEvidenceCategory.NOT_VERIFICATION,
             normalized_command=normalized,
             real_execution=real_execution,
-            reason="disallowed_shell_control_flow",
+            reason=analysis.rejection_reason or "disallowed_shell_control_flow",
         )
 
     matches = _matching_effective_verification_commands(
@@ -331,13 +392,39 @@ def classify_verification_evidence(
         effective_verification_commands=known,
     )
     if matches:
-        allowed = execution_ok and not material_touched
+        invalid_contract_reason = _invalid_contract_rejection_reason(
+            matches=matches,
+            known_verification_commands=known,
+            authoritative=authoritative,
+        )
+        contract_execution_ok = _contract_execution_allows_acceptance(
+            exit_code=exit_code,
+            real_execution=real_execution,
+        )
+        capability_ok = (
+            analysis.evidentiary_capability == VerificationCommandEvidentiaryCapability.ASSERTIVE
+            and not analysis.rejection_reason
+        )
+        allowed = (
+            not invalid_contract_reason
+            and contract_execution_ok
+            and capability_ok
+            and not material_touched
+        )
         category = (
             VerificationEvidenceCategory.AUTHORITATIVE
             if authoritative
             else VerificationEvidenceCategory.REPO_NATIVE
         )
-        if not execution_ok:
+        if invalid_contract_reason:
+            reason = invalid_contract_reason
+        elif not capability_ok:
+            reason = (
+                analysis.rejection_reason
+                or analysis.inconclusive_reason
+                or "unknown_verification_capability"
+            )
+        elif not contract_execution_ok:
             reason = "non_executing_or_failed_contract_command"
         elif mutation_reason:
             reason = mutation_reason
@@ -376,7 +463,35 @@ def classify_verification_evidence(
             reason="does_not_match_effective_contract",
         )
 
-    if _parse_verification_command_shape(normalized) is not None:
+    if task_reason:
+        if (
+            analysis.evidentiary_capability
+            == VerificationCommandEvidentiaryCapability.NON_ASSERTIVE
+            or analysis.rejection_reason
+        ):
+            return VerificationEvidence(
+                category=VerificationEvidenceCategory.NOT_VERIFICATION,
+                normalized_command=normalized,
+                real_execution=real_execution,
+                reason=analysis.rejection_reason
+                or analysis.capability_reason
+                or "non_assertive_verifier",
+            )
+        allowed = execution_ok and not material_touched
+        reason = task_reason if allowed else mutation_reason or "non_executing_or_failed_task_check"
+        return VerificationEvidence(
+            category=VerificationEvidenceCategory.TASK_ACCEPTANCE,
+            normalized_command=normalized,
+            real_execution=real_execution,
+            allowed_to_satisfy_contract=allowed,
+            reason=reason,
+        )
+
+    if (
+        _parse_verification_command_shape(normalized) is not None
+        and analysis.evidentiary_capability == VerificationCommandEvidentiaryCapability.ASSERTIVE
+        and not analysis.rejection_reason
+    ):
         allowed = execution_ok and not material_touched
         reason = (
             "repo_native_command"
@@ -394,6 +509,18 @@ def classify_verification_evidence(
     if _marker_fallback_is_verification_attempt(
         normalized
     ) and not _is_known_non_executing_verification_form(parts):
+        if (
+            analysis.evidentiary_capability != VerificationCommandEvidentiaryCapability.ASSERTIVE
+            or analysis.rejection_reason
+        ):
+            return VerificationEvidence(
+                category=VerificationEvidenceCategory.NOT_VERIFICATION,
+                normalized_command=normalized,
+                real_execution=real_execution,
+                reason=analysis.rejection_reason
+                or analysis.inconclusive_reason
+                or "unknown_verification_capability",
+            )
         allowed = execution_ok and not material_touched
         reason = (
             "repo_native_command"
@@ -402,17 +529,6 @@ def classify_verification_evidence(
         )
         return VerificationEvidence(
             category=VerificationEvidenceCategory.REPO_NATIVE,
-            normalized_command=normalized,
-            real_execution=real_execution,
-            allowed_to_satisfy_contract=allowed,
-            reason=reason,
-        )
-
-    if task_reason:
-        allowed = execution_ok and not material_touched
-        reason = task_reason if allowed else mutation_reason or "non_executing_or_failed_task_check"
-        return VerificationEvidence(
-            category=VerificationEvidenceCategory.TASK_ACCEPTANCE,
             normalized_command=normalized,
             real_execution=real_execution,
             allowed_to_satisfy_contract=allowed,

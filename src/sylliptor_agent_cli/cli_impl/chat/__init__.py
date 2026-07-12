@@ -4,6 +4,7 @@ import importlib
 from typing import Any
 
 _PUBLIC_FACADE_NAMES = {
+    "_PUBLIC_LOOP_COPY_VALUES",
     "_copy_loop_globals_to_public",
     "_apply_chat_effective_mode",
     "_handle_chat_command",
@@ -17,6 +18,7 @@ _PUBLIC_FACADE_NAMES = {
     "chat_impl",
     "run_impl",
 }
+_PUBLIC_LOOP_COPY_VALUES: dict[str, Any] = {}
 
 
 def _loop_module() -> Any:
@@ -34,6 +36,25 @@ def _copy_loop_globals_to_public(*, overwrite: bool = False) -> None:
             continue
         if overwrite or name not in module_globals:
             module_globals[name] = value
+            _PUBLIC_LOOP_COPY_VALUES[name] = value
+
+
+def _public_global_overrides() -> dict[str, Any]:
+    loop = _loop_module()
+    loop_globals = loop.__dict__
+    overrides: dict[str, Any] = {}
+    for name, value in globals().items():
+        if name.startswith("__") or name in _PUBLIC_FACADE_NAMES:
+            continue
+        if name not in loop_globals or loop_globals[name] is value:
+            continue
+        if _PUBLIC_LOOP_COPY_VALUES.get(name) is value:
+            continue
+        if callable(value) and getattr(value, "__module__", None) == loop.__name__:
+            continue
+        if name in loop_globals:
+            overrides[name] = value
+    return overrides
 
 
 def _sync_loop_globals_from_public() -> None:
@@ -41,12 +62,17 @@ def _sync_loop_globals_from_public() -> None:
     for name, value in globals().items():
         if name.startswith("__") or name in _PUBLIC_FACADE_NAMES:
             continue
+        if _PUBLIC_LOOP_COPY_VALUES.get(name) is value:
+            continue
         loop_globals[name] = value
 
 
 def _sync_cli_globals(cli_mod: Any) -> None:
+    public_overrides = _public_global_overrides()
     loop = _loop_module()
     loop._sync_cli_globals(cli_mod)
+    for name, value in public_overrides.items():
+        setattr(loop, name, value)
     _copy_loop_globals_to_public(overwrite=True)
 
 

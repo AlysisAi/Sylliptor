@@ -122,7 +122,7 @@ def test_run_turn_blocks_repeated_identical_failed_tool_calls(tmp_path: Path) ->
 
     assert exit_code == 0
     assert fake_client.calls == 5
-    assert 0.5 in fake_client.temperatures
+    assert all(temperature is None for temperature in fake_client.temperatures)
 
     events = list(read_session_events(sessions_dir / "retry-guard.jsonl"))
     tool_results = [
@@ -130,10 +130,11 @@ def test_run_turn_blocks_repeated_identical_failed_tool_calls(tmp_path: Path) ->
         for event in events
         if event.get("type") == "tool_result"
     ]
-    assert len(tool_results) == 3
+    assert len(tool_results) == 4
     assert "missing.txt" in str(tool_results[0].get("error", ""))
     assert "missing.txt" in str(tool_results[1].get("error", ""))
     assert "Blocked repeated tool call" in str(tool_results[2].get("error", ""))
+    assert "Blocked repeated tool call" in str(tool_results[3].get("error", ""))
 
     warnings = [
         event
@@ -144,7 +145,9 @@ def test_run_turn_blocks_repeated_identical_failed_tool_calls(tmp_path: Path) ->
     assert warnings
 
 
-def test_run_turn_retries_once_when_tool_arguments_are_invalid_json(tmp_path: Path) -> None:
+def test_run_turn_returns_tool_result_when_tool_arguments_are_invalid_json(
+    tmp_path: Path,
+) -> None:
     cfg = AppConfig(model="test-model", routing_mode="code_only")
     sessions_dir = tmp_path / "sessions"
     session = create_session(
@@ -188,17 +191,78 @@ def test_run_turn_retries_once_when_tool_arguments_are_invalid_json(tmp_path: Pa
 
     assert exit_code == 0
     assert fake_client.calls == 3
-    assert 0.5 in fake_client.temperatures
+    assert all(temperature is None for temperature in fake_client.temperatures)
 
     events = list(read_session_events(sessions_dir / "invalid-json-retry.jsonl"))
-    retries = [
+    recoveries = [
         event.get("payload", {})
+        for event in events
+        if event.get("type") == "invalid_tool_json_recovered"
+    ]
+    assert recoveries == [{"tool": "fs_read", "tool_call_id": "tc1", "step": 1}]
+
+    retries = [
+        event
         for event in events
         if event.get("type") == "warning"
         and event.get("payload", {}).get("warning") == "adaptive_temperature_retry"
     ]
-    assert retries
-    assert retries[0].get("reason") == "invalid_tool_arguments_json"
+    assert retries == []
+
+    tool_results = [
+        event.get("payload", {}) for event in events if event.get("type") == "tool_result"
+    ]
+    assert len(tool_results) == 2
+    invalid_json_result = tool_results[0].get("result", {})
+    assert invalid_json_result == {
+        "error": "tool call arguments were not valid JSON",
+        "error_code": "invalid_tool_arguments_json",
+        "guidance": "Re-issue the call with a valid JSON object for arguments.",
+    }
+    assert "missing.txt" in str(tool_results[1].get("result", {}).get("error", ""))
+
+
+def test_run_turn_preserves_unicode_in_tool_result_message(tmp_path: Path) -> None:
+    cfg = AppConfig(model="test-model", routing_mode="code_only")
+    sessions_dir = tmp_path / "sessions"
+    (tmp_path / "greek.txt").write_text("καλημέρα\n", encoding="utf-8")
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=sessions_dir,
+        session_id_override="unicode-tool-result",
+    )
+
+    responses = [
+        LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id="tc1", name="fs_read", arguments={"path": "greek.txt"})],
+            raw={},
+        ),
+        LLMResponse(content="done", tool_calls=[], raw={}),
+    ]
+    fake_client = _FakeClient(responses)
+    session.client = fake_client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Read greek.txt.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / "unicode-tool-result.jsonl"))
+    tool_result_events = [
+        event.get("payload", {}) for event in events if event.get("type") == "tool_result"
+    ]
+    assert tool_result_events
+    content = str(tool_result_events[0].get("content") or "")
+    assert "καλημέρα" in content
+    assert "\\u03" not in content
 
 
 def test_run_turn_rolls_back_user_message_after_llm_error(tmp_path: Path) -> None:

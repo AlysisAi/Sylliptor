@@ -5,11 +5,12 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .file_classification import BROAD_SOURCE_EXTENSIONS, INFERRED_FILE_EXTENSIONS
+from .file_classification import BROAD_SOURCE_EXTENSIONS, INFERRED_FILE_EXTENSIONS, classify_path
 from .git_safe import build_git_process_env
 from .runtime_artifacts import ROOT_RUNTIME_ARTIFACT_DIR_NAMES, is_runtime_artifact_path
 
@@ -138,6 +139,9 @@ _CARGO_PACKAGE_RE = re.compile(r"(?m)^\s*\[package\]\s*$")
 _RUST_SCOPE_DIR_NAMES = frozenset({"src", "tests", "test", "benches", "examples"})
 _RUST_ENTRYPOINT_FILENAMES = ("lib.rs", "main.rs")
 _READ_ONLY_GIT_TIMEOUT_S = 5.0
+_UNTRACKED_SOURCE_KINDS = frozenset(
+    {"config", "fixture", "frontend_surface", "implementation", "source", "test"}
+)
 SCRATCH_ARTIFACT_ENV = "SYLLIPTOR_ARTIFACT_SCRATCH_DIR"
 
 SCOPE_CLASS_IN_SCOPE = "in_scope"
@@ -219,6 +223,66 @@ class ScopeAssessment:
             "effective_changed_files": self.effective_changed_files,
             "expanded_allowed_scope": self.expanded_allowed_scope,
             "companion_expansions": [item.to_payload() for item in self.companion_expansions],
+        }
+
+
+@dataclass(frozen=True)
+class WorkspaceGitDiffState:
+    available: bool
+    tracked_diff_paths: tuple[str, ...] = ()
+    untracked_source_paths: tuple[str, ...] = ()
+
+    @property
+    def changed_paths(self) -> tuple[str, ...]:
+        return tuple(sorted({*self.tracked_diff_paths, *self.untracked_source_paths}))
+
+    @property
+    def empty(self) -> bool:
+        return self.available and not self.changed_paths
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "available": self.available,
+            "empty": self.empty,
+            "tracked_diff_paths": list(self.tracked_diff_paths),
+            "untracked_source_paths": list(self.untracked_source_paths),
+            "changed_paths": list(self.changed_paths),
+        }
+
+
+@dataclass(frozen=True)
+class ExistingTestEdit:
+    path: str
+    added_lines: int | None = None
+    deleted_lines: int | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "added_lines": self.added_lines,
+            "deleted_lines": self.deleted_lines,
+        }
+
+
+@dataclass(frozen=True)
+class ExistingTestEditsState:
+    available: bool
+    edits: tuple[ExistingTestEdit, ...] = ()
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        return tuple(edit.path for edit in self.edits)
+
+    @property
+    def has_edits(self) -> bool:
+        return bool(self.edits)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "available": self.available,
+            "has_edits": self.has_edits,
+            "paths": list(self.paths),
+            "edits": [edit.to_payload() for edit in self.edits],
         }
 
 
@@ -1051,6 +1115,31 @@ def is_non_material_untracked_path(path: str) -> bool:
     )
 
 
+def is_untracked_source_path(path: str, *, root: Path | None = None) -> bool:
+    normalized = _normalize_path(path).rstrip("/")
+    if (
+        not normalized
+        or is_non_material_untracked_path(normalized)
+        or is_runtime_artifact_path(normalized, root=root)
+    ):
+        return False
+    return classify_path(normalized).kind in _UNTRACKED_SOURCE_KINDS
+
+
+def is_existing_test_layout_path(path: str) -> bool:
+    normalized = _normalize_path(path).rstrip("/")
+    if not normalized or normalized.startswith(("/", "../")):
+        return False
+    parsed = PurePosixPath(normalized)
+    filename = parsed.name.casefold()
+    directory_parts = {part.casefold() for part in parsed.parts[:-1]}
+    return bool(
+        directory_parts & {"tests", "testing"}
+        or (filename.startswith("test_") and filename.endswith(".py"))
+        or filename.endswith("_test.py")
+    )
+
+
 def _is_known_sylliptor_scratch_path(path: str) -> bool:
     normalized = _normalize_path(path).rstrip("/")
     if not normalized:
@@ -1367,3 +1456,241 @@ def list_changed_files_including_untracked(root: Path) -> list[str]:
         seen.add(rel)
         changed.append(rel)
     return changed
+
+
+def resolve_workspace_git_base(root: Path) -> str | None:
+    """Return the current commit for use as a stable turn-local diff base."""
+
+    if shutil.which("git") is None:
+        return None
+    head = _run_git_capture(
+        root,
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        text=True,
+    )
+    if head is None or head.returncode != 0:
+        return None
+    value = head.stdout.strip()
+    return value or None
+
+
+def inspect_workspace_git_diff(
+    root: Path,
+    *,
+    base_ref: str | None = None,
+) -> WorkspaceGitDiffState:
+    """Inspect tracked diff paths plus non-scratch untracked files.
+
+    ``available=False`` distinguishes an unavailable/non-git workspace from a
+    successfully inspected clean worktree.
+    """
+
+    if shutil.which("git") is None:
+        return WorkspaceGitDiffState(available=False)
+
+    inside_worktree = _run_git_capture(
+        root,
+        ["rev-parse", "--is-inside-work-tree"],
+        text=True,
+    )
+    if (
+        inside_worktree is None
+        or inside_worktree.returncode != 0
+        or inside_worktree.stdout.strip().casefold() != "true"
+    ):
+        return WorkspaceGitDiffState(available=False)
+
+    requested_base = str(base_ref or "").strip()
+    head = _run_git_capture(
+        root,
+        ["rev-parse", "--verify", requested_base or "HEAD"],
+        text=True,
+    )
+    if head is None:
+        return WorkspaceGitDiffState(available=False)
+
+    tracked_procs: list[subprocess.CompletedProcess[Any] | None]
+    if head.returncode == 0:
+        tracked_procs = [
+            _run_git_capture(
+                root,
+                [
+                    "diff",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                    requested_base or "HEAD",
+                    "--",
+                ],
+            )
+        ]
+    else:
+        tracked_procs = [
+            _run_git_capture(root, ["ls-files", "--cached", "-z"]),
+            _run_git_capture(
+                root,
+                ["diff", "--name-only", "--no-renames", "-z", "--"],
+            ),
+        ]
+    untracked_proc = _run_git_capture(
+        root,
+        ["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    if (
+        untracked_proc is None
+        or untracked_proc.returncode != 0
+        or any(proc is None or proc.returncode != 0 for proc in tracked_procs)
+    ):
+        return WorkspaceGitDiffState(available=False)
+
+    def _nul_paths(proc: subprocess.CompletedProcess[Any]) -> list[str]:
+        stdout = proc.stdout
+        raw_stdout = (
+            stdout.encode("utf-8", errors="surrogateescape")
+            if isinstance(stdout, str)
+            else (stdout or b"")
+        )
+        return [
+            normalized
+            for item in raw_stdout.split(b"\0")
+            if item
+            if (
+                normalized := _normalize_path(
+                    item.decode("utf-8", errors="surrogateescape").strip('"')
+                )
+            )
+        ]
+
+    tracked_paths = sorted(
+        {path for proc in tracked_procs if proc is not None for path in _nul_paths(proc)}
+    )
+    untracked_source_paths = sorted(
+        {path for path in _nul_paths(untracked_proc) if is_untracked_source_path(path, root=root)}
+    )
+    return WorkspaceGitDiffState(
+        available=True,
+        tracked_diff_paths=tuple(tracked_paths),
+        untracked_source_paths=tuple(untracked_source_paths),
+    )
+
+
+def inspect_existing_test_edits(
+    root: Path,
+    *,
+    base_ref: str | None = None,
+) -> ExistingTestEditsState:
+    """Return edits to test files that existed at the requested base commit.
+
+    Added files are intentionally excluded so agents may add regression coverage without
+    rewriting the repository's existing test expectations.
+    """
+
+    if shutil.which("git") is None:
+        return ExistingTestEditsState(available=False)
+
+    inside_worktree = _run_git_capture(
+        root,
+        ["rev-parse", "--is-inside-work-tree"],
+        text=True,
+    )
+    if (
+        inside_worktree is None
+        or inside_worktree.returncode != 0
+        or inside_worktree.stdout.strip().casefold() != "true"
+    ):
+        return ExistingTestEditsState(available=False)
+
+    requested_base = str(base_ref or "").strip()
+    head = _run_git_capture(
+        root,
+        ["rev-parse", "--verify", requested_base or "HEAD"],
+        text=True,
+    )
+    if head is None or head.returncode != 0:
+        return ExistingTestEditsState(available=False)
+
+    diff = _run_git_capture(
+        root,
+        [
+            "diff",
+            "--numstat",
+            "--no-renames",
+            "--diff-filter=MDTUXB",
+            "-z",
+            requested_base or "HEAD",
+            "--",
+        ],
+    )
+    if diff is None or diff.returncode != 0:
+        return ExistingTestEditsState(available=False)
+
+    stdout = diff.stdout
+    raw_stdout = (
+        stdout.encode("utf-8", errors="surrogateescape")
+        if isinstance(stdout, str)
+        else (stdout or b"")
+    )
+    edits: list[ExistingTestEdit] = []
+    for raw_record in raw_stdout.split(b"\0"):
+        if not raw_record:
+            continue
+        parts = raw_record.split(b"\t", 2)
+        if len(parts) != 3:
+            continue
+        added_raw, deleted_raw, path_raw = parts
+        path = _normalize_path(path_raw.decode("utf-8", errors="surrogateescape").strip('"'))
+        if not is_existing_test_layout_path(path):
+            continue
+
+        def _line_count(value: bytes) -> int | None:
+            try:
+                return int(value)
+            except ValueError:
+                return None
+
+        edits.append(
+            ExistingTestEdit(
+                path=path,
+                added_lines=_line_count(added_raw),
+                deleted_lines=_line_count(deleted_raw),
+            )
+        )
+
+    return ExistingTestEditsState(
+        available=True,
+        edits=tuple(sorted(edits, key=lambda edit: edit.path)),
+    )
+
+
+def restore_existing_test_paths(
+    root: Path,
+    *,
+    base_ref: str,
+    paths: Collection[str],
+) -> bool:
+    """Restore selected tracked test paths from a verified base commit."""
+
+    normalized_paths = sorted(
+        {
+            normalized
+            for raw_path in paths
+            if (normalized := _normalize_path(str(raw_path)).rstrip("/"))
+            and is_existing_test_layout_path(normalized)
+        }
+    )
+    requested_base = str(base_ref or "").strip()
+    if not requested_base or not normalized_paths or shutil.which("git") is None:
+        return False
+    verified_base = _run_git_capture(
+        root,
+        ["rev-parse", "--verify", f"{requested_base}^{{commit}}"],
+        text=True,
+    )
+    if verified_base is None or verified_base.returncode != 0:
+        return False
+    restore = _run_git_capture(
+        root,
+        ["checkout", verified_base.stdout.strip(), "--", *normalized_paths],
+        text=True,
+    )
+    return restore is not None and restore.returncode == 0

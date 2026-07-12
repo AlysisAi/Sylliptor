@@ -4,8 +4,8 @@ A prompt_toolkit ``Application`` (alt-screen) that reproduces the launch
 screenshot: a centered white owl animation, the "What can I do for you?"
 heading, a dim hint line, a larger bordered multi-line input box, and a pinned
 2-line footer (brand · model · context/tokens/cost; user · workspace · branch ·
-auto-approve). Enter submits, Ctrl+J / Alt+Enter insert a newline, Shift+Tab
-toggles auto-approve.
+approval prompt policy). Enter submits, Ctrl+J / Alt+Enter insert a newline,
+Shift+Tab toggles whether approval prompts ask or auto-allow.
 
 Phase 2 wires the agent: when a ``session_builder`` is supplied, the welcome body
 swaps for a scrollable transcript and each submission runs ``session.run_turn``
@@ -16,6 +16,7 @@ when idle). Without a ``session_builder`` the shell keeps the Phase 1 stub reply
 
 from __future__ import annotations
 
+import os
 import textwrap
 import threading
 import time
@@ -27,7 +28,8 @@ from prompt_toolkit.application.current import get_app
 from prompt_toolkit.cursor_shapes import CursorShape
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.filters import Condition, has_focus
-from prompt_toolkit.formatted_text import FormattedText, to_formatted_text
+from prompt_toolkit.formatted_text import FormattedText, fragment_list_to_text, to_formatted_text
+from prompt_toolkit.input import create_input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, WindowAlign
 from prompt_toolkit.layout.containers import (
@@ -44,10 +46,13 @@ from prompt_toolkit.layout.dimension import D
 from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import BeforeInput, Processor, Transformation
-from prompt_toolkit.mouse_events import MouseEventType
+from prompt_toolkit.mouse_events import MouseButton, MouseEventType
 from prompt_toolkit.styles import Style, merge_styles
 from prompt_toolkit.widgets import Frame, TextArea
 
+from ...clipboard import ClipboardError, copy_text_to_clipboard
+from ...llm.types import LLMError
+from ...llm_error_display import friendly_llm_error_message, is_network_or_model_error
 from ...surface.types import ApprovalDecision
 from . import content as _content
 from .footer import footer_fragments
@@ -59,6 +64,13 @@ from .transcript import TuiTranscript
 
 _EXIT_WORDS = {"/exit", "/quit", ":q", "exit", "quit"}
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _model_access_setup_hint(subscription_provider_id: str | None) -> str:
+    if subscription_provider_id:
+        return "Set up model access: /login to choose a connection · /config for an API key"
+    return "Set up model access in /config"
+
 
 # Single accent colour for the input frame, the "> " prompt, the user band and
 # the assistant marker — a green shade. ``_BAND_BG`` is the subtle full-width
@@ -72,6 +84,18 @@ _ASSIST_MARK = "✦"
 _THINK_OPEN = "▾"
 _THINK_CLOSED = "▸"
 _THINK_RAIL = "│"
+
+# Explicit transcript copies are semantic, not a dump of rendered terminal
+# cells. Provider reasoning summaries and agent/tool chrome stay visible in the
+# pane but never enter the clipboard; unknown future roles fail closed until
+# they are intentionally classified here.
+_COPYABLE_TRANSCRIPT_ROLES = frozenset(
+    {"user", "assistant", "error", "warn", "info", "system", "spacer"}
+)
+
+_COMPLETION_MENU_BOTTOM = 8
+_COMPLETION_MENU_MAX_HEIGHT = 8
+_COMPLETION_MENU_MAX_WIDTH = 84
 
 _STYLE = Style.from_dict(
     {
@@ -119,6 +143,7 @@ _STYLE = Style.from_dict(
         # default light-grey bar). Faint near-black track + accent-green thumb.
         "scrollbar.background": "bg:#1a1a1a",
         "scrollbar.button": f"bg:{_ACCENT}",
+        "scrollbar.arrow": f"{_ACCENT} bg:#1a1a1a",
         "scrollbar.start": "nounderline",
         "scrollbar.end": "nounderline",
         # Centered /help popup: an opaque dark panel (so the transcript behind it
@@ -197,6 +222,7 @@ _STYLE = Style.from_dict(
         "tui.approve.key.no": "bold #e06c75 bg:#0d1117",
         "tui.approve.frame": "bg:#0d1117",
         "tui.approve.frame frame.border": "#d19a66",
+        "tui.modal.scrim": "bg:#0d1117",
     }
 )
 
@@ -232,8 +258,31 @@ def _user_band_rows(text: str, width: int) -> list[list[tuple[str, str]]]:
     return rows
 
 
-# Rows scrolled per mouse-wheel notch (small = smooth).
-_WHEEL_STEP_ROWS = 2
+# Rows scrolled per mouse-wheel notch. Three matches the familiar default used
+# by editors such as Vim, while an environment override keeps high-resolution
+# trackpads and coarse physical wheels tunable without a persistent HUD.
+_SCROLL_SPEED_ENV = "SYLLIPTOR_SCROLL_SPEED"
+_DEFAULT_WHEEL_STEP_ROWS = 3
+_MIN_WHEEL_STEP_ROWS = 1
+_MAX_WHEEL_STEP_ROWS = 20
+_COPY_NOTICE_SECONDS = 1.5
+
+
+def _resolve_wheel_step_rows(raw_value: str | None = None) -> int:
+    raw = os.environ.get(_SCROLL_SPEED_ENV, "") if raw_value is None else raw_value
+    try:
+        parsed = int(str(raw or "").strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_WHEEL_STEP_ROWS
+    return max(_MIN_WHEEL_STEP_ROWS, min(parsed, _MAX_WHEEL_STEP_ROWS))
+
+
+def _resolve_tui_input(explicit_input: Any | None) -> tuple[Any, Any | None]:
+    """Prefer the controlling terminal when stdin is redirected through a pipe."""
+    if explicit_input is not None:
+        return explicit_input, None
+    created_input = create_input(always_prefer_tty=True)
+    return created_input, created_input
 
 
 class _ScrollableControl(FormattedTextControl):
@@ -243,9 +292,16 @@ class _ScrollableControl(FormattedTextControl):
     would otherwise override); other events fall through unchanged.
     """
 
-    def __init__(self, *args: Any, on_scroll: Callable[[int], None], **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        on_scroll: Callable[[int], None],
+        on_mouse_event: Callable[[Any], Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._on_scroll = on_scroll
+        self._on_mouse_event = on_mouse_event
 
     def mouse_handler(self, mouse_event: Any) -> Any:
         event_type = mouse_event.event_type
@@ -255,7 +311,149 @@ class _ScrollableControl(FormattedTextControl):
         if event_type == MouseEventType.SCROLL_DOWN:
             self._on_scroll(1)
             return None
+        if self._on_mouse_event is not None:
+            return self._on_mouse_event(mouse_event)
         return NotImplemented
+
+
+def _ordered_selection(anchor: Point, active: Point) -> tuple[Point, Point]:
+    if (anchor.y, anchor.x) <= (active.y, active.x):
+        return anchor, active
+    return active, anchor
+
+
+def _selection_span_for_row(
+    *,
+    row_index: int,
+    row_length: int,
+    anchor: Point,
+    active: Point,
+) -> tuple[int, int] | None:
+    if anchor == active:
+        return None
+    start, end = _ordered_selection(anchor, active)
+    if row_index < start.y or row_index > end.y:
+        return None
+    start_col = start.x if row_index == start.y else 0
+    end_col = end.x + 1 if row_index == end.y else row_length
+    start_col = max(0, min(start_col, row_length))
+    end_col = max(start_col, min(end_col, row_length))
+    return (start_col, end_col) if end_col > start_col else None
+
+
+def _selected_text(
+    rows: list[str],
+    anchor: Point,
+    active: Point,
+    *,
+    row_roles: list[str] | None = None,
+) -> str:
+    """Extract the selected transcript text.
+
+    ``row_roles`` is supplied by the live TUI and makes clipboard copies
+    semantic: only conversation/diagnostic rows are eligible, while provider
+    reasoning summaries, tool traces, Forge activity, and other UI chrome are
+    omitted. The optional default preserves the helper's plain-row behaviour for
+    callers that do not have transcript role metadata.
+    """
+    if not rows or anchor == active:
+        return ""
+    start, end = _ordered_selection(anchor, active)
+    first_row = max(0, min(start.y, len(rows) - 1))
+    last_row = max(first_row, min(end.y, len(rows) - 1))
+    pieces: list[str] = []
+    for row_index in range(first_row, last_row + 1):
+        row = rows[row_index]
+        role = None
+        if row_roles is not None:
+            role = row_roles[row_index] if row_index < len(row_roles) else ""
+            if role not in _COPYABLE_TRANSCRIPT_ROLES:
+                continue
+        span = _selection_span_for_row(
+            row_index=row_index,
+            row_length=len(row),
+            anchor=start,
+            active=end,
+        )
+        if span is None:
+            pieces.append("")
+            continue
+        piece = row[span[0] : span[1]].rstrip()
+        pieces.append(_strip_transcript_copy_chrome(piece, role=role))
+    return "\n".join(pieces).strip("\n")
+
+
+def _strip_transcript_copy_chrome(text: str, *, role: str | None = None) -> str:
+    """Remove Sylliptor-only prefixes from copied transcript rows."""
+    prefixes = (
+        "› ",
+        f"{_ASSIST_MARK} ",
+        f"{_THINK_OPEN} ",
+        f"{_THINK_CLOSED} ",
+        f"{_THINK_RAIL} ",
+    )
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            return text[len(prefix) :]
+    # Failed tool outcomes remain useful diagnostics even though successful tool
+    # trace rows are excluded. Remove their status decoration without treating a
+    # literal glyph in user/assistant content as chrome.
+    if role == "error" and text.startswith("✗ "):
+        return text[2:]
+    if role == "warn" and text.startswith("⚠ "):
+        return text[2:]
+    return text
+
+
+def _highlight_selection_in_row(
+    row: list[tuple[str, str]],
+    *,
+    row_index: int,
+    anchor: Point | None,
+    active: Point | None,
+) -> list[tuple[str, str]]:
+    if anchor is None or active is None:
+        return row
+    row_length = sum(len(text) for _style, text in row)
+    span = _selection_span_for_row(
+        row_index=row_index,
+        row_length=row_length,
+        anchor=anchor,
+        active=active,
+    )
+    if span is None:
+        return row
+    selection_start, selection_end = span
+    highlighted: list[tuple[str, str]] = []
+    cursor = 0
+    for style, text in row:
+        fragment_start = cursor
+        fragment_end = cursor + len(text)
+        overlap_start = max(fragment_start, selection_start)
+        overlap_end = min(fragment_end, selection_end)
+        if overlap_start >= overlap_end:
+            highlighted.append((style, text))
+        else:
+            before = text[: overlap_start - fragment_start]
+            selected = text[overlap_start - fragment_start : overlap_end - fragment_start]
+            after = text[overlap_end - fragment_start :]
+            if before:
+                highlighted.append((style, before))
+            highlighted.append((f"{style} class:tui.transcript.selection".strip(), selected))
+            if after:
+                highlighted.append((style, after))
+        cursor = fragment_end
+    return highlighted
+
+
+def _copy_selection_notice(selected: str) -> str:
+    """Copy a completed selection and return the transient status message."""
+    try:
+        copy_text_to_clipboard(selected)
+    except ClipboardError:
+        return "Selected text · clipboard unavailable"
+    unit = "character" if len(selected) == 1 else "characters"
+    return f"Copied {len(selected):,} {unit}"
 
 
 def _scroll_target(current_row: int, last_row: int, delta: int) -> tuple[int, bool]:
@@ -294,6 +492,26 @@ def _plain_role_rows(style: str, text: str, width: int) -> list[list[tuple[str, 
         for chunk in _wrap_line(sub, width):
             rows.append([(style, chunk)])
     return rows
+
+
+def _completion_menu_height(
+    rows: int,
+    *,
+    bottom_margin: int = _COMPLETION_MENU_BOTTOM,
+    max_height: int = _COMPLETION_MENU_MAX_HEIGHT,
+) -> int:
+    """Cap the slash menu so it stays above the input/footer chrome."""
+    available = max(1, int(rows) - int(bottom_margin) - 2)
+    return max(1, min(int(max_height), available))
+
+
+def _completion_menu_width(
+    cols: int,
+    *,
+    max_width: int = _COMPLETION_MENU_MAX_WIDTH,
+) -> int:
+    """Bound completion rows so long command help cannot overflow right."""
+    return max(20, min(int(max_width), max(20, int(cols) - 8)))
 
 
 def _assistant_rows(
@@ -348,23 +566,32 @@ def _reasoning_rows(
     spinner: str = "",
     elapsed: int = 0,
 ) -> list[list[tuple[str, str]]]:
-    """Render the model's reasoning ("thinking") as a dim aside under the question.
+    """Render a provider-generated reasoning summary as a dim aside.
 
     A header sits flush left, directly beneath the user's message: while ``live``
     it animates as ``⠋ thinking… Ns`` (the ``spinner`` char + ``elapsed`` seconds);
-    once closed it collapses to ``▸ thought for Ns`` (``▾`` when expanded). The body
-    is hung off a dim left rail ``│`` and shown while live, or when expanded with
-    Ctrl+R, so the reasoning never crowds out the reply.
+    once closed it collapses to a short header (expanded automatically for
+    ``/trace full``). Provider adapters never route raw or encrypted reasoning
+    through this renderer.
     """
     rail = "class:tui.transcript.reasoningmark"
     body = "class:tui.transcript.reasoning"
     show_body = live or expanded
     if live:
         lead = spinner or _THINK_OPEN
-        header = f"thinking… {elapsed}s" if elapsed else "thinking…"
+        header = f"reasoning summary… {elapsed}s" if elapsed else "reasoning summary…"
+    elif expanded:
+        lead = _THINK_OPEN
+        header = "reasoning summary"
     else:
-        lead = _THINK_OPEN if expanded else _THINK_CLOSED
-        header = f"thought for {secs}s" if secs else "thought"
+        lead = _THINK_CLOSED
+        preview = " ".join(str(text or "").split()) or "reasoning summary"
+        preview_limit = max(12, int(width) - 2)
+        header = (
+            preview
+            if len(preview) <= preview_limit
+            else preview[: max(1, preview_limit - 1)].rstrip() + "…"
+        )
     rows: list[list[tuple[str, str]]] = [[(rail, f"{lead} "), (body, header)]]
     if not show_body:
         return rows
@@ -388,9 +615,9 @@ def _activity_rows(spinner: str, label: str, elapsed: int) -> list[list[tuple[st
 # --------------------------------------------------------- live Forge view
 # These buckets MUST mirror cli_common._forge_task_status_counts (the authority for
 # the "N done · N failed · N remaining" summary) so a task's glyph never contradicts
-# the count: done = exactly "done", failure = the same 7 states, obsolete = the same
+# the count: done = completed/satisfied states, failure = the same states, obsolete = the same
 # 2. Everything else (planned/in_progress/…) is "remaining".
-_FORGE_DONE_STATES = {"done"}
+_FORGE_DONE_STATES = {"done", "already_satisfied"}
 _FORGE_FAIL_STATES = {
     "failed",
     "verify_failed",
@@ -399,6 +626,8 @@ _FORGE_FAIL_STATES = {
     "merge_conflict",
     "blocked_integration",
     "blocked",
+    "interrupted",
+    "cancelled",
 }
 _FORGE_OBSOLETE_STATES = {"superseded", "invalidated"}
 _FORGE_RUNNING_STATES = {"in_progress", "running", "executing", "active"}
@@ -966,6 +1195,49 @@ def _has_conversation(entries: list[tuple[str, str]]) -> bool:
     return any(role in ("user", "assistant") for role, _ in entries)
 
 
+def _duplicate_assistant_indices(
+    entries: list[tuple[str, str]], streaming_index: int | None
+) -> set[int]:
+    """Indices of completed assistant entries that verbatim-repeat the previous
+    assistant block within the same turn (the tracker resets at each ``user``
+    entry). A multi-step agent turn can re-stream the same answer across
+    continuation/tool steps; the transcript keeps each streamed block, so without
+    this the identical reply renders 2-3 times. The live (still-streaming) block
+    is never collapsed, and the comparison is whitespace-insensitive and purely
+    content-based — no model/provider-specific logic."""
+    skip: set[int] = set()
+    previous: str | None = None
+    for index, (role, text) in enumerate(entries):
+        if role == "user":
+            previous = None
+            continue
+        if role != "assistant":
+            continue
+        normalized = " ".join(str(text or "").split())
+        if not normalized:
+            continue
+        if streaming_index != index and previous == normalized:
+            skip.add(index)
+            continue
+        previous = normalized
+    return skip
+
+
+def _status_line_fragments(
+    *,
+    running: bool,
+    notice: str = "",
+    selection_available: bool = False,
+) -> FormattedText:
+    if running:
+        return FormattedText([("class:tui.status", "  Esc or Ctrl+C to interrupt")])
+    if notice.strip():
+        return FormattedText([("class:tui.status", f"  {notice.strip()}")])
+    if selection_available:
+        return FormattedText([("class:tui.status", "  ctrl+c to copy")])
+    return FormattedText([])
+
+
 def run_tui(
     state: TuiState,
     *,
@@ -984,6 +1256,9 @@ def run_tui(
     completer: Any | None = None,
     config_flow_factory: Callable[[], Any] | None = None,
     on_config_saved: Callable[[], bool | None] | None = None,
+    unavailable_message: str | None = None,
+    subscription_provider_id: str | None = None,
+    open_config_on_start: bool = False,
 ) -> tuple[Any, list[tuple[str, str]]]:
     """Run the full-screen TUI shell, optionally hosting a real agent session.
 
@@ -1013,6 +1288,14 @@ def run_tui(
     pipe input and a dummy output. ``background_turns=False`` runs turns inline
     (used by tests for deterministic ordering).
 
+    ``unavailable_message`` keeps the shell usable without constructing a model
+    session: plain prompts show that blocker, while native commands such as
+    ``/help`` and ``/config`` continue to work. The native ``/login`` picker returns
+    a sentinel result so the caller can perform browser login outside the terminal's
+    alternate screen. ``open_config_on_start`` opens the configuration overlay on
+    first paint (used after a successful login when model/reasoning selection is
+    still required).
+
     ``panel_providers`` maps a command name (e.g. ``"/status"``) to a callable
     ``provider(arg)`` returning a panel spec ``{"title", "hint"?, "sections"}``
     where ``sections`` is a list of :data:`PanelSection`, or ``None`` to decline.
@@ -1025,6 +1308,7 @@ def run_tui(
     """
     owl = load_owl_animation(color_enabled=owl_color)
     transcript = TuiTranscript()
+    wheel_step_rows = _resolve_wheel_step_rows()
 
     # ---- turn/run state (mutated across threads; guarded by simple flags) ----
     running: dict[str, bool] = {"on": False}
@@ -1037,7 +1321,7 @@ def run_tui(
     # (or send a message).
     scroll: dict[str, Any] = {"follow": True, "offset": 0}
     # ``started`` stamps the running turn so the status line can show elapsed
-    # time; ``reasoning_expanded`` toggles full vs collapsed thinking (Ctrl+R).
+    # time; ``reasoning_expanded`` is a local expansion override (Ctrl+R).
     run_box: dict[str, float] = {"started": 0.0}
     view: dict[str, bool] = {"reasoning_expanded": False}
     # Centered popup panel (the reusable /help recipe): ``on`` toggles the Float;
@@ -1086,7 +1370,7 @@ def run_tui(
         except Exception:
             return False
 
-    # ---- approval (centered modal popup; only reached when auto-approve is off) ----
+    # ---- approval (centered modal popup; only reached when approvals are set to ask) ----
     def _approval_ui(request: Any) -> Any:
         if not _app_running():
             return ApprovalDecision(allow=False)
@@ -1156,6 +1440,14 @@ def run_tui(
         fragments.append(("class:tui.heading", _content.HEADING_TEXT))
         fragments.append(("class:tui.credit", "  ·  " + _content.CREDIT_TEXT))
         fragments.append(("", "\n\n"))
+        if state.connection_status:
+            fragments.append(
+                (
+                    "class:tui.footer.mode.warn",
+                    _model_access_setup_hint(subscription_provider_id),
+                )
+            )
+            fragments.append(("", "\n\n"))
         fragments.append(("class:tui.hint", _content.HINT_TEXT))
         return FormattedText(fragments)
 
@@ -1170,6 +1462,15 @@ def run_tui(
         return max(0, int(time.monotonic() - started)) if started else 0
 
     _row_count = {"n": 0}
+    selection: dict[str, Any] = {
+        "anchor": None,
+        "active": None,
+        "dragging": False,
+        "rows": [],
+        "row_roles": [],
+        "width": None,
+    }
+    selection_notice: dict[str, Any] = {"text": "", "generation": 0}
     _role_styles = {
         "system": "class:tui.transcript.system",
         "trace": "class:tui.transcript.trace",
@@ -1181,19 +1482,34 @@ def run_tui(
     def _transcript_fragments() -> FormattedText:
         entries, status, streaming_index = transcript.snapshot()
         reasoning_index, reasoning_secs = transcript.reasoning_snapshot()
-        # Content width EXCLUDING the right scrollbar margin, so the full-width
-        # user bands never overflow into a wrapped extra row.
+        # Use the transcript's full content width so full-width user bands never
+        # overflow into a wrapped extra row.
         info = transcript_window.render_info
         if info is not None:
             width = info.window_width
         else:
             try:
-                width = max(1, get_app().output.get_size().columns - 1)
+                width = max(1, get_app().output.get_size().columns)
             except Exception:
                 width = 80
-        fragments: list[tuple[str, str]] = []
-        rows = 0
+        if selection["width"] not in {None, width}:
+            selection.update({"anchor": None, "active": None, "dragging": False})
+        selection["width"] = width
+        rendered_rows: list[list[tuple[str, str]]] = []
+        rendered_row_roles: list[str] = []
+        duplicate_assistant = _duplicate_assistant_indices(entries, streaming_index)
+        future_copyable_entries = [False] * len(entries)
+        seen_copyable_entry = False
+        for entry_index in range(len(entries) - 1, -1, -1):
+            future_copyable_entries[entry_index] = seen_copyable_entry
+            entry_role = entries[entry_index][0]
+            if entry_index not in duplicate_assistant and entry_role in _COPYABLE_TRANSCRIPT_ROLES:
+                seen_copyable_entry = True
         for index, (role, text) in enumerate(entries):
+            if index in duplicate_assistant:
+                # A re-emitted verbatim copy of the same answer (multi-step turn):
+                # render it once, drop the repeats.
+                continue
             if role == "user":
                 block = _user_band_rows(text, width)  # full-width highlighted band
             elif role == "assistant":
@@ -1203,27 +1519,33 @@ def run_tui(
                 block = _assistant_rows(text, width, markdown=done)
             elif role == "reasoning":
                 is_live = reasoning_index == index
+                expanded = view["reasoning_expanded"] or transcript.trace_level == "full"
                 block = _reasoning_rows(
                     text,
                     width,
                     live=is_live,
                     secs=reasoning_secs.get(index, 0),
-                    expanded=view["reasoning_expanded"],
+                    expanded=expanded,
                     spinner=_SPINNER_FRAMES[spinner["i"] % len(_SPINNER_FRAMES)] if is_live else "",
                     elapsed=_run_elapsed() if is_live else 0,
                 )
             else:
                 style = _role_styles.get(role, "")
                 block = _plain_role_rows(style, text, width)
-            for row in block:
-                fragments.extend(row)
-                fragments.append(("", "\n"))
-                rows += 1
+            rendered_rows.extend(block)
+            rendered_row_roles.extend([role] * len(block))
             # Blank spacer between blocks for readability (so the thinking aside
             # is not glued to the highlighted question box above it).
             if index != len(entries) - 1:
-                fragments.append(("", "\n"))
-                rows += 1
+                rendered_rows.append([])
+                # Preserve a single semantic paragraph break between copyable
+                # entries even when one or more non-copyable trace/reasoning
+                # blocks are displayed between them.
+                rendered_row_roles.append(
+                    "spacer"
+                    if role in _COPYABLE_TRANSCRIPT_ROLES and future_copyable_entries[index]
+                    else "chrome"
+                )
         # Live Forge execution view (the task table + phase/spinner line) while
         # /execute plan runs the swarm — and it stays frozen as the final table once
         # the run completes (until the next submission clears it). It replaces the
@@ -1236,12 +1558,11 @@ def run_tui(
             except Exception:
                 forge_elapsed = 0
             if entries:
-                fragments.append(("", "\n"))
-                rows += 1
-            for row in _forge_view_rows(forge_view, width, frame, forge_elapsed):
-                fragments.extend(row)
-                fragments.append(("", "\n"))
-                rows += 1
+                rendered_rows.append([])
+                rendered_row_roles.append("chrome")
+            forge_rows = _forge_view_rows(forge_view, width, frame, forge_elapsed)
+            rendered_rows.extend(forge_rows)
+            rendered_row_roles.extend(["forge"] * len(forge_rows))
         # Single live activity indicator under the content while the turn runs:
         # the model's current step — "thinking…" or the running tool name — with a
         # spinner + elapsed. Hidden while a reasoning block is itself live (it
@@ -1251,13 +1572,28 @@ def run_tui(
             frame = _SPINNER_FRAMES[spinner["i"] % len(_SPINNER_FRAMES)]
             label = status or "thinking…"
             if entries:
-                fragments.append(("", "\n"))
-                rows += 1
-            for row in _activity_rows(frame, label, _run_elapsed()):
-                fragments.extend(row)
-                fragments.append(("", "\n"))
-                rows += 1
-        _row_count["n"] = rows
+                rendered_rows.append([])
+                rendered_row_roles.append("chrome")
+            activity_rows = _activity_rows(frame, label, _run_elapsed())
+            rendered_rows.extend(activity_rows)
+            rendered_row_roles.extend(["activity"] * len(activity_rows))
+        plain_rows = [fragment_list_to_text(row) for row in rendered_rows]
+        selection["rows"] = plain_rows
+        selection["row_roles"] = rendered_row_roles
+        anchor = selection["anchor"]
+        active = selection["active"]
+        fragments: list[tuple[str, str]] = []
+        for row_index, row in enumerate(rendered_rows):
+            fragments.extend(
+                _highlight_selection_in_row(
+                    row,
+                    row_index=row_index,
+                    anchor=anchor,
+                    active=active,
+                )
+            )
+            fragments.append(("", "\n"))
+        _row_count["n"] = len(rendered_rows)
         return FormattedText(fragments)
 
     def _last_row() -> int:
@@ -1284,8 +1620,58 @@ def run_tui(
         scroll["offset"], scroll["follow"] = _scroll_target(current, _follow_top(), delta)
 
     def _wheel_scroll(direction: int) -> None:
-        _scroll_move(direction * _WHEEL_STEP_ROWS)
+        _scroll_move(direction * wheel_step_rows)
         _safe_invalidate()
+
+    def _show_selection_notice(message: str) -> None:
+        selection_notice["generation"] += 1
+        generation = selection_notice["generation"]
+        selection_notice["text"] = message
+        _safe_invalidate()
+
+        def _clear_notice() -> None:
+            time.sleep(_COPY_NOTICE_SECONDS)
+            if selection_notice["generation"] == generation:
+                selection_notice["text"] = ""
+                _safe_invalidate()
+
+        threading.Thread(target=_clear_notice, daemon=True).start()
+
+    def _copy_transcript_selection(selected: str) -> None:
+        _show_selection_notice(_copy_selection_notice(selected))
+
+    def _current_transcript_selection() -> str:
+        anchor = selection["anchor"]
+        active = selection["active"]
+        if anchor is None or active is None:
+            return ""
+        return _selected_text(
+            selection["rows"],
+            anchor,
+            active,
+            row_roles=selection["row_roles"],
+        )
+
+    def _transcript_mouse_event(mouse_event: Any) -> Any:
+        event_type = mouse_event.event_type
+        point = Point(x=max(0, mouse_event.position.x), y=max(0, mouse_event.position.y))
+        if event_type == MouseEventType.MOUSE_DOWN and mouse_event.button == MouseButton.LEFT:
+            selection.update({"anchor": point, "active": point, "dragging": True})
+            _safe_invalidate()
+            return None
+        if event_type == MouseEventType.MOUSE_MOVE and selection["dragging"]:
+            selection["active"] = point
+            _safe_invalidate()
+            return None
+        if event_type == MouseEventType.MOUSE_UP and selection["dragging"]:
+            selection["active"] = point
+            selection["dragging"] = False
+            selected = _current_transcript_selection()
+            if not selected:
+                selection.update({"anchor": None, "active": None})
+            _safe_invalidate()
+            return None
+        return NotImplemented
 
     transcript_window = Window(
         _ScrollableControl(
@@ -1294,13 +1680,14 @@ def run_tui(
             show_cursor=False,
             get_cursor_position=lambda: Point(x=0, y=_cursor_row()),
             on_scroll=_wheel_scroll,
+            on_mouse_event=_transcript_mouse_event,
         ),
         wrap_lines=True,
         # Huge bottom scroll-offset pins our "cursor" (the top visible row) to the
         # top of the viewport, so vertical_scroll tracks it 1:1 → exact, smooth
-        # scrolling (no cursor-visibility snap) and a correct scrollbar position.
+        # scrolling without cursor-visibility snap.
         scroll_offsets=ScrollOffsets(bottom=10**6),
-        right_margins=[ScrollbarMargin(display_arrows=False)],
+        right_margins=[ScrollbarMargin(display_arrows=True)],
     )
 
     def _scroll_page_rows() -> int:
@@ -1323,19 +1710,13 @@ def run_tui(
     def _status_text() -> FormattedText:
         # All "agent is working" feedback (thinking + running tool, with the one
         # timer) now lives in the transcript under the question via the live
-        # activity indicator. The footer only carries the scrolled-up hint and an
-        # interrupt reminder while busy, so there is never a second timer here.
-        if running["on"]:
-            return FormattedText([("class:tui.status", "  Esc or Ctrl+C to interrupt")])
-        if state.mouse_capture:
-            # Scroll mode (opt-in): the app owns the mouse, so native text
-            # selection is off — remind the user how to get it back for copying.
-            return FormattedText(
-                [("class:tui.status", "  wheel-scroll on · F2 to select & copy text")]
-            )
-        if not scroll["follow"] and transcript.entries:
-            return FormattedText([("class:tui.status", "  ↓ scrolled up — Ctrl+End for latest")])
-        return FormattedText([("", "")])
+        # activity indicator. This line only carries the interrupt reminder while
+        # busy, so there is never a second timer here.
+        return _status_line_fragments(
+            running=bool(running["on"]),
+            notice=str(selection_notice["text"] or ""),
+            selection_available=bool(_current_transcript_selection()),
+        )
 
     status_window = Window(FormattedTextControl(_status_text, focusable=False), height=1)
 
@@ -1363,6 +1744,12 @@ def run_tui(
             BeforeInput("> ", style="class:tui.prompt"),
         ],
     )
+    welcome_visible = Condition(
+        lambda: not _conversation_started() and input_area.buffer.complete_state is None
+    )
+    welcome_completion_blank = Condition(
+        lambda: not _conversation_started() and input_area.buffer.complete_state is not None
+    )
 
     # ---- turn execution ----
     def _current_width() -> int:
@@ -1377,13 +1764,14 @@ def run_tui(
         # soft-interrupted (and keeps blocking on a slow model in the background).
         set_active_cancellation(my_token)
         cancelled = my_token is not None and getattr(my_token, "is_cancelled", False)
-        # A forge /execute plan run carries a callable that runs the swarm (with the
-        # live forge view) on this worker thread instead of a normal agent turn.
-        # POP it (not get) so it never leaks into session.run_turn(**run_kwargs).
-        forge_execute = run_kwargs.pop("_forge_execute", None) if run_kwargs else None
+        # Commands that perform blocking work can provide a deferred callable.
+        # Pop it so private TUI orchestration never leaks into
+        # session.run_turn(**run_kwargs). The callable shares the normal turn's
+        # worker, cancellation token, HUD refresh, and teardown lifecycle.
+        deferred_execute = run_kwargs.pop("_deferred_execute", None) if run_kwargs else None
         try:
-            if callable(forge_execute):
-                forge_execute(my_token)
+            if callable(deferred_execute):
+                deferred_execute(my_token)
             else:
                 session.run_turn(instruction, cancellation_token=my_token, **run_kwargs)
         except KeyboardInterrupt:
@@ -1394,7 +1782,10 @@ def run_tui(
         except BaseException as exc:  # noqa: BLE001 - surface any failure inline
             cancelled = my_token is not None and my_token.is_cancelled
             if not cancelled:
-                transcript.append("error", f"{type(exc).__name__}: {exc}")
+                if isinstance(exc, LLMError) or is_network_or_model_error(str(exc)):
+                    transcript.append("error", friendly_llm_error_message(exc))
+                else:
+                    transcript.append("error", f"{type(exc).__name__}: {exc}")
         finally:
             # Only reset shared run state if we are still the active turn — a
             # soft-interrupt (or a newer turn) may have moved on while we were
@@ -1446,6 +1837,13 @@ def run_tui(
         if pending is not None:
             approval_box["decision"] = ApprovalDecision(allow=False)
             pending.set()
+        surface = getattr(session, "surface", None)
+        interrupt_forge = getattr(surface, "interrupt_forge", None)
+        if callable(interrupt_forge):
+            try:
+                interrupt_forge()
+            except Exception:
+                pass
         transcript.append("warn", "Interrupted.")
         running["on"] = False
         cancel_box["token"] = None
@@ -1507,6 +1905,12 @@ def run_tui(
             _open_help()
             return
 
+        login_parts = stripped.split(maxsplit=1)
+        if len(login_parts) == 2 and login_parts[0].lower() == "/login":
+            buff.reset()
+            get_app().exit(result=("login_connection", login_parts[1].strip()))
+            return
+
         # /clear is TUI-native (the classic command clears the console screen).
         if session is not None and stripped.lower() == "/clear":
             transcript.clear()
@@ -1553,6 +1957,7 @@ def run_tui(
                     # dialog: Enter runs it (e.g. the /forge intro enters Forge),
                     # Esc/q cancels. None for ordinary read-only panels.
                     confirm = spec.get("confirm")
+                    on_confirm = spec.get("on_confirm")
                     if editor_spec is not None:
                         # An editable document (e.g. /plan edit) opens the editor
                         # float instead of a read-only panel.
@@ -1565,6 +1970,7 @@ def run_tui(
                             title,
                             lambda width, _b=body, _h=hint: _render_doc_panel_rows(_b, width, _h),
                             confirm=confirm,
+                            on_confirm=on_confirm,
                         )
                     else:
                         sections = spec.get("sections") or []
@@ -1574,6 +1980,7 @@ def run_tui(
                                 _s, width, _h
                             ),
                             confirm=confirm,
+                            on_confirm=on_confirm,
                         )
                     return
                 # spec is None → not a panel for this argument; fall through below.
@@ -1616,9 +2023,14 @@ def run_tui(
             _begin_run(text, {})
             return
 
-        # Stub path (no agent session): echo + canned reply.
+        # Shell-only path: keep configuration/help available while model calls are
+        # blocked. Phase-1 tests still get the historical preview reply when no
+        # explicit blocker was supplied.
         transcript.append_user(text)
-        transcript.append("system", _PREVIEW_REPLY)
+        if unavailable_message:
+            transcript.append("warn", unavailable_message)
+        else:
+            transcript.append("system", _PREVIEW_REPLY)
         buff.reset()
         _safe_invalidate()
 
@@ -1634,7 +2046,8 @@ def run_tui(
 
     body = HSplit(
         [
-            ConditionalContainer(welcome_window, filter=no_messages),
+            ConditionalContainer(welcome_window, filter=welcome_visible),
+            ConditionalContainer(Window(), filter=welcome_completion_blank),
             ConditionalContainer(transcript_window, filter=has_messages),
         ]
     )
@@ -1688,16 +2101,17 @@ def run_tui(
 
     def _resolve_help_sections() -> list[HelpSection]:
         if help_sections is not None:
-            return help_sections
-        try:
-            from ..commands.welcome import _chat_command_sections
+            sections = list(help_sections)
+        else:
+            try:
+                from ..commands.welcome import _chat_command_sections
 
-            sections = _chat_command_sections(ui_mode="chat")
-            if sections:
-                return sections
-        except Exception:
-            pass
-        return _fallback_help_sections()
+                sections = list(_chat_command_sections(ui_mode="chat") or [])
+            except Exception:
+                sections = []
+            if not sections:
+                sections = _fallback_help_sections()
+        return sections
 
     def _help_fragments() -> FormattedText:
         # Read the panel's ACTUAL content width from render_info (exactly like the
@@ -1762,7 +2176,7 @@ def run_tui(
             focusable=True,
             show_cursor=False,
             get_cursor_position=lambda: Point(x=0, y=_help_cursor_row()),
-            on_scroll=lambda direction: _help_scroll(direction * _WHEEL_STEP_ROWS),
+            on_scroll=lambda direction: _help_scroll(direction * wheel_step_rows),
         ),
         # MUST be True: the cursor-pin scroll trick only works on prompt_toolkit's
         # line-wrapping scroll path (_scroll_when_linewrapping). With wrap_lines
@@ -1786,6 +2200,7 @@ def run_tui(
         builder: Callable[[int], list[list[tuple[str, str]]]],
         *,
         confirm: str | None = None,
+        on_confirm: Callable[[], Any] | None = None,
     ) -> None:
         # Open the centered popup with an arbitrary title + row-builder. /help and
         # every panel command (/status, …) route through here so there is one
@@ -1796,6 +2211,7 @@ def run_tui(
         help_box["title"] = title
         help_box["builder"] = builder
         help_box["confirm"] = confirm
+        help_box["on_confirm"] = on_confirm
         try:
             help_frame.title = title
         except Exception:
@@ -1817,6 +2233,7 @@ def run_tui(
             return
         help_box["on"] = False
         help_box["confirm"] = None
+        help_box["on_confirm"] = None
         try:
             get_app().layout.focus(input_area)
         except Exception:
@@ -1953,7 +2370,7 @@ def run_tui(
             transcript.append("error", f"selection failed: {exc}")
             result = None
         # on_select returns either a list of (role, text) messages to echo, or a
-        # dict {"messages"?: [...], "prefill"?: str, "submit"?: str}.
+        # dict {"messages"?: [...], "prefill"?: str, "submit"?: str, "exit"?: Any}.
         #   · ``prefill`` drops text into the input box (cursor at end, focused) so a
         #     picked option can be finished by typing — e.g. choosing a subagent
         #     prefills "/subagent <name> " ready for the task.
@@ -1962,12 +2379,17 @@ def run_tui(
         messages = result
         prefill: str | None = None
         submit: str | None = None
+        exit_result: Any | None = None
         if isinstance(result, dict):
             messages = result.get("messages")
             prefill = result.get("prefill")
             submit = result.get("submit")
+            exit_result = result.get("exit")
         for role, text in messages or []:
             transcript.append(role, text)
+        if exit_result is not None:
+            get_app().exit(result=exit_result)
+            return
         if submit is not None:
             try:
                 input_area.text = str(submit)
@@ -1989,6 +2411,74 @@ def run_tui(
                 pass
         scroll["follow"] = True
         _safe_invalidate()
+
+    def _defer_plan_mode_approval(
+        *,
+        user_message: str,
+        draft: str,
+        approved_instruction: str,
+    ) -> None:
+        task = " ".join(str(user_message or "").split())
+        _ = draft
+        preview = task if len(task) <= 72 else task[:69].rstrip() + "..."
+        rows: list[PickerRow] = [
+            {
+                "value": "approve",
+                "label": "Approve and execute",
+                "description": "Run the task immediately using this approved draft.",
+                "current": True,
+            },
+            {
+                "value": "propose",
+                "label": "Propose changes",
+                "description": "Edit the task text and draft again with your requested changes.",
+            },
+            {
+                "value": "discard",
+                "label": "Discard this plan",
+                "description": "Cancel this draft and return to chat.",
+            },
+        ]
+
+        def _on_select(value: Any) -> Any:
+            selected = str(value or "").strip().lower()
+            if selected == "approve":
+                instruction = str(approved_instruction or "")
+                if not instruction.strip():
+                    return [("error", "Approved plan was empty; nothing to execute.")]
+                label = (
+                    f"Executing approved plan: {preview}" if preview else "Executing approved plan."
+                )
+                transcript.append("system", label)
+                _begin_run(instruction, {})
+                return None
+            if selected == "propose":
+                prefill = f"/plan {task} " if task else "/plan "
+                return {
+                    "messages": [
+                        (
+                            "system",
+                            "Edit the /plan task with the requested changes, "
+                            "then press Enter to draft again.",
+                        )
+                    ],
+                    "prefill": prefill,
+                }
+            return [("system", "Discarded plan. What do you want to build next?")]
+
+        _open_picker(
+            {
+                "title": "Plan approval",
+                "hint": (
+                    "Up/Down move / 1 approve / 2 revise / 3 discard / Enter select / Esc cancel"
+                ),
+                "rows": rows,
+                "on_select": _on_select,
+            }
+        )
+
+    if surface is not None:
+        surface.defer_plan_mode_approval = _defer_plan_mode_approval
 
     # ---- in-TUI editor (centered Float; e.g. /plan edit on plan.json) ----
     _editor_open = Condition(lambda: editor_box["on"])
@@ -2192,18 +2682,55 @@ def run_tui(
         config_overlay.open_condition if config_overlay is not None else Condition(lambda: False)
     )
     _config_floats = [config_overlay.float] if config_overlay is not None else []
+    _small_modal_open = _help_open | _picker_open | _editor_open | _approval_pending
+    _completion_allowed = ~_small_modal_open & ~_config_open
+
+    def _completion_float_width() -> int:
+        try:
+            cols = get_app().output.get_size().columns
+        except Exception:
+            cols = 80
+        return _completion_menu_width(cols)
+
+    def _completion_float_height() -> int:
+        try:
+            rows = get_app().output.get_size().rows
+        except Exception:
+            rows = 24
+        return _completion_menu_height(rows)
+
+    completion_float = Float(
+        xcursor=True,
+        bottom=_COMPLETION_MENU_BOTTOM,
+        width=_completion_float_width,
+        height=_completion_float_height,
+        content=CompletionsMenu(
+            max_height=_COMPLETION_MENU_MAX_HEIGHT,
+            scroll_offset=1,
+            extra_filter=_completion_allowed,
+        ),
+    )
+    modal_scrim = Float(
+        content=ConditionalContainer(
+            Window(char=" ", style="class:tui.modal.scrim"),
+            filter=_small_modal_open,
+        ),
+        left=0,
+        right=0,
+        top=0,
+        bottom=0,
+    )
 
     root_container = FloatContainer(
         content=root,
         floats=[
-            # Slash-command dropdown, anchored at the cursor. The FloatContainer
-            # flips it above the input automatically when there is no room below
-            # (the input sits near the bottom), so it reads as a command palette.
-            Float(
-                xcursor=True,
-                ycursor=True,
-                content=CompletionsMenu(max_height=12, scroll_offset=1),
-            ),
+            # Slash-command dropdown: horizontally follows the cursor, but is
+            # vertically pinned above the input/footer chrome so it never eats the
+            # input frame border.
+            completion_float,
+            # Opaque backing for the smaller centered modals. /config already owns
+            # its full-screen opaque float; these panels need the same masking.
+            modal_scrim,
             help_float,
             picker_float,
             editor_float,
@@ -2222,9 +2749,7 @@ def run_tui(
     # A turn (or its pending approval) is in flight — Esc / Ctrl+C interrupt it.
     _turn_active = Condition(lambda: running["on"] or approval_box.get("event") is not None)
 
-    @kb.add("c-c")
-    @kb.add("c-d")
-    def _interrupt_or_exit(event: Any) -> None:
+    def _interrupt_or_exit(event: Any, *, copy_selection: bool) -> None:
         if config_overlay is not None and config_overlay.is_open():
             config_overlay.request_cancel()
             return
@@ -2240,7 +2765,26 @@ def run_tui(
         if running["on"] or approval_box.get("event") is not None:
             _soft_interrupt()
             return
+        if copy_selection:
+            selected = _current_transcript_selection()
+            if selected:
+                selection.update({"anchor": None, "active": None, "dragging": False})
+                threading.Thread(
+                    target=_copy_transcript_selection,
+                    args=(selected,),
+                    daemon=True,
+                ).start()
+                event.app.invalidate()
+                return
         event.app.exit(result=None)
+
+    @kb.add("c-c")
+    def _copy_interrupt_or_exit(event: Any) -> None:
+        _interrupt_or_exit(event, copy_selection=True)
+
+    @kb.add("c-d")
+    def _eof_or_exit(event: Any) -> None:
+        _interrupt_or_exit(event, copy_selection=False)
 
     # ---- in-TUI editor keys (only while the editor float is open) ----
     @kb.add("c-s", filter=_editor_open)
@@ -2269,7 +2813,7 @@ def run_tui(
 
     @kb.add(
         "enter",
-        filter=_input_focused & ~_approval_pending & ~_help_open & ~_config_open,
+        filter=_input_focused & ~_small_modal_open & ~_config_open,
         eager=True,
     )
     def _submit_key(event: Any) -> None:
@@ -2283,8 +2827,8 @@ def run_tui(
             return
         _submit()
 
-    @kb.add("c-j", filter=_input_focused & ~_help_open & ~_config_open)
-    @kb.add("escape", "enter", filter=_input_focused & ~_help_open & ~_config_open)
+    @kb.add("c-j", filter=_input_focused & ~_small_modal_open & ~_config_open)
+    @kb.add("escape", "enter", filter=_input_focused & ~_small_modal_open & ~_config_open)
     def _newline(event: Any) -> None:
         input_area.buffer.insert_text("\n")
 
@@ -2322,10 +2866,28 @@ def run_tui(
 
     @kb.add("enter", filter=_help_open, eager=True)
     def _help_confirm(event: Any) -> None:
-        # Enter closes the panel; for a confirm panel (e.g. the /forge intro) it
-        # also runs the stored command, so the popup reads as a begin/cancel dialog.
+        # Enter closes the panel. A callback may return transcript messages and
+        # optionally chain a picker; otherwise the stored command is dispatched.
         confirm = help_box.get("confirm")
+        on_confirm = help_box.get("on_confirm")
         _close_help()
+        if on_confirm is not None:
+            try:
+                result = on_confirm()
+            except Exception as exc:
+                transcript.append("error", f"Confirm action failed: {exc}")
+                result = None
+            messages = result
+            picker_spec: dict[str, Any] | None = None
+            if isinstance(result, dict):
+                messages = result.get("messages")
+                picker_spec = result.get("picker")
+            for role, text in messages or []:
+                transcript.append(role, text)
+            if picker_spec:
+                _open_picker(picker_spec)
+            _safe_invalidate()
+            return
         if confirm:
             _dispatch_command(str(confirm))
 
@@ -2395,13 +2957,6 @@ def run_tui(
         state.toggle_auto_approve()
         event.app.invalidate()
 
-    @kb.add("f2", filter=~_config_open, eager=True)
-    def _toggle_mouse_capture(event: Any) -> None:
-        # Release/recapture the mouse so the user can natively select + copy
-        # transcript text (mouse off) or scroll with the wheel (mouse on).
-        state.toggle_mouse_capture()
-        event.app.invalidate()
-
     @kb.add("y", filter=_approval_pending, eager=True)
     def _approve_yes(event: Any) -> None:
         _resolve_approval(allow=True)
@@ -2421,7 +2976,7 @@ def run_tui(
 
     @kb.add("c-r", filter=~_config_open, eager=True)
     def _toggle_reasoning(event: Any) -> None:
-        # Expand/collapse the model's reasoning ("thinking") blocks.
+        # Expand/collapse provider-generated reasoning-summary blocks.
         view["reasoning_expanded"] = not view["reasoning_expanded"]
         event.app.invalidate()
 
@@ -2470,22 +3025,26 @@ def run_tui(
         config_overlay.register(kb)
         _app_style = merge_styles([_STYLE, _SETUP_STYLE])
 
+    tui_input, owned_tui_input = _resolve_tui_input(input)
     app: Application = Application(
         layout=Layout(root_container, focused_element=input_area),
         key_bindings=kb,
         style=_app_style,
         full_screen=True,
-        # Dynamic: the app captures the mouse for wheel-scroll by default, but F2
-        # releases it so the terminal's native click-drag selection (and copy)
-        # works. Re-evaluated every render, so toggling takes effect live.
-        mouse_support=Condition(lambda: bool(state.mouse_capture)),
+        # Keep mouse reporting enabled so wheel events and drag selection are both
+        # handled by the virtualized transcript. Completed selections are copied
+        # automatically; Sylliptor does not claim a copy key binding.
+        mouse_support=True,
         cursor=CursorShape.BEAM,
-        input=input,
+        input=tui_input,
         output=output,
     )
 
     # ---- animation driver: owl while idle, spinner while a turn runs ----
     def _pre_run() -> None:
+        if open_config_on_start and config_overlay is not None:
+            config_overlay.open()
+
         def _spin() -> None:
             while getattr(app, "is_running", False):
                 time.sleep(0.1)
@@ -2507,7 +3066,11 @@ def run_tui(
 
         threading.Thread(target=_spin, daemon=True).start()
 
-    result = app.run(pre_run=_pre_run)
+    try:
+        result = app.run(pre_run=_pre_run)
+    finally:
+        if owned_tui_input is not None:
+            owned_tui_input.close()
 
     # Unwind any in-flight turn before returning so the caller can close the
     # session safely (no teardown racing a live worker). Cancel the turn, release

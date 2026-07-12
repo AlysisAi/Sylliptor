@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from sylliptor_agent_cli.cli import app as sylliptor_app
@@ -31,6 +32,24 @@ def _seed_profiles(tmp_path: Path, monkeypatch) -> None:
     add_profile(cfg, ProfileSpec(name="anthropic", base_url="https://api.anthropic.com/v1"))
     set_active_profile(cfg, "openai")
     save_config(cfg)
+
+
+def _seed_subscription_profile(tmp_path: Path, monkeypatch) -> ProfileSpec:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    profile = ProfileSpec(
+        name="chatgpt-codex",
+        protocol="openai_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        auth_provider="openai-codex",
+        default_model="gpt-5.4",
+        reasoning_effort="high",
+    )
+    cfg = AppConfig(model=profile.default_model)
+    cfg.extra_fields = {"profiles": {}, "active_profile": ""}
+    add_profile(cfg, profile)
+    set_active_profile(cfg, profile.name)
+    save_config(cfg)
+    return profile
 
 
 def test_profile_list_shows_profiles_with_active_marker(monkeypatch, tmp_path: Path) -> None:
@@ -71,6 +90,53 @@ def test_profile_add_creates_profile(monkeypatch, tmp_path: Path) -> None:
     assert "custom" in load_config().extra_fields["profiles"]
 
 
+def test_profile_add_accepts_safe_reasoning_trace_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    result = CliRunner().invoke(
+        sylliptor_app,
+        [
+            "profile",
+            "add",
+            "custom",
+            "--base-url",
+            "https://example.com/v1",
+            "--reasoning-trace-adapter",
+            "openrouter_reasoning",
+        ],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 0
+    profile = load_config().extra_fields["profiles"]["custom"]
+    assert profile["reasoning_trace_adapter"] == "openrouter_reasoning"
+
+
+def test_profile_add_cannot_overwrite_subscription_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original = _seed_subscription_profile(tmp_path, monkeypatch)
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        [
+            "profile",
+            "add",
+            original.name,
+            "--base-url",
+            "https://example.com/v1",
+        ],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 2
+    assert "managed by the 'openai-codex' subscription connection" in result.output
+    assert load_config().extra_fields["profiles"][original.name] == original.to_dict()
+
+
 def test_profile_remove_with_yes_skips_confirm(monkeypatch, tmp_path: Path) -> None:
     _seed_profiles(tmp_path, monkeypatch)
 
@@ -98,6 +164,32 @@ def test_profile_preset_clones_into_named_profile(monkeypatch, tmp_path: Path) -
     assert profile["base_url"] == "https://api.anthropic.com/v1"
     assert profile["default_model"] == "claude-sonnet-4-6"
     assert profile["extra_headers"] == {}
+
+
+def test_profile_preset_yes_cannot_overwrite_subscription_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original = _seed_subscription_profile(tmp_path, monkeypatch)
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        [
+            "profile",
+            "preset",
+            "openai-responses",
+            "--as",
+            original.name,
+            "--yes",
+        ],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 2
+    assert "cannot be overwritten through generic profile commands" in " ".join(
+        result.output.split()
+    )
+    assert load_config().extra_fields["profiles"][original.name] == original.to_dict()
 
 
 def test_profile_set_key_persists_per_profile(monkeypatch, tmp_path: Path) -> None:
@@ -181,6 +273,30 @@ def test_profile_convert_to_native_updates_protocol_without_exposing_key(
     assert profile["web_search_adapter"] == "anthropic_messages"
     assert profile["web_search_model"] == ""
     assert load_persisted_profile_keys()["anthropic"] == "sk-ant-test"
+
+
+def test_profile_convert_cannot_convert_subscription_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original = _seed_subscription_profile(tmp_path, monkeypatch)
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        [
+            "profile",
+            "convert",
+            original.name,
+            "--to",
+            "compatibility",
+            "--yes",
+        ],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 2
+    assert "cannot be converted through generic profile commands" in " ".join(result.output.split())
+    assert load_config().extra_fields["profiles"][original.name] == original.to_dict()
 
 
 def test_profile_convert_to_compatibility_updates_gemini_native_profile(

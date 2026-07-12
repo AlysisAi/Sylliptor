@@ -6,9 +6,12 @@ no real terminal is required (works in CI / on Windows).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from sylliptor_agent_cli.cli_impl.tui import run_tui
+from sylliptor_agent_cli.cli_impl.tui.app import _model_access_setup_hint
 from sylliptor_agent_cli.cli_impl.tui.config import is_tui_enabled
 from sylliptor_agent_cli.cli_impl.tui.content import (
     HEADING_TEXT,
@@ -61,6 +64,13 @@ def test_input_placeholder_is_sylliptor_greeting():
     assert "coding buddy" in INPUT_PLACEHOLDER
 
 
+def test_disconnected_landing_uses_one_neutral_model_access_instruction():
+    hint = _model_access_setup_hint("openai-codex")
+
+    assert hint == "Set up model access: /login to choose a connection · /config for an API key"
+    assert "subscription not connected" not in hint
+
+
 @pytest.mark.parametrize(
     "model,expected",
     [
@@ -83,10 +93,10 @@ def test_footer_auto_on():
     text = _plain(footer_fragments(state, width=90))
     assert "sylliptor" in text
     assert "DeepSeek Chat" in text
-    assert "context 100%" in text
-    assert "0 tokens" in text and "$0.0000" in text
+    assert "ctx 100% left" in text
+    assert "session 0 tok" in text and "$0.0000" in text
     assert "perdikis" in text
-    assert "auto-approve on" in text and "shift+tab" in text
+    assert "sensitive: auto" in text and "shift+tab" in text
     # Distinct from Cline: no "(0)", no "▶▶", no Plan/Act toggle.
     assert "(0)" not in text
     assert "▶▶" not in text
@@ -96,7 +106,22 @@ def test_footer_auto_on():
 def test_footer_auto_off():
     state = TuiState(model_name="deepseek-chat", username="perdikis", auto_approve=False)
     text = _plain(footer_fragments(state, width=90))
-    assert "auto-approve off" in text
+    assert "sensitive: ask" in text
+    assert "auto-approve off" not in text
+
+
+def test_footer_fast_mode_with_manual_sensitive_approvals_is_not_contradictory():
+    state = TuiState(
+        model_name="deepseek-chat",
+        exec_mode="auto",
+        username="perdikis",
+        auto_approve=False,
+    )
+    text = _plain(footer_fragments(state, width=100))
+
+    assert "fast" in text
+    assert "sensitive: ask" in text
+    assert "auto-approve off" not in text
 
 
 def test_footer_shows_workspace_and_branch():
@@ -116,7 +141,48 @@ def test_footer_context_indicator_value():
     text = _plain(
         footer_fragments(TuiState(model_name="m", username="u", context_pct=42.0), width=90)
     )
-    assert "context 42%" in text
+    assert "ctx 42% left" in text
+
+
+def test_footer_usage_hud_off_hides_usage_metrics():
+    text = _plain(
+        footer_fragments(
+            TuiState(
+                model_name="deepseek-chat",
+                username="perdikis",
+                usage_hud_enabled=False,
+                context_pct=42.0,
+                tokens=1234,
+                cost_usd=0.25,
+            ),
+            width=90,
+        )
+    )
+    line1 = text.split("\n")[0]
+    assert "DeepSeek Chat" in line1
+    assert "ctx " not in line1
+    assert "session " not in line1
+    assert "$" not in line1
+
+
+def test_tui_session_state_sync_updates_local_command_footer_state():
+    from sylliptor_agent_cli.cli_impl.chat.loop import _sync_tui_session_state
+
+    state = TuiState(
+        model_name="m",
+        username="u",
+        exec_mode="review",
+        usage_hud_enabled=True,
+    )
+    session = SimpleNamespace(
+        mode="auto",
+        _usage_hud_enabled=False,
+    )
+
+    _sync_tui_session_state(state, session, include_exec_mode=True)
+
+    assert state.exec_mode == "auto"
+    assert state.usage_hud_enabled is False
 
 
 def test_footer_forge_badge_hidden_by_default():
@@ -156,8 +222,8 @@ def test_footer_is_two_lines_and_right_aligned():
     assert len(lines) == 2
     assert lines[0].rstrip().endswith("$0.0000")  # cost right-aligned, line 1
     assert lines[0].startswith("◇ sylliptor")  # brand mark + wordmark, line 1 left
-    assert "1,234 tokens" in lines[0]  # spelled + comma-grouped
-    assert lines[1].startswith("u")  # username left, line 2
+    assert "session 1,234 tok" in lines[0]  # labeled + comma-grouped
+    assert "u" in lines[1]  # username still present on line 2
     assert lines[1].rstrip().endswith("shift+tab")  # hint right-aligned, line 2
 
 
@@ -215,38 +281,124 @@ def test_app_records_submission_then_exits():
     assert result == "/exit"
 
 
+def test_app_without_session_surfaces_model_blocker():
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    state = TuiState(
+        model_name="gpt-codex-test",
+        connection_status="subscription not connected",
+    )
+    with create_pipe_input() as pipe:
+        pipe.send_text("hello there\r/exit\r")
+        result, transcript = run_tui(
+            state,
+            owl_color=False,
+            input=pipe,
+            output=DummyOutput(),
+            unavailable_message="Connect the selected subscription before sending a message.",
+        )
+
+    assert result == "/exit"
+    assert ("user", "hello there") in transcript
+    assert (
+        "warn",
+        "Connect the selected subscription before sending a message.",
+    ) in transcript
+    assert ("system", "TUI preview - no agent session attached.") not in transcript
+
+
+def test_app_login_picker_exits_with_selected_connection():
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    state = TuiState(connection_status="subscription not connected")
+    with create_pipe_input() as pipe:
+        pipe.send_text("/login\r2")
+        result, transcript = run_tui(
+            state,
+            owl_color=False,
+            input=pipe,
+            output=DummyOutput(),
+            picker_providers={
+                "/login": lambda: {
+                    "title": "Log in",
+                    "rows": [
+                        {"label": "Sylliptor", "value": "sylliptor"},
+                        {"label": "ChatGPT Codex", "value": "openai-codex"},
+                    ],
+                    "on_select": lambda value: {
+                        "exit": ("login_connection", value),
+                    },
+                }
+            },
+        )
+
+    assert result == ("login_connection", "openai-codex")
+    assert transcript == []
+
+
+def test_app_explicit_login_connection_exits_for_browser_flow():
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    with create_pipe_input() as pipe:
+        pipe.send_text("/login sylliptor\r")
+        result, _transcript = run_tui(
+            TuiState(),
+            owl_color=False,
+            input=pipe,
+            output=DummyOutput(),
+        )
+
+    assert result == ("login_connection", "sylliptor")
+
+
 def test_app_shift_tab_toggles_auto_approve_then_exits():
     state = TuiState(model_name="deepseek-chat", username="t", auto_approve=True)
-    # Shift+Tab toggles auto-approve off, then exit.
+    # Shift+Tab changes approval prompts from auto-allow to ask, then exits.
     _run_headless(state, "\x1b[Z/exit\r")
     assert state.auto_approve is False
 
 
-# --------------------------- mouse capture / copy-paste ---------------------------
+# --------------------------- mouse wheel / status line ---------------------------
 
 
-def test_toggle_mouse_capture():
+def test_tui_state_has_no_mouse_mode_toggle():
     state = TuiState(model_name="m")
-    assert state.mouse_capture is False  # selection/copy works by default
-    assert state.toggle_mouse_capture() is True  # opt into wheel-scroll
-    assert state.mouse_capture is True
-    assert state.toggle_mouse_capture() is False
+    assert not hasattr(state, "terminal_selection_mode")
+    assert not hasattr(state, "toggle_terminal_selection_mode")
 
 
 def test_footer_omits_mouse_mode_chip():
-    # The "copy (F2: scroll)" / "scroll (F2: copy)" chip was removed from the footer
-    # as bottom-right noise; the F2 key still toggles the mode. Neither phrasing of
-    # the chip should appear, in either mouse mode, and "shift+tab" stays the tail.
     default = _plain(footer_fragments(TuiState(model_name="m", username="u"), width=120))
     line2 = default.split("\n")[1]
-    assert "F2" not in line2
-    assert "copy (F2: scroll)" not in line2
     assert line2.rstrip().endswith("shift+tab")
-    scroll = _plain(
-        footer_fragments(TuiState(model_name="m", username="u", mouse_capture=True), width=120)
+    assert "F2" not in line2
+
+
+def test_footer_omits_repeated_connection_status():
+    state = TuiState(
+        model_name="gpt-codex-test",
+        username="u",
+        connection_status="subscription not connected",
     )
-    assert "F2" not in scroll.split("\n")[1]
-    assert "scroll (F2: copy)" not in scroll
+    line1 = _plain(footer_fragments(state, width=140)).split("\n")[0]
+    assert "subscription not connected" not in line1
+    assert "GPT Codex Test" in line1
+
+
+def test_status_line_is_blank_when_idle_and_shows_interrupt_when_running():
+    from sylliptor_agent_cli.cli_impl.tui.app import _status_line_fragments
+
+    assert _plain(_status_line_fragments(running=False)) == ""
+    assert "Copied 12 characters" in _plain(
+        _status_line_fragments(running=False, notice="Copied 12 characters")
+    )
+    assert "ctrl+c to copy" in _plain(
+        _status_line_fragments(running=False, selection_available=True)
+    )
+    assert "Esc or Ctrl+C to interrupt" in _plain(_status_line_fragments(running=True))
 
 
 def test_footer_cost_unknown_shows_na():
@@ -263,14 +415,6 @@ def test_footer_cost_known_shows_dollars():
     line1 = _plain(footer_fragments(state, width=120)).split("\n")[0]
     assert "$0.1234" in line1
     assert "n/a" not in line1
-
-
-def test_app_f2_toggles_mouse_capture_then_exits():
-    state = TuiState(model_name="deepseek-chat", username="t")
-    assert state.mouse_capture is False
-    # F2 (\x1bOQ) opts into wheel-scroll (mouse captured), then exit.
-    _run_headless(state, "\x1bOQ/exit\r")
-    assert state.mouse_capture is True
 
 
 # --------------------------- welcome landing vs startup notices ---------------------------

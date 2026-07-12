@@ -15,8 +15,13 @@ from sylliptor_agent_cli.agent.turn.core import (
 from sylliptor_agent_cli.agent_loop import SYSTEM_PROMPT, ToolDef, build_tools, create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.execution_deadline import ExecutionDeadline
+from sylliptor_agent_cli.profiles import ProfileSpec
 from sylliptor_agent_cli.runtime_kind import RuntimeKind
-from sylliptor_agent_cli.step_budget import StepBudgetRuntime
+from sylliptor_agent_cli.step_budget import (
+    StepBudgetRequest,
+    StepBudgetRuntime,
+    resolve_step_budget,
+)
 from sylliptor_agent_cli.subagents import (
     SubagentDefinition,
     built_in_subagents,
@@ -295,6 +300,7 @@ def _build_main_tools(
     max_steps: int = 8,
     step_budget_runtime: StepBudgetRuntime | None = None,
     execution_deadline: ExecutionDeadline | None = None,
+    api_key: str = "test-key",
 ) -> dict[str, ToolDef]:
     recording_store = store or _RecordingStore()
     effective_cfg = cfg or AppConfig(model="test-model")
@@ -306,7 +312,7 @@ def _build_main_tools(
         mode=mode,
         yes=True,
         cfg=effective_cfg,
-        api_key="test-key",
+        api_key=api_key,
         max_steps=max_steps,
         subagents_enabled=subagents_enabled,
         subagent_depth=subagent_depth,
@@ -493,6 +499,57 @@ def test_subagent_allowlist_denylist_and_default_readonly_mode(
     }
     catalog_payload = _last_store_event_payload(recording_store, "subagent_tool_catalog")
     assert catalog_payload["tool_names"] == ["fs_read"]
+
+
+def test_subscription_profile_can_launch_subagent_without_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+    fake_sub_session = _FakeSubSession(
+        tools=_readonly_subagent_tools(),
+        messages=[{"role": "assistant", "content": "Subscription subagent result"}],
+    )
+
+    def _fake_create_session(**kwargs: Any) -> _FakeSubSession:
+        captured_kwargs.update(kwargs)
+        return fake_sub_session
+
+    monkeypatch.setattr(agent_loop, "create_session", _fake_create_session)
+    profile = ProfileSpec(
+        name="chatgpt-codex",
+        protocol="openai_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        auth_provider="openai-codex",
+        default_model="gpt-codex-test",
+    )
+    cfg = AppConfig(model=profile.default_model)
+    cfg.extra_fields = {
+        "profiles": {profile.name: profile.to_dict()},
+        "active_profile": profile.name,
+    }
+    registry = {
+        "sandboxed": SubagentDefinition(
+            name="sandboxed",
+            description="subscription-backed test agent",
+            system_prompt="Inspect the repository.",
+            mode="readonly",
+            allow_tools=("fs_read",),
+        )
+    }
+    tools = _build_main_tools(
+        tmp_path=tmp_path,
+        subagents_enabled=True,
+        subagent_registry=registry,
+        cfg=cfg,
+        api_key="",
+    )
+
+    result = tools["subagent_run"].run({"name": "sandboxed", "task": "Inspect repository"})
+
+    assert result["result"] == "Subscription subagent result"
+    assert captured_kwargs["api_key_override"] is None
+    assert captured_kwargs["cfg"].extra_fields["active_profile"] == profile.name
 
 
 def test_subagent_result_prefers_final_store_event_over_assistant_transcript(
@@ -900,19 +957,11 @@ def test_subagent_definition_mode_is_capped_by_parent_mode(
     assert captured_kwargs["mode"] == "review"
 
 
-@pytest.mark.parametrize(
-    ("subagent_name", "expected_max_steps"),
-    [
-        ("explorer", 12),
-        ("reviewer", 10),
-        ("test-strategist", 11),
-    ],
-)
-def test_subagent_profile_defaults_use_adaptive_budgets(
+@pytest.mark.parametrize("subagent_name", ["explorer", "reviewer", "test-strategist"])
+def test_subagent_profiles_default_to_autonomous_unlimited_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     subagent_name: str,
-    expected_max_steps: int,
 ) -> None:
     captured_kwargs: dict[str, Any] = {}
 
@@ -922,12 +971,25 @@ def test_subagent_profile_defaults_use_adaptive_budgets(
 
     monkeypatch.setattr(agent_loop, "create_session", _fake_create_session)
 
+    cfg = AppConfig(model="test-model")
+    expected_resolution = resolve_step_budget(
+        StepBudgetRequest(
+            kind="subagent",
+            policy=cfg.step_budget_policy,
+            hard_cap=cfg.subagent_max_steps,
+            mode="readonly",
+            subagent_name=subagent_name,
+            parent_turn_budget=20,
+            explicit_path_count=0,
+        )
+    )
     recording_store = _RecordingStore()
     tools = _build_main_tools(
         tmp_path=tmp_path,
         subagents_enabled=True,
         subagent_registry=built_in_subagents(),
         store=recording_store,
+        cfg=cfg,
         max_steps=40,
         step_budget_runtime=StepBudgetRuntime(active_turn_budget=20),
     )
@@ -936,11 +998,14 @@ def test_subagent_profile_defaults_use_adaptive_budgets(
     start_payload = _last_store_event_payload(recording_store, "subagent_start")
 
     assert result["result"] == "subagent final"
-    assert captured_kwargs["max_steps"] == expected_max_steps
+    assert captured_kwargs["max_steps"] == expected_resolution.resolved_max_steps
     assert captured_kwargs["enable_chat_turn_step_budget"] is False
-    assert start_payload["max_steps"] == expected_max_steps
+    assert start_payload["max_steps"] == expected_resolution.resolved_max_steps
     assert start_payload["parent_turn_budget"] == 20
-    assert start_payload["step_budget"]["reason"] == "adaptive_subagent"
+    assert captured_kwargs["max_steps"] is None
+    assert start_payload["max_steps"] is None
+    assert start_payload["step_budget"]["unlimited"] is True
+    assert start_payload["step_budget"]["reason"] == "autonomous_unbounded"
     assert start_payload["step_budget"]["profile"] == subagent_name
 
 
@@ -974,11 +1039,11 @@ def test_subagent_explicit_max_steps_uses_fixed_override_semantics(
     assert captured_kwargs["max_steps"] == 7
     assert start_payload["max_steps"] == 7
     assert start_payload["step_budget"]["resolved_max_steps"] == 7
-    assert start_payload["step_budget"]["reason"] == "fixed_override"
+    assert start_payload["step_budget"]["reason"] == "explicit_limit"
     assert start_payload["step_budget"]["override_applied"] is True
 
 
-def test_subagent_budget_clamps_to_cfg_subagent_cap(
+def test_autonomous_subagent_ignores_legacy_configured_cap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1004,13 +1069,14 @@ def test_subagent_budget_clamps_to_cfg_subagent_cap(
     _ = tools["subagent_run"].run({"name": "explorer", "task": "Inspect repository"})
     start_payload = _last_store_event_payload(recording_store, "subagent_start")
 
-    assert captured_kwargs["max_steps"] == 9
-    assert start_payload["max_steps"] == 9
-    assert start_payload["step_budget"]["hard_cap"] == 9
-    assert start_payload["step_budget"]["resolved_max_steps"] == 9
+    assert captured_kwargs["max_steps"] is None
+    assert start_payload["max_steps"] is None
+    assert start_payload["step_budget"]["hard_cap"] is None
+    assert start_payload["step_budget"]["resolved_max_steps"] is None
+    assert start_payload["step_budget"]["unlimited"] is True
 
 
-def test_subagent_budget_clamps_to_active_parent_turn_budget(
+def test_autonomous_subagent_is_not_capped_by_parent_turn_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1035,13 +1101,13 @@ def test_subagent_budget_clamps_to_active_parent_turn_budget(
     _ = tools["subagent_run"].run({"name": "explorer", "task": "Inspect repository"})
     start_payload = _last_store_event_payload(recording_store, "subagent_start")
 
-    assert captured_kwargs["max_steps"] == 10
+    assert captured_kwargs["max_steps"] is None
     assert start_payload["parent_turn_budget"] == 10
-    assert start_payload["step_budget"]["hard_cap"] == 10
-    assert start_payload["step_budget"]["resolved_max_steps"] == 10
+    assert start_payload["step_budget"]["hard_cap"] is None
+    assert start_payload["step_budget"]["resolved_max_steps"] is None
 
 
-def test_subagent_budget_falls_back_to_parent_session_max_steps_without_active_turn_budget(
+def test_autonomous_subagent_remains_unlimited_without_active_parent_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1066,10 +1132,10 @@ def test_subagent_budget_falls_back_to_parent_session_max_steps_without_active_t
     _ = tools["subagent_run"].run({"name": "explorer", "task": "Inspect repository"})
     start_payload = _last_store_event_payload(recording_store, "subagent_start")
 
-    assert captured_kwargs["max_steps"] == 10
+    assert captured_kwargs["max_steps"] is None
     assert start_payload["parent_turn_budget"] == 10
-    assert start_payload["step_budget"]["hard_cap"] == 10
-    assert start_payload["step_budget"]["resolved_max_steps"] == 10
+    assert start_payload["step_budget"]["hard_cap"] is None
+    assert start_payload["step_budget"]["resolved_max_steps"] is None
 
 
 def test_subagent_start_payload_includes_step_budget_metadata(
@@ -1081,12 +1147,25 @@ def test_subagent_start_payload_includes_step_budget_metadata(
 
     monkeypatch.setattr(agent_loop, "create_session", _fake_create_session)
 
+    cfg = AppConfig(model="test-model")
+    expected_resolution = resolve_step_budget(
+        StepBudgetRequest(
+            kind="subagent",
+            policy=cfg.step_budget_policy,
+            hard_cap=cfg.subagent_max_steps,
+            mode="readonly",
+            subagent_name="test-strategist",
+            parent_turn_budget=20,
+            explicit_path_count=2,
+        )
+    )
     recording_store = _RecordingStore()
     tools = _build_main_tools(
         tmp_path=tmp_path,
         subagents_enabled=True,
         subagent_registry=built_in_subagents(),
         store=recording_store,
+        cfg=cfg,
         max_steps=40,
         step_budget_runtime=StepBudgetRuntime(active_turn_budget=20),
     )
@@ -1099,7 +1178,7 @@ def test_subagent_start_payload_includes_step_budget_metadata(
     )
     start_payload = _last_store_event_payload(recording_store, "subagent_start")
 
-    assert start_payload["max_steps"] == 13
+    assert start_payload["max_steps"] == expected_resolution.resolved_max_steps
     assert start_payload["parent_turn_budget"] == 20
     assert start_payload["step_budget"]["kind"] == "subagent"
     assert start_payload["step_budget"]["profile"] == "test-strategist"

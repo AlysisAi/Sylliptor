@@ -3,13 +3,16 @@ from __future__ import annotations
 import copy
 import json
 import re
+import shlex
 from collections.abc import Collection
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import count
 from time import perf_counter
 from typing import Any, Literal
 
 from ...config import resolve_role_temperature
+from ...error_text import sanitize_error_text_for_output, sanitize_optional_error_summary
 from ...execution_deadline import (
     MINIMUM_LLM_START_SECONDS,
     MINIMUM_TOOL_START_SECONDS,
@@ -18,14 +21,29 @@ from ...execution_deadline import (
     DeadlinePhase,
     temporarily_clamp_client_timeout,
 )
+from ...failure_category import classify_failure_category, is_context_window_exceeded_error
+from ...llm.base import effective_tools_for_client
 from ...llm.metadata import assistant_message_from_response
 from ...llm.types import LLMError
 from ...runtime_kind import RuntimeKind
-from ...step_budget import StepBudgetRequest, resolve_step_budget
+from ...step_budget import StepBudgetRequest, resolve_step_budget, step_budget_is_autonomous
 from ...subagents import SubagentDefinition, canonical_subagent_name, normalize_subagent_mode
 from ...surface import NoopSurface, ToolEndEvent, ToolOutputEvent, ToolStartEvent
 from ...surface.base import Surface
-from ...tools.availability import is_tool_unavailable_result, unavailable_tool_result
+from ...task_scope import (
+    inspect_existing_test_edits,
+    inspect_workspace_git_diff,
+    resolve_workspace_git_base,
+    restore_existing_test_paths,
+)
+from ...tools.availability import (
+    WEB_TOOL_NAMES,
+    is_recoverable_web_error_result,
+    is_recoverable_web_tool_error,
+    is_tool_unavailable_result,
+    unavailable_tool_result,
+    web_unavailable_result,
+)
 from ...tools.fs import FsError
 from ...tools.git import GitError
 from ...tools.history import HistorySearchError
@@ -37,8 +55,6 @@ from ...tools.registry import (
 from ...tools.search import SearchError
 from ...tools.shell import ShellError
 from ...tools.symbols import SymbolSearchError
-from ...tools.web import WebFetchError
-from ...tools.web_search import WebSearchError
 from ...turn_intent import (
     classify_local_materialization_requirement,
 )
@@ -46,7 +62,6 @@ from ...turn_intent import (
     classify_repo_execution_intent as _classify_one_shot_repo_turn_intent,
 )
 from ...turn_intent import normalize_turn_intent_text as _normalize_marker_text
-from ...usage_tracker import build_usage_record
 from ...verify_gate import VerifyError
 from .. import _patchable
 from ..acceptance_contract import (
@@ -58,13 +73,12 @@ from ..completion_gate import (
     NON_FINAL_PROGRESS_PROBLEM,
     NON_FINAL_PROGRESS_STAGE,
     CompletionGateDecision,
-    CompletionGateDecisionKind,
     build_completion_gate_snapshot,
     completion_gate_decision_payload,
     decide_completion_gate,
     record_completion_gate_decision,
 )
-from ..errors import AgentRuntimeError
+from ..errors import AgentRuntimeError, ApprovalDeclinedError
 from ..prompt_context import (
     _IMAGE_ATTACHMENT_TURN_SYSTEM_HINT,
     MAX_POST_EXPLORE_ANCHOR_PATHS,
@@ -120,13 +134,14 @@ from ..verification import (
     _completion_gate_problem_summary,
     _completion_gate_problems,
     _completion_gate_repair_stage,
-    _completion_gate_step_budget_exhausted_message,
-    _completion_gate_terminal_failure_message,
     _extract_touched_repo_paths,
+    _fresh_executed_evidence_for_claim,
+    _live_background_process_finalization_advisory_line,
     _record_tool_effect,
     _refresh_execute_turn_verification_selection,
     _runtime_message,
     _sorted_missing_verification_commands,
+    _successful_verification_claim_kind,
     _verification_expected_for_turn,
 )
 from .events import (
@@ -154,6 +169,7 @@ from .exploration import (
     _one_shot_progress_fingerprint,
     _tool_call_retry_key,
 )
+from .interventions import ControllerInterventionTracker
 from .read_cache import (
     _maybe_reuse_same_batch_read_result,
     _remember_same_batch_read_result,
@@ -162,16 +178,16 @@ from .read_cache import (
 )
 
 MAX_IDENTICAL_TOOL_CALL_FAILURES = 2
-MAX_NON_FINAL_CONTINUATIONS_PER_TURN = 2
+MAX_NON_FINAL_CONTINUATIONS_PER_TURN = 1
 MAX_EXPLORATION_ONLY_STEPS_BEFORE_NUDGE = 6
 MAX_IDENTICAL_EXPLORATION_ATTEMPTS = 3
-MAX_EXPLORATION_NUDGES_PER_TURN = 2
-MAX_POST_EXPLORE_BOOTSTRAP_NUDGES_PER_TURN = 2
+MAX_EXPLORATION_NUDGES_PER_TURN = 1
+MAX_POST_EXPLORE_BOOTSTRAP_NUDGES_PER_TURN = 1
+MAX_STAGNATION_NUDGES_PER_TURN = 2
 MAX_FAILED_EDIT_STEPS_BEFORE_NUDGE = 2
 MAX_IDENTICAL_FAILED_EDIT_ATTEMPTS = 2
-MAX_EDIT_NUDGES_PER_TURN = 2
+MAX_EDIT_NUDGES_PER_TURN = 1
 MAX_EMPTY_RESPONSE_ANOMALY_RECOVERIES = 2
-_ADAPTIVE_RETRY_TEMPERATURE = 0.5
 _FORCED_FINAL_SUMMARY_SYSTEM_PROMPT_TEMPLATE = """The current turn is stopping now.
 
 Stop reason: {termination_cause}
@@ -206,14 +222,6 @@ Recent path anchors: {anchor_paths}"""
 _SUBAGENT_REQUIRED_NUDGE_TEMPLATE = """The current user request explicitly asked for subagent or delegation behavior, but this turn has not attempted subagent_run yet.
 Use the next tool-enabled step to call subagent_run with the best registered subagent and a self-contained task brief. If subagent_run is unavailable or fails, report that concrete blocker instead of finalizing as if delegation happened.
 Available subagents: {available_subagents}"""
-_SUBAGENT_REQUIRED_RETRY_EXHAUSTED_MESSAGE = (
-    "The user explicitly requested subagent delegation, but the turn reached the retry limit "
-    "without any subagent_run attempt."
-)
-_SUBAGENT_REQUEST_UNAVAILABLE_MESSAGE_TEMPLATE = (
-    "Subagents were explicitly requested, but subagent_run is unavailable for this session "
-    "({reason}). Enable subagents for a top-level session and retry."
-)
 _CLARIFICATION_ONLY_RE = re.compile(
     r"(?:\?|"
     r"\b(?:clarify|clarification|which|what|where|who|when|could you provide|"
@@ -222,12 +230,63 @@ _CLARIFICATION_ONLY_RE = re.compile(
     r"περισσοτερες πληροφοριες)\b)",
     re.IGNORECASE,
 )
-_CLARIFICATION_VALID_BLOCKER_RE = re.compile(
-    r"\b(?:credential|credentials|password|token|secret|api\s+key|login|auth|"
-    r"authorization|access|permission|destructive|delete|remove|wipe|overwrite|"
-    r"drop|production|external\s+input|unavailable|missing)\b",
-    re.IGNORECASE,
+_ONE_SHOT_CLARIFICATION_ADVISORY = (
+    "This is a non-interactive run - no one can answer questions. Make the safest "
+    "reasonable assumption, state it explicitly, and proceed; or report a concrete "
+    "blocker if proceeding would be unsafe (credentials, destructive actions, missing "
+    "external input)."
 )
+_EMPTY_DIFF_FINALIZATION_CORRECTIVE = (
+    "Empty-diff finalization blocked: no human user exists in this run, and no fix has "
+    "been applied. Do not suggest a workaround, advise a user, ask a follow-up question, "
+    "or merely describe the fix. Continue working from the repository with tools until "
+    "you make a concrete code change and verify it."
+)
+MAX_BLOCKING_FINALIZATION_CORRECTIVES = 3
+_EXISTING_TEST_EDIT_FINALIZATION_CORRECTIVE = (
+    "Existing-test edit finalization blocked: revert every change to tracked test files "
+    "and fix the source implementation instead. Existing tests are immutable acceptance "
+    "evidence; if one contradicts your change, the source change is wrong. You may add a "
+    "new test file, but do not alter, delete, or rename an existing test. Your next response "
+    "must use a tool to restore the listed files, not explain or defend the test edits."
+)
+_EXISTING_TEST_EDIT_HARD_BLOCK_CORRECTIVE = (
+    "Hard block, repeated violation: tracked test files are still modified after the prior "
+    "correction. A final answer is forbidden. The controller restores test paths that were "
+    "clean at turn start from the starting commit; do not re-edit them. Correct the source "
+    "implementation, then rerun relevant tests against their restored expectations. Do not "
+    "argue that expectations should change. New test files are allowed."
+)
+_EXECUTION_EVIDENCE_FINALIZATION_CORRECTIVE = (
+    "Execution-evidence finalization blocked: the response claims successful verification, "
+    "but this session has no matching successful command execution with observed output and "
+    "an exit code after the last source edit. Run the claimed tests or verification command "
+    "now and inspect its output before finalizing. If an environment or collection error "
+    "prevents execution, state that verification was impossible, do not claim success or "
+    "infer that the source is already fixed, and re-derive the fix from the issue and repository."
+)
+_SPEC_FAITHFULNESS_ADVISORY = (
+    "Final check before you finish: if the task specifies an exact output format, "
+    "reference value, or worked example, re-read that part of the task now and compare "
+    "your actual produced output against it byte-for-byte / field-by-field. Your own "
+    "tests passing is not the same as matching the spec. If they diverge, fix the "
+    "output; if you cannot verify, state the specific assumption you made. If everything "
+    "already matches, finalize - this check is advisory."
+)
+
+
+def _spec_faithfulness_advisory_message(
+    *,
+    one_shot_execution: bool,
+    live_background_processes: int = 0,
+) -> str:
+    live_background_process_line = _live_background_process_finalization_advisory_line(
+        one_shot_execution=one_shot_execution,
+        live_background_processes=live_background_processes,
+    )
+    if not live_background_process_line:
+        return _SPEC_FAITHFULNESS_ADVISORY
+    return f"{_SPEC_FAITHFULNESS_ADVISORY}\n{live_background_process_line}"
 
 
 @dataclass
@@ -240,6 +299,7 @@ class _EmptyResponseAnomalyRecoveryState:
 
 MAX_SUBAGENT_REQUIRED_NUDGES_PER_TURN = 2
 MAX_SUBAGENT_EXPLORATION_NUDGES_PER_TURN = 1
+MAX_PHASE_BUDGET_EXPLORATION_NUDGES_PER_TURN = 2
 MAX_PARALLEL_SUBAGENT_TOOL_CALLS = 4
 _SUBAGENT_REQUEST_PATTERNS = (
     re.compile(
@@ -277,6 +337,7 @@ _DEADLINE_FINALIZATION_EXPLORATION_TOOL_NAMES = frozenset(
         "git_history",
         "git_status",
         "history_search",
+        "repo_map",
         "search_rg",
         "skill_read",
         "symbol_search",
@@ -385,9 +446,12 @@ def _resolve_subagent_turn_policy(
     available_names = tuple(sorted((subagent_registry or {}).keys()))
     if _instruction_explicitly_opts_out_subagent(instruction):
         return _SubagentTurnPolicy(level="off", reason="user_opt_out")
-    explicit_request = _instruction_explicitly_requests_subagent(
-        instruction,
-        subagent_names=available_names,
+    explicit_request = (
+        _instruction_explicitly_requests_subagent(
+            instruction,
+            subagent_names=available_names,
+        )
+        and enforce_explicit_request
     )
     if not explicit_request and not available_names:
         return _SubagentTurnPolicy(level="off", reason="no_registered_subagents")
@@ -493,14 +557,42 @@ def _subagent_exploration_nudge_message(
 
 def _has_invalid_tool_call_json(tool_calls: list[Any]) -> bool:
     for tc in tool_calls:
-        arguments = getattr(tc, "arguments", None)
-        if not isinstance(arguments, dict):
-            continue
-        if set(arguments.keys()) != {"_raw_arguments"}:
-            continue
-        if isinstance(arguments.get("_raw_arguments"), str):
+        if _tool_call_has_invalid_tool_arguments_json(tc):
             return True
     return False
+
+
+def _tool_call_has_invalid_tool_arguments_json(tool_call: Any) -> bool:
+    arguments = getattr(tool_call, "arguments", None)
+    if not isinstance(arguments, dict):
+        return False
+    if set(arguments.keys()) != {"_raw_arguments"}:
+        return False
+    return isinstance(arguments.get("_raw_arguments"), str)
+
+
+def _invalid_tool_arguments_json_result() -> dict[str, str]:
+    return {
+        "error": "tool call arguments were not valid JSON",
+        "error_code": "invalid_tool_arguments_json",
+        "guidance": "Re-issue the call with a valid JSON object for arguments.",
+    }
+
+
+def _latest_accepted_verification_generation(state: Any) -> int | None:
+    generation = getattr(state, "last_successful_verification_generation", None)
+    if isinstance(generation, int):
+        return generation
+    accepted_evidence = getattr(state, "accepted_verification_evidence", None)
+    if not isinstance(accepted_evidence, list):
+        return None
+    for payload in reversed(accepted_evidence):
+        if not isinstance(payload, dict):
+            continue
+        evidence_generation = payload.get("generation")
+        if isinstance(evidence_generation, int):
+            return evidence_generation
+    return None
 
 
 def _is_subagent_run_tool_call(tool_call: Any) -> bool:
@@ -534,10 +626,8 @@ def _subagent_tool_call_resolves_readonly_mode(
     if mode_override:
         return normalize_subagent_mode(mode_override) in {"readonly", "review"}
     requested_name = canonical_subagent_name(str(arguments.get("name") or ""))
-    if requested_name is None:
-        return subagent_registry is None
-    if not subagent_registry:
-        return True
+    if requested_name is None or not subagent_registry:
+        return False
     definition = subagent_registry.get(requested_name)
     if definition is None:
         return False
@@ -586,16 +676,47 @@ def _emit_surface_error(
     worker_id: str | None = None,
     role: str | None = None,
 ) -> None:
+    message = sanitize_error_text_for_output(message)
     surface_cls = getattr(surface, "__class__", None)
     handler = getattr(surface, "emit_error", None)
+    display_code = "" if code == "completion_gate_error" else code
     if callable(handler):
         cls_handler = getattr(surface_cls, "emit_error", None)
         if cls_handler is not getattr(NoopSurface, "emit_error", None):
-            handler(code, message, recoverable, worker_id=worker_id, role=role)
+            handler(display_code, message, recoverable, worker_id=worker_id, role=role)
             return
     fallback = getattr(surface, "on_error", None)
     if callable(fallback):
         fallback(message)
+
+
+def _approval_declined_final_text(*, tool_name: str, approval_kind: str) -> str:
+    label = str(tool_name or approval_kind or "the requested action").strip()
+    return (
+        f"Approval declined for {label}. I stopped without retrying that action. "
+        "Tell me how you want to proceed."
+    )
+
+
+def _surface_accepts_reasoning_summaries(surface: Any) -> bool:
+    """Return whether this surface currently wants safe provider summaries.
+
+    Merely defining ``on_reasoning_token`` is insufficient because the TUI keeps
+    that callback installed while ``/trace off`` is active. Older/test surfaces
+    without an explicit flag retain the original callback-based opt-in behavior.
+    """
+
+    if not callable(getattr(surface, "on_reasoning_token", None)):
+        return False
+    enabled = getattr(surface, "reasoning_trace_enabled", None)
+    if callable(enabled):
+        try:
+            return bool(enabled())
+        except Exception:
+            return False
+    if enabled is not None:
+        return bool(enabled)
+    return True
 
 
 def run_turn(
@@ -633,6 +754,69 @@ def run_turn(
     steps_attempted = 0
     deadline = getattr(self, "execution_deadline", None)
     diagnostics = getattr(self, "crash_diagnostics", None)
+    controller_interventions = ControllerInterventionTracker(self.store)
+
+    def _controller_interventions_payload() -> dict[str, Any]:
+        return controller_interventions.payload()
+
+    def _controller_intervention_event_fields() -> dict[str, Any]:
+        return {
+            "controller_interventions": _controller_interventions_payload(),
+            "controller_interventions_total": controller_interventions.headline_total,
+        }
+
+    def _record_controller_intervention(
+        intervention_class: str,
+        detail: str,
+        *,
+        step: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        headline_counted: bool | None = None,
+    ) -> None:
+        controller_interventions.record(
+            intervention_class,
+            detail,
+            step=step,
+            metadata=metadata,
+            headline_counted=headline_counted,
+        )
+
+    def _append_controller_system_message(
+        message: str,
+        *,
+        intervention_class: str,
+        detail: str,
+        step: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        headline_counted: bool | None = None,
+    ) -> None:
+        self.messages.append({"role": "system", "content": message})
+        _record_controller_intervention(
+            intervention_class,
+            detail,
+            step=step,
+            metadata=metadata,
+            headline_counted=headline_counted,
+        )
+
+    def _append_controller_ephemeral_system_message(
+        prompts: list[str],
+        message: str,
+        *,
+        intervention_class: str,
+        detail: str,
+        step: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        headline_counted: bool | None = None,
+    ) -> None:
+        prompts.append(message)
+        _record_controller_intervention(
+            intervention_class,
+            detail,
+            step=step,
+            metadata=metadata,
+            headline_counted=headline_counted,
+        )
 
     def _deadline_snapshot() -> dict[str, Any] | None:
         if deadline is None:
@@ -683,6 +867,11 @@ def run_turn(
                 "deadline": _deadline_snapshot(),
                 "decision": payload,
             },
+        )
+        _record_controller_intervention(
+            "deadline_block",
+            str(payload.get("operation") or operation),
+            metadata={"reason": payload.get("reason"), "decision": payload},
         )
         _diagnostic_event(
             "deadline_operation_blocked",
@@ -739,6 +928,8 @@ def run_turn(
                 "steps_attempted": steps_attempted,
                 "runtime_kind": str(getattr(self.runtime_kind, "value", self.runtime_kind)),
                 "deadline": _deadline_snapshot(),
+                "controller_interventions": _controller_interventions_payload(),
+                "controller_interventions_total": controller_interventions.headline_total,
             },
             durable=True,
         )
@@ -762,6 +953,38 @@ def run_turn(
             )
         return code
 
+    def _finish_with_host_message(
+        message: str,
+        *,
+        reason: str,
+        exit_code: int,
+    ) -> int:
+        nonlocal assistant_message_emitted
+        final_text = str(message or "").strip()
+        assistant_message = {"role": "assistant", "content": final_text}
+        self.messages.append(assistant_message)
+        self.store.append(
+            "assistant_message",
+            {"content": final_text, "message": assistant_message, "host_generated": True},
+        )
+        self.store.append(
+            "final",
+            {
+                "content": final_text,
+                "host_generated": True,
+                "controller_interventions": _controller_interventions_payload(),
+                "controller_interventions_total": controller_interventions.headline_total,
+            },
+        )
+        _emit_assistant_message_events(
+            self.surface,
+            final_text,
+            streamed_text_emitted=False,
+        )
+        self.surface.on_assistant_message_done(final_text)
+        assistant_message_emitted = True
+        return _finish_turn(exit_code, reason=reason, final_text=final_text)
+
     routing_mode = _normalize_routing_mode(
         routing_mode_override if routing_mode_override is not None else self.routing_mode
     )
@@ -784,6 +1007,11 @@ def run_turn(
             f"Prompt blocked by hook: {prompt_hook_result.reason}"
             if prompt_hook_result.reason
             else "Prompt blocked by hook."
+        )
+        _record_controller_intervention(
+            "safety_block",
+            "prompt_hook_blocked",
+            metadata={"reason": prompt_hook_result.reason},
         )
         self.store.append("error", {"error": message})
         _emit_surface_error(self.surface, "hook_error", message, True)
@@ -824,7 +1052,7 @@ def run_turn(
         )
 
     def _record_turn_llm_error(err: LLMError) -> None:
-        self.store.append("error", {"error": str(err)})
+        self.store.append("error", {"error": sanitize_error_text_for_output(err)})
         _rollback_turn_after_llm_error()
 
     ephemeral_turn_system_messages = [
@@ -832,7 +1060,13 @@ def run_turn(
     ]
     ephemeral_turn_system_messages = [prompt for prompt in ephemeral_turn_system_messages if prompt]
     if image_paths and _IMAGE_ATTACHMENT_TURN_SYSTEM_HINT not in ephemeral_turn_system_messages:
-        ephemeral_turn_system_messages.append(_IMAGE_ATTACHMENT_TURN_SYSTEM_HINT)
+        _append_controller_ephemeral_system_message(
+            ephemeral_turn_system_messages,
+            _IMAGE_ATTACHMENT_TURN_SYSTEM_HINT,
+            intervention_class="context_setup",
+            detail="image_attachment_turn_hint",
+            metadata={"image_count": len(image_paths)},
+        )
         self.store.append(
             "system_note",
             {
@@ -896,10 +1130,16 @@ def run_turn(
         if deadline.finalization_directive_sent:
             return
         checkpoint_hint = _deadline_checkpoint_hint()
-        suffixes.append(
-            _DEADLINE_FINALIZATION_SYSTEM_PROMPT_TEMPLATE.format(
-                checkpoint_hint=checkpoint_hint,
-            ).strip()
+        directive = _DEADLINE_FINALIZATION_SYSTEM_PROMPT_TEMPLATE.format(
+            checkpoint_hint=checkpoint_hint,
+        ).strip()
+        _append_controller_ephemeral_system_message(
+            suffixes,
+            directive,
+            intervention_class="deadline_directive",
+            detail="deadline_finalization_directive",
+            step=step,
+            metadata={"checkpoint_hint": checkpoint_hint},
         )
         deadline.mark_finalization_directive_sent()
         self.store.append(
@@ -913,11 +1153,43 @@ def run_turn(
 
     if self.step_budget_runtime is not None:
         self.step_budget_runtime.active_turn_budget = None
+        self.step_budget_runtime.last_resolution = None
 
-    turn_tools = self.tools
+    turn_tools = dict(self.tools)
     turn_tool_list = _registered_tool_schema_list(turn_tools, self.tool_list)
+    web_tools_unavailable_for_turn: set[str] = set()
 
-    def _current_turn_step_limit() -> int:
+    def _mark_web_tool_unavailable(
+        *,
+        tool_name: str,
+        step: int,
+        tool_call_id: str,
+        error: BaseException | str,
+    ) -> dict[str, Any]:
+        nonlocal turn_tool_list
+        normalized_tool_name = str(tool_name or "").strip().casefold()
+        web_tools_unavailable_for_turn.add(normalized_tool_name)
+        turn_tool_list = _registered_tool_schema_list(
+            {
+                name: tool
+                for name, tool in turn_tools.items()
+                if name.casefold() not in web_tools_unavailable_for_turn
+            },
+            self.tool_list,
+        )
+        error_summary = sanitize_optional_error_summary(str(error)) or "web tool failed"
+        payload = {
+            "tool": normalized_tool_name,
+            "tool_call_id": tool_call_id,
+            "step": step,
+            "error": error_summary,
+            "observation": web_unavailable_result(normalized_tool_name),
+        }
+        self.store.append("web_tool_unavailable", payload)
+        _diagnostic_event("web_tool_unavailable", payload)
+        return web_unavailable_result(normalized_tool_name)
+
+    def _current_turn_step_limit() -> int | None:
         active_turn_budget = (
             self.step_budget_runtime.active_turn_budget
             if self.step_budget_runtime is not None
@@ -925,25 +1197,15 @@ def run_turn(
         )
         if isinstance(active_turn_budget, int) and active_turn_budget > 0:
             return active_turn_budget
+        if (
+            self.enable_chat_turn_step_budget
+            and self.chat_turn_fixed_override is None
+            and step_budget_is_autonomous(self.cfg.step_budget_policy)
+        ):
+            return None
+        if self.max_steps is None:
+            return None
         return max(1, int(self.max_steps))
-
-    # Live reasoning channel shared by both the non-repo and repo turn paths:
-    # surfaces that opt in (the TUI) receive the model's streamed thinking via
-    # ``on_reasoning_token``; the classic RichSurface defines no such method, so
-    # this stays a no-op there and the classic CLI is untouched.
-    _reasoning_sink_exists = callable(getattr(self.surface, "on_reasoning_token", None))
-
-    def _on_reasoning_delta(delta: str) -> None:
-        # Per-token cancellation check: a long (streamed) reasoning phase must be
-        # interruptible, not just at step boundaries. Raises KeyboardInterrupt,
-        # which propagates out of the LLM stream (past ``except LLMError``).
-        _throw_if_cancelled()
-        sink = getattr(self.surface, "on_reasoning_token", None)
-        if delta and callable(sink):
-            try:
-                sink(delta)
-            except Exception:
-                pass
 
     def _deadline_exhausted_result(operation: str, *, step: int | None = None) -> int:
         nonlocal assistant_message_emitted
@@ -959,6 +1221,12 @@ def run_turn(
         _diagnostic_event("deadline_exhausted", payload, durable=True)
         message = "The run deadline was exhausted before the turn could finish."
         _emit_surface_error(self.surface, "deadline_error", message, True)
+        _record_controller_intervention(
+            "local_final",
+            "forced_final_summary:deadline_exhausted",
+            step=step,
+            metadata={"operation": operation},
+        )
         self._emit_forced_final_summary_before_termination(
             reason="deadline_exhausted",
             termination_cause="the run deadline is exhausted",
@@ -969,6 +1237,7 @@ def run_turn(
             explicit_language_override=turn_language_explicit,
             latest_assistant_text=last_visible_assistant_text,
             allow_llm_summary=False,
+            final_event_payload=_controller_intervention_event_fields(),
         )
         assistant_message_emitted = True
         return _finish_turn(1, reason="deadline_exhausted")
@@ -981,7 +1250,11 @@ def run_turn(
             image_paths=image_paths,
         )
     ):
-        self.messages.append({"role": "system", "content": _NON_REPO_TURN_SYSTEM_HINT})
+        _append_controller_system_message(
+            _NON_REPO_TURN_SYSTEM_HINT,
+            intervention_class="context_setup",
+            detail="non_repo_turn_hint",
+        )
         self.store.append("system_note", {"message": "non_repo_turn_hint"})
 
     user_message, log_payload = _build_user_message(
@@ -1006,6 +1279,75 @@ def run_turn(
     )
     _phase_update_key("phase_understanding_request")
 
+    reasoning_block_sequence = count(1)
+    reasoning_surface = self.surface
+
+    class _ReasoningSummarySink:
+        """Call-scoped bridge from provider summary deltas to surface events."""
+
+        def __init__(self) -> None:
+            self.block_id = f"reasoning-{turn_user_message_index}-{next(reasoning_block_sequence)}"
+            self.started = False
+            self.closed = False
+
+        def __call__(self, delta: str) -> None:
+            # Summaries may stream for a while, so cancellation stays
+            # interruptible before the assistant answer begins.
+            _throw_if_cancelled()
+            if self.closed or not delta:
+                return
+            if not self.started:
+                self.started = True
+                start = getattr(reasoning_surface, "on_reasoning_start", None)
+                if callable(start):
+                    try:
+                        start(self.block_id)
+                    except Exception:
+                        pass
+            token = getattr(reasoning_surface, "on_reasoning_token", None)
+            if callable(token):
+                try:
+                    token(delta)
+                except Exception:
+                    pass
+
+        def close(self) -> None:
+            if self.closed:
+                return
+            self.closed = True
+            if not self.started:
+                return
+            end = getattr(reasoning_surface, "on_reasoning_end", None)
+            if callable(end):
+                try:
+                    end(self.block_id)
+                except Exception:
+                    pass
+
+    def _reasoning_summary_callback_for(
+        client: Any,
+        *,
+        stream: bool,
+    ) -> Any | None:
+        """Return the safe summary sink supported by this concrete route."""
+
+        if not _surface_accepts_reasoning_summaries(self.surface):
+            return None
+        capability = getattr(client, "reasoning_trace_capability", None)
+        if not bool(getattr(capability, "has_safe_summary", False)):
+            return None
+        supported = (
+            bool(getattr(capability, "supports_streaming", False))
+            if stream
+            else bool(getattr(capability, "supports_buffered", False))
+        )
+        return _ReasoningSummarySink() if supported else None
+
+    def _close_reasoning_summary_sink(sink: Any | None) -> None:
+        close = getattr(sink, "close", None)
+        if callable(close):
+            close()
+
     local_materialization_requirement = classify_local_materialization_requirement(instruction)
 
     def _local_materialization_payload() -> dict[str, Any]:
@@ -1024,10 +1366,28 @@ def run_turn(
 
     recent_visible_non_repo_history = _recent_visible_non_repo_history(self.messages)
     route_client = self.router_client or self.client
+
+    def _record_route_llm_usage(
+        *,
+        client: Any,
+        response: Any,
+        messages: list[dict[str, Any]],
+        tool_list: list[dict[str, Any]] | None,
+        operation: str,
+    ) -> None:
+        self._record_llm_usage(
+            client=client,
+            response=response,
+            messages=messages,
+            tool_list=tool_list,
+            operation=operation,
+        )
+
     if routing_mode == _ROUTING_MODE_AUTO and not image_paths:
         route_context = _turn_route_context(
             self,
             had_active_workspace_task_before_turn=had_active_workspace_task_before_turn,
+            available_tools=turn_tools,
         )
         allow_implicit_repo_bugfix_override = _workspace_kind_is_repo_backed(
             self.store.workspace_kind
@@ -1058,6 +1418,7 @@ def run_turn(
                     route_context=route_context,
                     recent_visible_history=recent_visible_non_repo_history,
                     allow_implicit_repo_bugfix_override=allow_implicit_repo_bugfix_override,
+                    record_usage=(lambda **kw: _record_route_llm_usage(client=route_client, **kw)),
                 )
             _record_deadline_duration(DeadlineOperation.ROUTING_LLM, operation_started)
             if (
@@ -1091,6 +1452,9 @@ def run_turn(
                         route_context=route_context,
                         recent_visible_history=recent_visible_non_repo_history,
                         allow_implicit_repo_bugfix_override=allow_implicit_repo_bugfix_override,
+                        record_usage=(
+                            lambda **kw: _record_route_llm_usage(client=self.client, **kw)
+                        ),
                     )
                 _record_deadline_duration(DeadlineOperation.ROUTING_LLM, operation_started)
                 if not str(getattr(retry_route_decision, "decision_source", "") or "").startswith(
@@ -1124,7 +1488,7 @@ def run_turn(
                 {
                     "operation": "routing_llm",
                     "step": 0,
-                    "failure_category": "llm_error",
+                    "failure_category": classify_failure_category(err).value,
                     "deadline": _deadline_snapshot(),
                 },
             )
@@ -1291,7 +1655,6 @@ def run_turn(
                 ),
             },
         )
-
         if route_decision.route != "repo":
             _phase_update_key("phase_drafting_response")
             non_repo_streamed_text_emitted = False
@@ -1305,11 +1668,25 @@ def run_turn(
                 self.surface.on_assistant_token(delta)
 
             final_assistant_message: dict[str, Any] | None = None
-            final_text = _route_reply_for_non_repo_turn(
+            # A router reply is already fully buffered inside the route-decision
+            # JSON. Reusing it while streaming is enabled would make casual turns
+            # appear non-streaming and cannot expose genuine reasoning summaries.
+            # Preserve the low-latency shortcut only for explicitly buffered
+            # sessions; streamed sessions use the real response call below.
+            router_reply = _route_reply_for_non_repo_turn(
                 route_decision,
                 explicit_language_override=turn_language_explicit,
                 recent_visible_history=recent_visible_non_repo_history,
             )
+            if self.stream and router_reply:
+                self.store.append(
+                    "non_repo_router_reply_bypassed_for_streaming",
+                    {
+                        "route": route_decision.route,
+                        "decision_source": route_decision.decision_source,
+                    },
+                )
+            final_text = "" if self.stream else router_reply
             if final_text:
                 self.store.append(
                     "non_repo_router_reply_used",
@@ -1321,7 +1698,7 @@ def run_turn(
             else:
                 non_repo_tools = (
                     _non_repo_tool_assisted_tools(
-                        self.tools,
+                        turn_tools,
                         route_decision=route_decision,
                     )
                     if route_decision.route in {"general", "tool"}
@@ -1332,27 +1709,33 @@ def run_turn(
                     respond_non_repo_turn = _patchable(
                         "_respond_non_repo_turn", _respond_non_repo_turn
                     )
-                    non_repo_response = respond_non_repo_turn(
-                        client=route_client,
-                        instruction=instruction,
-                        route=route_decision.route,
-                        language=turn_language,
-                        script=turn_script,
-                        explicit_language_override=turn_language_explicit,
-                        temperature=resolve_role_temperature(self.cfg, role="chat"),
-                        recent_visible_history=recent_visible_non_repo_history,
-                        tool_defs=non_repo_tools,
-                        tool_list=non_repo_tool_list,
-                        surface=self.surface,
-                        store=self.store,
+                    reasoning_sink = _reasoning_summary_callback_for(
+                        route_client,
                         stream=self.stream,
-                        on_text_delta=_on_non_repo_text_delta if self.stream else None,
-                        on_reasoning_delta=(
-                            _on_reasoning_delta
-                            if (self.stream and _reasoning_sink_exists)
-                            else None
-                        ),
                     )
+                    try:
+                        non_repo_response = respond_non_repo_turn(
+                            client=route_client,
+                            record_usage=(
+                                lambda **kw: _record_route_llm_usage(client=route_client, **kw)
+                            ),
+                            instruction=instruction,
+                            route=route_decision.route,
+                            language=turn_language,
+                            script=turn_script,
+                            explicit_language_override=turn_language_explicit,
+                            temperature=resolve_role_temperature(self.cfg, role="chat"),
+                            recent_visible_history=recent_visible_non_repo_history,
+                            tool_defs=non_repo_tools,
+                            tool_list=non_repo_tool_list,
+                            surface=self.surface,
+                            store=self.store,
+                            stream=self.stream,
+                            on_text_delta=(_on_non_repo_text_delta if self.stream else None),
+                            on_reasoning_delta=reasoning_sink,
+                        )
+                    finally:
+                        _close_reasoning_summary_sink(reasoning_sink)
                     assistant_message_candidate = getattr(
                         non_repo_response,
                         "assistant_message",
@@ -1372,6 +1755,9 @@ def run_turn(
                         script=turn_script,
                         explicit_language_override=turn_language_explicit,
                         client=route_client,
+                        record_usage=(
+                            lambda **kw: self._record_llm_usage(client=route_client, **kw)
+                        ),
                     ).reply
                 except LLMError as err:
                     _record_turn_llm_error(err)
@@ -1384,7 +1770,14 @@ def run_turn(
                 "assistant_message",
                 {"content": final_text, "message": final_assistant_message},
             )
-            self.store.append("final", {"content": final_text})
+            self.store.append(
+                "final",
+                {
+                    "content": final_text,
+                    "controller_interventions": _controller_interventions_payload(),
+                    "controller_interventions_total": controller_interventions.headline_total,
+                },
+            )
             _emit_assistant_message_events(
                 self.surface,
                 final_text,
@@ -1413,7 +1806,16 @@ def run_turn(
         explicit_language_override=turn_language_explicit,
     )
     if turn_language_system_message:
-        self.messages.append({"role": "system", "content": turn_language_system_message})
+        _append_controller_system_message(
+            turn_language_system_message,
+            intervention_class="context_setup",
+            detail="turn_language_script_directive",
+            metadata={
+                "language": turn_language,
+                "script": turn_script,
+                "explicit_language_override": turn_language_explicit,
+            },
+        )
         self.store.append(
             "system_note",
             {
@@ -1426,13 +1828,13 @@ def run_turn(
         )
 
     failed_tool_call_counts: dict[str, int] = {}
-    adaptive_retry_keys_used: set[str] = set()
     repo_turn_execution_intent = _resolve_repo_turn_execution_intent(
         one_shot_execution=self.one_shot_execution,
         runtime_kind=self.runtime_kind,
         route_execution_posture=route_execution_posture,
         classified_turn_intent=one_shot_turn_intent,
     )
+
     execution_safeguards_enabled = repo_turn_execution_intent == "execute"
     resolved_turn_intent_kind = (
         "mutating_execution" if execution_safeguards_enabled else "read_only"
@@ -1456,7 +1858,7 @@ def run_turn(
             **_local_materialization_payload(),
         },
     )
-    turn_max_steps = max(1, int(self.max_steps))
+    turn_max_steps = max(1, int(self.max_steps)) if self.max_steps is not None else None
     if self.enable_chat_turn_step_budget:
         turn_budget_resolution = resolve_step_budget(
             StepBudgetRequest(
@@ -1487,7 +1889,24 @@ def run_turn(
             "turn_step_budget_resolved",
             turn_budget_resolution.to_payload(),
         )
+
+    def _step_limit_allows_more(step: int) -> bool:
+        return turn_max_steps is None or step < turn_max_steps
+
+    def _step_limit_reached(step: int) -> bool:
+        return turn_max_steps is not None and step >= turn_max_steps
+
     known_verification_commands = list(self.effective_verification_commands)
+    verification_contract_unavailable = bool(
+        not known_verification_commands
+        and str(self.verification_contract_type or "").strip() == "unavailable"
+    )
+    verification_contract_available = not (
+        verification_contract_unavailable
+        and local_materialization_requirement.required
+        and local_materialization_requirement.confidence >= 0.8
+        and bool(local_materialization_requirement.output_paths)
+    )
     acceptance_contract = None
     if execution_safeguards_enabled:
         acceptance_contract = build_acceptance_contract(
@@ -1509,6 +1928,46 @@ def run_turn(
         expected_verification_commands=set(known_verification_commands),
         acceptance_contract=acceptance_contract,
     )
+    background_processes_started_this_turn = 0
+    background_processes_killed_this_turn = 0
+
+    def _fallback_live_background_process_count() -> int:
+        return max(
+            0,
+            background_processes_started_this_turn - background_processes_killed_this_turn,
+        )
+
+    def _live_background_processes_at_finalization() -> int:
+        if not self.one_shot_execution:
+            return 0
+        terminal_manager = getattr(self, "terminal_manager", None)
+        list_processes = getattr(terminal_manager, "list", None)
+        fallback_reason = ""
+        fallback_error = ""
+        if callable(list_processes):
+            try:
+                return sum(
+                    1 for summary in list_processes() if getattr(summary, "status", "") == "running"
+                )
+            except Exception as exc:  # noqa: BLE001 - finalization advisory must not crash turn
+                fallback_reason = "terminal_manager_list_failed"
+                fallback_error = str(exc)
+        else:
+            fallback_reason = "terminal_manager_unavailable"
+        fallback_count = _fallback_live_background_process_count()
+        self.store.append(
+            "live_background_process_count_fallback",
+            {
+                "reason": fallback_reason,
+                "error": fallback_error,
+                "fallback_count": fallback_count,
+                "bg_start_count": background_processes_started_this_turn,
+                "bg_kill_count": background_processes_killed_this_turn,
+                "runtime_kind": self.runtime_kind.value,
+            },
+        )
+        return fallback_count
+
     subagent_turn_policy = _resolve_subagent_turn_policy(
         instruction=instruction,
         subagents_enabled=self.subagents_enabled,
@@ -1522,8 +1981,10 @@ def run_turn(
     subagent_exploration_nudges_sent = 0
     subagent_attempt_count = 0
     if subagent_turn_policy.unavailable:
-        final_text = _SUBAGENT_REQUEST_UNAVAILABLE_MESSAGE_TEMPLATE.format(
-            reason=subagent_turn_policy.reason,
+        unavailable_note = (
+            "The user asked for subagent delegation but subagent_run is unavailable in this "
+            f"session ({subagent_turn_policy.reason}). Do the work directly and mention this "
+            "limitation in your final answer."
         )
         self.store.append(
             "subagent_request_unavailable",
@@ -1533,14 +1994,22 @@ def run_turn(
                 "instruction": instruction,
             },
         )
-        self._emit_final_assistant_text(
-            final_text=final_text,
-            language=turn_language,
-            script=turn_script,
-            explicit_language_override=turn_language_explicit,
+        self.store.append(
+            "subagent_request_unavailable_proceeding",
+            {
+                "reason": subagent_turn_policy.reason,
+                "available_subagents": list(subagent_turn_policy.available_subagents),
+                "instruction": instruction,
+                "message": unavailable_note,
+            },
         )
-        assistant_message_emitted = True
-        return _finish_turn(1, reason="subagent_request_unavailable", final_text=final_text)
+        _append_controller_ephemeral_system_message(
+            ephemeral_turn_system_messages,
+            unavailable_note,
+            intervention_class="subagent",
+            detail="subagent_request_unavailable_proceeding",
+            metadata={"reason": subagent_turn_policy.reason},
+        )
     subagent_turn_context = _subagent_turn_context_message(subagent_turn_policy)
     if subagent_turn_context:
         ephemeral_turn_user_messages.append(subagent_turn_context)
@@ -1569,56 +2038,41 @@ def run_turn(
         and self.runtime_kind == RuntimeKind.INTERACTIVE_CHAT
     )
     completion_gate_enabled = execution_follow_through_enabled
+    workspace_git_base = (
+        resolve_workspace_git_base(self.root)
+        if self.one_shot_execution and completion_gate_enabled
+        else None
+    )
+    initial_existing_test_edit_paths = (
+        set(
+            inspect_existing_test_edits(
+                self.root,
+                base_ref=workspace_git_base,
+            ).paths
+        )
+        if workspace_git_base is not None
+        else set()
+    )
     execution_phase_tracking_enabled = execution_follow_through_enabled
     completion_gate_failed_event = (
         "one_shot_completion_gate_failed"
         if self.one_shot_execution
         else "interactive_completion_gate_failed"
     )
-    completion_gate_incomplete_event = (
-        "one_shot_completion_gate_incomplete_after_retries"
-        if self.one_shot_execution
-        else "interactive_completion_gate_incomplete_after_retries"
-    )
     no_material_edits_detected_event = (
         "one_shot_no_material_edits_detected"
         if self.one_shot_execution
         else "interactive_no_material_edits_detected"
-    )
-    no_material_edits_incomplete_event = (
-        "one_shot_no_material_edits_incomplete_after_retries"
-        if self.one_shot_execution
-        else "interactive_no_material_edits_incomplete_after_retries"
     )
     completion_gate_nudge_prefix_key = (
         "completion_gate_nudge_prefix"
         if self.one_shot_execution
         else "interactive_completion_gate_nudge_prefix"
     )
-    completion_gate_terminal_message_key = (
-        "completion_gate_terminal_failure"
-        if self.one_shot_execution
-        else "interactive_completion_gate_terminal_failure"
-    )
-    completion_gate_step_budget_message_key = (
-        "completion_gate_step_budget_exhausted"
-        if self.one_shot_execution
-        else "interactive_completion_gate_step_budget_exhausted"
-    )
     non_final_progress_detected_event = (
         "one_shot_non_final_progress_detected"
         if self.one_shot_execution
         else "interactive_non_final_progress_detected"
-    )
-    non_final_incomplete_event = (
-        "one_shot_incomplete_after_retries"
-        if self.one_shot_execution
-        else "interactive_incomplete_after_retries"
-    )
-    non_final_progress_stopped_key = (
-        "one_shot_non_final_progress_stopped"
-        if self.one_shot_execution
-        else "interactive_non_final_progress_stopped"
     )
     continuation_nudge_key = (
         "one_shot_continuation_nudge"
@@ -1630,7 +2084,10 @@ def run_turn(
     )
     one_shot_edit_guard_enabled = one_shot_exploration_guard_enabled
     consecutive_exploration_only_steps = 0
+    phase_budget_exploration_nudges_sent = 0
+    last_phase_budget_exploration_nudge_steps = 0
     exploration_nudges_sent = 0
+    stagnation_nudges_sent = 0
     exploration_attempt_call_counts: dict[str, int] = {}
     exploration_attempt_similarity_counts: dict[str, int] = {}
     consecutive_exploration_success_count = 0
@@ -1656,6 +2113,16 @@ def run_turn(
     empty_response_anomaly_state = _EmptyResponseAnomalyRecoveryState()
     forced_tool_choice_for_next_step: dict[str, Any] | None = None
     finalization_empty_anomaly_recovery_pending = False
+    continuation_nudges_sent = 0
+    last_continuation_nudge_material_edit_generation = -1
+    last_continuation_nudge_verification_attempt_count = -1
+    clarification_advisory_sent = False
+    finalization_checklist_sent = False
+    blocking_finalization_correctives_sent = 0
+    existing_test_edit_violation_count = 0
+    existing_test_edit_forced_logged = False
+    execution_evidence_violation_count = 0
+    execution_evidence_forced_logged = False
 
     def _observed_repo_tool_intent() -> str:
         if not repo_tool_activity_observed:
@@ -1715,11 +2182,16 @@ def run_turn(
         message: str,
         decision: CompletionGateDecision,
     ) -> bool:
-        return bool(
-            message
-            and message == last_nudge_text_sent
-            and not decision.meaningful_progress_since_previous_rejection
-        )
+        _ = decision
+        return bool(message and message == last_nudge_text_sent)
+
+    def _clarification_text_ends_with_question(text: str) -> bool:
+        stripped = str(text or "").strip().rstrip("*_`~>)]}").rstrip()
+        return stripped.endswith("?")
+
+    def _clarification_text_has_short_question_sentence(text: str) -> bool:
+        raw_text = str(text or "").strip()
+        return len(raw_text) <= 300 and bool(re.search(r"\?(?:\s|$)", raw_text))
 
     def _assistant_text_is_clarification_only(text: str) -> bool:
         raw_text = str(text or "").strip()
@@ -1730,29 +2202,22 @@ def run_turn(
         if _assistant_text_contains_progress_intent(raw_text):
             return False
         normalized = _normalize_marker_text(raw_text)
-        return bool(_CLARIFICATION_ONLY_RE.search(normalized))
+        if not _CLARIFICATION_ONLY_RE.search(normalized):
+            return False
+        ends_with_question = _clarification_text_ends_with_question(raw_text)
+        if ends_with_question or _clarification_text_has_short_question_sentence(raw_text):
+            return True
+        _record_controller_intervention(
+            "finalization_checklist",
+            "clarification_suppressed_by_guard",
+            headline_counted=False,
+            metadata={"text_len": len(raw_text), "ends_with_question": ends_with_question},
+        )
+        return False
 
     def _clarification_can_finalize(*, text: str) -> bool:
-        if not self.one_shot_execution:
-            if (
-                repo_turn_execution_intent == "execute"
-                and local_materialization_requirement.required
-                and local_materialization_requirement.confidence >= 0.8
-            ):
-                return bool(_CLARIFICATION_VALID_BLOCKER_RE.search(_normalize_marker_text(text)))
-            return True
-        if repo_turn_execution_intent != "execute":
-            return True
-        if one_shot_turn_intent != "execute":
-            return True
-        if (
-            local_materialization_requirement.required
-            and local_materialization_requirement.confidence >= 0.8
-        ):
-            normalized = _normalize_marker_text(text)
-            return bool(_CLARIFICATION_VALID_BLOCKER_RE.search(normalized))
-        normalized = _normalize_marker_text(text)
-        return bool(_CLARIFICATION_VALID_BLOCKER_RE.search(normalized))
+        _ = text
+        return True
 
     def _empty_response_missing_action() -> str:
         if execution_state.material_edit_count <= 0:
@@ -1767,6 +2232,8 @@ def run_turn(
                 self.verification_contract_type
                 in {"authoritative_override", "explicit_override", "task_inferred"}
             ),
+            verification_contract_available=verification_contract_available,
+            effective_verification_commands=known_verification_commands,
         ) and (
             execution_state.verification_attempt_count <= 0
             or execution_state.missing_verification_commands()
@@ -1862,19 +2329,11 @@ def run_turn(
         return {
             "decision": payload["decision"],
             "completion_gate_decision": payload["decision"],
-            "completion_gate_episode_id": payload["episode_id"],
-            "completion_gate_previous_episode_id": payload["previous_episode_id"],
-            "completion_gate_stagnant_attempt_count": payload["stagnant_attempt_count"],
-            "completion_gate_meaningful_progress_since_previous_rejection": payload[
-                "meaningful_progress_since_previous_rejection"
-            ],
             "completion_gate_decision_reason": payload["reason"],
             "completion_gate_nudge_reason": payload["reason"],
             "nudge_reason": payload["reason"],
-            "completion_gate_consecutive_no_progress_rejections": payload[
-                "consecutive_no_progress_rejections"
-            ],
-            "completion_gate_max_stagnant_attempts": payload["max_stagnant_attempts"],
+            "completion_gate_recommended_action": payload["recommended_action"],
+            "completion_gate_preferred_tool_names": payload["preferred_tool_names"],
             "completion_gate_controller": payload,
         }
 
@@ -1888,43 +2347,139 @@ def run_turn(
             "verification_evidence_generation": execution_state.verification_evidence_generation,
         }
 
+    def _all_verification_evidence_self_authored() -> bool:
+        return bool(
+            execution_state.verification_attempt_count > 0
+            and execution_state.last_verification_passed is True
+            and execution_state.supplemental_verification_evidence
+            and not execution_state.accepted_verification_evidence
+        )
+
+    def _has_current_independent_verification_evidence() -> bool:
+        if not execution_state.accepted_verification_evidence:
+            return False
+        generation = _latest_accepted_verification_generation(execution_state)
+        if generation is None:
+            return False
+        return generation >= execution_state.verification_relevant_edit_generation
+
+    def _completion_gate_can_accept_after_continuation_nudge() -> bool:
+        return bool(
+            continuation_nudges_sent > 0
+            and execution_state.material_edit_generation
+            == last_continuation_nudge_material_edit_generation
+            and execution_state.verification_attempt_count
+            == last_continuation_nudge_verification_attempt_count
+        )
+
     def _acceptance_contract_fields() -> dict[str, Any]:
         return acceptance_contract_problem_payload(execution_state.acceptance_contract)
 
-    for step in range(1, turn_max_steps + 1):
+    def _stagnation_budget_state_payload() -> dict[str, Any]:
+        active: dict[str, Any] = {
+            "stagnation_nudges_sent": stagnation_nudges_sent,
+            "stagnation_nudge_cap": MAX_STAGNATION_NUDGES_PER_TURN,
+        }
+        if last_post_explore_stagnation_payload is not None:
+            active["post_explore"] = {
+                "nudge_attempts": post_explore_bootstrap_nudges_sent,
+                "last_stagnation": last_post_explore_stagnation_payload,
+            }
+        if last_exploration_stagnation_payload is not None:
+            active["exploration"] = {
+                "nudge_attempts": exploration_nudges_sent,
+                "last_stagnation": last_exploration_stagnation_payload,
+            }
+        if last_edit_stagnation_payload is not None:
+            active["failed_edit"] = {
+                "nudge_attempts": edit_nudges_sent,
+                "consecutive_failed_edit_steps": consecutive_failed_edit_steps,
+                "consecutive_failed_edit_attempt_count": consecutive_failed_edit_attempt_count,
+                "last_stagnation": last_edit_stagnation_payload,
+            }
+        return active if len(active) > 2 else {}
+
+    step_iterator = count(1) if turn_max_steps is None else range(1, turn_max_steps + 1)
+    for step in step_iterator:
         _throw_if_cancelled()
         steps_attempted = step
         stream_used = self.stream
         step_ephemeral_suffix_system_messages: list[str] = []
-        remaining_tool_steps_after_this = turn_max_steps - step
-        if step == turn_max_steps:
-            step_ephemeral_suffix_system_messages.append(_FINAL_TOOL_ENABLED_STEP_SYSTEM_PROMPT)
-        elif 0 < remaining_tool_steps_after_this <= 3:
-            step_ephemeral_suffix_system_messages.append(
+        remaining_tool_steps_after_this = None if turn_max_steps is None else turn_max_steps - step
+        if remaining_tool_steps_after_this == 0:
+            _append_controller_ephemeral_system_message(
+                step_ephemeral_suffix_system_messages,
+                _FINAL_TOOL_ENABLED_STEP_SYSTEM_PROMPT,
+                intervention_class="step_budget_pressure",
+                detail="final_tool_enabled_step_prompt",
+                step=step,
+            )
+        elif (
+            remaining_tool_steps_after_this is not None and 0 < remaining_tool_steps_after_this <= 3
+        ):
+            _append_controller_ephemeral_system_message(
+                step_ephemeral_suffix_system_messages,
                 _LOW_STEP_BUDGET_SYSTEM_PROMPT_TEMPLATE.format(
                     remaining_steps=remaining_tool_steps_after_this
-                )
+                ),
+                intervention_class="step_budget_pressure",
+                detail="low_step_budget_prompt",
+                step=step,
+                metadata={"remaining_steps": remaining_tool_steps_after_this},
             )
         if (
             execution_follow_through_enabled
             and consecutive_exploration_only_steps >= 3
             and execution_state.material_edit_count <= 0
         ):
-            step_ephemeral_suffix_system_messages.append(
-                _PHASE_BUDGET_EXPLORATION_SYSTEM_PROMPT_TEMPLATE.format(
-                    exploration_steps=consecutive_exploration_only_steps
-                )
+            phase_budget_exploration_metadata = {
+                "exploration_steps": consecutive_exploration_only_steps,
+            }
+            phase_budget_exploration_rearmed = (
+                phase_budget_exploration_nudges_sent <= 0
+                or consecutive_exploration_only_steps - last_phase_budget_exploration_nudge_steps
+                >= 3
             )
+            if (
+                phase_budget_exploration_nudges_sent < MAX_PHASE_BUDGET_EXPLORATION_NUDGES_PER_TURN
+                and phase_budget_exploration_rearmed
+            ):
+                phase_budget_exploration_nudges_sent += 1
+                last_phase_budget_exploration_nudge_steps = consecutive_exploration_only_steps
+                _append_controller_ephemeral_system_message(
+                    step_ephemeral_suffix_system_messages,
+                    _PHASE_BUDGET_EXPLORATION_SYSTEM_PROMPT_TEMPLATE.format(
+                        exploration_steps=consecutive_exploration_only_steps
+                    ),
+                    intervention_class="step_budget_pressure",
+                    detail="phase_budget_exploration_prompt",
+                    step=step,
+                    metadata=phase_budget_exploration_metadata,
+                )
+            else:
+                _record_controller_intervention(
+                    "step_budget_pressure",
+                    "phase_budget_exploration_prompt",
+                    step=step,
+                    metadata={**phase_budget_exploration_metadata, "suppressed": True},
+                    headline_counted=False,
+                )
         elif (
             execution_follow_through_enabled
             and execution_state.material_edit_count > 0
             and execution_state.verification_attempt_count <= 0
+            and remaining_tool_steps_after_this is not None
             and 0 < remaining_tool_steps_after_this <= 5
         ):
-            step_ephemeral_suffix_system_messages.append(
+            _append_controller_ephemeral_system_message(
+                step_ephemeral_suffix_system_messages,
                 _PHASE_BUDGET_VERIFICATION_SYSTEM_PROMPT_TEMPLATE.format(
                     remaining_steps=remaining_tool_steps_after_this
-                )
+                ),
+                intervention_class="step_budget_pressure",
+                detail="phase_budget_verification_prompt",
+                step=step,
+                metadata={"remaining_steps": remaining_tool_steps_after_this},
             )
         _append_deadline_finalization_prompt(step_ephemeral_suffix_system_messages, step=step)
 
@@ -1952,6 +2507,19 @@ def run_turn(
                 prompts=list(suffix_prompts),
             )
 
+        def _provider_request_messages_builder(
+            persistent_messages: list[dict[str, Any]],
+            turn_prompts: tuple[str, ...] = tuple(ephemeral_turn_system_messages),
+            user_context_messages: tuple[str, ...] = tuple(ephemeral_turn_user_messages),
+            suffix_prompts: tuple[str, ...] = tuple(step_ephemeral_suffix_system_messages),
+        ) -> list[dict[str, Any]]:
+            return _request_messages_for_step(
+                persistent_messages,
+                turn_prompts=turn_prompts,
+                user_context_messages=user_context_messages,
+                suffix_prompts=suffix_prompts,
+            )
+
         streamed_text_emitted = False
 
         def _on_text_delta(delta: str) -> None:
@@ -1961,10 +2529,6 @@ def run_turn(
                 _emit_message_delta_event(self.surface, delta)
                 streamed_text_emitted = True
             self.surface.on_assistant_token(delta)
-
-        # Reasoning sink (``_on_reasoning_delta``) is defined once before the route
-        # split above; here we only gate it on this step's effective stream mode.
-        _reasoning_enabled = stream_used and _reasoning_sink_exists
 
         request_messages = _request_messages_for_step(self.messages)
         try:
@@ -1981,6 +2545,7 @@ def run_turn(
                     None,
                 )
                 try:
+                    self.refresh_compactor_calibration_filters()
                     operation_started = perf_counter()
                     with temporarily_clamp_client_timeout(
                         compactor_client,
@@ -1989,9 +2554,18 @@ def run_turn(
                     ):
                         compacted_messages, compacted = self.conversation_compactor.maybe_compact(
                             messages=self.messages,
-                            tool_list=turn_tool_list,
+                            tool_list=effective_tools_for_client(
+                                self.client,
+                                turn_tool_list,
+                            ),
                             main_model=self.client.model,
+                            cache_policy=getattr(
+                                self.client,
+                                "prompt_cache_policy_metadata",
+                                None,
+                            ),
                             focus=instruction,
+                            request_messages_builder=_provider_request_messages_builder,
                         )
                     _record_deadline_duration(
                         DeadlineOperation.COMPACTION_LLM,
@@ -2003,6 +2577,7 @@ def run_turn(
                 if deadline is not None and deadline.is_exhausted():
                     return _deadline_exhausted_result("compaction_llm", step=step)
                 if compacted:
+                    self.invalidate_request_context(reason="conversation_compacted")
                     _phase_update_key("phase_compacted_history")
                     if self.hook_dispatcher is not None:
                         cwd, active_workdir_relpath = self._hook_runtime_context()
@@ -2052,21 +2627,28 @@ def run_turn(
             operation_started = perf_counter()
             request_tool_choice = forced_tool_choice_for_next_step
             forced_tool_choice_for_next_step = None
-            with temporarily_clamp_client_timeout(
+            reasoning_sink = _reasoning_summary_callback_for(
                 self.client,
-                deadline,
-                operation="main_llm",
-            ):
-                resp = _main_agent_chat(
-                    client=self.client,
-                    messages=request_messages,
-                    tools=turn_tool_list,
-                    stream=stream_used,
-                    on_text_delta=_on_text_delta if stream_used else None,
-                    on_reasoning_delta=_on_reasoning_delta if _reasoning_enabled else None,
-                    cancellation_token=cancellation_token,
-                    tool_choice=request_tool_choice,
-                )
+                stream=stream_used,
+            )
+            try:
+                with temporarily_clamp_client_timeout(
+                    self.client,
+                    deadline,
+                    operation="main_llm",
+                ):
+                    resp = _main_agent_chat(
+                        client=self.client,
+                        messages=request_messages,
+                        tools=turn_tool_list,
+                        stream=stream_used,
+                        on_text_delta=_on_text_delta if stream_used else None,
+                        on_reasoning_delta=reasoning_sink,
+                        cancellation_token=cancellation_token,
+                        tool_choice=request_tool_choice,
+                    )
+            finally:
+                _close_reasoning_summary_sink(reasoning_sink)
             _record_deadline_duration(DeadlineOperation.MAIN_LLM, operation_started)
             _diagnostic_event(
                 "llm_completed",
@@ -2077,10 +2659,202 @@ def run_turn(
         except DeadlineExhausted:
             return _deadline_exhausted_result("main_llm", step=step)
         except LLMError as e:
-            if stream_used and _is_stream_unsupported_error(e):
+            context_overflow_recovered = False
+            compact_for_overflow = getattr(
+                self.conversation_compactor,
+                "compact_for_overflow",
+                None,
+            )
+            if (
+                is_context_window_exceeded_error(e)
+                and not streamed_text_emitted
+                and callable(compact_for_overflow)
+            ):
                 self.store.append(
                     "warning",
-                    {"warning": "stream_not_supported", "error": str(e)},
+                    {
+                        "warning": "provider_context_overflow",
+                        "error": sanitize_error_text_for_output(e),
+                        "step": step,
+                    },
+                )
+                progress_handler = getattr(self.surface, "on_progress_update", None)
+                if callable(progress_handler):
+                    progress_handler("Context limit reached; compacting safely and retrying.")
+                compacted = False
+                try:
+                    if not _deadline_allows(
+                        DeadlineOperation.COMPACTION_LLM,
+                        minimum_remaining_seconds=MINIMUM_LLM_START_SECONDS,
+                    ):
+                        return _deadline_exhausted_result(
+                            "context_overflow_compaction",
+                            step=step,
+                        )
+                    compactor_client = getattr(
+                        self.conversation_compactor,
+                        "compactor_client",
+                        None,
+                    )
+                    operation_started = perf_counter()
+                    with temporarily_clamp_client_timeout(
+                        compactor_client,
+                        deadline,
+                        operation="context_overflow_compaction",
+                    ):
+                        compacted_messages, compacted = compact_for_overflow(
+                            messages=self.messages,
+                            tool_list=effective_tools_for_client(
+                                self.client,
+                                turn_tool_list,
+                            ),
+                            main_model=self.client.model,
+                            cache_policy=getattr(
+                                self.client,
+                                "prompt_cache_policy_metadata",
+                                None,
+                            ),
+                            focus=instruction,
+                            request_messages_builder=_provider_request_messages_builder,
+                        )
+                    _record_deadline_duration(
+                        DeadlineOperation.COMPACTION_LLM,
+                        operation_started,
+                    )
+                    if compacted:
+                        self.messages = compacted_messages
+                        self.invalidate_request_context(reason="provider_overflow_compaction")
+                        verify_fits = getattr(
+                            self.conversation_compactor,
+                            "request_fits_input_budget",
+                            None,
+                        )
+                        if callable(verify_fits) and not verify_fits(
+                            messages=self.messages,
+                            tool_list=effective_tools_for_client(
+                                self.client,
+                                turn_tool_list,
+                            ),
+                            main_model=self.client.model,
+                            cache_policy=getattr(
+                                self.client,
+                                "prompt_cache_policy_metadata",
+                                None,
+                            ),
+                            request_messages_builder=_provider_request_messages_builder,
+                        ):
+                            compacted = False
+                            self.store.append(
+                                "compaction_warning",
+                                {
+                                    "warning": "context_overflow_retry_still_oversized",
+                                    "step": step,
+                                },
+                            )
+                except DeadlineExhausted:
+                    return _deadline_exhausted_result(
+                        "context_overflow_compaction",
+                        step=step,
+                    )
+                except Exception as compact_error:  # noqa: BLE001 - preserve original provider error
+                    self.store.append(
+                        "compaction_warning",
+                        {
+                            "warning": "context_overflow_compaction_failed",
+                            "error": sanitize_error_text_for_output(compact_error),
+                            "step": step,
+                        },
+                    )
+
+                if compacted:
+                    request_messages = _provider_request_messages_builder(self.messages)
+                    try:
+                        if not _deadline_allows(
+                            DeadlineOperation.MAIN_LLM_RETRY,
+                            minimum_remaining_seconds=MINIMUM_LLM_START_SECONDS,
+                        ):
+                            return _deadline_exhausted_result(
+                                "context_overflow_retry",
+                                step=step,
+                            )
+                        _diagnostic_event(
+                            "llm_started",
+                            {
+                                "operation": "context_overflow_retry",
+                                "step": step,
+                                "deadline": _deadline_snapshot(),
+                            },
+                        )
+                        operation_started = perf_counter()
+                        reasoning_sink = _reasoning_summary_callback_for(
+                            self.client,
+                            stream=stream_used,
+                        )
+                        try:
+                            with temporarily_clamp_client_timeout(
+                                self.client,
+                                deadline,
+                                operation="context_overflow_retry",
+                            ):
+                                resp = _main_agent_chat(
+                                    client=self.client,
+                                    messages=request_messages,
+                                    tools=turn_tool_list,
+                                    stream=stream_used,
+                                    on_text_delta=(_on_text_delta if stream_used else None),
+                                    on_reasoning_delta=reasoning_sink,
+                                    cancellation_token=cancellation_token,
+                                    tool_choice=request_tool_choice,
+                                )
+                        finally:
+                            _close_reasoning_summary_sink(reasoning_sink)
+                        _record_deadline_duration(
+                            DeadlineOperation.MAIN_LLM_RETRY,
+                            operation_started,
+                        )
+                        _diagnostic_event(
+                            "llm_completed",
+                            {
+                                "operation": "context_overflow_retry",
+                                "step": step,
+                                "deadline": _deadline_snapshot(),
+                            },
+                        )
+                        context_overflow_recovered = True
+                        self.store.append(
+                            "context_overflow_recovered",
+                            {"step": step, "message_count": len(self.messages)},
+                        )
+                    except DeadlineExhausted:
+                        return _deadline_exhausted_result(
+                            "context_overflow_retry",
+                            step=step,
+                        )
+                    except LLMError as retry_err:
+                        _diagnostic_event(
+                            "llm_failed",
+                            {
+                                "operation": "context_overflow_retry",
+                                "step": step,
+                                "failure_category": classify_failure_category(retry_err).value,
+                                "deadline": _deadline_snapshot(),
+                            },
+                        )
+                        self.store.append(
+                            "error", {"error": sanitize_error_text_for_output(retry_err)}
+                        )
+                        _rollback_turn_after_llm_error()
+                        raise
+
+            if context_overflow_recovered:
+                pass
+            elif stream_used and _is_stream_unsupported_error(e):
+                self.store.append(
+                    "warning",
+                    {
+                        "warning": "stream_not_supported",
+                        "error": sanitize_error_text_for_output(e),
+                    },
                 )
                 progress_handler = getattr(self.surface, "on_progress_update", None)
                 if callable(progress_handler):
@@ -2100,21 +2874,28 @@ def run_turn(
                         },
                     )
                     operation_started = perf_counter()
-                    with temporarily_clamp_client_timeout(
+                    reasoning_sink = _reasoning_summary_callback_for(
                         self.client,
-                        deadline,
-                        operation="main_llm_retry",
-                    ):
-                        resp = _main_agent_chat(
-                            client=self.client,
-                            messages=request_messages,
-                            tools=turn_tool_list,
-                            stream=False,
-                            on_text_delta=None,
-                            on_reasoning_delta=None,
-                            cancellation_token=cancellation_token,
-                            tool_choice=request_tool_choice,
-                        )
+                        stream=False,
+                    )
+                    try:
+                        with temporarily_clamp_client_timeout(
+                            self.client,
+                            deadline,
+                            operation="main_llm_retry",
+                        ):
+                            resp = _main_agent_chat(
+                                client=self.client,
+                                messages=request_messages,
+                                tools=turn_tool_list,
+                                stream=False,
+                                on_text_delta=None,
+                                on_reasoning_delta=reasoning_sink,
+                                cancellation_token=cancellation_token,
+                                tool_choice=request_tool_choice,
+                            )
+                    finally:
+                        _close_reasoning_summary_sink(reasoning_sink)
                     _record_deadline_duration(
                         DeadlineOperation.MAIN_LLM_RETRY,
                         operation_started,
@@ -2137,11 +2918,11 @@ def run_turn(
                         {
                             "operation": "main_llm_retry",
                             "step": step,
-                            "failure_category": "llm_error",
+                            "failure_category": classify_failure_category(retry_err).value,
                             "deadline": _deadline_snapshot(),
                         },
                     )
-                    self.store.append("error", {"error": str(retry_err)})
+                    self.store.append("error", {"error": sanitize_error_text_for_output(retry_err)})
                     _rollback_turn_after_llm_error()
                     raise
                 stream_used = False
@@ -2151,157 +2932,23 @@ def run_turn(
                     {
                         "operation": "main_llm",
                         "step": step,
-                        "failure_category": "llm_error",
+                        "failure_category": classify_failure_category(e).value,
                         "deadline": _deadline_snapshot(),
                     },
                 )
-                self.store.append("error", {"error": str(e)})
+                self.store.append("error", {"error": sanitize_error_text_for_output(e)})
                 _rollback_turn_after_llm_error()
                 raise
 
-        usage = resp.usage
-        usage_record = build_usage_record(
-            role=self.usage_role,
-            requested_model=self.client.model,
-            response_model=resp.response_model,
+        self._record_llm_usage(
+            client=self.client,
+            response=resp,
             messages=request_messages,
-            response_content=resp.content or "",
-            response_tool_calls=[
-                {"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in resp.tool_calls
-            ],
-            api_prompt_tokens=(usage.prompt_tokens if usage else None),
-            api_completion_tokens=(usage.completion_tokens if usage else None),
-            api_total_tokens=(usage.total_tokens if usage else None),
-            api_cached_prompt_tokens=(usage.cached_prompt_tokens if usage else None),
             tool_list=turn_tool_list,
-            pinned_prefix_len=self.pinned_prefix_len,
-            registry=self.model_registry,
+            operation="main_llm",
         )
-        self.usage_summary.add_record(usage_record)
-        self.store.append("llm_usage", usage_record.to_payload())
 
         tool_calls = resp.tool_calls
-        has_invalid_tool_arguments_json = _has_invalid_tool_call_json(tool_calls)
-        adaptive_retry_keys = [
-            key
-            for key in (_tool_call_retry_key(tc.name, tc.arguments) for tc in tool_calls)
-            if failed_tool_call_counts.get(key, 0) >= MAX_IDENTICAL_TOOL_CALL_FAILURES
-            and key not in adaptive_retry_keys_used
-        ]
-        adaptive_retry_reason: str | None = None
-        if has_invalid_tool_arguments_json:
-            adaptive_retry_reason = "invalid_tool_arguments_json"
-        elif adaptive_retry_keys:
-            adaptive_retry_reason = "repeated_tool_error"
-        if adaptive_retry_reason is not None:
-            adaptive_tools = [
-                {
-                    "name": tc.name,
-                    "arguments": tc.arguments,
-                }
-                for tc in tool_calls
-            ]
-            self.store.append(
-                "warning",
-                {
-                    "warning": "adaptive_temperature_retry",
-                    "reason": adaptive_retry_reason,
-                    "step": step,
-                    "temperature": _ADAPTIVE_RETRY_TEMPERATURE,
-                    "tool_calls": adaptive_tools,
-                },
-            )
-            _phase_update_key("phase_retrying_step")
-            try:
-                if not _deadline_allows(
-                    DeadlineOperation.ADAPTIVE_RETRY_LLM,
-                    minimum_remaining_seconds=MINIMUM_LLM_START_SECONDS,
-                ):
-                    return _deadline_exhausted_result("adaptive_retry_llm", step=step)
-                _diagnostic_event(
-                    "llm_started",
-                    {
-                        "operation": "adaptive_retry_llm",
-                        "step": step,
-                        "deadline": _deadline_snapshot(),
-                    },
-                )
-                operation_started = perf_counter()
-                with temporarily_clamp_client_timeout(
-                    self.client,
-                    deadline,
-                    operation="adaptive_retry_llm",
-                ):
-                    retry_resp = _main_agent_chat(
-                        client=self.client,
-                        messages=_request_messages_for_step(self.messages),
-                        tools=turn_tool_list,
-                        stream=False,
-                        on_text_delta=None,
-                        temperature=_ADAPTIVE_RETRY_TEMPERATURE,
-                    )
-                _record_deadline_duration(
-                    DeadlineOperation.ADAPTIVE_RETRY_LLM,
-                    operation_started,
-                )
-                _diagnostic_event(
-                    "llm_completed",
-                    {
-                        "operation": "adaptive_retry_llm",
-                        "step": step,
-                        "deadline": _deadline_snapshot(),
-                    },
-                )
-                if deadline is not None and deadline.is_exhausted():
-                    return _deadline_exhausted_result("adaptive_retry_llm", step=step)
-            except DeadlineExhausted:
-                return _deadline_exhausted_result("adaptive_retry_llm", step=step)
-            except LLMError as adaptive_retry_error:
-                _diagnostic_event(
-                    "llm_failed",
-                    {
-                        "operation": "adaptive_retry_llm",
-                        "step": step,
-                        "failure_category": "llm_error",
-                        "deadline": _deadline_snapshot(),
-                    },
-                )
-                self.store.append(
-                    "warning",
-                    {
-                        "warning": "adaptive_temperature_retry_failed",
-                        "step": step,
-                        "error": str(adaptive_retry_error),
-                    },
-                )
-            else:
-                retry_usage = retry_resp.usage
-                retry_usage_record = build_usage_record(
-                    role=self.usage_role,
-                    requested_model=self.client.model,
-                    response_model=retry_resp.response_model,
-                    messages=request_messages,
-                    response_content=retry_resp.content or "",
-                    response_tool_calls=[
-                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                        for tc in retry_resp.tool_calls
-                    ],
-                    api_prompt_tokens=(retry_usage.prompt_tokens if retry_usage else None),
-                    api_completion_tokens=(retry_usage.completion_tokens if retry_usage else None),
-                    api_total_tokens=(retry_usage.total_tokens if retry_usage else None),
-                    api_cached_prompt_tokens=(
-                        retry_usage.cached_prompt_tokens if retry_usage else None
-                    ),
-                    tool_list=turn_tool_list,
-                    pinned_prefix_len=self.pinned_prefix_len,
-                    registry=self.model_registry,
-                )
-                self.usage_summary.add_record(retry_usage_record)
-                self.store.append("llm_usage", retry_usage_record.to_payload())
-                if adaptive_retry_reason == "repeated_tool_error":
-                    adaptive_retry_keys_used.update(adaptive_retry_keys)
-                resp = retry_resp
-                tool_calls = retry_resp.tool_calls
         if tool_calls:
             repo_tool_activity_observed = True
             names = ", ".join(tc.name for tc in tool_calls[:3])
@@ -2340,10 +2987,20 @@ def run_turn(
             repeated_failed_edit_key: str | None = None
             step_failed_edit_errors: list[str] = []
             step_tool_names = [tc.name for tc in tool_calls]
-            for step_tool_name in step_tool_names:
-                if _is_exploration_only_tool(step_tool_name):
+            for step_tool_call in tool_calls:
+                step_tool_name = step_tool_call.name
+                step_tool_arguments = (
+                    step_tool_call.arguments if isinstance(step_tool_call.arguments, dict) else {}
+                )
+                if _is_exploration_only_tool(
+                    step_tool_name,
+                    arguments=step_tool_arguments,
+                ):
                     repo_read_only_tool_activity_observed = True
-                elif _is_action_progress_tool(step_tool_name):
+                elif _is_action_progress_tool(
+                    step_tool_name,
+                    arguments=step_tool_arguments,
+                ):
                     repo_action_tool_activity_observed = True
                 else:
                     repo_unknown_tool_activity_observed = True
@@ -2458,13 +3115,37 @@ def run_turn(
                 hook_runtime_system_messages: list[str] = []
                 hook_runtime_user_messages: list[str] = []
                 pre_tool_blocked = False
+                terminal_approval_declined_error: ApprovalDeclinedError | None = None
                 tool_executed_for_deadline_observation = False
                 unavailable_result = unavailable_tool_result(effective_tool_name)
+                invalid_tool_arguments_json = _tool_call_has_invalid_tool_arguments_json(tc)
                 subagent_blocked_by_turn_policy = (
                     str(tc.name or "").strip().lower() == "subagent_run"
                     and subagent_turn_policy.reason == "user_opt_out"
                 )
-                if subagent_blocked_by_turn_policy:
+                if invalid_tool_arguments_json:
+                    result = _invalid_tool_arguments_json_result()
+                    _record_controller_intervention(
+                        "other",
+                        "invalid_tool_arguments_json",
+                        step=step,
+                        metadata={"tool": tc.name, "tool_call_id": tc.id},
+                    )
+                    self.store.append(
+                        "invalid_tool_json_recovered",
+                        {
+                            "tool": tc.name,
+                            "tool_call_id": tc.id,
+                            "step": step,
+                        },
+                    )
+                elif subagent_blocked_by_turn_policy:
+                    _record_controller_intervention(
+                        "user_opt_out_block",
+                        "subagent_run_user_opt_out",
+                        step=step,
+                        metadata={"tool": tc.name, "tool_call_id": tc.id},
+                    )
                     result = {
                         "error": (
                             "subagent_run is disabled for this turn because the user "
@@ -2472,8 +3153,26 @@ def run_turn(
                         )
                     }
                 elif unavailable_result is not None:
+                    _record_controller_intervention(
+                        "other",
+                        "tool_unavailable",
+                        step=step,
+                        metadata={"tool": tc.name, "tool_call_id": tc.id},
+                    )
                     result = unavailable_result
+                elif effective_tool_name.casefold() in web_tools_unavailable_for_turn:
+                    result = web_unavailable_result(effective_tool_name)
                 elif prior_failures >= MAX_IDENTICAL_TOOL_CALL_FAILURES:
+                    _record_controller_intervention(
+                        "repeated_failure_block",
+                        "repeated_tool_failure_guard",
+                        step=step,
+                        metadata={
+                            "tool": tc.name,
+                            "tool_call_id": tc.id,
+                            "failures": prior_failures,
+                        },
+                    )
                     result = {
                         "error": (
                             "Blocked repeated tool call after "
@@ -2496,7 +3195,14 @@ def run_turn(
                         arguments=tc.arguments,
                         available_tool_names=turn_tools.keys(),
                     )
-                    hook_runtime_system_messages.append(str(result.get("guidance") or ""))
+                    _append_controller_ephemeral_system_message(
+                        hook_runtime_system_messages,
+                        str(result.get("guidance") or ""),
+                        intervention_class="other",
+                        detail="unknown_tool_recovery",
+                        step=step,
+                        metadata={"tool": tc.name, "tool_call_id": tc.id},
+                    )
                     self.store.append(
                         "unknown_tool_recovery",
                         {
@@ -2525,6 +3231,17 @@ def run_turn(
                         },
                     )
                     if deadline_decision is not None and not bool(deadline_decision.get("allowed")):
+                        _record_controller_intervention(
+                            "deadline_block",
+                            str(deadline_decision.get("operation") or tool_deadline_operation),
+                            step=step,
+                            metadata={
+                                "tool": tc.name,
+                                "tool_call_id": tc.id,
+                                "reason": deadline_decision.get("reason"),
+                                "decision": deadline_decision,
+                            },
+                        )
                         result = {
                             "error": (
                                 f"{tc.name} skipped because the run deadline policy blocked "
@@ -2591,6 +3308,16 @@ def run_turn(
                     if pre_tool_hook_result.blocked:
                         pre_tool_blocked = True
                         blocked_reason = pre_tool_hook_result.reason or f"{tc.name} blocked by hook"
+                        _record_controller_intervention(
+                            "safety_block",
+                            "pre_tool_use_hook",
+                            step=step,
+                            metadata={
+                                "tool": effective_tool_name,
+                                "tool_call_id": tc.id,
+                                "reason": blocked_reason,
+                            },
+                        )
                         result = {"error": f"Blocked by hook: {blocked_reason}"}
                         if self.hook_dispatcher is not None:
                             self._safe_dispatch_hooks(
@@ -2624,6 +3351,14 @@ def run_turn(
                                     result = future.result()
                                 else:
                                     result = tool.run(effective_tool_arguments)
+                            except ApprovalDeclinedError as e:
+                                terminal_approval_declined_error = e
+                                result = {
+                                    "status": "approval_declined",
+                                    "approval_declined": True,
+                                    "approval_kind": e.approval_kind,
+                                    "message": str(e),
+                                }
                             except (
                                 FsError,
                                 SearchError,
@@ -2632,13 +3367,34 @@ def run_turn(
                                 ShellError,
                                 GitError,
                                 VerifyError,
-                                WebFetchError,
-                                WebSearchError,
                                 AgentRuntimeError,
                             ) as e:
                                 result = {"error": str(e)}
                             except Exception as e:  # noqa: BLE001
-                                result = {"error": f"Tool failed: {e}"}
+                                if effective_tool_name.casefold() in WEB_TOOL_NAMES:
+                                    if is_recoverable_web_tool_error(e):
+                                        result = {"error": str(e), "recoverable": True}
+                                    else:
+                                        result = _mark_web_tool_unavailable(
+                                            tool_name=effective_tool_name,
+                                            step=step,
+                                            tool_call_id=tc.id,
+                                            error=e,
+                                        )
+                                else:
+                                    result = {"error": f"Tool failed: {e}"}
+                            if (
+                                effective_tool_name.casefold() in WEB_TOOL_NAMES
+                                and isinstance(result, dict)
+                                and "error" in result
+                                and not is_recoverable_web_error_result(result)
+                            ):
+                                result = _mark_web_tool_unavailable(
+                                    tool_name=effective_tool_name,
+                                    step=step,
+                                    tool_call_id=tc.id,
+                                    error=str(result.get("error") or "web tool failed"),
+                                )
                         post_tool_hook_result = self._safe_dispatch_hooks(
                             lambda tool_name=effective_tool_name, tool_input=copy.deepcopy(effective_tool_arguments), tool_response=copy.deepcopy(result if isinstance(result, dict) else {}), hook_cwd=cwd, hook_relpath=active_workdir_relpath, hook_step=step: (
                                 self.hook_dispatcher.fire_post_tool_use(  # type: ignore[union-attr]
@@ -2698,33 +3454,56 @@ def run_turn(
                     )
                 )
                 status = "failed" if isinstance(result, dict) and "error" in result else "done"
+                if terminal_approval_declined_error is not None:
+                    status = "failed"
+                if getattr(self, "agentbox_telemetry", None) is not None:
+                    self.agentbox_telemetry.tool(effective_tool_name)
                 tool_unavailable = is_tool_unavailable_result(result)
+                if status == "done" and not tool_unavailable:
+                    if effective_tool_name == "shell_background":
+                        background_processes_started_this_turn += 1
+                    elif effective_tool_name == "shell_kill":
+                        background_processes_killed_this_turn += 1
                 meta: dict[str, Any] = {}
                 if alias_recovery_payload is not None:
                     meta["executed_tool_name"] = effective_tool_name
                     meta["compatibility_alias"] = alias_recovery_payload
+                if terminal_approval_declined_error is not None:
+                    meta["approval_declined"] = True
+                    meta["approval_kind"] = terminal_approval_declined_error.approval_kind
+                result_dict = result if isinstance(result, dict) else {}
+                touched_workspace_paths = (
+                    set()
+                    if tool_unavailable
+                    else _extract_touched_repo_paths(
+                        root=self.root,
+                        tool_name=effective_tool_name,
+                        arguments=effective_tool_arguments,
+                        result=result_dict,
+                    )
+                )
                 if status == "failed":
-                    meta["error"] = str(result.get("error"))
-                    if prior_failures >= MAX_IDENTICAL_TOOL_CALL_FAILURES:
+                    meta["error"] = str(
+                        result.get("error")
+                        or result.get("message")
+                        or terminal_approval_declined_error
+                        or ""
+                    )
+                    if terminal_approval_declined_error is not None:
+                        failed_tool_call_counts[retry_key] = prior_failures
+                    elif prior_failures >= MAX_IDENTICAL_TOOL_CALL_FAILURES:
                         failed_tool_call_counts[retry_key] = prior_failures
                     else:
                         failed_tool_call_counts[retry_key] = prior_failures + 1
                 else:
                     failed_tool_call_counts.pop(retry_key, None)
-                    if not tool_unavailable and _is_action_progress_tool(effective_tool_name):
+                    if not tool_unavailable and _is_action_progress_tool(
+                        effective_tool_name,
+                        arguments=effective_tool_arguments,
+                        result=result_dict,
+                        touched_paths=touched_workspace_paths,
+                    ):
                         step_had_successful_action_progress = True
-                    touched_workspace_paths = (
-                        set()
-                        if tool_unavailable
-                        else _extract_touched_repo_paths(
-                            root=self.root,
-                            tool_name=effective_tool_name,
-                            arguments=effective_tool_arguments,
-                            result=result if isinstance(result, dict) else {},
-                        )
-                    )
-                    if touched_workspace_paths:
-                        self.workspace_touched_paths.update(touched_workspace_paths)
                     if not tool_unavailable:
                         _remember_same_batch_read_result(
                             root=self.root,
@@ -2733,8 +3512,16 @@ def run_turn(
                             arguments=effective_tool_arguments,
                             result=result if isinstance(result, dict) else {},
                         )
+                if touched_workspace_paths:
+                    self.workspace_touched_paths.update(touched_workspace_paths)
                 if _same_batch_read_cache_should_invalidate(effective_tool_name, tool):
                     same_batch_read_cache.clear()
+                verified_generation_before_tool = _latest_accepted_verification_generation(
+                    execution_state
+                )
+                verification_relevant_generation_before_tool = (
+                    execution_state.verification_relevant_edit_generation
+                )
                 _record_tool_effect(
                     root=self.root,
                     state=execution_state,
@@ -2745,6 +3532,37 @@ def run_turn(
                     known_verification_commands=known_verification_commands,
                     verification_authoritative=bool(self.verification_authoritative),
                 )
+                verified_state_invalidation_note = ""
+                verified_state_invalidation_payload: dict[str, Any] | None = None
+                if (
+                    verified_generation_before_tool is not None
+                    and verified_generation_before_tool
+                    == verification_relevant_generation_before_tool
+                    and execution_state.verification_relevant_edit_generation
+                    > verification_relevant_generation_before_tool
+                ):
+                    verified_generation_id = (
+                        f"verification-generation-{verified_generation_before_tool}"
+                    )
+                    verified_state_invalidation_note = (
+                        "Note: this edit invalidates the previously verified state "
+                        f"({verified_generation_id}); re-verify before finalizing if "
+                        "verification was expected."
+                    )
+                    verified_state_invalidation_payload = {
+                        "tool": effective_tool_name,
+                        "requested_tool": tc.name,
+                        "tool_call_id": tc.id,
+                        "step": step,
+                        "verified_generation_id": verified_generation_id,
+                        "previous_verification_relevant_generation": (
+                            verification_relevant_generation_before_tool
+                        ),
+                        "current_verification_relevant_generation": (
+                            execution_state.verification_relevant_edit_generation
+                        ),
+                        "message": verified_state_invalidation_note,
+                    }
 
                 is_successful_subagent_run = _is_successful_subagent_run(
                     tool_name=effective_tool_name,
@@ -2753,7 +3571,12 @@ def run_turn(
                     result=result if isinstance(result, dict) else {},
                 )
                 if execution_phase_tracking_enabled and not tool_unavailable:
-                    if _is_action_progress_tool(effective_tool_name):
+                    if _is_action_progress_tool(
+                        effective_tool_name,
+                        arguments=effective_tool_arguments,
+                        result=result if isinstance(result, dict) else {},
+                        touched_paths=touched_workspace_paths,
+                    ):
                         step_had_action_progress = True
                         if is_successful_subagent_run:
                             subagent_success_count += 1
@@ -2773,7 +3596,12 @@ def run_turn(
                                 )
                         else:
                             post_explore_action_progress_started = True
-                    elif _is_exploration_only_tool(effective_tool_name):
+                    elif _is_exploration_only_tool(
+                        effective_tool_name,
+                        arguments=effective_tool_arguments,
+                        result=result if isinstance(result, dict) else {},
+                        touched_paths=touched_workspace_paths,
+                    ):
                         step_exploration_attempt_count += 1
                         if status == "failed":
                             step_exploration_failed_count += 1
@@ -2874,7 +3702,7 @@ def run_turn(
                 )
                 content_for_message = json.dumps(
                     result,
-                    ensure_ascii=True,
+                    ensure_ascii=False,
                     separators=(",", ":"),
                 )
                 if self.tool_output_offloader is not None:
@@ -2932,11 +3760,65 @@ def run_turn(
                         "content": content_for_message,
                     }
                 )
+                if verified_state_invalidation_payload is not None:
+                    self.store.append(
+                        "verified_state_invalidated_by_edit",
+                        verified_state_invalidation_payload,
+                    )
+                    _append_controller_system_message(
+                        verified_state_invalidation_note,
+                        intervention_class="other",
+                        detail="verified_state_invalidated_by_edit",
+                        step=step,
+                        metadata=verified_state_invalidation_payload,
+                    )
                 self._append_hook_messages(
                     event_name="tool_hook_context",
                     system_messages=hook_runtime_system_messages,
                     user_messages=hook_runtime_user_messages,
                 )
+                if terminal_approval_declined_error is not None:
+                    _shutdown_parallel_subagent_executor()
+                    approval_payload = {
+                        "tool_name": effective_tool_name,
+                        "requested_tool_name": tc.name,
+                        "tool_call_id": tc.id,
+                        "approval_kind": terminal_approval_declined_error.approval_kind,
+                        "step": step,
+                    }
+                    self.store.append("approval_declined", approval_payload)
+                    _diagnostic_event("approval_declined", approval_payload, durable=True)
+                    final_text = _approval_declined_final_text(
+                        tool_name=effective_tool_name,
+                        approval_kind=terminal_approval_declined_error.approval_kind,
+                    )
+                    _record_controller_intervention(
+                        "local_final",
+                        "approval_declined",
+                        step=step,
+                        metadata=approval_payload,
+                    )
+                    assistant_message = {"role": "assistant", "content": final_text}
+                    self.messages.append(assistant_message)
+                    last_visible_assistant_text = self._emit_assistant_message_if_changed(
+                        text=final_text,
+                        prior_visible_text=last_visible_assistant_text,
+                        extra_payload={
+                            "message": assistant_message,
+                            "termination_reason": "approval_declined",
+                            "approval": approval_payload,
+                        },
+                    )
+                    self.store.append(
+                        "final",
+                        {
+                            "content": final_text,
+                            "controller_interventions": _controller_interventions_payload(),
+                            "controller_interventions_total": controller_interventions.headline_total,
+                        },
+                    )
+                    assistant_message_emitted = True
+                    return _finish_turn(1, reason="approval_declined", final_text=final_text)
                 if deadline is not None and deadline.is_exhausted():
                     _shutdown_parallel_subagent_executor()
                     return _deadline_exhausted_result("tool_dispatch", step=step)
@@ -2952,7 +3834,6 @@ def run_turn(
                     consecutive_exploration_failed_count = 0
                     last_exploration_stagnation_payload = None
                     if post_explore_action_progress_started:
-                        post_explore_bootstrap_nudges_sent = 0
                         last_post_explore_stagnation_payload = None
                 elif step_exploration_attempt_count > 0:
                     consecutive_exploration_only_steps += 1
@@ -2995,7 +3876,16 @@ def run_turn(
                         exploration_steps=consecutive_exploration_only_steps,
                         anchor_paths=anchor_paths,
                     )
-                    self.messages.append({"role": "system", "content": nudge})
+                    _append_controller_system_message(
+                        nudge,
+                        intervention_class="subagent",
+                        detail="subagent_exploration_nudge",
+                        step=step,
+                        metadata={
+                            "attempt": subagent_exploration_nudges_sent,
+                            "anchor_paths": anchor_paths,
+                        },
+                    )
                     self.store.append(
                         "subagent_exploration_nudge",
                         {
@@ -3052,157 +3942,101 @@ def run_turn(
                                 "nudge_attempt": post_explore_bootstrap_nudges_sent + 1,
                             }
                         )
+                        can_send_post_explore_nudge = (
+                            post_explore_bootstrap_nudges_sent
+                            < MAX_POST_EXPLORE_BOOTSTRAP_NUDGES_PER_TURN
+                            and stagnation_nudges_sent < MAX_STAGNATION_NUDGES_PER_TURN
+                        )
+                        post_payload["nudge_sent"] = can_send_post_explore_nudge
+                        post_payload["stagnation_nudges_sent"] = stagnation_nudges_sent
+                        post_payload["stagnation_nudge_cap"] = MAX_STAGNATION_NUDGES_PER_TURN
                         last_post_explore_stagnation_payload = dict(post_payload)
                         self.store.append(
                             "one_shot_post_explore_stagnation_detected",
                             post_payload,
                         )
-                        if (
-                            post_explore_bootstrap_nudges_sent
-                            >= MAX_POST_EXPLORE_BOOTSTRAP_NUDGES_PER_TURN
-                        ):
-                            message = _runtime_text("one_shot_post_explore_retry_exhausted")
+                        if can_send_post_explore_nudge:
+                            post_explore_bootstrap_nudges_sent += 1
+                            stagnation_nudges_sent += 1
+                            nudge_message = _build_post_explore_bootstrap_nudge(
+                                anchor_paths=anchored_targets,
+                                language=turn_language,
+                                explicit_language_override=turn_language_explicit,
+                            )
+                            _append_controller_system_message(
+                                nudge_message,
+                                intervention_class="stagnation",
+                                detail="post_explore_bootstrap_nudge",
+                                step=step,
+                                metadata={
+                                    "attempt": post_explore_bootstrap_nudges_sent,
+                                    "reason": reason,
+                                },
+                            )
                             self.store.append(
-                                "one_shot_post_explore_incomplete_after_retries",
+                                "implementation_bootstrap_nudge",
                                 {
                                     "step": step,
+                                    "attempt": post_explore_bootstrap_nudges_sent,
+                                    "message": nudge_message,
                                     "reason": reason,
                                     "exploration_attempt_outcome": exploration_attempt_outcome,
                                     "step_exploration_attempt_outcome": (
                                         step_exploration_attempt_outcome
                                     ),
-                                    "nudge_attempts": post_explore_bootstrap_nudges_sent,
-                                    "consecutive_exploration_only_steps": (
-                                        consecutive_exploration_only_steps
-                                    ),
-                                    "exploration_attempt_count": step_exploration_attempt_count,
-                                    "exploration_success_count": step_exploration_success_count,
-                                    "exploration_failed_count": step_exploration_failed_count,
-                                    "consecutive_exploration_success_count": (
-                                        consecutive_exploration_success_count
-                                    ),
-                                    "consecutive_exploration_failed_count": (
-                                        consecutive_exploration_failed_count
-                                    ),
-                                    "tool_names": step_tool_names,
-                                    "repeated_tool": repeated_exploration_tool,
                                     "anchor_paths": anchored_targets,
+                                    "stagnation_nudges_sent": stagnation_nudges_sent,
+                                    "stagnation_nudge_cap": MAX_STAGNATION_NUDGES_PER_TURN,
                                 },
                             )
-                            _emit_surface_error(
-                                self.surface,
-                                "execution_guard_error",
-                                message,
-                                True,
-                            )
-                            self._emit_forced_final_summary_before_termination(
-                                reason="post_explore_retry_exhausted",
-                                termination_cause="post-explore bootstrap retries are exhausted",
-                                termination_kind="execution_guard_stagnation",
-                                max_steps=_current_turn_step_limit(),
-                                language=turn_language,
-                                script=turn_script,
-                                explicit_language_override=turn_language_explicit,
-                            )
-                            assistant_message_emitted = True
-                            return _finish_turn(1, reason="post_explore_retry_exhausted")
-
-                        post_explore_bootstrap_nudges_sent += 1
-                        nudge_message = _build_post_explore_bootstrap_nudge(
-                            anchor_paths=anchored_targets,
-                            language=turn_language,
-                            explicit_language_override=turn_language_explicit,
-                        )
-                        self.messages.append({"role": "system", "content": nudge_message})
-                        self.store.append(
-                            "implementation_bootstrap_nudge",
-                            {
-                                "step": step,
-                                "attempt": post_explore_bootstrap_nudges_sent,
-                                "message": nudge_message,
-                                "reason": reason,
-                                "exploration_attempt_outcome": exploration_attempt_outcome,
-                                "step_exploration_attempt_outcome": (
-                                    step_exploration_attempt_outcome
-                                ),
-                                "anchor_paths": anchored_targets,
-                            },
-                        )
-                        _phase_update_key("phase_post_explore_bootstrap")
+                            _phase_update_key("phase_post_explore_bootstrap")
                     else:
+                        can_send_exploration_nudge = (
+                            exploration_nudges_sent < MAX_EXPLORATION_NUDGES_PER_TURN
+                            and stagnation_nudges_sent < MAX_STAGNATION_NUDGES_PER_TURN
+                        )
+                        stagnation_payload["nudge_sent"] = can_send_exploration_nudge
+                        stagnation_payload["stagnation_nudges_sent"] = stagnation_nudges_sent
+                        stagnation_payload["stagnation_nudge_cap"] = MAX_STAGNATION_NUDGES_PER_TURN
                         last_exploration_stagnation_payload = dict(stagnation_payload)
                         self.store.append(
                             "one_shot_exploration_stagnation_detected",
                             stagnation_payload,
                         )
-                        if exploration_nudges_sent >= MAX_EXPLORATION_NUDGES_PER_TURN:
-                            message = _runtime_text("one_shot_exploration_retry_exhausted")
+                        if can_send_exploration_nudge:
+                            exploration_nudges_sent += 1
+                            stagnation_nudges_sent += 1
+                            exploration_nudge = _runtime_text("one_shot_exploration_nudge")
+                            _append_controller_system_message(
+                                exploration_nudge,
+                                intervention_class="stagnation",
+                                detail="exploration_nudge",
+                                step=step,
+                                metadata={
+                                    "attempt": exploration_nudges_sent,
+                                    "reason": reason,
+                                },
+                            )
                             self.store.append(
-                                "one_shot_exploration_incomplete_after_retries",
+                                "exploration_nudge",
                                 {
                                     "step": step,
+                                    "attempt": exploration_nudges_sent,
+                                    "message": exploration_nudge,
                                     "reason": reason,
                                     "exploration_attempt_outcome": exploration_attempt_outcome,
                                     "step_exploration_attempt_outcome": (
                                         step_exploration_attempt_outcome
                                     ),
-                                    "nudge_attempts": exploration_nudges_sent,
-                                    "consecutive_exploration_only_steps": (
-                                        consecutive_exploration_only_steps
-                                    ),
-                                    "exploration_attempt_count": step_exploration_attempt_count,
-                                    "exploration_success_count": step_exploration_success_count,
-                                    "exploration_failed_count": step_exploration_failed_count,
-                                    "consecutive_exploration_success_count": (
-                                        consecutive_exploration_success_count
-                                    ),
-                                    "consecutive_exploration_failed_count": (
-                                        consecutive_exploration_failed_count
-                                    ),
-                                    "tool_names": step_tool_names,
-                                    "repeated_tool": repeated_exploration_tool,
+                                    "stagnation_nudges_sent": stagnation_nudges_sent,
+                                    "stagnation_nudge_cap": MAX_STAGNATION_NUDGES_PER_TURN,
                                 },
                             )
-                            _emit_surface_error(
-                                self.surface,
-                                "execution_guard_error",
-                                message,
-                                True,
-                            )
-                            self._emit_forced_final_summary_before_termination(
-                                reason="exploration_retry_exhausted",
-                                termination_cause="exploration retries are exhausted",
-                                termination_kind="execution_guard_stagnation",
-                                max_steps=_current_turn_step_limit(),
-                                language=turn_language,
-                                script=turn_script,
-                                explicit_language_override=turn_language_explicit,
-                            )
-                            assistant_message_emitted = True
-                            return _finish_turn(1, reason="exploration_retry_exhausted")
-
-                        exploration_nudges_sent += 1
-                        exploration_nudge = _runtime_text("one_shot_exploration_nudge")
-                        self.messages.append({"role": "system", "content": exploration_nudge})
-                        self.store.append(
-                            "exploration_nudge",
-                            {
-                                "step": step,
-                                "attempt": exploration_nudges_sent,
-                                "message": exploration_nudge,
-                                "reason": reason,
-                                "exploration_attempt_outcome": exploration_attempt_outcome,
-                                "step_exploration_attempt_outcome": (
-                                    step_exploration_attempt_outcome
-                                ),
-                            },
-                        )
-                        _phase_update_key("phase_exploration_stagnation")
+                            _phase_update_key("phase_exploration_stagnation")
 
             if one_shot_edit_guard_enabled:
                 if step_had_successful_action_progress:
                     consecutive_failed_edit_steps = 0
-                    edit_nudges_sent = 0
                     failed_edit_attempt_call_counts.clear()
                     failed_edit_similarity_counts.clear()
                     consecutive_failed_edit_attempt_count = 0
@@ -3242,57 +4076,38 @@ def run_turn(
                         "error_samples": step_failed_edit_errors[:3],
                         "nudge_attempt": edit_nudges_sent + 1,
                     }
+                    can_send_edit_nudge = (
+                        edit_nudges_sent < MAX_EDIT_NUDGES_PER_TURN
+                        and stagnation_nudges_sent < MAX_STAGNATION_NUDGES_PER_TURN
+                    )
+                    stagnation_payload["nudge_sent"] = can_send_edit_nudge
+                    stagnation_payload["stagnation_nudges_sent"] = stagnation_nudges_sent
+                    stagnation_payload["stagnation_nudge_cap"] = MAX_STAGNATION_NUDGES_PER_TURN
                     last_edit_stagnation_payload = dict(stagnation_payload)
                     self.store.append("one_shot_edit_stagnation_detected", stagnation_payload)
-                    if edit_nudges_sent >= MAX_EDIT_NUDGES_PER_TURN:
-                        message = _runtime_text("one_shot_edit_retry_exhausted")
+                    if can_send_edit_nudge:
+                        edit_nudges_sent += 1
+                        stagnation_nudges_sent += 1
+                        edit_nudge = _runtime_text("one_shot_edit_strategy_nudge")
+                        _append_controller_system_message(
+                            edit_nudge,
+                            intervention_class="stagnation",
+                            detail="edit_strategy_nudge",
+                            step=step,
+                            metadata={"attempt": edit_nudges_sent, "reason": reason},
+                        )
                         self.store.append(
-                            "one_shot_edit_incomplete_after_retries",
+                            "edit_strategy_nudge",
                             {
                                 "step": step,
+                                "attempt": edit_nudges_sent,
+                                "message": edit_nudge,
                                 "reason": reason,
-                                "nudge_attempts": edit_nudges_sent,
-                                "consecutive_failed_edit_steps": (consecutive_failed_edit_steps),
-                                "step_failed_edit_attempt_count": (step_failed_edit_attempt_count),
-                                "consecutive_failed_edit_attempt_count": (
-                                    consecutive_failed_edit_attempt_count
-                                ),
-                                "tool_names": step_tool_names,
-                                "repeated_tool": repeated_failed_edit_tool,
-                                "error_samples": step_failed_edit_errors[:3],
+                                "stagnation_nudges_sent": stagnation_nudges_sent,
+                                "stagnation_nudge_cap": MAX_STAGNATION_NUDGES_PER_TURN,
                             },
                         )
-                        _emit_surface_error(
-                            self.surface,
-                            "execution_guard_error",
-                            message,
-                            True,
-                        )
-                        self._emit_forced_final_summary_before_termination(
-                            reason="edit_retry_exhausted",
-                            termination_cause="failed edit retries are exhausted",
-                            termination_kind="execution_guard_stagnation",
-                            max_steps=_current_turn_step_limit(),
-                            language=turn_language,
-                            script=turn_script,
-                            explicit_language_override=turn_language_explicit,
-                        )
-                        assistant_message_emitted = True
-                        return _finish_turn(1, reason="edit_retry_exhausted")
-
-                    edit_nudges_sent += 1
-                    edit_nudge = _runtime_text("one_shot_edit_strategy_nudge")
-                    self.messages.append({"role": "system", "content": edit_nudge})
-                    self.store.append(
-                        "edit_strategy_nudge",
-                        {
-                            "step": step,
-                            "attempt": edit_nudges_sent,
-                            "message": edit_nudge,
-                            "reason": reason,
-                        },
-                    )
-                    _phase_update_key("phase_failed_edit_loop")
+                        _phase_update_key("phase_failed_edit_loop")
 
             continue
 
@@ -3300,54 +4115,41 @@ def run_turn(
 
         if final_text and subagent_turn_policy.required_by_user and subagent_attempt_count <= 0:
             if subagent_required_nudges_sent >= MAX_SUBAGENT_REQUIRED_NUDGES_PER_TURN:
-                self.store.append(
-                    "subagent_required_incomplete_after_retries",
-                    {
-                        "step": step,
-                        "attempts": subagent_required_nudges_sent,
-                        "content": final_text,
-                        "available_subagents": list(subagent_turn_policy.available_subagents),
-                    },
-                )
-                _emit_surface_error(
-                    self.surface,
-                    "execution_guard_error",
-                    _SUBAGENT_REQUIRED_RETRY_EXHAUSTED_MESSAGE,
-                    True,
-                )
-                self._emit_forced_final_summary_before_termination(
-                    reason="subagent_required_retry_exhausted",
-                    termination_cause="required subagent_run was not attempted",
-                    termination_kind="execution_guard_stagnation",
-                    max_steps=_current_turn_step_limit(),
-                    language=turn_language,
-                    script=turn_script,
-                    explicit_language_override=turn_language_explicit,
-                    latest_assistant_text=final_text,
-                )
-                assistant_message_emitted = True
-                return _finish_turn(1, reason="subagent_required_retry_exhausted")
-            subagent_required_nudges_sent += 1
-            assistant_message = assistant_message_from_response(resp, content=final_text)
-            self.messages.append(assistant_message)
-            self.store.append(
-                "assistant_message",
-                {"content": final_text, "message": assistant_message},
-            )
-            nudge = _subagent_required_nudge_message(subagent_turn_policy)
-            self.messages.append({"role": "system", "content": nudge})
-            self.store.append(
-                "subagent_required_nudge",
-                {
+                payload = {
                     "step": step,
-                    "attempt": subagent_required_nudges_sent,
+                    "attempts": subagent_required_nudges_sent,
                     "content": final_text,
                     "available_subagents": list(subagent_turn_policy.available_subagents),
-                    "message": nudge,
-                },
-            )
-            _phase_update("Subagent delegation requested; retrying with subagent_run.")
-            continue
+                }
+                self.store.append("subagent_required_not_honored", payload)
+            else:
+                subagent_required_nudges_sent += 1
+                assistant_message = assistant_message_from_response(resp, content=final_text)
+                self.messages.append(assistant_message)
+                self.store.append(
+                    "assistant_message",
+                    {"content": final_text, "message": assistant_message},
+                )
+                nudge = _subagent_required_nudge_message(subagent_turn_policy)
+                _append_controller_system_message(
+                    nudge,
+                    intervention_class="subagent",
+                    detail="subagent_required_nudge",
+                    step=step,
+                    metadata={"attempt": subagent_required_nudges_sent},
+                )
+                self.store.append(
+                    "subagent_required_nudge",
+                    {
+                        "step": step,
+                        "attempt": subagent_required_nudges_sent,
+                        "content": final_text,
+                        "available_subagents": list(subagent_turn_policy.available_subagents),
+                        "message": nudge,
+                    },
+                )
+                _phase_update("Subagent delegation requested; retrying with subagent_run.")
+                continue
 
         should_retry_first_turn_repo_grounding = (
             self.runtime_kind == RuntimeKind.INTERACTIVE_CHAT
@@ -3369,7 +4171,13 @@ def run_turn(
                 self,
                 instruction,
             )
-            self.messages.append({"role": "system", "content": grounding_nudge})
+            _append_controller_system_message(
+                grounding_nudge,
+                intervention_class="other",
+                detail="first_turn_repo_execute_retry",
+                step=step,
+                metadata={"targets": grounding_targets},
+            )
             self.store.append(
                 "normal_chat_first_turn_repo_execute_retry",
                 {
@@ -3396,6 +4204,7 @@ def run_turn(
 
         should_continue_execution_progress = (
             execution_follow_through_enabled
+            and continuation_nudges_sent < MAX_NON_FINAL_CONTINUATIONS_PER_TURN
             and bool(final_text)
             and _assistant_text_contains_progress_intent(final_text)
             and not _assistant_text_has_completion_marker(final_text)
@@ -3412,56 +4221,13 @@ def run_turn(
                 non_final_progress_detected_event,
                 {
                     "step": step,
-                    "attempt": decision.stagnant_attempt_count,
+                    "attempt": 1,
                     "fingerprint": fingerprint,
                     "content": final_text,
                     "runtime_kind": self.runtime_kind.value,
                     **_completion_gate_decision_fields(decision),
                 },
             )
-            if decision.kind == CompletionGateDecisionKind.TERMINATE_STAGNANT:
-                record_completion_gate_decision(
-                    execution_state.completion_gate_controller_state,
-                    decision,
-                )
-                reason = "stagnant_progress"
-                message = _runtime_text(non_final_progress_stopped_key)
-                self.store.append(
-                    non_final_incomplete_event,
-                    {
-                        "step": step,
-                        "attempts": decision.stagnant_attempt_count,
-                        "reason": reason,
-                        "content": final_text,
-                        "runtime_kind": self.runtime_kind.value,
-                        **_completion_gate_decision_fields(decision),
-                    },
-                )
-                _emit_surface_error(
-                    self.surface,
-                    "execution_guard_error",
-                    message,
-                    True,
-                )
-                self._emit_forced_final_summary_before_termination(
-                    reason="non_final_progress_retry_exhausted",
-                    termination_cause=(
-                        "non-final progress stagnated without implementation or verification progress"
-                    ),
-                    termination_kind="completion_gate_stagnation",
-                    max_steps=_current_turn_step_limit(),
-                    language=turn_language,
-                    script=turn_script,
-                    explicit_language_override=turn_language_explicit,
-                    latest_assistant_text=final_text,
-                )
-                assistant_message_emitted = True
-                return _finish_turn(
-                    1,
-                    reason="non_final_progress_retry_exhausted",
-                    final_text=final_text,
-                )
-
             record_completion_gate_decision(
                 execution_state.completion_gate_controller_state,
                 decision,
@@ -3487,18 +4253,31 @@ def run_turn(
                 "assistant_message",
                 {"content": final_text, "message": assistant_message},
             )
-            self.messages.append({"role": "system", "content": continuation_nudge})
+            _append_controller_system_message(
+                continuation_nudge,
+                intervention_class="continuation",
+                detail="non_final_progress_continuation_nudge",
+                step=step,
+                metadata={"stage": NON_FINAL_PROGRESS_STAGE},
+            )
             last_nudge_text_sent = continuation_nudge
             self.store.append(
                 "continuation_nudge",
                 {
                     "step": step,
-                    "attempt": decision.stagnant_attempt_count,
+                    "attempt": 1,
                     "message": continuation_nudge,
                     "runtime_kind": self.runtime_kind.value,
                     **_turn_intent_payload(),
                     **_completion_gate_decision_fields(decision),
                 },
+            )
+            continuation_nudges_sent += 1
+            last_continuation_nudge_material_edit_generation = (
+                execution_state.material_edit_generation
+            )
+            last_continuation_nudge_verification_attempt_count = (
+                execution_state.verification_attempt_count
             )
             _phase_update_key(
                 "phase_continuing_one_shot"
@@ -3521,7 +4300,7 @@ def run_turn(
                 not in_finalization_window
                 or empty_response_anomaly_state.finalization_window_attempts < 1
             )
-            step_recovery_allowed = step < turn_max_steps
+            step_recovery_allowed = _step_limit_allows_more(step)
             deadline_recovery_allowed = finalization_recovery_allowed and _deadline_allows(
                 DeadlineOperation.MAIN_LLM,
                 minimum_remaining_seconds=MINIMUM_LLM_START_SECONDS,
@@ -3579,6 +4358,12 @@ def run_turn(
                     "Known issues or risks:\n"
                     "- The final model response was empty, so this is a local runtime summary."
                 )
+                _record_controller_intervention(
+                    "local_final",
+                    reason,
+                    step=step,
+                    metadata={"missing_action": missing_action},
+                )
                 self._emit_final_assistant_text(
                     final_text=local_summary,
                     language=turn_language,
@@ -3586,6 +4371,7 @@ def run_turn(
                     explicit_language_override=turn_language_explicit,
                     prior_visible_text=last_visible_assistant_text,
                     streamed_text_emitted=streamed_text_emitted,
+                    final_event_payload=_controller_intervention_event_fields(),
                 )
                 assistant_message_emitted = True
                 return _finish_turn(1, reason=reason, final_text=local_summary)
@@ -3602,7 +4388,20 @@ def run_turn(
             )
             empty_response_anomaly_state.last_tool_choice = forced_tool_choice_for_next_step
             recovery_message = _empty_response_recovery_message(missing_action)
-            self.messages.append({"role": "system", "content": recovery_message})
+            _append_controller_system_message(
+                recovery_message,
+                intervention_class="empty_response_recovery",
+                detail="empty_response_recovery_message",
+                step=step,
+                metadata={"missing_action": missing_action},
+            )
+            if forced_tool_choice_for_next_step is not None:
+                _record_controller_intervention(
+                    "forced_tool_choice",
+                    "empty_response_recovery",
+                    step=step,
+                    metadata={"tool_choice": forced_tool_choice_for_next_step},
+                )
             recovery_payload = {
                 "step": step,
                 "runtime_kind": self.runtime_kind.value,
@@ -3649,6 +4448,314 @@ def run_turn(
             continue
 
         if completion_gate_enabled:
+            if self.one_shot_execution:
+                existing_test_edits = inspect_existing_test_edits(
+                    self.root,
+                    base_ref=workspace_git_base,
+                )
+                violating_test_paths = tuple(
+                    path
+                    for path in existing_test_edits.paths
+                    if path not in initial_existing_test_edit_paths
+                )
+                if violating_test_paths:
+                    existing_test_edit_violation_count += 1
+                    hard_block = existing_test_edit_violation_count >= 2
+                    controller_restore_attempted = False
+                    controller_restore_succeeded = False
+                    restored_test_paths: tuple[str, ...] = ()
+                    remaining_test_paths = violating_test_paths
+                    if hard_block and workspace_git_base is not None:
+                        controller_restore_attempted = True
+                        controller_restore_succeeded = restore_existing_test_paths(
+                            self.root,
+                            base_ref=workspace_git_base,
+                            paths=violating_test_paths,
+                        )
+                        post_restore_test_edits = inspect_existing_test_edits(
+                            self.root,
+                            base_ref=workspace_git_base,
+                        )
+                        remaining_test_paths = tuple(
+                            path
+                            for path in post_restore_test_edits.paths
+                            if path not in initial_existing_test_edit_paths
+                        )
+                        restored_test_paths = tuple(
+                            path
+                            for path in violating_test_paths
+                            if path not in remaining_test_paths
+                        )
+                        if restored_test_paths:
+                            execution_state.touched_repo_paths.update(restored_test_paths)
+                            execution_state.note_verification_relevant_edit()
+                    corrective = (
+                        _EXISTING_TEST_EDIT_HARD_BLOCK_CORRECTIVE
+                        if hard_block
+                        else _EXISTING_TEST_EDIT_FINALIZATION_CORRECTIVE
+                    )
+                    path_preview = ", ".join(violating_test_paths[:8])
+                    if path_preview:
+                        restore_ref = workspace_git_base or "HEAD"
+                        restore_paths = " ".join(shlex.quote(path) for path in violating_test_paths)
+                        restore_command = (
+                            f"git checkout {shlex.quote(restore_ref)} -- {restore_paths}"
+                        )
+                        restore_outcome = ""
+                        if controller_restore_attempted:
+                            restore_outcome = (
+                                "\nController restore: "
+                                f"succeeded={str(controller_restore_succeeded).lower()}, "
+                                f"restored={', '.join(restored_test_paths) or 'none'}, "
+                                f"remaining={', '.join(remaining_test_paths) or 'none'}."
+                            )
+                        corrective = (
+                            f"{corrective}\nTracked test edits: {path_preview}.\n"
+                            f"Restore command: `{restore_command}`{restore_outcome}"
+                        )
+                    violation_payload = {
+                        "step": step,
+                        "max_steps": turn_max_steps,
+                        "steps_remaining": (
+                            None if turn_max_steps is None else max(0, turn_max_steps - step)
+                        ),
+                        "runtime_kind": self.runtime_kind.value,
+                        "content": final_text,
+                        "existing_test_edits": existing_test_edits.to_payload(),
+                        "violating_test_paths": list(violating_test_paths),
+                        "controller_restore_attempted": controller_restore_attempted,
+                        "controller_restore_succeeded": controller_restore_succeeded,
+                        "restored_test_paths": list(restored_test_paths),
+                        "remaining_test_paths": list(remaining_test_paths),
+                        "violation_count": existing_test_edit_violation_count,
+                        "hard_block": hard_block,
+                        "correctives_sent": blocking_finalization_correctives_sent,
+                        "corrective_cap": MAX_BLOCKING_FINALIZATION_CORRECTIVES,
+                        **_turn_intent_payload(),
+                    }
+                    if (
+                        _step_limit_allows_more(step)
+                        and blocking_finalization_correctives_sent
+                        < MAX_BLOCKING_FINALIZATION_CORRECTIVES
+                    ):
+                        if final_text:
+                            assistant_message = assistant_message_from_response(
+                                resp,
+                                content=final_text,
+                            )
+                            self.messages.append(assistant_message)
+                            self.store.append(
+                                "assistant_message",
+                                {"content": final_text, "message": assistant_message},
+                            )
+                        blocking_finalization_correctives_sent += 1
+                        forced_tool_choice_for_next_step = _safe_forced_tool_choice_for_recovery(
+                            client=self.client,
+                            tools=turn_tool_list,
+                            preferred_tool_names=("shell_run", "fs_edit"),
+                        )
+                        _append_controller_system_message(
+                            corrective,
+                            intervention_class="finalization_checklist",
+                            detail="existing_test_edit_finalization_guard",
+                            step=step,
+                            metadata={
+                                "stage": "existing_test_edits",
+                                "problems": ["existing_test_edits"],
+                                "violation_count": existing_test_edit_violation_count,
+                                "hard_block": hard_block,
+                                "correctives_sent": blocking_finalization_correctives_sent,
+                                "corrective_cap": MAX_BLOCKING_FINALIZATION_CORRECTIVES,
+                                "forced_tool_choice": forced_tool_choice_for_next_step,
+                            },
+                        )
+                        if forced_tool_choice_for_next_step is not None:
+                            _record_controller_intervention(
+                                "forced_tool_choice",
+                                "existing_test_edit_finalization_guard",
+                                step=step,
+                                metadata={"tool_choice": forced_tool_choice_for_next_step},
+                            )
+                        last_nudge_text_sent = corrective
+                        self.store.append(
+                            "existing_test_edits_finalization_blocked",
+                            {
+                                **violation_payload,
+                                "message": corrective,
+                                "correctives_sent": blocking_finalization_correctives_sent,
+                            },
+                        )
+                        _phase_update_key("phase_completion_gate_repair")
+                        continue
+
+                    if not existing_test_edit_forced_logged:
+                        forced_payload = {
+                            **violation_payload,
+                            "reason": (
+                                "step_budget_exhausted"
+                                if not _step_limit_allows_more(step)
+                                else "corrective_cap_exhausted"
+                            ),
+                            "violation_flag": "existing_test_edits",
+                        }
+                        self.store.append(
+                            "existing_test_edits_violation_forced",
+                            forced_payload,
+                        )
+                        _diagnostic_event(
+                            "existing_test_edits_violation_forced",
+                            forced_payload,
+                            durable=True,
+                        )
+                        existing_test_edit_forced_logged = True
+
+                verification_claim_kind = _successful_verification_claim_kind(final_text)
+                matching_execution_evidence = (
+                    _fresh_executed_evidence_for_claim(
+                        execution_state,
+                        claim_kind=verification_claim_kind,
+                    )
+                    if verification_claim_kind is not None
+                    else []
+                )
+                if (
+                    execution_state.material_edit_count > 0
+                    and verification_claim_kind is not None
+                    and not matching_execution_evidence
+                ):
+                    execution_evidence_violation_count += 1
+                    violation_payload = {
+                        "step": step,
+                        "max_steps": turn_max_steps,
+                        "steps_remaining": (
+                            None if turn_max_steps is None else max(0, turn_max_steps - step)
+                        ),
+                        "runtime_kind": self.runtime_kind.value,
+                        "content": final_text,
+                        "claim_kind": verification_claim_kind,
+                        "required_generation": (
+                            execution_state.verification_relevant_edit_generation
+                        ),
+                        "violation_count": execution_evidence_violation_count,
+                        "correctives_sent": blocking_finalization_correctives_sent,
+                        "corrective_cap": MAX_BLOCKING_FINALIZATION_CORRECTIVES,
+                        **_turn_intent_payload(),
+                    }
+                    if (
+                        _step_limit_allows_more(step)
+                        and blocking_finalization_correctives_sent
+                        < MAX_BLOCKING_FINALIZATION_CORRECTIVES
+                    ):
+                        if final_text:
+                            assistant_message = assistant_message_from_response(
+                                resp,
+                                content=final_text,
+                            )
+                            self.messages.append(assistant_message)
+                            self.store.append(
+                                "assistant_message",
+                                {"content": final_text, "message": assistant_message},
+                            )
+                        blocking_finalization_correctives_sent += 1
+                        _append_controller_system_message(
+                            _EXECUTION_EVIDENCE_FINALIZATION_CORRECTIVE,
+                            intervention_class="finalization_checklist",
+                            detail="execution_evidence_finalization_guard",
+                            step=step,
+                            metadata={
+                                "stage": "execution_evidence",
+                                "problems": ["missing_execution_evidence"],
+                                "claim_kind": verification_claim_kind,
+                                "violation_count": execution_evidence_violation_count,
+                                "correctives_sent": blocking_finalization_correctives_sent,
+                                "corrective_cap": MAX_BLOCKING_FINALIZATION_CORRECTIVES,
+                            },
+                        )
+                        last_nudge_text_sent = _EXECUTION_EVIDENCE_FINALIZATION_CORRECTIVE
+                        self.store.append(
+                            "execution_evidence_finalization_blocked",
+                            {
+                                **violation_payload,
+                                "message": _EXECUTION_EVIDENCE_FINALIZATION_CORRECTIVE,
+                                "correctives_sent": blocking_finalization_correctives_sent,
+                            },
+                        )
+                        _phase_update_key("phase_completion_gate_repair")
+                        continue
+
+                    if not execution_evidence_forced_logged:
+                        forced_payload = {
+                            **violation_payload,
+                            "reason": (
+                                "step_budget_exhausted"
+                                if not _step_limit_allows_more(step)
+                                else "corrective_cap_exhausted"
+                            ),
+                            "violation_flag": "missing_execution_evidence",
+                        }
+                        self.store.append(
+                            "execution_evidence_violation_forced",
+                            forced_payload,
+                        )
+                        _diagnostic_event(
+                            "execution_evidence_violation_forced",
+                            forced_payload,
+                            durable=True,
+                        )
+                        execution_evidence_forced_logged = True
+
+            workspace_diff = inspect_workspace_git_diff(
+                self.root,
+                base_ref=workspace_git_base,
+            )
+            if self.one_shot_execution and workspace_diff.empty:
+                empty_diff_payload = {
+                    "step": step,
+                    "max_steps": turn_max_steps,
+                    "steps_remaining": (
+                        None if turn_max_steps is None else max(0, turn_max_steps - step)
+                    ),
+                    "runtime_kind": self.runtime_kind.value,
+                    "content": final_text,
+                    "workspace_diff": workspace_diff.to_payload(),
+                    **_turn_intent_payload(),
+                }
+                if _step_limit_allows_more(step):
+                    if final_text:
+                        assistant_message = assistant_message_from_response(
+                            resp,
+                            content=final_text,
+                        )
+                        self.messages.append(assistant_message)
+                        self.store.append(
+                            "assistant_message",
+                            {"content": final_text, "message": assistant_message},
+                        )
+                    _append_controller_system_message(
+                        _EMPTY_DIFF_FINALIZATION_CORRECTIVE,
+                        intervention_class="finalization_checklist",
+                        detail="empty_diff_finalization_guard",
+                        step=step,
+                        metadata={"stage": "empty_diff", "problems": ["empty_diff"]},
+                    )
+                    last_nudge_text_sent = _EMPTY_DIFF_FINALIZATION_CORRECTIVE
+                    self.store.append(
+                        "empty_diff_finalization_blocked",
+                        {
+                            **empty_diff_payload,
+                            "message": _EMPTY_DIFF_FINALIZATION_CORRECTIVE,
+                        },
+                    )
+                    _phase_update_key("phase_completion_gate_repair")
+                    continue
+
+                forced_payload = {
+                    **empty_diff_payload,
+                    "reason": "step_budget_exhausted",
+                }
+                self.store.append("empty_diff_forced", forced_payload)
+                _diagnostic_event("empty_diff_forced", forced_payload, durable=True)
+
             finalize_acceptance_contract(
                 contract=execution_state.acceptance_contract,
                 root=self.root,
@@ -3665,99 +4772,40 @@ def run_turn(
                 blocked_response=blocked_response,
             )
             clarification_response = _assistant_text_is_clarification_only(final_text)
-            clarification_allows_completion = (
+            clarification_allows_completion = bool(
                 clarification_response and _clarification_can_finalize(text=final_text)
             )
-            if clarification_allows_completion:
+            completion_gate_turn_intent = _completion_gate_repo_turn_execution_intent(final_text)
+            verification_expected = False
+            if clarification_response and not self.one_shot_execution:
                 blocked_response = True
                 blocked_response_allows_completion = True
-            completion_gate_turn_intent = _completion_gate_repo_turn_execution_intent(final_text)
-            verification_expected = _verification_expected_for_turn(
-                turn_intent=completion_gate_turn_intent,
-                blocked=blocked_response_allows_completion,
-                touched_repo_paths=execution_state.touched_repo_paths,
-                verification_contract_requires_execution=(
-                    self.verification_contract_type
-                    in {"authoritative_override", "explicit_override", "task_inferred"}
-                ),
-            )
-            gate_problems = _completion_gate_problems(
-                state=execution_state,
-                final_text=final_text,
-                blocked=blocked_response_allows_completion,
-                verification_expected=verification_expected,
-                require_material_edit_evidence=_completion_gate_requires_material_edit_evidence(
-                    final_text=final_text,
-                    gate_turn_intent=completion_gate_turn_intent,
-                ),
-            )
             if (
                 clarification_response
-                and not clarification_allows_completion
-                and "clarification_requested" not in gate_problems
+                and self.one_shot_execution
+                and not clarification_advisory_sent
             ):
-                gate_problems.append("clarification_requested")
-            if gate_problems:
-                gate_stage = _completion_gate_repair_stage(gate_problems)
+                gate_problems = ["clarification_requested"]
+                gate_stage = "clarification_requested"
                 decision = _build_completion_gate_decision(
                     stage=gate_stage,
                     problems=gate_problems,
                     final_text=final_text,
-                    blocked_response=blocked_response,
-                    blocked_response_allows_completion=blocked_response_allows_completion,
-                    verification_expected=verification_expected,
+                    blocked_response=False,
+                    blocked_response_allows_completion=False,
+                    verification_expected=False,
                 )
                 record_completion_gate_decision(
                     execution_state.completion_gate_controller_state,
                     decision,
                 )
                 decision_fields = _completion_gate_decision_fields(decision)
-                stage_limit = decision.max_stagnant_attempts
-                stage_attempts = decision.stagnant_attempt_count
-                if "empty_final_response" in gate_problems:
+                if final_text:
+                    assistant_message = assistant_message_from_response(resp, content=final_text)
+                    self.messages.append(assistant_message)
                     self.store.append(
-                        "empty_model_response_recovery",
-                        {
-                            "step": step,
-                            "runtime_kind": self.runtime_kind.value,
-                            "stage": gate_stage,
-                            "attempt": stage_attempts,
-                            "stage_limit": stage_limit,
-                            "problems": gate_problems,
-                            **_turn_intent_payload(
-                                completion_gate_turn_intent=completion_gate_turn_intent,
-                            ),
-                            **decision_fields,
-                        },
-                    )
-                failure_snippet = (
-                    execution_state.last_verification_failure_snippet
-                    or execution_state.first_failed_verification_snippet()
-                    if gate_stage == "verification_failed"
-                    else ""
-                )
-                no_material_anchor_paths = (
-                    recent_exploration_paths[-MAX_POST_EXPLORE_ANCHOR_PATHS:]
-                    if gate_stage == "no_material_edits"
-                    else []
-                )
-                if gate_stage == "no_material_edits":
-                    self.store.append(
-                        no_material_edits_detected_event,
-                        {
-                            "step": step,
-                            "runtime_kind": self.runtime_kind.value,
-                            "repo_tool_activity_observed": repo_tool_activity_observed,
-                            "anchor_paths": no_material_anchor_paths,
-                            "state": execution_state.as_payload(),
-                            "content": final_text,
-                            **_turn_intent_payload(
-                                completion_gate_turn_intent=completion_gate_turn_intent,
-                            ),
-                            **_verification_evidence_fields(),
-                            **_acceptance_contract_fields(),
-                            **decision_fields,
-                        },
+                        "assistant_message",
+                        {"content": final_text, "message": assistant_message},
                     )
                 self.store.append(
                     completion_gate_failed_event,
@@ -3767,10 +4815,260 @@ def run_turn(
                         "problems": gate_problems,
                         "problem_summary": _completion_gate_problem_summary(gate_problems),
                         "stage": gate_stage,
+                        "stage_attempt": 1,
+                        "stage_limit": 1,
+                        "blocked_response": False,
+                        "blocked_response_allows_completion": False,
+                        "clarification_response": True,
+                        "clarification_allows_completion": False,
+                        "verification_expected": False,
+                        "verification_failure_snippet": "",
+                        "repo_tool_activity_observed": repo_tool_activity_observed,
+                        "anchor_paths": [],
+                        "missing_verification_commands": _sorted_missing_verification_commands(
+                            execution_state
+                        ),
+                        "verification_coverage_stale": (
+                            execution_state.verification_coverage_is_stale()
+                        ),
+                        "state": execution_state.as_payload(),
+                        "content": final_text,
+                        "attempt": 1,
+                        **_turn_intent_payload(
+                            completion_gate_turn_intent=completion_gate_turn_intent,
+                        ),
+                        **_verification_evidence_fields(),
+                        **_acceptance_contract_fields(),
+                        **decision_fields,
+                    },
+                )
+                execution_state.increment_repair_attempts_for_stage(gate_stage)
+                _append_controller_system_message(
+                    _ONE_SHOT_CLARIFICATION_ADVISORY,
+                    intervention_class="finalization_checklist",
+                    detail="one_shot_clarification_advisory",
+                    step=step,
+                    metadata={"stage": gate_stage, "problems": gate_problems},
+                )
+                last_nudge_text_sent = _ONE_SHOT_CLARIFICATION_ADVISORY
+                self.store.append(
+                    "completion_gate_nudge",
+                    {
+                        "step": step,
+                        "runtime_kind": self.runtime_kind.value,
+                        "attempt": execution_state.completion_gate_repair_attempts,
+                        "stage": gate_stage,
+                        "stage_attempt": 1,
+                        "stage_limit": 1,
+                        "problems": gate_problems,
+                        "problem_summary": _completion_gate_problem_summary(gate_problems),
+                        "verification_failure_snippet": "",
+                        "repo_tool_activity_observed": repo_tool_activity_observed,
+                        "anchor_paths": [],
+                        "verification_coverage_stale": (
+                            execution_state.verification_coverage_is_stale()
+                        ),
+                        "language": turn_language,
+                        "explicit_language_override": turn_language_explicit,
+                        "message": _ONE_SHOT_CLARIFICATION_ADVISORY,
+                        "forced_tool_choice": None,
+                        "forced_tool_choice_supported": False,
+                        **_turn_intent_payload(
+                            completion_gate_turn_intent=completion_gate_turn_intent,
+                        ),
+                        **_verification_evidence_fields(),
+                        **_acceptance_contract_fields(),
+                        **decision_fields,
+                    },
+                )
+                clarification_advisory_sent = True
+                _phase_update_key("phase_completion_gate_repair")
+                continue
+
+            if not (
+                clarification_response
+                and (not self.one_shot_execution or clarification_advisory_sent)
+            ):
+                verification_expected = bool(
+                    self.verification_enabled
+                    and _verification_expected_for_turn(
+                        turn_intent=completion_gate_turn_intent,
+                        blocked=blocked_response_allows_completion,
+                        touched_repo_paths=execution_state.touched_repo_paths,
+                        verification_contract_requires_execution=(
+                            self.verification_contract_type
+                            in {"authoritative_override", "explicit_override", "task_inferred"}
+                        ),
+                        verification_contract_available=verification_contract_available,
+                        effective_verification_commands=known_verification_commands,
+                    )
+                )
+                gate_problems = _completion_gate_problems(
+                    state=execution_state,
+                    final_text=final_text,
+                    blocked=blocked_response_allows_completion,
+                    verification_expected=verification_expected,
+                    require_material_edit_evidence=_completion_gate_requires_material_edit_evidence(
+                        final_text=final_text,
+                        gate_turn_intent=completion_gate_turn_intent,
+                    ),
+                )
+                live_background_processes = _live_background_processes_at_finalization()
+                spec_faithfulness_advisory_needed = bool(
+                    live_background_processes > 0
+                    or (
+                        execution_state.material_edit_count > 0
+                        and not _has_current_independent_verification_evidence()
+                    )
+                )
+                if (
+                    not gate_problems
+                    and spec_faithfulness_advisory_needed
+                    and not finalization_checklist_sent
+                    and not blocked_response_allows_completion
+                    and not clarification_response
+                    and _step_limit_allows_more(step)
+                    and (self.one_shot_execution or completion_gate_turn_intent == "execute")
+                ):
+                    gate_stage = "spec_faithfulness_advisory"
+                    decision = _build_completion_gate_decision(
+                        stage="complete",
+                        problems=[],
+                        final_text=final_text,
+                        blocked_response=blocked_response,
+                        blocked_response_allows_completion=blocked_response_allows_completion,
+                        verification_expected=verification_expected,
+                    )
+                    decision_fields = _completion_gate_decision_fields(decision)
+                    if final_text:
+                        assistant_message = assistant_message_from_response(
+                            resp, content=final_text
+                        )
+                        self.messages.append(assistant_message)
+                        self.store.append(
+                            "assistant_message",
+                            {"content": final_text, "message": assistant_message},
+                        )
+                    spec_faithfulness_advisory = _spec_faithfulness_advisory_message(
+                        one_shot_execution=self.one_shot_execution,
+                        live_background_processes=live_background_processes,
+                    )
+                    _append_controller_system_message(
+                        spec_faithfulness_advisory,
+                        intervention_class="finalization_checklist",
+                        detail="spec_faithfulness_advisory",
+                        step=step,
+                        metadata={
+                            "stage": gate_stage,
+                            "problems": [],
+                            "live_background_processes": live_background_processes,
+                        },
+                    )
+                    last_nudge_text_sent = spec_faithfulness_advisory
+                    self.store.append(
+                        "completion_gate_nudge",
+                        {
+                            "step": step,
+                            "runtime_kind": self.runtime_kind.value,
+                            "attempt": execution_state.completion_gate_repair_attempts,
+                            "stage": gate_stage,
+                            "stage_attempt": 1,
+                            "stage_limit": 1,
+                            "problems": [],
+                            "problem_summary": _completion_gate_problem_summary([]),
+                            "verification_failure_snippet": "",
+                            "repo_tool_activity_observed": repo_tool_activity_observed,
+                            "anchor_paths": [],
+                            "verification_coverage_stale": (
+                                execution_state.verification_coverage_is_stale()
+                            ),
+                            "language": turn_language,
+                            "explicit_language_override": turn_language_explicit,
+                            "message": spec_faithfulness_advisory,
+                            "live_background_processes": live_background_processes,
+                            "forced_tool_choice": None,
+                            "forced_tool_choice_supported": False,
+                            **_turn_intent_payload(
+                                completion_gate_turn_intent=completion_gate_turn_intent,
+                            ),
+                            **_verification_evidence_fields(),
+                            **_acceptance_contract_fields(),
+                            **decision_fields,
+                        },
+                    )
+                    finalization_checklist_sent = True
+                    _phase_update_key("phase_completion_gate_repair")
+                    continue
+                if gate_problems:
+                    gate_stage = _completion_gate_repair_stage(gate_problems)
+                    if finalization_checklist_sent or _step_limit_reached(step):
+                        execution_state.completion_gate_controller_state.checklist_sent = True
+                    decision = _build_completion_gate_decision(
+                        stage=gate_stage,
+                        problems=gate_problems,
+                        final_text=final_text,
+                        blocked_response=blocked_response,
+                        blocked_response_allows_completion=blocked_response_allows_completion,
+                        verification_expected=verification_expected,
+                    )
+                    decision_fields = _completion_gate_decision_fields(decision)
+                    stage_limit = 1
+                    stage_attempts = 1
+                    failure_snippet = (
+                        execution_state.last_verification_failure_snippet
+                        or execution_state.first_failed_verification_snippet()
+                        if gate_stage == "verification_failed"
+                        else ""
+                    )
+                    no_material_anchor_paths = (
+                        recent_exploration_paths[-MAX_POST_EXPLORE_ANCHOR_PATHS:]
+                        if gate_stage == "no_material_edits"
+                        else []
+                    )
+                    if "empty_final_response" in gate_problems:
+                        self.store.append(
+                            "empty_model_response_recovery",
+                            {
+                                "step": step,
+                                "runtime_kind": self.runtime_kind.value,
+                                "stage": gate_stage,
+                                "attempt": stage_attempts,
+                                "stage_limit": stage_limit,
+                                "problems": gate_problems,
+                                **_turn_intent_payload(
+                                    completion_gate_turn_intent=completion_gate_turn_intent,
+                                ),
+                                **decision_fields,
+                            },
+                        )
+                    if gate_stage == "no_material_edits":
+                        self.store.append(
+                            no_material_edits_detected_event,
+                            {
+                                "step": step,
+                                "runtime_kind": self.runtime_kind.value,
+                                "repo_tool_activity_observed": repo_tool_activity_observed,
+                                "anchor_paths": no_material_anchor_paths,
+                                "state": execution_state.as_payload(),
+                                "content": final_text,
+                                **_turn_intent_payload(
+                                    completion_gate_turn_intent=completion_gate_turn_intent,
+                                ),
+                                **_verification_evidence_fields(),
+                                **_acceptance_contract_fields(),
+                                **decision_fields,
+                            },
+                        )
+                    completion_gate_failure_payload = {
+                        "step": step,
+                        "runtime_kind": self.runtime_kind.value,
+                        "problems": gate_problems,
+                        "problem_summary": _completion_gate_problem_summary(gate_problems),
+                        "stage": gate_stage,
                         "stage_attempt": stage_attempts,
                         "stage_limit": stage_limit,
                         "blocked_response": blocked_response,
-                        "blocked_response_allows_completion": (blocked_response_allows_completion),
+                        "blocked_response_allows_completion": blocked_response_allows_completion,
                         "clarification_response": clarification_response,
                         "clarification_allows_completion": clarification_allows_completion,
                         "verification_expected": verification_expected,
@@ -3792,37 +5090,42 @@ def run_turn(
                         **_verification_evidence_fields(),
                         **_acceptance_contract_fields(),
                         **decision_fields,
-                    },
-                )
-                if decision.kind == CompletionGateDecisionKind.TERMINATE_STAGNANT:
-                    problem_summary = _completion_gate_problem_summary(gate_problems)
-                    message = _completion_gate_terminal_failure_message(
-                        problem_summary=problem_summary,
-                        stage=gate_stage,
-                        message_key=completion_gate_terminal_message_key,
-                        verification_failure_snippet=failure_snippet,
-                        language=turn_language,
-                        explicit_language_override=turn_language_explicit,
+                    }
+                    accept_open_problems_now = bool(
+                        finalization_checklist_sent
+                        or _step_limit_reached(step)
+                        or (
+                            gate_stage == "no_material_edits"
+                            and _completion_gate_can_accept_after_continuation_nudge()
+                        )
                     )
-                    if gate_stage == "no_material_edits":
+                    if accept_open_problems_now:
+                        record_completion_gate_decision(
+                            execution_state.completion_gate_controller_state,
+                            decision,
+                        )
                         self.store.append(
-                            no_material_edits_incomplete_event,
+                            "completion_gate_accepted_with_open_problems",
                             {
                                 "step": step,
                                 "runtime_kind": self.runtime_kind.value,
                                 "problems": gate_problems,
-                                "problem_summary": problem_summary,
+                                "remaining_problems": gate_problems,
+                                "problem_summary": _completion_gate_problem_summary(gate_problems),
                                 "stage": gate_stage,
-                                "stage_attempts": stage_attempts,
-                                "stage_limit": stage_limit,
-                                "repair_nudges_sent": (
-                                    execution_state.completion_gate_repair_attempts
+                                "blocked_response": blocked_response,
+                                "blocked_response_allows_completion": (
+                                    blocked_response_allows_completion
                                 ),
-                                "repo_tool_activity_observed": repo_tool_activity_observed,
-                                "anchor_paths": no_material_anchor_paths,
+                                "clarification_response": clarification_response,
+                                "clarification_allows_completion": clarification_allows_completion,
+                                "verification_expected": verification_expected,
+                                "verification_failure_snippet": failure_snippet,
+                                "completion_certificate": dict(
+                                    execution_state.latest_completion_certificate
+                                ),
                                 "state": execution_state.as_payload(),
                                 "content": final_text,
-                                "attempts": stage_attempts,
                                 **_turn_intent_payload(
                                     completion_gate_turn_intent=completion_gate_turn_intent,
                                 ),
@@ -3831,168 +5134,146 @@ def run_turn(
                                 **decision_fields,
                             },
                         )
-                    self.store.append(
-                        completion_gate_incomplete_event,
-                        {
-                            "step": step,
-                            "runtime_kind": self.runtime_kind.value,
-                            "problems": gate_problems,
-                            "problem_summary": problem_summary,
-                            "stage": gate_stage,
-                            "stage_attempts": stage_attempts,
-                            "stage_limit": stage_limit,
-                            "repair_nudges_sent": (execution_state.completion_gate_repair_attempts),
-                            "blocked_response": blocked_response,
-                            "blocked_response_allows_completion": (
-                                blocked_response_allows_completion
-                            ),
-                            "verification_expected": verification_expected,
-                            "verification_failure_snippet": failure_snippet,
-                            "repo_tool_activity_observed": repo_tool_activity_observed,
-                            "anchor_paths": no_material_anchor_paths,
-                            "missing_verification_commands": _sorted_missing_verification_commands(
+                    else:
+                        self.store.append(
+                            completion_gate_failed_event,
+                            completion_gate_failure_payload,
+                        )
+                        record_completion_gate_decision(
+                            execution_state.completion_gate_controller_state,
+                            decision,
+                        )
+                        execution_state.increment_repair_attempts_for_stage(gate_stage)
+                        if final_text:
+                            assistant_message = assistant_message_from_response(
+                                resp, content=final_text
+                            )
+                            self.messages.append(assistant_message)
+                            self.store.append(
+                                "assistant_message",
+                                {"content": final_text, "message": assistant_message},
+                            )
+                        nudge = _completion_gate_nudge_message(
+                            gate_problems,
+                            prefix_key=completion_gate_nudge_prefix_key,
+                            verification_failure_snippet=failure_snippet,
+                            missing_verification_commands=_sorted_missing_verification_commands(
                                 execution_state
                             ),
-                            "verification_coverage_stale": (
+                            verification_coverage_stale=(
                                 execution_state.verification_coverage_is_stale()
                             ),
-                            "state": execution_state.as_payload(),
-                            "content": final_text,
-                            "attempts": stage_attempts,
-                            **_turn_intent_payload(
-                                completion_gate_turn_intent=completion_gate_turn_intent,
+                            anchor_paths=no_material_anchor_paths,
+                            has_material_edits=execution_state.material_edit_count > 0,
+                            all_verification_evidence_self_authored=(
+                                _all_verification_evidence_self_authored()
                             ),
-                            **_verification_evidence_fields(),
-                            **_acceptance_contract_fields(),
-                            **decision_fields,
-                        },
-                    )
-                    _emit_surface_error(
-                        self.surface,
-                        "completion_gate_error",
-                        message,
-                        True,
-                    )
-                    self._emit_forced_final_summary_before_termination(
-                        reason="completion_gate_terminal_failure",
-                        termination_cause=(
-                            "completion-gate stagnation after repeated invalid "
-                            "finalization attempts without new implementation or "
-                            "verification progress"
-                        ),
-                        termination_kind="completion_gate_stagnation",
-                        max_steps=_current_turn_step_limit(),
-                        language=turn_language,
-                        script=turn_script,
-                        explicit_language_override=turn_language_explicit,
-                        latest_assistant_text=final_text,
-                    )
-                    assistant_message_emitted = True
-                    return _finish_turn(1, reason="completion_gate_terminal_failure")
+                            diff_review_stale=execution_state.diff_review_is_stale(),
+                            language=turn_language,
+                            explicit_language_override=turn_language_explicit,
+                            one_shot_execution=self.one_shot_execution,
+                            live_background_processes=live_background_processes,
+                        )
+                        if _nudge_would_repeat_without_progress(nudge, decision):
+                            self.store.append(
+                                "nudge_stall_detected",
+                                {
+                                    "step": step,
+                                    "stage": gate_stage,
+                                    "reason": "duplicate_completion_gate_nudge",
+                                    "message": nudge,
+                                    "runtime_kind": self.runtime_kind.value,
+                                    "problems": gate_problems,
+                                    "problem_summary": _completion_gate_problem_summary(
+                                        gate_problems
+                                    ),
+                                    "content": final_text,
+                                    **_turn_intent_payload(
+                                        completion_gate_turn_intent=completion_gate_turn_intent,
+                                    ),
+                                    **_verification_evidence_fields(),
+                                    **_acceptance_contract_fields(),
+                                    **decision_fields,
+                                },
+                            )
+                        _append_controller_system_message(
+                            nudge,
+                            intervention_class="finalization_checklist",
+                            detail="completion_gate_checklist",
+                            step=step,
+                            metadata={
+                                "stage": gate_stage,
+                                "problems": gate_problems,
+                                "live_background_processes": live_background_processes,
+                            },
+                        )
+                        last_nudge_text_sent = nudge
+                        self.store.append(
+                            "completion_gate_nudge",
+                            {
+                                "step": step,
+                                "runtime_kind": self.runtime_kind.value,
+                                "attempt": execution_state.completion_gate_repair_attempts,
+                                "stage": gate_stage,
+                                "stage_attempt": 1,
+                                "stage_limit": stage_limit,
+                                "problems": gate_problems,
+                                "problem_summary": _completion_gate_problem_summary(gate_problems),
+                                "verification_failure_snippet": failure_snippet,
+                                "repo_tool_activity_observed": repo_tool_activity_observed,
+                                "anchor_paths": no_material_anchor_paths,
+                                "verification_coverage_stale": (
+                                    execution_state.verification_coverage_is_stale()
+                                ),
+                                "language": turn_language,
+                                "explicit_language_override": turn_language_explicit,
+                                "message": nudge,
+                                "live_background_processes": live_background_processes,
+                                "forced_tool_choice": None,
+                                "forced_tool_choice_supported": False,
+                                **_turn_intent_payload(
+                                    completion_gate_turn_intent=completion_gate_turn_intent,
+                                ),
+                                **_verification_evidence_fields(),
+                                **_acceptance_contract_fields(),
+                                **decision_fields,
+                            },
+                        )
+                        if gate_stage == "no_material_edits":
+                            self.store.append(
+                                "no_material_edits_bootstrap_nudge",
+                                {
+                                    "step": step,
+                                    "attempt": 1,
+                                    "stage_limit": stage_limit,
+                                    "repo_tool_activity_observed": repo_tool_activity_observed,
+                                    "anchor_paths": no_material_anchor_paths,
+                                    "message": nudge,
+                                    **_turn_intent_payload(
+                                        completion_gate_turn_intent=completion_gate_turn_intent,
+                                    ),
+                                    **decision_fields,
+                                },
+                            )
+                        if gate_stage == "verification_failed":
+                            self.store.append(
+                                "failed_verification_repair_attempt",
+                                {
+                                    "step": step,
+                                    "attempt": 1,
+                                    "stage_limit": stage_limit,
+                                    "snippet": failure_snippet,
+                                    "message": nudge,
+                                    **_turn_intent_payload(
+                                        completion_gate_turn_intent=completion_gate_turn_intent,
+                                    ),
+                                    **decision_fields,
+                                },
+                            )
+                        finalization_checklist_sent = True
+                        _phase_update_key("phase_completion_gate_repair")
+                        continue
 
-                execution_state.increment_repair_attempts_for_stage(gate_stage)
-                if final_text:
-                    assistant_message = assistant_message_from_response(resp, content=final_text)
-                    self.messages.append(assistant_message)
-                    self.store.append(
-                        "assistant_message",
-                        {"content": final_text, "message": assistant_message},
-                    )
-                nudge = _completion_gate_nudge_message(
-                    gate_problems,
-                    prefix_key=completion_gate_nudge_prefix_key,
-                    verification_failure_snippet=failure_snippet,
-                    missing_verification_commands=_sorted_missing_verification_commands(
-                        execution_state
-                    ),
-                    verification_coverage_stale=execution_state.verification_coverage_is_stale(),
-                    anchor_paths=no_material_anchor_paths,
-                    language=turn_language,
-                    explicit_language_override=turn_language_explicit,
-                )
-                if _nudge_would_repeat_without_progress(nudge, decision):
-                    self.store.append(
-                        "nudge_stall_detected",
-                        {
-                            "step": step,
-                            "stage": gate_stage,
-                            "reason": "duplicate_completion_gate_nudge",
-                            "message": nudge,
-                            "runtime_kind": self.runtime_kind.value,
-                            "problems": gate_problems,
-                            "problem_summary": _completion_gate_problem_summary(gate_problems),
-                            "content": final_text,
-                            **_turn_intent_payload(
-                                completion_gate_turn_intent=completion_gate_turn_intent,
-                            ),
-                            **_verification_evidence_fields(),
-                            **_acceptance_contract_fields(),
-                            **decision_fields,
-                        },
-                    )
-                self.messages.append({"role": "system", "content": nudge})
-                last_nudge_text_sent = nudge
-                self.store.append(
-                    "completion_gate_nudge",
-                    {
-                        "step": step,
-                        "runtime_kind": self.runtime_kind.value,
-                        "attempt": execution_state.completion_gate_repair_attempts,
-                        "stage": gate_stage,
-                        "stage_attempt": execution_state.repair_attempts_for_stage(gate_stage),
-                        "stage_limit": stage_limit,
-                        "problems": gate_problems,
-                        "problem_summary": _completion_gate_problem_summary(gate_problems),
-                        "verification_failure_snippet": failure_snippet,
-                        "repo_tool_activity_observed": repo_tool_activity_observed,
-                        "anchor_paths": no_material_anchor_paths,
-                        "verification_coverage_stale": (
-                            execution_state.verification_coverage_is_stale()
-                        ),
-                        "language": turn_language,
-                        "explicit_language_override": turn_language_explicit,
-                        "message": nudge,
-                        **_turn_intent_payload(
-                            completion_gate_turn_intent=completion_gate_turn_intent,
-                        ),
-                        **_verification_evidence_fields(),
-                        **_acceptance_contract_fields(),
-                        **decision_fields,
-                    },
-                )
-                if gate_stage == "no_material_edits":
-                    self.store.append(
-                        "no_material_edits_bootstrap_nudge",
-                        {
-                            "step": step,
-                            "attempt": execution_state.repair_attempts_for_stage(gate_stage),
-                            "stage_limit": stage_limit,
-                            "repo_tool_activity_observed": repo_tool_activity_observed,
-                            "anchor_paths": no_material_anchor_paths,
-                            "message": nudge,
-                            **_turn_intent_payload(
-                                completion_gate_turn_intent=completion_gate_turn_intent,
-                            ),
-                            **decision_fields,
-                        },
-                    )
-                if gate_stage == "verification_failed":
-                    self.store.append(
-                        "failed_verification_repair_attempt",
-                        {
-                            "step": step,
-                            "attempt": execution_state.repair_attempts_for_stage(gate_stage),
-                            "stage_limit": stage_limit,
-                            "snippet": failure_snippet,
-                            "message": nudge,
-                            **_turn_intent_payload(
-                                completion_gate_turn_intent=completion_gate_turn_intent,
-                            ),
-                            **decision_fields,
-                        },
-                    )
-                _phase_update_key("phase_completion_gate_repair")
-                continue
             if blocked_response_allows_completion:
                 self.store.append(
                     "completion_gate_blocker_accepted",
@@ -4011,19 +5292,6 @@ def run_turn(
                         **_acceptance_contract_fields(),
                     },
                 )
-                if not stream_used:
-                    _phase_update_key("phase_writing_final_response")
-                self._emit_final_assistant_text(
-                    final_text=final_text,
-                    assistant_response=resp,
-                    language=turn_language,
-                    script=turn_script,
-                    explicit_language_override=turn_language_explicit,
-                    prior_visible_text=last_visible_assistant_text,
-                    streamed_text_emitted=streamed_text_emitted,
-                )
-                assistant_message_emitted = True
-                return _finish_turn(0, reason="blocked", final_text=final_text)
 
         if not stream_used:
             _phase_update_key("phase_writing_final_response")
@@ -4032,6 +5300,8 @@ def run_turn(
             {
                 "runtime_kind": self.runtime_kind.value,
                 "state": execution_state.as_payload(),
+                "controller_interventions": _controller_interventions_payload(),
+                "controller_interventions_total": controller_interventions.headline_total,
                 **_turn_intent_payload(
                     completion_gate_turn_intent=_completion_gate_repo_turn_execution_intent(
                         final_text
@@ -4048,234 +5318,107 @@ def run_turn(
             explicit_language_override=turn_language_explicit,
             prior_visible_text=last_visible_assistant_text,
             streamed_text_emitted=streamed_text_emitted,
+            final_event_payload=_controller_intervention_event_fields(),
         )
         assistant_message_emitted = True
         return _finish_turn(0, reason="completed", final_text=final_text)
 
-    if (
-        one_shot_exploration_guard_enabled
-        and subagent_success_count > 0
-        and not post_explore_action_progress_started
-        and (
-            post_explore_bootstrap_nudges_sent > 0
-            or consecutive_exploration_only_steps > 0
-            or last_post_explore_stagnation_payload is not None
+    if self.one_shot_execution and completion_gate_enabled:
+        existing_test_edits = inspect_existing_test_edits(
+            self.root,
+            base_ref=workspace_git_base,
         )
-    ):
-        payload: dict[str, Any] = {
-            "step": _current_turn_step_limit(),
-            "max_steps": _current_turn_step_limit(),
-            "reason": "post_explore_step_budget_exhausted",
-            "subagent_success_count": subagent_success_count,
-            "nudge_attempts": post_explore_bootstrap_nudges_sent,
-            "consecutive_exploration_only_steps": consecutive_exploration_only_steps,
-            "consecutive_exploration_success_count": consecutive_exploration_success_count,
-            "consecutive_exploration_failed_count": consecutive_exploration_failed_count,
-            "anchor_paths": recent_exploration_paths[-MAX_POST_EXPLORE_ANCHOR_PATHS:],
-        }
-        if last_post_explore_stagnation_payload is not None:
-            payload["last_stagnation"] = last_post_explore_stagnation_payload
-        self.store.append("one_shot_post_explore_incomplete_after_retries", payload)
-        _emit_surface_error(
-            self.surface,
-            "step_budget_error",
-            _runtime_text("one_shot_post_explore_step_budget_exhausted"),
-            True,
+        violating_test_paths = tuple(
+            path
+            for path in existing_test_edits.paths
+            if path not in initial_existing_test_edit_paths
         )
-        self._emit_forced_final_summary_before_termination(
-            reason="post_explore_step_budget_exhausted",
-            termination_cause="the overall step budget is exhausted",
-            termination_kind="step_budget_exhausted",
-            max_steps=_current_turn_step_limit(),
-            language=turn_language,
-            script=turn_script,
-            explicit_language_override=turn_language_explicit,
-        )
-        assistant_message_emitted = True
-        return _finish_turn(1, reason="post_explore_step_budget_exhausted")
-
-    if one_shot_exploration_guard_enabled and (
-        exploration_nudges_sent > 0
-        or consecutive_exploration_only_steps > 0
-        or last_exploration_stagnation_payload is not None
-    ):
-        reason = "exploration_step_budget_exhausted"
-        exploration_attempt_outcome = _exploration_attempt_outcome(
-            consecutive_exploration_success_count,
-            consecutive_exploration_failed_count,
-        )
-        payload: dict[str, Any] = {
-            "step": _current_turn_step_limit(),
-            "max_steps": _current_turn_step_limit(),
-            "reason": reason,
-            "exploration_attempt_outcome": exploration_attempt_outcome,
-            "nudge_attempts": exploration_nudges_sent,
-            "consecutive_exploration_only_steps": consecutive_exploration_only_steps,
-            "consecutive_exploration_success_count": consecutive_exploration_success_count,
-            "consecutive_exploration_failed_count": consecutive_exploration_failed_count,
-        }
-        if last_exploration_stagnation_payload is not None:
-            payload["last_stagnation"] = last_exploration_stagnation_payload
-        self.store.append("one_shot_exploration_incomplete_after_retries", payload)
-        _emit_surface_error(
-            self.surface,
-            "step_budget_error",
-            _runtime_text("one_shot_exploration_step_budget_exhausted"),
-            True,
-        )
-        self._emit_forced_final_summary_before_termination(
-            reason=reason,
-            termination_cause="the overall step budget is exhausted",
-            termination_kind="step_budget_exhausted",
-            max_steps=_current_turn_step_limit(),
-            language=turn_language,
-            script=turn_script,
-            explicit_language_override=turn_language_explicit,
-        )
-        assistant_message_emitted = True
-        return _finish_turn(1, reason="exploration_step_budget_exhausted")
-
-    if one_shot_edit_guard_enabled and (
-        edit_nudges_sent > 0
-        or consecutive_failed_edit_steps > 0
-        or last_edit_stagnation_payload is not None
-    ):
-        payload: dict[str, Any] = {
-            "step": _current_turn_step_limit(),
-            "max_steps": _current_turn_step_limit(),
-            "reason": "edit_step_budget_exhausted",
-            "nudge_attempts": edit_nudges_sent,
-            "consecutive_failed_edit_steps": consecutive_failed_edit_steps,
-            "consecutive_failed_edit_attempt_count": consecutive_failed_edit_attempt_count,
-        }
-        if last_edit_stagnation_payload is not None:
-            payload["last_stagnation"] = last_edit_stagnation_payload
-        self.store.append("one_shot_edit_incomplete_after_retries", payload)
-        _emit_surface_error(
-            self.surface,
-            "step_budget_error",
-            _runtime_text("one_shot_edit_step_budget_exhausted"),
-            True,
-        )
-        self._emit_forced_final_summary_before_termination(
-            reason="edit_step_budget_exhausted",
-            termination_cause="the overall step budget is exhausted",
-            termination_kind="step_budget_exhausted",
-            max_steps=_current_turn_step_limit(),
-            language=turn_language,
-            script=turn_script,
-            explicit_language_override=turn_language_explicit,
-        )
-        assistant_message_emitted = True
-        return _finish_turn(1, reason="edit_step_budget_exhausted")
-
-    if completion_gate_enabled and execution_state.completion_gate_repair_attempts > 0:
-        exhausted_stage = "generic"
-        exhausted_stage_attempts = execution_state.completion_gate_repair_attempts
-        reason = "completion_gate_step_budget_exhausted"
-        failure_snippet = ""
-        if execution_state.completion_gate_failed_verify_repair_attempts > 0:
-            exhausted_stage = "verification_failed"
-            exhausted_stage_attempts = execution_state.completion_gate_failed_verify_repair_attempts
-            reason = "completion_gate_failed_verification_step_budget_exhausted"
-            failure_snippet = execution_state.last_verification_failure_snippet
-        elif execution_state.completion_gate_missing_verify_repair_attempts > 0:
-            exhausted_stage = (
-                "verification_incomplete"
-                if execution_state.expected_verification_commands
-                and execution_state.missing_verification_commands()
-                else "verification_not_attempted"
+        if violating_test_paths and not existing_test_edit_forced_logged:
+            controller_restore_succeeded = bool(
+                workspace_git_base is not None
+                and restore_existing_test_paths(
+                    self.root,
+                    base_ref=workspace_git_base,
+                    paths=violating_test_paths,
+                )
             )
-            exhausted_stage_attempts = (
-                execution_state.completion_gate_missing_verify_repair_attempts
+            post_restore_test_edits = inspect_existing_test_edits(
+                self.root,
+                base_ref=workspace_git_base,
             )
-            reason = (
-                "completion_gate_incomplete_verification_step_budget_exhausted"
-                if exhausted_stage == "verification_incomplete"
-                else "completion_gate_missing_verification_step_budget_exhausted"
+            remaining_test_paths = tuple(
+                path
+                for path in post_restore_test_edits.paths
+                if path not in initial_existing_test_edit_paths
             )
-        exhausted_problems = [exhausted_stage] if exhausted_stage != "generic" else ["generic"]
-        decision = _build_completion_gate_decision(
-            stage=exhausted_stage,
-            problems=exhausted_problems,
-            final_text="",
-            budget_exhausted=True,
-        )
-        record_completion_gate_decision(
-            execution_state.completion_gate_controller_state,
-            decision,
-        )
-        decision_fields = _completion_gate_decision_fields(decision)
-        exhausted_stage_limit = decision.max_stagnant_attempts
-        self.store.append(
-            completion_gate_incomplete_event,
-            {
-                "step": _current_turn_step_limit(),
-                "max_steps": _current_turn_step_limit(),
+            restored_test_paths = tuple(
+                path for path in violating_test_paths if path not in remaining_test_paths
+            )
+            forced_payload = {
+                "step": turn_max_steps,
+                "max_steps": turn_max_steps,
+                "steps_remaining": 0,
                 "runtime_kind": self.runtime_kind.value,
-                "reason": reason,
-                "attempts": execution_state.completion_gate_repair_attempts,
-                "stage": exhausted_stage,
-                "stage_attempts": exhausted_stage_attempts,
-                "stage_limit": exhausted_stage_limit,
-                "verification_failure_snippet": failure_snippet,
-                "missing_verification_commands": _sorted_missing_verification_commands(
-                    execution_state
-                ),
-                "verification_coverage_stale": (execution_state.verification_coverage_is_stale()),
-                "state": execution_state.as_payload(),
-                **decision_fields,
-            },
-        )
-        exit_code = 1
-        if interactive_step_budget_handoff_enabled:
-            exit_code = 0
-            _phase_update_key("phase_step_budget_handoff")
-            self.store.append(
-                "interactive_step_budget_handoff",
-                {
-                    "step": _current_turn_step_limit(),
-                    "max_steps": _current_turn_step_limit(),
-                    "reason": reason,
-                    "stage": exhausted_stage,
-                },
+                "content": last_visible_assistant_text,
+                "existing_test_edits": existing_test_edits.to_payload(),
+                "violating_test_paths": list(violating_test_paths),
+                "controller_restore_attempted": workspace_git_base is not None,
+                "controller_restore_succeeded": controller_restore_succeeded,
+                "restored_test_paths": list(restored_test_paths),
+                "remaining_test_paths": list(remaining_test_paths),
+                "violation_count": existing_test_edit_violation_count,
+                "hard_block": existing_test_edit_violation_count >= 2,
+                "correctives_sent": blocking_finalization_correctives_sent,
+                "corrective_cap": MAX_BLOCKING_FINALIZATION_CORRECTIVES,
+                "reason": "step_budget_exhausted",
+                "termination_path": "step_loop_exhausted",
+                "violation_flag": "existing_test_edits",
+                **_turn_intent_payload(),
+            }
+            self.store.append("existing_test_edits_violation_forced", forced_payload)
+            _diagnostic_event(
+                "existing_test_edits_violation_forced",
+                forced_payload,
+                durable=True,
             )
-        else:
-            _emit_surface_error(
-                self.surface,
-                "completion_gate_error",
-                _completion_gate_step_budget_exhausted_message(
-                    stage=exhausted_stage,
-                    message_key=completion_gate_step_budget_message_key,
-                    verification_failure_snippet=failure_snippet,
-                    language=turn_language,
-                    explicit_language_override=turn_language_explicit,
-                ),
-                True,
-            )
-        self._emit_forced_final_summary_before_termination(
-            reason=reason,
-            termination_cause="the overall step budget is exhausted during completion-gate repair",
-            termination_kind="step_budget_exhausted",
-            max_steps=_current_turn_step_limit(),
-            language=turn_language,
-            script=turn_script,
-            explicit_language_override=turn_language_explicit,
+            existing_test_edit_forced_logged = True
+
+        workspace_diff = inspect_workspace_git_diff(
+            self.root,
+            base_ref=workspace_git_base,
         )
-        assistant_message_emitted = True
-        return _finish_turn(exit_code, reason=reason)
+        if workspace_diff.empty:
+            forced_payload = {
+                "step": turn_max_steps,
+                "max_steps": turn_max_steps,
+                "steps_remaining": 0,
+                "runtime_kind": self.runtime_kind.value,
+                "content": last_visible_assistant_text,
+                "workspace_diff": workspace_diff.to_payload(),
+                "reason": "step_budget_exhausted",
+                "termination_path": "step_loop_exhausted",
+                **_turn_intent_payload(),
+            }
+            self.store.append("empty_diff_forced", forced_payload)
+            _diagnostic_event("empty_diff_forced", forced_payload, durable=True)
 
     max_steps_message = _runtime_text("max_steps_exceeded")
+    stagnation_budget_state = _stagnation_budget_state_payload()
     if interactive_step_budget_handoff_enabled:
-        self.store.append(
-            "interactive_step_budget_handoff",
-            {
-                "step": _current_turn_step_limit(),
-                "max_steps": _current_turn_step_limit(),
-                "reason": "max_steps_exhausted",
-            },
-        )
+        payload = {
+            "step": _current_turn_step_limit(),
+            "max_steps": _current_turn_step_limit(),
+            "reason": "max_steps_exhausted",
+        }
+        if stagnation_budget_state:
+            payload["stagnation_state"] = stagnation_budget_state
+        self.store.append("interactive_step_budget_handoff", payload)
         _phase_update_key("phase_step_budget_handoff")
+        _record_controller_intervention(
+            "local_final",
+            "forced_final_summary:max_steps_exhausted",
+            metadata={"max_steps": _current_turn_step_limit()},
+        )
         self._emit_forced_final_summary_before_termination(
             reason="max_steps_exhausted",
             termination_cause="the overall step budget is exhausted",
@@ -4284,17 +5427,24 @@ def run_turn(
             language=turn_language,
             script=turn_script,
             explicit_language_override=turn_language_explicit,
+            latest_assistant_text=last_visible_assistant_text,
+            final_event_payload=_controller_intervention_event_fields(),
         )
         assistant_message_emitted = True
         return _finish_turn(0, reason="max_steps_exhausted")
-    self.store.append(
-        "error",
-        {
-            "error": max_steps_message,
-            "max_steps": _current_turn_step_limit(),
-        },
-    )
+    error_payload: dict[str, Any] = {
+        "error": max_steps_message,
+        "max_steps": _current_turn_step_limit(),
+    }
+    if stagnation_budget_state:
+        error_payload["stagnation_state"] = stagnation_budget_state
+    self.store.append("error", error_payload)
     _emit_surface_error(self.surface, "step_budget_error", max_steps_message, True)
+    _record_controller_intervention(
+        "local_final",
+        "forced_final_summary:max_steps_exceeded",
+        metadata={"max_steps": _current_turn_step_limit()},
+    )
     self._emit_forced_final_summary_before_termination(
         reason="max_steps_exceeded",
         termination_cause="the overall step budget is exhausted",
@@ -4303,6 +5453,8 @@ def run_turn(
         language=turn_language,
         script=turn_script,
         explicit_language_override=turn_language_explicit,
+        latest_assistant_text=last_visible_assistant_text,
+        final_event_payload=_controller_intervention_event_fields(),
     )
     assistant_message_emitted = True
     return _finish_turn(1, reason="max_steps_exceeded")

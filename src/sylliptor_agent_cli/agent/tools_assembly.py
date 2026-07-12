@@ -22,7 +22,12 @@ from ..approval_scope import (
     exact_file_set_scope,
     exact_verify_command_set_scope,
 )
-from ..config import AppConfig, ConfigError, resolve_role_temperature
+from ..config import AppConfig, ConfigError, resolve_role_temperature, resolve_web_search_policy
+from ..context.tool_schema_budgeter import (
+    CUSTOM_MCP_SCHEMA_FAMILIES,
+    DEFAULT_CUSTOM_MCP_DESCRIPTION_MAX_CHARS,
+    compact_custom_mcp_tool_parameters,
+)
 from ..crash_diagnostics import CrashDiagnosticLogger
 from ..custom_tools import (
     CustomToolDiscoveryResult,
@@ -98,12 +103,18 @@ from ..tools.registry import (
     iter_builtin_tool_metadata,
     require_builtin_tool_metadata,
 )
+from ..tools.repo_map import repo_map
 from ..tools.search import search_rg
 from ..tools.shell import shell_run
 from ..tools.symbols import symbol_search
+from ..tools.test_discovery import test_discover
 from ..tools.web import web_fetch
 from ..tools.web_search import WebSearchError, resolve_web_search_runtime_status, web_search
 from ..usage_tracker import UsageRecord, UsageSummary
+from ..verification_command_analysis import (
+    VerificationCommandEvidentiaryCapability,
+    analyze_verification_command,
+)
 from ..verify_gate import (
     ResolvedVerifyCommands,
     VerifyError,
@@ -123,7 +134,7 @@ from ..web_research import (
 )
 from ..workspace_context import resolve_workspace_context
 from . import _patchable
-from .errors import AgentRuntimeError, SessionWorkdirError
+from .errors import AgentRuntimeError, ApprovalDeclinedError, SessionWorkdirError
 from .mutation_classification import classify_mutation_paths
 from .prompt_context import (
     _MODE_FULLACCESS,
@@ -140,6 +151,7 @@ from .prompt_context import (
     resolve_workdir_relpath_within_workspace,
 )
 from .verification_commands import (
+    _expand_simple_verify_command_chain,
     _has_disallowed_shell_control_flow,
     _verify_run_commands_match_effective_contract,
 )
@@ -439,10 +451,21 @@ class ToolDef:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def as_openai_tool(self) -> dict[str, Any]:
+        family = _model_schema_family(self.metadata)
+        description_max_chars = self.metadata.get("model_description_max_chars")
+        if family in CUSTOM_MCP_SCHEMA_FAMILIES:
+            description_max_chars = _schema_description_max_chars(description_max_chars)
         description = str(self.metadata.get("model_description") or self.description)
+        description = _model_facing_tool_description(
+            description,
+            max_chars=description_max_chars,
+        )
         parameters = self.parameters
         if bool(self.metadata.get("compact_parameters_for_model")):
-            parameters = _drop_schema_descriptions(self.parameters)
+            if family in CUSTOM_MCP_SCHEMA_FAMILIES:
+                parameters = compact_custom_mcp_tool_parameters(self.parameters)
+            else:
+                parameters = _drop_model_facing_schema_prose(self.parameters)
         return {
             "type": "function",
             "function": {
@@ -453,16 +476,67 @@ class ToolDef:
         }
 
 
-def _drop_schema_descriptions(value: Any) -> Any:
+_MODEL_FACING_SCHEMA_PROSE_KEYS = frozenset(
+    {
+        "$comment",
+        "description",
+        "example",
+        "examples",
+        "markdownDescription",
+        "title",
+    }
+)
+
+
+def _model_schema_family(metadata: dict[str, Any]) -> str:
+    tool_type = str(metadata.get("tool_type") or "").strip().lower()
+    if tool_type == "custom_tool":
+        return "custom"
+    if tool_type in {"mcp", "mcp_tool"}:
+        return "mcp"
+    return tool_type
+
+
+def _schema_description_max_chars(value: Any) -> int:
+    try:
+        configured = int(value)
+    except (TypeError, ValueError):
+        configured = 0
+    if configured <= 0:
+        return DEFAULT_CUSTOM_MCP_DESCRIPTION_MAX_CHARS
+    return configured
+
+
+def _model_facing_tool_description(description: str, *, max_chars: Any) -> str:
+    text = " ".join(str(description or "").split())
+    try:
+        limit = int(max_chars)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _drop_model_facing_schema_prose(value: Any) -> Any:
     if isinstance(value, dict):
-        return {
-            key: _drop_schema_descriptions(item)
-            for key, item in value.items()
-            if key != "description"
-        }
+        reduced: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = str(key)
+            if normalized_key in _MODEL_FACING_SCHEMA_PROSE_KEYS:
+                continue
+            if normalized_key in {"const", "default", "enum"}:
+                reduced[key] = copy.deepcopy(item)
+                continue
+            reduced[key] = _drop_model_facing_schema_prose(item)
+        return reduced
     if isinstance(value, list):
-        return [_drop_schema_descriptions(item) for item in value]
+        return [_drop_model_facing_schema_prose(item) for item in value]
     return copy.deepcopy(value)
+
+
+def _drop_schema_descriptions(value: Any) -> Any:
+    return _drop_model_facing_schema_prose(value)
 
 
 _BUILTIN_MODEL_DESCRIPTIONS: dict[str, str] = {
@@ -476,15 +550,33 @@ _BUILTIN_MODEL_DESCRIPTIONS: dict[str, str] = {
     "fs_mkdir": "Create a workspace directory.",
     "fs_list": "List workspace files with optional filters.",
     "web_fetch": "Fetch one provided or web_search HTTP(S) URL.",
-    "symbol_search": "Search Python and JS/TS workspace symbols.",
+    "symbol_search": "Find Python, JS/TS, or Java symbols; request details/snippets when planning edits.",
+    "test_discover": "Suggest likely focused tests and commands for paths or failures.",
+    "repo_map": "Map related files, imports, symbols, and likely tests before broad exploration.",
     "search_rg": "Search workspace text with a ripgrep regex.",
     "history_search": "Search session history and tool artifacts.",
     "verify_run": "Run configured verifier; no pipes/filters or swapped tools.",
     "shell_run": "Run a policy-checked shell command.",
-    "shell_background": "Start a policy-checked background shell command.",
-    "shell_service_start": "Start an explicit durable service with readiness checks.",
-    "shell_service_status": "Check a durable service and re-run its readiness probe.",
-    "shell_service_stop": "Stop a durable service by service_id.",
+    "shell_background": (
+        "Run a background command with session lifetime; killed when this session ends, "
+        "but survives across chat turns. Use shell_service_start for durable servers."
+    ),
+    "shell_service_start": (
+        "Start a durable service with durable lifetime: keeps running after this session "
+        "ends. Use for servers/daemons that must outlive the session; manage with status/stop."
+    ),
+    "workspace_preview_start": (
+        "Serve static workspace files without Docker. Choose semantic access (auto/local/lan); "
+        "the runtime resolves interfaces and a free port. LAN access is approval-gated and "
+        "temporarily authenticated. Manage the service with shell_service_status/stop."
+    ),
+    "shell_service_status": (
+        "Check a durable service that outlives the session and re-run its readiness probe."
+    ),
+    "shell_service_stop": (
+        "Stop a durable service by service_id. Durable services otherwise keep running "
+        "after the session ends."
+    ),
     "shell_output": "Read buffered output from a background shell process.",
     "shell_wait": "Wait for background process output or exit without busy polling.",
     "shell_kill": "Terminate a background shell process.",
@@ -766,6 +858,32 @@ def build_tools(
             )
         return payload
 
+    def _deadline_warning_fields(
+        message: str,
+        *,
+        start_decision: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "deadline_warning": message,
+            "deadline_prevented_launch": False,
+            **_deadline_payload(),
+        }
+        if start_decision is not None:
+            payload["deadline_start_decision"] = start_decision
+        if crash_diagnostics is not None:
+            crash_diagnostics.event(
+                "deadline_exhausted",
+                {
+                    "operation": "tool",
+                    "deadline_exhausted": payload["deadline_exhausted"],
+                    "remaining_seconds": payload["remaining_seconds"],
+                    "deadline": payload["deadline"],
+                    "deadline_start_decision": start_decision,
+                },
+                durable=True,
+            )
+        return payload
+
     def _deadline_start_decision(
         operation: DeadlineOperation,
         *,
@@ -956,7 +1074,25 @@ def build_tools(
                 )
             )
             if not decision.allow:
-                raise AgentRuntimeError(f"User declined: {kind}")
+                raise ApprovalDeclinedError(kind)
+        if mode == "auto" and kind == "fs_delete" and not yes:
+            if non_interactive and not host_managed_approvals:
+                raise AgentRuntimeError(
+                    "Confirmation required for sensitive command. Re-run with --yes or adjust plan."
+                )
+            decision = surface.request_approval(
+                ApprovalRequest(
+                    kind=kind,
+                    reason="file deletion requires confirmation",
+                    preview=preview,
+                    files=files or [],
+                    allow_for_session_scope=exact_file_set_scope(files or [], operation=kind)
+                    if files
+                    else None,
+                )
+            )
+            if not decision.allow:
+                raise ApprovalDeclinedError(kind)
 
     def guard_shell(cmd: str, *, tool_name: str = "shell_run") -> None:
         if matched_pattern := _fullaccess_denylist_match(cmd):
@@ -987,7 +1123,7 @@ def build_tools(
                 )
             )
             if not decision.allow:
-                raise AgentRuntimeError(f"User declined: {tool_name}")
+                raise ApprovalDeclinedError(tool_name)
             return
         # auto mode
         if decision.needs_confirm and not yes:
@@ -1005,7 +1141,7 @@ def build_tools(
                 )
             )
             if not choice.allow:
-                raise AgentRuntimeError(f"User declined: {tool_name}")
+                raise ApprovalDeclinedError(tool_name)
 
     def guard_terminal_op(op_name: str) -> None:
         if is_full_access_mode:
@@ -1047,7 +1183,7 @@ def build_tools(
                 )
             )
             if not decision.allow:
-                raise AgentRuntimeError("User declined: verify_run")
+                raise ApprovalDeclinedError("verify_run")
             return
 
         if sensitive_reason and not yes:
@@ -1065,7 +1201,7 @@ def build_tools(
                 )
             )
             if not choice.allow:
-                raise AgentRuntimeError("User declined: verify_run")
+                raise ApprovalDeclinedError("verify_run")
 
     parent_mode_normalized = normalize_subagent_mode(mode)
 
@@ -1134,7 +1270,15 @@ def build_tools(
             return {"error": "Subagents are disabled for this session."}
         if subagent_depth > 0:
             return {"error": "Subagents cannot invoke subagents (nesting is blocked)."}
-        if cfg is None or not api_key:
+        provider_auth_available = False
+        if cfg is not None and not api_key:
+            try:
+                from ..profiles import get_active_profile
+
+                provider_auth_available = bool(get_active_profile(cfg).auth_provider)
+            except Exception:
+                provider_auth_available = False
+        if cfg is None or (not api_key and not provider_auth_available):
             return {"error": "Subagent execution unavailable: missing session configuration."}
 
         raw_name = str(args.get("name", "")).strip()
@@ -1286,7 +1430,7 @@ def build_tools(
                 yes=yes,
                 max_steps=effective_subagent_max_steps,
                 no_log=no_log,
-                api_key_override=api_key,
+                api_key_override=api_key or None,
                 console=None,
                 deny_write_prefixes=deny_write_prefixes,
                 allow_write_globs=allow_write_globs,
@@ -1796,7 +1940,10 @@ def build_tools(
                 )
             )
             if not decision.allow:
-                raise AgentRuntimeError(f"User declined: custom tool '{spec.name}'")
+                raise ApprovalDeclinedError(
+                    f"custom tool '{spec.name}'",
+                    message=f"User declined: custom tool '{spec.name}'",
+                )
         artifact_dir: Path | None = None
         artifact_reference_prefix: str | None = None
         if store.artifact_persistence_enabled:
@@ -2038,10 +2185,13 @@ def build_tools(
         ),
     )
 
-    web_search_exposed_in_mode = _built_in_tool_exposed_in_mode(
-        tool_name="web_search",
-        mode=mode,
-        subagent_depth=subagent_depth,
+    web_search_exposed_in_mode = (
+        _built_in_tool_exposed_in_mode(
+            tool_name="web_search",
+            mode=mode,
+            subagent_depth=subagent_depth,
+        )
+        and resolve_web_search_policy(cfg) != "off"
     )
     web_search_status = (
         resolve_web_search_runtime_status(cfg=cfg, api_key=api_key)
@@ -2194,6 +2344,7 @@ def build_tools(
                 allowed_domains=[host] if host else None,
                 max_sources=5,
                 external_web_access=True,
+                session_id=str(getattr(store, "session_id", "") or "") or None,
             )
         except WebSearchError as exc:
             return (
@@ -2252,6 +2403,7 @@ def build_tools(
             raw_requested_url
         )
         requested_url = resolved_requested_url or raw_requested_url
+        recovered_via_search = False
         if provenance_classification is None:
             (
                 provenance_classification,
@@ -2262,34 +2414,34 @@ def build_tools(
                 raw_requested_url=raw_requested_url,
             )
             if provenance_classification is None:
-                result = recovery_result or _web_fetch_recovery_payload(
+                rejection = recovery_result or _web_fetch_recovery_payload(
                     requested_url=requested_url,
                     raw_requested_url=raw_requested_url,
                     finalization_suppressed=False,
                 )
                 fetchable_urls = store.fetchable_web_fetch_urls()
                 if fetchable_urls:
-                    result["fetchable_urls"] = fetchable_urls
-                    result["guidance"] = (
+                    rejection["fetchable_urls"] = fetchable_urls
+                    rejection["guidance"] = (
                         "Do not guess or restate URLs from memory. Retry web_fetch with one of "
-                        "fetchable_urls (these came from web_search results or the user), or run "
+                        "fetchable_urls (these came from prior trusted session evidence), or run "
                         "web_search again to find the page."
                     )
                 else:
-                    result["guidance"] = (
-                        "No URLs are fetchable yet. Run web_search first, or ask the user for the "
-                        "exact URL. Do not guess URLs."
+                    rejection["guidance"] = (
+                        "No URLs are fetchable yet. Run web_search first, or ask the user for "
+                        "the exact URL. Do not guess URLs."
                     )
-                if raw_requested_url and raw_requested_url != requested_url:
-                    result["raw_input_url"] = raw_requested_url
-                return result
+                return rejection
+            recovered_via_search = True
             if recovered_url:
                 requested_url = recovered_url
         result = _patchable("web_fetch", web_fetch)(
             url=requested_url,
             max_chars=(args["max_chars"] if "max_chars" in args else 20000),
         )
-        result["provenance_classification"] = provenance_classification
+        if recovered_via_search:
+            result["provenance_classification"] = provenance_classification
         return result
 
     _append_builtin_tool("web_fetch", run=_web_fetch_tool)
@@ -2314,6 +2466,7 @@ def build_tools(
                     external_web_access=(
                         args["external_web_access"] if "external_web_access" in args else True
                     ),
+                    session_id=str(getattr(store, "session_id", "") or "") or None,
                 ),
             )
 
@@ -2333,6 +2486,37 @@ def build_tools(
             globs=args.get("globs"),
             max_results=(int(args["max_results"]) if args.get("max_results") is not None else 100),
             exact=bool(args.get("exact", False)),
+        ),
+    )
+
+    _append_builtin_tool(
+        "test_discover",
+        run=lambda args: _patchable("test_discover", test_discover)(
+            root=root,
+            paths=args.get("paths"),
+            symbols=args.get("symbols"),
+            changed_only=bool(args.get("changed_only", False)),
+            include_commands=bool(args.get("include_commands", True)),
+            max_results=(int(args["max_results"]) if args.get("max_results") is not None else 20),
+            failure_summary=(
+                args.get("failure_summary")
+                if isinstance(args.get("failure_summary"), dict)
+                else None
+            ),
+        ),
+    )
+
+    _append_builtin_tool(
+        "repo_map",
+        run=lambda args: _patchable("repo_map", repo_map)(
+            root=root,
+            paths=args.get("paths"),
+            symbols=args.get("symbols"),
+            include_tests=bool(args.get("include_tests", True)),
+            include_imports=bool(args.get("include_imports", True)),
+            include_references=bool(args.get("include_references", False)),
+            depth=(int(args["depth"]) if args.get("depth") is not None else 2),
+            max_items=(int(args["max_items"]) if args.get("max_items") is not None else 80),
         ),
     )
 
@@ -2430,6 +2614,36 @@ def build_tools(
         current_effective_verification_commands = _normalized_verify_commands(
             list(current_selection.commands) if current_selection is not None else []
         )
+        unavailable_verification_contract = bool(
+            current_selection is not None
+            and str(current_selection.contract_type or "").strip() == "unavailable"
+            and not current_effective_verification_commands
+        )
+        ignore_explicit_commands_for_unavailable_contract = (
+            unavailable_verification_contract
+            and authoritative_verify_commands is None
+            and (
+                (not one_shot_execution and resolved_runtime_kind == RuntimeKind.INTERACTIVE_CHAT)
+                or not _normalized_verify_commands(
+                    getattr(effective_cfg, "verify_commands", []) or []
+                )
+            )
+        )
+        trusted_shell_commands = trusted_shell_expression_command_set(current_selection)
+
+        def _validate_explicit_verify_candidate(command: str) -> None:
+            normalized_exact = " ".join(str(command or "").strip().split())
+            trusted = normalized_exact in trusted_shell_commands
+            analysis = analyze_verification_command(
+                command,
+                trusted=trusted,
+                workspace_root=root,
+            )
+            if analysis.rejection_reason:
+                raise VerifyError("verification command is invalid: " + analysis.rejection_reason)
+            if _has_disallowed_shell_control_flow(command) and not trusted:
+                raise VerifyError("verification command is invalid: disallowed_shell_control_flow")
+
         selection_metadata = verification_selection_payload(
             current_selection
             if current_selection is not None
@@ -2454,10 +2668,21 @@ def build_tools(
                 text = str(item).strip()
                 if not text:
                     raise VerifyError("commands cannot contain empty values.")
-                verify_cmd.append(text)
+                expanded_commands = _expand_simple_verify_command_chain(
+                    text,
+                    workspace_root=root,
+                )
+                if not ignore_explicit_commands_for_unavailable_contract:
+                    if len(expanded_commands) == 1 and expanded_commands[0] == text:
+                        _validate_explicit_verify_candidate(text)
+                    else:
+                        for command in expanded_commands:
+                            _validate_explicit_verify_candidate(command)
+                verify_cmd.extend(expanded_commands)
             if not verify_cmd:
                 raise VerifyError("commands cannot be empty.")
 
+        ignored_model_verification_commands: list[str] = []
         if authoritative_verify_commands is not None:
             if verify_cmd is not None:
                 requested_commands = _normalized_verify_commands(verify_cmd)
@@ -2477,6 +2702,19 @@ def build_tools(
                     "verify_run commands must stay within the session's effective verification contract."
                 )
             commands = requested_commands
+        elif verify_cmd is not None and unavailable_verification_contract:
+            requested_commands = _normalized_verify_commands(verify_cmd)
+            commands = []
+            for command in requested_commands:
+                analysis = analyze_verification_command(command, trusted=False, workspace_root=root)
+                if (
+                    analysis.evidentiary_capability
+                    == VerificationCommandEvidentiaryCapability.ASSERTIVE
+                    and not analysis.rejection_reason
+                ):
+                    commands.append(command)
+                else:
+                    ignored_model_verification_commands.append(command)
         elif verify_cmd is not None and current_selection is not None:
             commands = _normalized_verify_commands(verify_cmd)
         elif verify_cmd is None and current_selection is not None:
@@ -2497,9 +2735,15 @@ def build_tools(
             raise VerifyError(
                 "authoritative verification command is invalid: " + "; ".join(validation_errors[:3])
             )
-        trusted_shell_commands = trusted_shell_expression_command_set(current_selection)
         for command in commands:
             normalized_exact = " ".join(str(command or "").strip().split())
+            analysis = analyze_verification_command(
+                command,
+                trusted=normalized_exact in trusted_shell_commands,
+                workspace_root=root,
+            )
+            if analysis.rejection_reason:
+                raise VerifyError("verification command is invalid: " + analysis.rejection_reason)
             if (
                 _has_disallowed_shell_control_flow(command)
                 and normalized_exact not in trusted_shell_commands
@@ -2525,6 +2769,9 @@ def build_tools(
             ),
         )
         payload = verify_run_result_to_payload(root=root, result=result)
+        if ignored_model_verification_commands:
+            payload["ignored_model_verification_commands"] = ignored_model_verification_commands
+            payload["verification_skip_reason"] = "verification_contract_unavailable"
         material_touched_repo_paths: list[str] = []
         if touched_repo_paths:
             payload = dict(payload)
@@ -2595,6 +2842,10 @@ def build_tools(
                 "verification_evidence_supplemental_only": payload.get(
                     "verification_evidence_supplemental_only"
                 ),
+                "ignored_model_verification_commands": payload.get(
+                    "ignored_model_verification_commands", []
+                ),
+                "verification_skip_reason": payload.get("verification_skip_reason"),
                 "material_touched_repo_paths": payload.get("material_touched_repo_paths", []),
                 "benign_runtime_paths": payload.get("benign_runtime_paths", []),
                 **selection_metadata,
@@ -2737,6 +2988,8 @@ def build_tools(
             },
             "failure_category": payload.get("failure_category"),
             "log_paths": payload.get("log_paths"),
+            "preview_url": payload.get("preview_url"),
+            "startup_error": payload.get("startup_error"),
         }
 
     def _guard_service_readiness_spec(raw_readiness: Any) -> dict[str, Any] | None:
@@ -2777,6 +3030,7 @@ def build_tools(
             lines.append({"seq": line.seq, "stream": line.stream, "text": text})
         payload = {
             "process_id": process_id,
+            "lifetime": "session",
             "status": snapshot.status,
             "exit_code": snapshot.exit_code,
             "failure_reason": snapshot.failure_reason,
@@ -2789,6 +3043,64 @@ def build_tools(
         if output_truncated_by_max_bytes:
             payload["output_truncated_by_max_bytes"] = True
             payload["max_bytes"] = max_bytes
+        return payload
+
+    def _format_bg_summaries(manager: TerminalManager) -> list[dict[str, Any]]:
+        return [
+            {
+                "process_id": summary.process_id,
+                "cmd": summary.cmd,
+                "cwd": str(summary.cwd),
+                "status": summary.status,
+                "exit_code": summary.exit_code,
+                "runtime_s": round(summary.runtime_s, 3),
+                "started_at_wall": summary.started_at_wall,
+            }
+            for summary in manager.list()
+        ]
+
+    def _unknown_bg_process_payload(
+        *,
+        manager: TerminalManager,
+        process_id: str,
+        operation: str,
+        since: int | None = None,
+    ) -> dict[str, Any]:
+        known_processes = _format_bg_summaries(manager)
+        payload: dict[str, Any] = {
+            "status": "unknown_process_id",
+            "unknown_process_id": True,
+            "process_id": process_id,
+            "requested_process_id": process_id,
+            "operation": operation,
+            "exit_code": None,
+            "failure_reason": "No background process with that process_id is tracked in this session.",
+            "lines": [],
+            "next_seq": since if since is not None else 0,
+            "dropped_lines": 0,
+            "runtime_s": 0.0,
+            "total_bytes": 0,
+            "known_processes": known_processes,
+            "known_process_ids": [process["process_id"] for process in known_processes],
+            "recovery": {
+                "recommended_tool": "shell_list",
+                "suggested_arguments": {},
+                "reason": (
+                    "The supplied process_id is not tracked. Use shell_list or the process_id "
+                    "returned by shell_background; do not use a tool_call_id as process_id."
+                ),
+            },
+        }
+        if since is not None:
+            payload["since"] = since
+        store.append(
+            "bg_unknown_process",
+            {
+                "operation": operation,
+                "process_id": process_id,
+                "known_process_count": len(known_processes),
+            },
+        )
         return payload
 
     shell_empty_poll_counts: dict[tuple[str, int, int, str], int] = {}
@@ -2886,9 +3198,11 @@ def build_tools(
             DeadlineOperation.SHELL_BACKGROUND,
             minimum_remaining_seconds=MINIMUM_TOOL_START_SECONDS,
         )
+        deadline_warning = None
         if deadline_decision is not None and not bool(deadline_decision.get("allowed")):
-            return _deadline_error(
-                "shell_background skipped because the run deadline policy blocks background work.",
+            deadline_warning = _deadline_warning_fields(
+                "Deadline policy would normally block background work; start proceeded because "
+                "this is advisory and not safety.",
                 start_decision=deadline_decision,
             )
         manager = _require_terminal_manager()
@@ -2919,7 +3233,10 @@ def build_tools(
             except (ConfigError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
                 raise AgentRuntimeError(f"Failed to start background process: {exc}") from exc
             snapshot = manager.read(process_id)
-            return _format_bg_snapshot(process_id=process_id, snapshot=snapshot)
+            payload = _format_bg_snapshot(process_id=process_id, snapshot=snapshot)
+            if deadline_warning is not None:
+                payload.update(deadline_warning)
+            return payload
         finally:
             if is_full_access_mode:
                 duration_ms = int((perf_counter() - started) * 1000)
@@ -2946,8 +3263,13 @@ def build_tools(
         since = _coerce_shell_since(args.get("since"))
         try:
             snapshot = manager.read(process_id, since=since)
-        except KeyError as exc:
-            raise AgentRuntimeError(f"Unknown background process_id: {process_id}") from exc
+        except KeyError:
+            return _unknown_bg_process_payload(
+                manager=manager,
+                process_id=process_id,
+                operation="shell_output",
+                since=since,
+            )
         payload = _format_bg_snapshot(process_id=process_id, snapshot=snapshot)
         _maybe_add_empty_poll_guidance(
             payload=payload,
@@ -2976,8 +3298,27 @@ def build_tools(
                 timeout_s=clamped_wait_seconds,
                 until=until,  # type: ignore[arg-type]
             )
-        except KeyError as exc:
-            raise AgentRuntimeError(f"Unknown background process_id: {process_id}") from exc
+        except KeyError:
+            payload = _unknown_bg_process_payload(
+                manager=manager,
+                process_id=process_id,
+                operation="shell_wait",
+                since=since,
+            )
+            payload.update(
+                {
+                    "waited": False,
+                    "timed_out": False,
+                    "wait_seconds_requested": wait_seconds,
+                    "wait_seconds_effective": 0.0,
+                    "until": until,
+                    "elapsed_ms": int((perf_counter() - started) * 1000),
+                }
+            )
+            if deadline_decision is not None:
+                payload["deadline_start_decision"] = deadline_decision
+                payload["deadline_clamped"] = clamped_wait_seconds < wait_seconds
+            return payload
         elapsed_ms = int((perf_counter() - started) * 1000)
         payload = _format_bg_snapshot(
             process_id=process_id,
@@ -3022,30 +3363,18 @@ def build_tools(
     def _shell_list(_args: dict[str, Any]) -> dict[str, Any]:
         manager = _require_terminal_manager()
         guard_terminal_op("shell_list")
-        summaries = manager.list()
-        return {
-            "processes": [
-                {
-                    "process_id": summary.process_id,
-                    "cmd": summary.cmd,
-                    "cwd": str(summary.cwd),
-                    "status": summary.status,
-                    "exit_code": summary.exit_code,
-                    "runtime_s": round(summary.runtime_s, 3),
-                    "started_at_wall": summary.started_at_wall,
-                }
-                for summary in summaries
-            ]
-        }
+        return {"processes": _format_bg_summaries(manager)}
 
     def _shell_service_start(args: dict[str, Any]) -> dict[str, Any]:
         deadline_decision = _deadline_start_decision(
             DeadlineOperation.SHELL_BACKGROUND,
             minimum_remaining_seconds=MINIMUM_TOOL_START_SECONDS,
         )
+        deadline_warning = None
         if deadline_decision is not None and not bool(deadline_decision.get("allowed")):
-            return _deadline_error(
-                "shell_service_start skipped because the run deadline policy blocks service work.",
+            deadline_warning = _deadline_warning_fields(
+                "Deadline policy would normally block service work; start proceeded because "
+                "this is advisory and not safety.",
                 start_decision=deadline_decision,
             )
         manager = _require_durable_service_manager()
@@ -3066,12 +3395,94 @@ def build_tools(
             raise AgentRuntimeError(f"Invalid durable service request: {exc}") from exc
         except (ConfigError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
             raise AgentRuntimeError(f"Failed to start durable service: {exc}") from exc
-        payload = started.payload
+        payload = dict(started.payload)
+        payload["lifetime"] = "durable"
+        if deadline_warning is not None:
+            payload.update(deadline_warning)
         store.append(
             "service_start",
             {
                 **_service_event_payload(payload),
                 "cwd": effective_cwd_relpath,
+            },
+        )
+        return payload
+
+    def _workspace_preview_start(args: dict[str, Any]) -> dict[str, Any]:
+        deadline_decision = _deadline_start_decision(
+            DeadlineOperation.SHELL_BACKGROUND,
+            minimum_remaining_seconds=MINIMUM_TOOL_START_SECONDS,
+        )
+        deadline_warning = None
+        if deadline_decision is not None and not bool(deadline_decision.get("allowed")):
+            deadline_warning = _deadline_warning_fields(
+                "Deadline policy would normally block preview work; start proceeded because "
+                "this is advisory and not safety.",
+                start_decision=deadline_decision,
+            )
+        manager = _require_durable_service_manager()
+        guard_terminal_op("workspace_preview_start")
+        requested_access = str(args.get("access") or "auto").strip().lower()
+        try:
+            effective_access = manager.resolve_preview_access(requested_access)
+        except ValueError as exc:
+            raise AgentRuntimeError(f"Invalid workspace preview request: {exc}") from exc
+        if effective_access == "lan" and not yes and not is_full_access_mode:
+            if non_interactive and not host_managed_approvals:
+                raise AgentRuntimeError(
+                    "LAN preview exposure requires interactive approval. Use local access or "
+                    "re-run in an approval-capable session."
+                )
+            decision = surface.request_approval(
+                ApprovalRequest(
+                    kind="workspace_preview_lan",
+                    reason=(
+                        "LAN preview access exposes an authenticated workspace server to other "
+                        "devices on the current network"
+                    ),
+                    preview="Start a temporary authenticated LAN workspace preview",
+                )
+            )
+            if not decision.allow:
+                raise ApprovalDeclinedError("workspace_preview_lan")
+        raw_port = args.get("port")
+        if raw_port is None or raw_port == "":
+            port = None
+        else:
+            if isinstance(raw_port, bool):
+                raise AgentRuntimeError("Preview port must be an integer")
+            try:
+                port = int(raw_port)
+            except (TypeError, ValueError) as exc:
+                raise AgentRuntimeError("Preview port must be an integer") from exc
+        effective_cwd_relpath = _resolve_workspace_relative_path(
+            raw_path=args.get("cwd"),
+            raw_base=args.get("cwd_base"),
+            field_name="cwd",
+            base_field_name="cwd_base",
+            allow_empty=True,
+        )
+        cwd_path = root if not effective_cwd_relpath else (root / effective_cwd_relpath).resolve()
+        try:
+            started = manager.start_preview(
+                cwd=cwd_path,
+                access=requested_access,
+                port=port,
+            )
+        except ValueError as exc:
+            raise AgentRuntimeError(f"Invalid workspace preview request: {exc}") from exc
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            raise AgentRuntimeError(f"Failed to start workspace preview: {exc}") from exc
+        payload = dict(started.payload)
+        payload["lifetime"] = "durable"
+        if deadline_warning is not None:
+            payload.update(deadline_warning)
+        store.append(
+            "service_start",
+            {
+                **_service_event_payload(payload),
+                "cwd": effective_cwd_relpath,
+                "service_kind": "workspace_preview",
             },
         )
         return payload
@@ -3112,6 +3523,7 @@ def build_tools(
     _append_builtin_tool("shell_kill", run=_shell_kill)
     _append_builtin_tool("shell_list", run=_shell_list)
     _append_builtin_tool("shell_service_start", run=_shell_service_start)
+    _append_builtin_tool("workspace_preview_start", run=_workspace_preview_start)
     _append_builtin_tool("shell_service_status", run=_shell_service_status)
     _append_builtin_tool("shell_service_stop", run=_shell_service_stop)
 
@@ -3203,6 +3615,8 @@ def build_tools(
                 run=lambda args, spec=custom_tool_spec: _run_custom_tool(spec, args),
                 metadata={
                     "tool_type": "custom_tool",
+                    "compact_parameters_for_model": True,
+                    "model_description_max_chars": 1200,
                     "custom_tool": custom_tool_spec.metadata(include_output_schema=True),
                 },
             )
@@ -3217,6 +3631,11 @@ def build_tools(
                     description=bound_binding.description,
                     parameters=bound_binding.parameters,
                     run=bound_binding.run,
+                    metadata={
+                        "tool_type": "mcp",
+                        "compact_parameters_for_model": True,
+                        "model_description_max_chars": 1000,
+                    },
                 )
             )
     active_tools = {t.name: t for t in tools}

@@ -188,7 +188,12 @@ def test_shell_service_tools_are_additive_to_legacy_tool_catalog(tmp_path: Path)
 
     for tool_name in ("shell_background", "shell_output", "shell_kill", "shell_list"):
         assert tool_name in tools
-    for tool_name in ("shell_service_start", "shell_service_status", "shell_service_stop"):
+    for tool_name in (
+        "shell_service_start",
+        "workspace_preview_start",
+        "shell_service_status",
+        "shell_service_stop",
+    ):
         assert tool_name in tools
 
 

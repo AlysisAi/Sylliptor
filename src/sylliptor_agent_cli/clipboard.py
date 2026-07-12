@@ -12,6 +12,69 @@ class ClipboardError(RuntimeError):
     pass
 
 
+def _run_clipboard_writer(command: list[str], payload: bytes) -> str | None:
+    try:
+        proc = subprocess.run(
+            command,
+            input=payload,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return str(exc)
+    if proc.returncode == 0:
+        return None
+    detail = _decode_text(proc.stderr) if proc.stderr else ""
+    return detail or f"exit code {proc.returncode}"
+
+
+def copy_text_to_clipboard(text: str) -> None:
+    """Copy text to the host clipboard without shell interpolation.
+
+    The ordered backends cover macOS, Windows/WSL, Wayland, and X11. PowerShell
+    receives base64-encoded UTF-8 so non-ASCII selections survive the WSL/Windows
+    process boundary without depending on the active console code page.
+    """
+    value = str(text or "")
+    if not value:
+        raise ClipboardError("Cannot copy empty text.")
+
+    utf8_payload = value.encode("utf-8")
+    candidates: list[tuple[str, list[str], bytes]] = [
+        ("pbcopy", ["pbcopy"], utf8_payload),
+        (
+            "powershell.exe",
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                (
+                    "$b=[Console]::In.ReadToEnd(); "
+                    "$t=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b)); "
+                    "Set-Clipboard -Value $t"
+                ),
+            ],
+            base64.b64encode(utf8_payload),
+        ),
+        ("clip.exe", ["clip.exe"], utf8_payload),
+        ("wl-copy", ["wl-copy", "--type", "text/plain;charset=utf-8"], utf8_payload),
+        ("xclip", ["xclip", "-selection", "clipboard", "-in"], utf8_payload),
+        ("xsel", ["xsel", "--clipboard", "--input"], utf8_payload),
+    ]
+    errors: list[str] = []
+    for executable, command, payload in candidates:
+        if shutil.which(executable) is None:
+            continue
+        error = _run_clipboard_writer(command, payload)
+        if error is None:
+            return
+        errors.append(f"{executable}: {error}")
+    detail = "; ".join(errors) if errors else "no supported clipboard command found"
+    raise ClipboardError(f"Could not copy text to the system clipboard: {detail}")
+
+
 def _default_output_path(root: Path) -> Path:
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return root / ".sylliptor_images" / f"clipboard_{ts}_{uuid.uuid4().hex[:6]}.png"

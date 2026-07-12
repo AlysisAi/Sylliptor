@@ -425,6 +425,138 @@ def test_list_sessions(tmp_path: Path) -> None:
     assert any(i.session_id == sid for i in infos)
 
 
+def test_read_session_last_event_ts_returns_latest(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.session_store import read_session_last_event_ts
+
+    p = tmp_path / "s.jsonl"
+    events = [
+        {"type": "session_start", "ts": "2026-01-01T10:00:00+00:00", "payload": {}},
+        {"type": "user_message", "ts": "2026-01-01T10:05:00+00:00", "payload": {"content": "hi"}},
+        {"type": "final", "ts": "2026-01-01T10:09:00+00:00", "payload": {"content": "bye"}},
+    ]
+    p.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+    assert read_session_last_event_ts(p) == "2026-01-01T10:09:00+00:00"
+
+
+def test_read_session_last_event_ts_handles_empty_corrupt_missing(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.session_store import read_session_last_event_ts
+
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    assert read_session_last_event_ts(empty) is None
+
+    corrupt = tmp_path / "corrupt.jsonl"
+    corrupt.write_text("not json\n{bad\n", encoding="utf-8")
+    assert read_session_last_event_ts(corrupt) is None
+
+    assert read_session_last_event_ts(tmp_path / "missing.jsonl") is None
+
+
+def test_read_session_last_event_ts_skips_trailing_partial_line(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.session_store import read_session_last_event_ts
+
+    p = tmp_path / "s.jsonl"
+    good = json.dumps({"type": "final", "ts": "2026-01-01T10:09:00+00:00", "payload": {}})
+    # A crash can leave a half-written final line; the reader should walk back to
+    # the last fully parseable event.
+    p.write_text(good + "\n" + '{"type": "tool_call", "ts": "2026-', encoding="utf-8")
+    assert read_session_last_event_ts(p) == "2026-01-01T10:09:00+00:00"
+
+
+def test_read_session_first_event_workspace_toplevel_and_payload(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.session_store import read_session_first_event_workspace
+
+    top = tmp_path / "top.jsonl"
+    top.write_text(
+        json.dumps(
+            {
+                "type": "session_start",
+                "ts": "2026-01-01T10:00:00+00:00",
+                "workspace_root": "/repo",
+                "git_root": "/repo",
+                "payload": {"mode": "auto"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert read_session_first_event_workspace(top) == ("/repo", "/repo")
+
+    payload_only = tmp_path / "payload.jsonl"
+    payload_only.write_text(
+        json.dumps(
+            {
+                "type": "session_start",
+                "ts": "2026-01-01T10:00:00+00:00",
+                "payload": {"workspace_root": "/w", "git_root": "/g"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert read_session_first_event_workspace(payload_only) == ("/w", "/g")
+
+    none = tmp_path / "none.jsonl"
+    none.write_text(json.dumps({"type": "x", "payload": {}}) + "\n", encoding="utf-8")
+    assert read_session_first_event_workspace(none) == (None, None)
+
+
+def test_session_belongs_to_workspace_predicate(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.session_store import (
+        SessionInfo,
+        canonical_workspace_path,
+        session_belongs_to_workspace,
+    )
+
+    ws = tmp_path / "repo"
+    other = tmp_path / "other"
+    ws.mkdir()
+    other.mkdir()
+    current = canonical_workspace_path(str(ws))
+
+    # Primary workspace_root match (trailing separator proves normalization).
+    match = SessionInfo(
+        session_id="m", path=tmp_path / "m.jsonl", mtime=1.0, workspace_root=str(ws) + os.sep
+    )
+    assert session_belongs_to_workspace(match, current) is True
+
+    # Different workspace is excluded.
+    diff = SessionInfo(
+        session_id="d", path=tmp_path / "d.jsonl", mtime=1.0, workspace_root=str(other)
+    )
+    assert session_belongs_to_workspace(diff, current) is False
+
+    # Legacy log (no workspace_root) matches on git_root.
+    legacy = SessionInfo(session_id="l", path=tmp_path / "l.jsonl", mtime=1.0, git_root=str(ws))
+    assert session_belongs_to_workspace(legacy, current, canonical_workspace_path(str(ws))) is True
+    # Legacy log with no current git_root -> excluded.
+    assert session_belongs_to_workspace(legacy, current, None) is False
+
+    # No identity at all -> excluded.
+    stray = SessionInfo(session_id="s", path=tmp_path / "s.jsonl", mtime=1.0)
+    assert session_belongs_to_workspace(stray, current) is False
+
+
+def test_list_sessions_enriches_workspace_and_last_event_ts(tmp_path: Path) -> None:
+    p = tmp_path / "s.jsonl"
+    events = [
+        {
+            "type": "session_start",
+            "ts": "2026-01-01T10:00:00+00:00",
+            "workspace_root": "/repo",
+            "git_root": "/repo",
+            "payload": {},
+        },
+        {"type": "final", "ts": "2026-01-01T10:09:00+00:00", "payload": {"content": "done"}},
+    ]
+    p.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+
+    [info] = list_sessions(tmp_path)
+    assert info.workspace_root == "/repo"
+    assert info.git_root == "/repo"
+    assert info.last_event_ts == "2026-01-01T10:09:00+00:00"
+
+
 def test_session_store_reopen_preserves_user_provided_web_url_classification(
     tmp_path: Path,
 ) -> None:
@@ -1491,3 +1623,276 @@ def test_session_store_reopen_rewrites_cumulative_artifact_when_newer_artifact_p
     assert payload["deduped_normalized_fetch_urls"] == ["https://docs.example.com/guide"]
     assert payload["deduped_normalized_final_fetch_urls"] == ["https://docs.example.com/final"]
     assert [entry["normalized_query"] for entry in payload["searches"]] == ["docs example guide"]
+
+
+def test_local_session_owner_is_deterministic_and_nonempty() -> None:
+    from sylliptor_agent_cli.session_store import local_session_owner
+
+    owner = local_session_owner()
+    assert owner is not None
+    assert "@" in owner
+    # Deterministic: two calls on the same account/host agree.
+    assert local_session_owner() == owner
+
+
+def test_session_store_stamps_owner_on_events(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.session_store import (
+        SessionStore,
+        list_sessions,
+        local_session_owner,
+        read_session_events,
+    )
+
+    store = SessionStore(
+        enabled=True,
+        sessions_dir=tmp_path,
+        session_id="owned",
+        cwd=str(tmp_path),
+        repo_root=None,
+        workspace_root=str(tmp_path),
+    )
+    store.append("session_start", {"mode": "auto"})
+    store.close()
+
+    events = list(read_session_events(tmp_path / "owned.jsonl"))
+    assert events and events[0].get("owner") == local_session_owner()
+
+    infos = list_sessions(tmp_path)
+    assert [info.session_id for info in infos] == ["owned"]
+    assert infos[0].owner == local_session_owner()
+
+
+def test_read_session_first_event_scope_reads_owner(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.session_store import read_session_first_event_scope
+
+    log = tmp_path / "s.jsonl"
+    log.write_text(
+        json.dumps(
+            {
+                "type": "session_start",
+                "ts": "2026-01-01T10:00:00+00:00",
+                "workspace_root": "/repo",
+                "git_root": "/repo",
+                "owner": "alice@laptop",
+                "payload": {"mode": "auto"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert read_session_first_event_scope(log) == ("/repo", "/repo", "alice@laptop")
+
+    legacy = tmp_path / "legacy.jsonl"
+    legacy.write_text(
+        json.dumps(
+            {
+                "type": "session_start",
+                "ts": "2026-01-01T10:00:00+00:00",
+                "workspace_root": "/repo",
+                "payload": {"mode": "auto"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert read_session_first_event_scope(legacy) == ("/repo", None, None)
+
+
+def test_session_belongs_to_owner_predicate(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.session_store import SessionInfo, session_belongs_to_owner
+
+    def info(owner: str | None) -> SessionInfo:
+        return SessionInfo(session_id="s", path=tmp_path / "s.jsonl", mtime=1.0, owner=owner)
+
+    # Legacy logs (no recorded owner) stay visible for any local identity.
+    assert session_belongs_to_owner(info(None), "alice@laptop") is True
+    assert session_belongs_to_owner(info(None), None) is True
+
+    # Recorded owner must match the local identity (case-insensitively:
+    # Windows usernames and DNS hostnames are not case-significant).
+    assert session_belongs_to_owner(info("alice@laptop"), "alice@laptop") is True
+    assert session_belongs_to_owner(info("Alice@LAPTOP"), "alice@laptop") is True
+    assert session_belongs_to_owner(info("mallory@other-pc"), "alice@laptop") is False
+
+    # A foreign-stamped log never surfaces on an unidentifiable account.
+    assert session_belongs_to_owner(info("alice@laptop"), None) is False
+    assert session_belongs_to_owner(info("alice@laptop"), "   ") is False
+
+
+def test_filter_sessions_to_local_owner_drops_foreign_sessions(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.session_store import (
+        SessionInfo,
+        filter_sessions_to_local_owner,
+        local_session_owner,
+    )
+
+    mine = SessionInfo(
+        session_id="mine", path=tmp_path / "mine.jsonl", mtime=3.0, owner=local_session_owner()
+    )
+    foreign = SessionInfo(
+        session_id="foreign",
+        path=tmp_path / "foreign.jsonl",
+        mtime=2.0,
+        owner="someone-else@another-host",
+    )
+    legacy = SessionInfo(session_id="legacy", path=tmp_path / "legacy.jsonl", mtime=1.0)
+
+    kept = filter_sessions_to_local_owner([mine, foreign, legacy])
+    assert [info.session_id for info in kept] == ["mine", "legacy"]
+
+
+def test_session_belongs_to_owner_last_owner_self_heal(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.session_store import SessionInfo, session_belongs_to_owner
+
+    # Identity drift (e.g. hostname rename): the creator stamp no longer
+    # matches, but an explicit resume re-stamped the tail with the new
+    # identity, so the session lists again for its rightful owner.
+    healed = SessionInfo(
+        session_id="s",
+        path=tmp_path / "s.jsonl",
+        mtime=1.0,
+        owner="alice@old-host",
+        last_owner="alice@new-host",
+    )
+    assert session_belongs_to_owner(healed, "alice@new-host") is True
+    assert session_belongs_to_owner(healed, "alice@old-host") is True
+
+    # A foreign log stays hidden either way: both stamps are foreign.
+    assert session_belongs_to_owner(healed, "bob@somewhere") is False
+
+    # A legacy log resumed post-upgrade carries an owner only at the tail;
+    # it belongs to that account and is no longer visible to everyone.
+    adopted = SessionInfo(
+        session_id="a",
+        path=tmp_path / "a.jsonl",
+        mtime=1.0,
+        owner=None,
+        last_owner="alice@laptop",
+    )
+    assert session_belongs_to_owner(adopted, "alice@laptop") is True
+    assert session_belongs_to_owner(adopted, "bob@somewhere") is False
+
+
+def test_list_sessions_reads_late_owner_stamp_and_last_owner(tmp_path: Path) -> None:
+    """A pre-upgrade log resumed post-upgrade carries its owner stamp only on
+    later events. The first-event scan must keep looking (within its bound)
+    instead of classifying the log as legacy, and the tail read must surface
+    the newest event's owner."""
+    from sylliptor_agent_cli.session_store import list_sessions
+
+    log = tmp_path / "mixed.jsonl"
+    events = [
+        # Two pre-upgrade events: workspace recorded, no owner stamp.
+        {
+            "type": "session_start",
+            "ts": "2026-01-01T10:00:00+00:00",
+            "workspace_root": "/repo",
+            "payload": {"mode": "auto"},
+        },
+        {
+            "type": "user_message",
+            "ts": "2026-01-01T10:00:01+00:00",
+            "workspace_root": "/repo",
+            "payload": {"content": "old"},
+        },
+        # Post-upgrade resume appends stamped events.
+        {
+            "type": "session_start",
+            "ts": "2026-02-01T10:00:00+00:00",
+            "workspace_root": "/repo",
+            "owner": "alice@laptop",
+            "payload": {"mode": "auto"},
+        },
+        {
+            "type": "user_message",
+            "ts": "2026-02-01T10:00:01+00:00",
+            "workspace_root": "/repo",
+            "owner": "alice@new-laptop",
+            "payload": {"content": "new"},
+        },
+    ]
+    log.write_text(
+        "".join(json.dumps(event, ensure_ascii=True) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    infos = list_sessions(tmp_path)
+    assert len(infos) == 1
+    assert infos[0].owner == "alice@laptop"
+    assert infos[0].last_owner == "alice@new-laptop"
+    assert infos[0].last_event_ts == "2026-02-01T10:00:01+00:00"
+
+
+def test_read_session_last_event_fields_owner_from_newest_event(tmp_path: Path) -> None:
+    from sylliptor_agent_cli.session_store import read_session_last_event_fields
+
+    log = tmp_path / "s.jsonl"
+    log.write_text(
+        json.dumps({"type": "a", "ts": "2026-01-01T10:00:00+00:00", "owner": "old@host"})
+        + "\n"
+        + json.dumps({"type": "b", "ts": "2026-01-02T10:00:00+00:00", "owner": "new@host"})
+        + "\n",
+        encoding="utf-8",
+    )
+    assert read_session_last_event_fields(log) == ("2026-01-02T10:00:00+00:00", "new@host")
+
+    legacy = tmp_path / "legacy.jsonl"
+    legacy.write_text(
+        json.dumps({"type": "a", "ts": "2026-01-01T10:00:00+00:00"}) + "\n",
+        encoding="utf-8",
+    )
+    assert read_session_last_event_fields(legacy) == ("2026-01-01T10:00:00+00:00", None)
+
+
+def test_sessions_list_cli_hides_foreign_sessions_unless_all(tmp_path: Path) -> None:
+    import os as _os
+    import uuid
+
+    from typer.testing import CliRunner
+
+    from sylliptor_agent_cli import cli as cli_mod
+    from sylliptor_agent_cli.session_store import local_session_owner
+
+    runner = CliRunner()
+    cfg_dir = tmp_path / "config"
+    data_dir = tmp_path / "data"
+    sessions_dir = data_dir / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    def _write_log(session_id: str, owner: str | None, ts: str) -> None:
+        stamp = {"owner": owner} if owner else {}
+        event = {
+            "type": "session_start",
+            "ts": ts,
+            "session_id": session_id,
+            **stamp,
+            "payload": {"mode": "auto"},
+        }
+        (sessions_dir / f"{session_id}.jsonl").write_text(
+            json.dumps(event) + "\n", encoding="utf-8"
+        )
+
+    _write_log("sess_own", local_session_owner(), "2026-07-10T12:00:00+00:00")
+    _write_log(
+        "sess_foreign",
+        f"foreign-user@foreign-host-{uuid.uuid4().hex}",
+        "2026-07-11T12:00:00+00:00",
+    )
+
+    env = {
+        "SYLLIPTOR_CONFIG_DIR": _os.fspath(cfg_dir),
+        "SYLLIPTOR_DATA_DIR": _os.fspath(data_dir),
+    }
+
+    scoped = runner.invoke(cli_mod.app, ["sessions", "list"], env=env, terminal_width=200)
+    assert scoped.exit_code == 0
+    assert "sess_own" in scoped.output
+    assert "sess_foreign" not in scoped.output
+    assert "hidden" in scoped.output
+
+    unscoped = runner.invoke(
+        cli_mod.app, ["sessions", "list", "--all"], env=env, terminal_width=200
+    )
+    assert unscoped.exit_code == 0
+    assert "sess_own" in unscoped.output
+    assert "sess_foreign" in unscoped.output

@@ -50,7 +50,7 @@ def _service_readiness_property() -> dict[str, Any]:
                 "enum": ["process_alive", "tcp", "unix_socket", "command"],
                 "default": "process_alive",
             },
-            "host": {"type": "string", "default": "127.0.0.1"},
+            "host": {"type": "string", "default": "localhost"},
             "port": {"type": "integer", "minimum": 1, "maximum": 65535},
             "path": {"type": "string"},
             "command": {"type": "string"},
@@ -308,6 +308,34 @@ def _summary_symbol_search(parsed: dict[str, Any]) -> str:
     return f'Found {count} symbol match(es) for "{query}"{trunc_note}.'
 
 
+def _summary_test_discover(parsed: dict[str, Any]) -> str:
+    tests = parsed.get("candidate_tests")
+    commands = parsed.get("candidate_commands")
+    test_count = len(tests) if isinstance(tests, list) else 0
+    command_count = len(commands) if isinstance(commands, list) else 0
+    frameworks = parsed.get("frameworks")
+    framework_text = ""
+    if isinstance(frameworks, list) and frameworks:
+        framework_text = " (" + ", ".join(str(item) for item in frameworks[:3]) + ")"
+    return (
+        f"Found {test_count} likely test file(s) and "
+        f"{command_count} candidate command(s){framework_text}."
+    )
+
+
+def _summary_repo_map(parsed: dict[str, Any]) -> str:
+    related = parsed.get("related_files")
+    edges = parsed.get("import_edges")
+    tests = parsed.get("candidate_tests")
+    related_count = len(related) if isinstance(related, list) else 0
+    edge_count = len(edges) if isinstance(edges, list) else 0
+    test_count = len(tests) if isinstance(tests, list) else 0
+    return (
+        f"Mapped {related_count} related file(s), {edge_count} import edge(s), "
+        f"and {test_count} likely test file(s)."
+    )
+
+
 def _summary_search_rg(parsed: dict[str, Any]) -> str:
     matches = parsed.get("matches")
     count = len(matches) if isinstance(matches, list) else 0
@@ -421,6 +449,13 @@ def _summary_shell_background(parsed: dict[str, Any]) -> str:
 def _summary_shell_output(parsed: dict[str, Any]) -> str:
     process_id = str(parsed.get("process_id") or "?")
     status = str(parsed.get("status") or "?")
+    if status == "unknown_process_id" or bool(parsed.get("unknown_process_id")):
+        known = parsed.get("known_process_ids")
+        known_count = len(known) if isinstance(known, list) else 0
+        return (
+            f'Unknown background process "{process_id}"; '
+            f"{known_count} process id(s) currently tracked."
+        )
     lines = parsed.get("lines")
     line_count = len(lines) if isinstance(lines, list) else 0
     dropped = int(parsed.get("dropped_lines") or 0)
@@ -431,6 +466,13 @@ def _summary_shell_output(parsed: dict[str, Any]) -> str:
 def _summary_shell_wait(parsed: dict[str, Any]) -> str:
     process_id = str(parsed.get("process_id") or "?")
     status = str(parsed.get("status") or "?")
+    if status == "unknown_process_id" or bool(parsed.get("unknown_process_id")):
+        known = parsed.get("known_process_ids")
+        known_count = len(known) if isinstance(known, list) else 0
+        return (
+            f'Unknown background process "{process_id}"; '
+            f"{known_count} process id(s) currently tracked."
+        )
     lines = parsed.get("lines")
     line_count = len(lines) if isinstance(lines, list) else 0
     timed_out = bool(parsed.get("timed_out"))
@@ -519,6 +561,104 @@ def _summary_git_apply_patch(parsed: dict[str, Any]) -> str:
     return f"Output keys: {keys or '-'}."
 
 
+def _fs_edit_op_variant(
+    *,
+    ops: tuple[str, ...],
+    required: tuple[str, ...],
+    include_content: bool,
+    include_target: bool,
+    include_replacement: bool,
+    extra_properties: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "op": {"type": "string", "enum": list(ops)},
+    }
+    if include_content:
+        properties["content"] = {"type": "string"}
+    if include_target:
+        properties["target"] = {"type": "string", "minLength": 1}
+        properties["expected_match_count"] = {"type": "integer", "minimum": 0}
+    if include_replacement:
+        properties["replacement"] = {"type": "string"}
+    if extra_properties:
+        properties.update(extra_properties)
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(required),
+    }
+
+
+def _fs_edit_parameters() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "path": {"type": "string"},
+            "path_base": _path_base_property(),
+            "edits": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "anyOf": [
+                        _fs_edit_op_variant(
+                            ops=("replace", "replace_exact"),
+                            required=("op", "target", "replacement"),
+                            include_content=False,
+                            include_target=True,
+                            include_replacement=True,
+                        ),
+                        _fs_edit_op_variant(
+                            ops=("insert_before_exact", "insert_after_exact"),
+                            required=("op", "target", "content"),
+                            include_content=True,
+                            include_target=True,
+                            include_replacement=False,
+                        ),
+                        _fs_edit_op_variant(
+                            ops=("append", "prepend"),
+                            required=("op", "content"),
+                            include_content=True,
+                            include_target=False,
+                            include_replacement=False,
+                        ),
+                        _fs_edit_op_variant(
+                            ops=("replace_lines",),
+                            required=("op", "start_line", "end_line", "replacement"),
+                            include_content=False,
+                            include_target=False,
+                            include_replacement=True,
+                            extra_properties={
+                                "start_line": {"type": "integer", "minimum": 1},
+                                "end_line": {"type": "integer", "minimum": 1},
+                                "expected_old": {
+                                    "type": "string",
+                                    "description": (
+                                        "Optional exact old text for replace_lines; the edit fails "
+                                        "closed if the selected line range no longer matches."
+                                    ),
+                                },
+                            },
+                        ),
+                        _fs_edit_op_variant(
+                            ops=("insert_before_line", "insert_after_line"),
+                            required=("op", "line", "content"),
+                            include_content=True,
+                            include_target=False,
+                            include_replacement=False,
+                            extra_properties={
+                                "line": {"type": "integer", "minimum": 1},
+                            },
+                        ),
+                    ]
+                },
+            },
+        },
+        "required": ["path", "edits"],
+    }
+
+
 @dataclass(frozen=True)
 class RichToolMetadata:
     display_name: str
@@ -601,47 +741,24 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
     ),
     BuiltinToolMetadata(
         name="fs_edit",
-        description="Apply deterministic exact-text edits to one UTF-8 text file. Prefer for localized edits to an existing file.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "path_base": _path_base_property(),
-                "edits": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "op": {
-                                "type": "string",
-                                "enum": [
-                                    "replace",
-                                    "replace_exact",
-                                    "insert_before_exact",
-                                    "insert_after_exact",
-                                    "append",
-                                    "prepend",
-                                ],
-                            },
-                            "target": {"type": "string"},
-                            "replacement": {"type": "string"},
-                            "content": {"type": "string"},
-                            "expected_match_count": {"type": "integer", "minimum": 0},
-                        },
-                        "required": ["op"],
-                    },
-                },
-            },
-            "required": ["path", "edits"],
-        },
+        description=(
+            "Apply deterministic edits to one UTF-8 text file. Prefer for localized edits to an "
+            "existing file. Prefer line-range edits after fs_read_lines; use exact-text ops when "
+            "matching known text."
+        ),
+        parameters=_fs_edit_parameters(),
         categories=("write", "fs"),
         rich=RichToolMetadata(
             display_name="Edit File",
-            reasoning_hint="Apply deterministic exact-text edits to one file.",
+            reasoning_hint="Apply deterministic exact-text or line-range edits to one file.",
             action_hint=(
-                "Edit a localized file region with exact-match operations and review the diff preview."
+                "Edit a localized file region with line-range or exact-match operations and review "
+                "the diff preview."
             ),
-            fallback_hint="If a target is ambiguous or missing, narrow the edit or use git_apply_patch.",
+            fallback_hint=(
+                "If exact text is ambiguous or missing, re-read lines and use replace_lines with "
+                "expected_old; use git_apply_patch for broader multi-file patches."
+            ),
             input_preview_formatter=_preview_single_path,
             output_summary_formatter=_summary_fs_edit,
         ),
@@ -831,9 +948,13 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
     BuiltinToolMetadata(
         name="web_search",
         description=(
-            "Search the public web for external docs, APIs, release notes, or error research and return a "
-            "concise answer with cited sources. Prefer this when the task requires live/current/latest external discovery or explicit web browsing. Use web_fetch only after you have a URL the user provided or "
-            "web_search returned. `external_web_access=false` is only supported by the OpenAI Responses backend."
+            "Search the public web and return grounded content with cited sources. Decide to use it "
+            "whenever a reliable answer depends on unstable external facts, authoritative current "
+            "sources, current high-stakes guidance, current product or service information, or "
+            "requested internet research. Every result includes `retrieved_at` — the UTC wall-clock "
+            "time the search executed; trust it over your training prior for what 'today'/'current' "
+            "means. Use web_fetch only after you have a URL the user provided or web_search returned. "
+            "`external_web_access=false` is only supported by the OpenAI Responses backend."
         ),
         parameters={
             "type": "object",
@@ -862,7 +983,7 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
     BuiltinToolMetadata(
         name="symbol_search",
         description=(
-            "Search Python (AST) and JavaScript/TypeScript (heuristic) symbols "
+            "Search Python (AST), JavaScript/TypeScript (heuristic), and Java (heuristic) symbols "
             "(functions, classes, methods, constants) under the working root. Prefer this before broad regex search when locating definitions."
         ),
         parameters={
@@ -878,6 +999,9 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
                 "globs": {"type": "array", "items": {"type": "string"}},
                 "max_results": {"type": "integer", "default": 100},
                 "exact": {"type": "boolean", "default": False},
+                "include_details": {"type": "boolean", "default": False},
+                "include_snippet": {"type": "boolean", "default": False},
+                "include_references": {"type": "boolean", "default": False},
             },
             "required": ["query"],
         },
@@ -895,8 +1019,69 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
         built_in_subagent_exposure="readonly",
     ),
     BuiltinToolMetadata(
+        name="test_discover",
+        description=(
+            "Find likely tests and focused test commands for changed files, symbols, or a "
+            "verification failure summary. Use for repair targeting before broad final verification."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}},
+                "symbols": {"type": "array", "items": {"type": "string"}},
+                "changed_only": {"type": "boolean", "default": False},
+                "include_commands": {"type": "boolean", "default": True},
+                "max_results": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+                "failure_summary": {"type": "object"},
+            },
+        },
+        categories=("read", "search", "verification"),
+        rich=RichToolMetadata(
+            display_name="Discover Tests",
+            reasoning_hint="Map changed files or verification failures to likely focused tests.",
+            action_hint="Suggest likely test files and candidate targeted commands without running them.",
+            fallback_hint=(
+                "If no focused test is found, use broad_commands or the configured verify_run contract."
+            ),
+            output_summary_formatter=_summary_test_discover,
+        ),
+        built_in_subagent_exposure="readonly",
+    ),
+    BuiltinToolMetadata(
+        name="repo_map",
+        description=(
+            "Build a compact heuristic map of files, imports, symbols, likely tests, and "
+            "repo-native commands related to paths or symbols. Use before broad exploration in unfamiliar repos."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}},
+                "symbols": {"type": "array", "items": {"type": "string"}},
+                "include_tests": {"type": "boolean", "default": True},
+                "include_imports": {"type": "boolean", "default": True},
+                "include_references": {"type": "boolean", "default": False},
+                "depth": {"type": "integer", "default": 2, "minimum": 0, "maximum": 4},
+                "max_items": {"type": "integer", "default": 80, "minimum": 1, "maximum": 200},
+            },
+        },
+        categories=("read", "search", "symbol", "verification"),
+        rich=RichToolMetadata(
+            display_name="Map Repo",
+            reasoning_hint="Orient around changed paths/symbols before scattered file reads.",
+            action_hint="Return related implementation files, imports, tests, and candidate commands.",
+            fallback_hint="If the map is sparse, use symbol_search, search_rg, or test_discover directly.",
+            output_summary_formatter=_summary_repo_map,
+        ),
+        built_in_subagent_exposure="readonly",
+    ),
+    BuiltinToolMetadata(
         name="search_rg",
-        description="Search for a regex pattern under root_path using ripgrep when available. Prefer this for fast text/code lookup before reading or patching files.",
+        description=(
+            "Search for a regex or literal pattern under root_path using ripgrep when available. "
+            "Prefer this for fast text/code lookup before reading or patching files. "
+            "Use context options for edit planning."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -904,14 +1089,20 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
                 "root_path": {"type": "string"},
                 "path_base": _path_base_property(),
                 "globs": {"type": "array", "items": {"type": "string"}},
+                "max_results": {"type": "integer", "default": 200, "minimum": 1, "maximum": 500},
+                "before_context": {"type": "integer", "default": 0, "minimum": 0, "maximum": 5},
+                "after_context": {"type": "integer", "default": 0, "minimum": 0, "maximum": 5},
+                "literal": {"type": "boolean", "default": False},
+                "case_sensitive": {"type": "boolean", "default": True},
+                "include_hidden": {"type": "boolean", "default": False},
             },
             "required": ["pattern"],
         },
         categories=("read", "search"),
         rich=RichToolMetadata(
             display_name="Search Workspace",
-            reasoning_hint="Locate exact code/text matches fast.",
-            action_hint="Run pattern search and return matching lines.",
+            reasoning_hint="Locate exact code/text matches fast with optional surrounding context.",
+            action_hint="Run bounded text search and return matching lines plus requested context.",
             fallback_hint="If no matches, broaden pattern and search scope.",
             input_preview_formatter=_preview_pattern,
             output_summary_formatter=_summary_search_rg,
@@ -1015,7 +1206,8 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
         name="verify_run",
         description=(
             "Run configured verification commands. Prefer for tests/lint/build. "
-            "Do not pipe/filter, run list/build-only checks, or swap build systems."
+            "If overriding commands, pass one verifier per array item; do not join with "
+            "&&, ;, pipes, filters, list/build-only checks, or swapped build systems."
         ),
         parameters={
             "type": "object",
@@ -1061,7 +1253,8 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
         description=(
             "Start a long-running shell command in the background under the working root "
             "(policy-checked). Returns a process_id you can use with shell_output, shell_kill, "
-            "and shell_list. Use this for dev servers, file watchers, log tailers, or any "
+            "and shell_list. It is terminated when the session closes. Use this for dev servers "
+            "you only need while this session is running, file watchers, log tailers, or any "
             "command that should not block the agent loop."
         ),
         parameters={
@@ -1091,7 +1284,9 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
             "Read accumulated stdout/stderr from a background process started with shell_background. "
             "Pass since=<next_seq> from the previous read to get only new lines. For a quiet "
             "long-running process, prefer shell_wait instead of repeatedly polling shell_output. "
-            "Output is ring-buffered; very chatty processes may report dropped_lines > 0."
+            "Output is ring-buffered; very chatty processes may report dropped_lines > 0. "
+            "Use the process_id returned by shell_background or shell_list, not a tool_call_id; "
+            "unknown ids return structured recovery guidance."
         ),
         parameters={
             "type": "object",
@@ -1116,7 +1311,8 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
         description=(
             "Wait inside one bounded tool call for a background process to emit new output, exit, "
             "or either condition. Use this instead of repeatedly polling shell_output when no new "
-            "output is available."
+            "output is available. Use the process_id returned by shell_background or shell_list, "
+            "not a tool_call_id; unknown ids return structured recovery guidance."
         ),
         parameters={
             "type": "object",
@@ -1185,12 +1381,51 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
         ),
     ),
     BuiltinToolMetadata(
+        name="workspace_preview_start",
+        description=(
+            "Start Sylliptor's constrained static-file preview for a workspace directory. "
+            "The model chooses semantic access (auto, local, or lan); the runtime discovers a "
+            "suitable interface and allocates a free port when none is requested. LAN previews "
+            "require approval and temporary authentication. The server does not require Docker, "
+            "disables directory listing, blocks hidden files, and rejects symlink escapes."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "cwd": {"type": "string"},
+                "cwd_base": _cwd_base_property(),
+                "access": {
+                    "type": "string",
+                    "enum": ["auto", "local", "lan"],
+                    "default": "auto",
+                },
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            },
+            "required": [],
+        },
+        categories=("shell", "background", "service"),
+        rich=RichToolMetadata(
+            display_name="Start Workspace Preview",
+            reasoning_hint=(
+                "Use auto unless the user explicitly asks for local-only or LAN access."
+            ),
+            action_hint=(
+                "Let the runtime allocate the endpoint, then use the returned access_url."
+            ),
+            fallback_hint=(
+                "If a requested port is occupied, omit it so the operating system chooses one."
+            ),
+            output_summary_formatter=_summary_shell_service,
+        ),
+    ),
+    BuiltinToolMetadata(
         name="shell_service_start",
         description=(
             "Start an explicit durable service under the working root. Unlike shell_background, "
-            "this service is not reaped by AgentSession.close and must be stopped with "
-            "shell_service_stop when no longer needed. Provide readiness when the task requires "
-            "a server or daemon to remain available after finalization."
+            "this service keeps running after the session ends and must be stopped with "
+            "shell_service_stop when no longer needed. For static HTML/CSS/JS previews, use "
+            "workspace_preview_start instead. Provide readiness when another server or daemon "
+            "must remain available after finalization."
         ),
         parameters={
             "type": "object",
@@ -1208,7 +1443,8 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
             reasoning_hint="Use only when the task explicitly requires service persistence.",
             action_hint="Start the service and check the returned readiness/status fields.",
             fallback_hint=(
-                "For ordinary temporary dev servers, use shell_background so session close reaps it."
+                "Use workspace_preview_start for static sites, or shell_background for temporary "
+                "non-preview processes that should be reaped when the session closes."
             ),
             input_preview_formatter=_preview_shell_run,
             output_summary_formatter=_summary_shell_service,
@@ -1377,7 +1613,7 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
         description=(
             "Run a registered subagent in an isolated nested session and return its single "
             "final report. Each call spawns a fresh subagent with its own system prompt, "
-            "tool sandbox, step budget, and message history; the subagent does not see this "
+            "tool sandbox, execution policy, and message history; the subagent does not see this "
             "conversation's transcript and you do not see its intermediate steps -- only the "
             "final text it produced plus structured metadata.\n"
             "\n"
@@ -1405,9 +1641,9 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
             "no more permissive than the parent session's mode, and is never raised above "
             "`auto` unless the parent session itself is `fullaccess`. You cannot use this to "
             "escalate privileges.\n"
-            "- max_steps (optional, integer): hard cap on the subagent's tool-step budget. "
-            "If omitted, the budget is resolved from session policy and the subagent's name. "
-            "Set this only when you have a specific reason; the default is usually correct.\n"
+            "- max_steps (optional, integer): explicit safety limit on the subagent's "
+            "agentic iterations. If omitted, autonomous subagents continue until they finish, "
+            "are cancelled, become blocked, or encounter a fatal error.\n"
             "\n"
             "Output shape on success\n"
             "Returns an object with: `subagent` (resolved name), `subagent_session_id`, "
@@ -1479,9 +1715,8 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
                 "max_steps": {
                     "type": "integer",
                     "description": (
-                        "Optional cap on the subagent's tool-step "
-                        "budget. If omitted, resolved from session "
-                        "policy and the subagent's name."
+                        "Optional safety limit on the subagent's agentic iterations. "
+                        "If omitted, autonomous execution has no step ceiling."
                     ),
                 },
             },
@@ -1545,21 +1780,6 @@ def tool_display_name(tool_name: str) -> str:
     if spec is None:
         return tool_name
     return spec.rich.display_name
-
-
-def tool_reasoning_hints(tool_name: str) -> tuple[str, str, str]:
-    spec = get_builtin_tool_metadata(tool_name)
-    if spec is None:
-        return (
-            "Execute a targeted helper action.",
-            "Run tool and collect structured output.",
-            "If it fails, use a narrower fallback strategy.",
-        )
-    return (
-        spec.rich.reasoning_hint,
-        spec.rich.action_hint,
-        spec.rich.fallback_hint,
-    )
 
 
 def tool_input_preview(tool_name: str, args: dict[str, Any]) -> str:

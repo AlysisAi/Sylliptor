@@ -21,6 +21,38 @@ class _ChatSlashCompletionSpec:
     description: str
 
 
+_DISPLAY_WIDTH = 72
+_USAGE_COLUMN = 34
+
+
+def _ellipsize(text: str, limit: int) -> str:
+    clean = " ".join(str(text or "").split())
+    limit = max(1, int(limit))
+    if len(clean) <= limit:
+        return clean
+    if limit <= 3:
+        return "." * limit
+    return clean[: limit - 3].rstrip() + "..."
+
+
+def _completion_display(
+    usage: str,
+    description: str,
+    *,
+    width: int = _DISPLAY_WIDTH,
+) -> str:
+    """Return one bounded completion row for prompt_toolkit's menu."""
+    width = max(8, int(width))
+    usage_text = " ".join(str(usage or "").split())
+    desc_text = " ".join(str(description or "").split())
+    if width <= _USAGE_COLUMN + 1:
+        return _ellipsize(usage_text, width)
+    usage_cell = _ellipsize(usage_text, _USAGE_COLUMN)
+    prefix = f"{usage_cell:<{_USAGE_COLUMN}} "
+    remaining = max(1, width - len(prefix))
+    return (prefix + _ellipsize(desc_text, remaining))[:width]
+
+
 SPECS: tuple[ChatSlashCommandSpec, ...] = (
     ChatSlashCommandSpec("help", "/help", "Show available commands"),
     ChatSlashCommandSpec("mode", "/mode", "Change execution mode"),
@@ -32,6 +64,7 @@ SPECS: tuple[ChatSlashCommandSpec, ...] = (
     ChatSlashCommandSpec("compact", "/compact [focus]", "Force conversation compaction"),
     ChatSlashCommandSpec("clear", "/clear", "Wipe conversation; keep session id and log"),
     ChatSlashCommandSpec("resume", "/resume [id]", "Resume a previous session"),
+    ChatSlashCommandSpec("stream", "/stream", "Toggle live answer and reasoning output"),
     ChatSlashCommandSpec("trace", "/trace", "Set reasoning trace detail"),
     ChatSlashCommandSpec("config", "/config", "Open or show configuration"),
     ChatSlashCommandSpec("toolbar", "/toolbar", "Configure status toolbar"),
@@ -85,6 +118,11 @@ _SHARED_NESTED_SPECS: tuple[_ChatSlashCompletionSpec, ...] = (
     _ChatSlashCompletionSpec("/subagent off", "/subagent off", "Disable subagent delegation"),
     _ChatSlashCompletionSpec(
         "/subagent status", "/subagent status", "Show the current subagent state"
+    ),
+    _ChatSlashCompletionSpec("/stream on", "/stream on", "Render model output live"),
+    _ChatSlashCompletionSpec("/stream off", "/stream off", "Buffer model output until complete"),
+    _ChatSlashCompletionSpec(
+        "/stream status", "/stream status", "Show the current streaming setting"
     ),
 )
 
@@ -149,7 +187,7 @@ class ChatSlashCompleter(Completer):
             yield Completion(
                 text=spec.completion,
                 start_position=-len(text),
-                display=f"{spec.usage:<34} {spec.description}",
+                display=_completion_display(spec.usage, spec.description),
             )
 
     def _matching_completions(self, text: str) -> list[_ChatSlashCompletionSpec]:

@@ -30,6 +30,9 @@ _FS_EDIT_OPERATIONS = {
     "replace_exact",
     "insert_before_exact",
     "insert_after_exact",
+    "replace_lines",
+    "insert_before_line",
+    "insert_after_line",
     "append",
     "prepend",
 }
@@ -213,6 +216,15 @@ def _require_edit_string(edit: dict[str, Any], key: str, *, index: int, op: str)
     return value
 
 
+def _require_edit_line_number(edit: dict[str, Any], key: str, *, index: int, op: str) -> int:
+    value = edit.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise FsError(f"Edit {index} ({op}) requires integer field: {key}")
+    if value < 1:
+        raise FsError(f"Edit {index} ({op}) {key} must be >= 1")
+    return value
+
+
 def _optional_expected_match_count(edit: dict[str, Any], *, index: int, op: str) -> int | None:
     value = edit.get("expected_match_count")
     if value is None:
@@ -250,6 +262,95 @@ def _validate_match_count(
         )
 
 
+def _content_lines(content: str) -> list[str]:
+    return content.splitlines(keepends=True)
+
+
+def _validate_line_range(
+    *,
+    lines: list[str],
+    start_line: int,
+    end_line: int,
+    index: int,
+    op: str,
+) -> None:
+    total_lines = len(lines)
+    if end_line < start_line:
+        raise FsError(
+            f"Edit {index} ({op}) end_line ({end_line}) must be >= start_line ({start_line})"
+        )
+    if start_line > total_lines:
+        raise FsError(
+            f"Edit {index} ({op}) start_line {start_line} is beyond end of file "
+            f"({total_lines} lines)"
+        )
+    if end_line > total_lines:
+        raise FsError(
+            f"Edit {index} ({op}) end_line {end_line} is beyond end of file ({total_lines} lines)"
+        )
+
+
+def _line_selection(lines: list[str], *, start_line: int, end_line: int) -> str:
+    return "".join(lines[start_line - 1 : end_line])
+
+
+def _canonical_line_text(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _validate_expected_old(
+    *,
+    selected: str,
+    edit: dict[str, Any],
+    index: int,
+    op: str,
+) -> None:
+    expected_old = edit.get("expected_old")
+    if expected_old is None:
+        return
+    if not isinstance(expected_old, str):
+        raise FsError(f"Edit {index} ({op}) expected_old must be a string when provided")
+    if selected != expected_old and _canonical_line_text(selected) != _canonical_line_text(
+        expected_old
+    ):
+        selected_preview = selected[:500].replace("\n", "\\n")
+        expected_preview = expected_old[:500].replace("\n", "\\n")
+        raise FsError(
+            f"Edit {index} ({op}) selected line text did not match expected_old. "
+            f"selected={selected_preview!r} expected={expected_preview!r}"
+        )
+
+
+def _apply_line_edit(content: str, edit: dict[str, Any], *, index: int, op: str) -> str:
+    lines = _content_lines(content)
+    total_lines = len(lines)
+
+    if op == "replace_lines":
+        start_line = _require_edit_line_number(edit, "start_line", index=index, op=op)
+        end_line = _require_edit_line_number(edit, "end_line", index=index, op=op)
+        _validate_line_range(
+            lines=lines,
+            start_line=start_line,
+            end_line=end_line,
+            index=index,
+            op=op,
+        )
+        selected = _line_selection(lines, start_line=start_line, end_line=end_line)
+        _validate_expected_old(selected=selected, edit=edit, index=index, op=op)
+        replacement = _require_edit_string(edit, "replacement", index=index, op=op)
+        return "".join(lines[: start_line - 1]) + replacement + "".join(lines[end_line:])
+
+    line = _require_edit_line_number(edit, "line", index=index, op=op)
+    if line > total_lines:
+        raise FsError(
+            f"Edit {index} ({op}) line {line} is beyond end of file ({total_lines} lines)"
+        )
+    insert_content = _require_edit_string(edit, "content", index=index, op=op)
+    if op == "insert_before_line":
+        return "".join(lines[: line - 1]) + insert_content + "".join(lines[line - 1 :])
+    return "".join(lines[:line]) + insert_content + "".join(lines[line:])
+
+
 def _apply_single_fs_edit(content: str, edit: dict[str, Any], *, index: int) -> str:
     raw_op = edit.get("op")
     if not isinstance(raw_op, str):
@@ -263,6 +364,8 @@ def _apply_single_fs_edit(content: str, edit: dict[str, Any], *, index: int) -> 
         return content + _require_edit_string(edit, "content", index=index, op=op)
     if op == "prepend":
         return _require_edit_string(edit, "content", index=index, op=op) + content
+    if op in {"replace_lines", "insert_before_line", "insert_after_line"}:
+        return _apply_line_edit(content, edit, index=index, op=op)
 
     target = _require_edit_string(edit, "target", index=index, op=op)
     replacement: str | None = None

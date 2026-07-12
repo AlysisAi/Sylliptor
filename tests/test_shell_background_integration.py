@@ -12,6 +12,7 @@ import sylliptor_agent_cli.agent_loop as agent_loop_mod
 from sylliptor_agent_cli.agent_loop import AgentRuntimeError, create_session
 from sylliptor_agent_cli.background_runner import BackgroundProcessSpawn
 from sylliptor_agent_cli.config import AppConfig, ConfigError
+from sylliptor_agent_cli.execution_deadline import ExecutionDeadline
 from sylliptor_agent_cli.surface import ApprovalDecision, ApprovalRequest, NoopSurface
 
 
@@ -173,6 +174,7 @@ def _session_with_runner(
     yes: bool = True,
     non_interactive: bool = True,
     surface: RecordingSurface | None = None,
+    execution_deadline: ExecutionDeadline | None = None,
 ):
     def fake_build_background_shell_runner_from_settings(*_args: object, **_kwargs: object):
         return runner
@@ -192,6 +194,7 @@ def _session_with_runner(
         api_key_override="override-key",
         non_interactive=non_interactive,
         surface=surface,
+        execution_deadline=execution_deadline,
     )
 
 
@@ -211,9 +214,42 @@ def test_shell_background_starts_and_returns_process_id(
         result = session.tools["shell_background"].run({"cmd": "echo hi"})
 
         assert result["process_id"]
+        assert result["lifetime"] == "session"
         assert result["status"] == "running"
         assert result["lines"] == []
         assert "next_seq" in result
+        assert runner.calls[0]["cmd"] == "echo hi"
+    finally:
+        session.close()
+
+
+def test_shell_background_deadline_denial_is_warning_not_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    deadline = ExecutionDeadline.from_absolute(
+        started_at_monotonic=0.0,
+        deadline_monotonic=4.0,
+        configured_duration_seconds=4.0,
+        clock=lambda: 3.5,
+    )
+    runner = FakeBackgroundRunner()
+    session = _session_with_runner(
+        monkeypatch,
+        tmp_path,
+        runner,
+        execution_deadline=deadline,
+    )
+    try:
+        result = session.tools["shell_background"].run({"cmd": "echo hi"})
+
+        assert result["process_id"]
+        assert result["lifetime"] == "session"
+        assert result["deadline_prevented_launch"] is False
+        assert "error" not in result
+        assert "deadline_warning" in result
+        assert result["deadline_start_decision"]["allowed"] is False
+        assert result["deadline_start_decision"]["reason"] == "finalization_disallows_operation"
         assert runner.calls[0]["cmd"] == "echo hi"
     finally:
         session.close()
@@ -460,14 +496,26 @@ def test_shell_output_reads_snapshot_with_since(
         session.close()
 
 
-def test_shell_output_unknown_process_id_raises_agent_error(
+def test_shell_output_unknown_process_id_returns_recovery_payload(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     session = _session_with_runner(monkeypatch, tmp_path, FakeBackgroundRunner())
     try:
-        with pytest.raises(AgentRuntimeError, match="Unknown background process_id"):
-            session.tools["shell_output"].run({"process_id": "missing"})
+        result = session.tools["shell_output"].run({"process_id": "missing"})
+
+        assert result["status"] == "unknown_process_id"
+        assert result["unknown_process_id"] is True
+        assert result["requested_process_id"] == "missing"
+        assert result["known_process_ids"] == []
+        assert result["recovery"]["recommended_tool"] == "shell_list"
+        assert "tool_call_id" in result["recovery"]["reason"]
+        assert any(
+            event["type"] == "bg_unknown_process"
+            and event["payload"]["operation"] == "shell_output"
+            and event["payload"]["process_id"] == "missing"
+            for event in session.store.events_snapshot()
+        )
     finally:
         session.close()
 

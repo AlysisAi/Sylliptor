@@ -99,10 +99,9 @@ def test_run_config_menu_raw_picker_sequence_persists_expected_changes(
             "anthropic",
             config_menu_mod._INHERIT_DEFAULT_MODEL_VALUE,
             "auto",
-            "fixed",
         ]
     )
-    prompt = PromptScript(["50", "100", "10"])
+    prompt = PromptScript([])
 
     def fake_top_level(*, state: config_menu_mod.ConfigMenuState, console: Console) -> str:
         del state, console
@@ -122,8 +121,8 @@ def test_run_config_menu_raw_picker_sequence_persists_expected_changes(
     assert result.saved is True
     assert saved_cfg.extra_fields["active_profile"] == "anthropic"
     assert saved_cfg.routing_mode == "auto"
-    assert saved_cfg.step_budget_policy == "fixed"
-    assert saved_cfg.task_max_steps == 100
+    assert saved_cfg.step_budget_policy == "limited"
+    assert saved_cfg.task_max_steps == AppConfig().task_max_steps
 
 
 def test_router_section_esc_on_router_model_picker_returns_without_next_prompts(
@@ -139,7 +138,7 @@ def test_router_section_esc_on_router_model_picker_returns_without_next_prompts(
         return None
 
     def fail_prompt(*_args: Any, **_kwargs: Any) -> str:
-        raise AssertionError("Routing & Limits text prompts should not run after Esc")
+        raise AssertionError("Routing text prompts should not run after Esc")
 
     monkeypatch.setattr(config_menu_mod, "_run_config_picker", fake_picker)
     monkeypatch.setattr(config_menu_mod.typer, "prompt", fail_prompt)

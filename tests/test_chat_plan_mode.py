@@ -20,6 +20,7 @@ from sylliptor_agent_cli import interactive_plan_mode as interactive_plan_mode_m
 from sylliptor_agent_cli import workspace_binding as workspace_binding_mod
 from sylliptor_agent_cli.cli import app as sylliptor_app
 from sylliptor_agent_cli.cli_impl import chat as chat_impl_mod
+from sylliptor_agent_cli.cli_impl.chat import commands as chat_commands_mod
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.forge import (
     add_task,
@@ -34,6 +35,7 @@ from sylliptor_agent_cli.plan_mode import instruction_with_approved_plan
 from sylliptor_agent_cli.run_lock import write_run_mutation_lock_metadata
 from sylliptor_agent_cli.session_store import SessionStore, read_session_events
 from sylliptor_agent_cli.swarm_trace import build_swarm_trace_event
+from sylliptor_agent_cli.usage_tracker import UsageSummary
 
 
 def _env(tmp_path: Path) -> dict[str, str]:
@@ -1191,7 +1193,7 @@ def test_forge_entry_status_explains_when_workspace_change_forces_fresh_run() ->
     )
 
 
-def test_forge_enter_command_rejects_unknown_arguments(
+def test_forge_enter_command_accepts_goal_shortcut(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1203,29 +1205,185 @@ def test_forge_enter_command_rejects_unknown_arguments(
         client=SimpleNamespace(model="test-model", temperature=1.0),
         cfg=AppConfig(model="test-model", default_mode="review"),
     )
+    forge_state = cli_mod._ForgeChatState()
+    captured: dict[str, Any] = {}
     chat_impl_mod._sync_cli_globals(cli_mod)
-    monkeypatch.setattr(
-        chat_impl_mod,
-        "_enter_forge_mode",
-        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("should not enter forge")),
-    )
+
+    def fake_enter_forge_mode(**kwargs: Any) -> bool:
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(chat_impl_mod, "_enter_forge_mode", fake_enter_forge_mode)
 
     result = chat_impl_mod._handle_chat_command(
-        input_text="/forge later",
+        input_text="/forge create a hello page",
         root=tmp_path,
         session=session,
         pending_images=[],
         console=console,
-        forge_state=cli_mod._ForgeChatState(),
+        forge_state=forge_state,
         plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"
     rendered = console_file.getvalue()
-    assert "Unknown /forge argument." in rendered
-    assert "Usage:" in rendered
-    assert "/forge resume" in rendered
-    assert "fresh run for a new chat session" in rendered
+    assert "Unknown /forge argument." not in rendered
+    assert captured["forge_state"] is forge_state
+    assert forge_state.entry_request_mode == "plain"
+    assert forge_state.entry_goal == "create a hello page"
+
+
+def test_chat_forge_entry_goal_shortcut_sets_project_goal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(cli_mod, "_prompt_forge_entry_plan_assistant", lambda *, console: False)
+    console_file = io.StringIO()
+    forge_state = cli_mod._ForgeChatState(entry_goal="create a hello page")
+
+    assert cli_mod._enter_forge_mode(
+        root=repo,
+        console=Console(file=console_file, force_terminal=False),
+        forge_state=forge_state,
+    )
+
+    assert forge_state.paths is not None
+    plan = load_plan(forge_state.paths)
+    assert plan["project_goal"] == "create a hello page"
+    assert plan["summary"] == "create a hello page"
+    assert plan.get("requirements") == []
+    assert forge_state.entry_goal == ""
+    assert "Project goal set from /forge." in console_file.getvalue()
+
+
+def test_chat_forge_tui_entry_defaults_plan_assistant_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = SimpleNamespace(
+        mode="review",
+        stream=False,
+        _sylliptor_tui_interactive=True,
+        client=SimpleNamespace(model="test-model", temperature=1.0),
+        cfg=AppConfig(model="test-model", default_mode="review"),
+    )
+    captured: dict[str, Any] = {}
+    chat_impl_mod._sync_cli_globals(cli_mod)
+
+    def fake_enter_forge_mode(**kwargs: Any) -> bool:
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(chat_impl_mod, "_enter_forge_mode", fake_enter_forge_mode)
+
+    result = chat_impl_mod._handle_chat_command(
+        input_text="/forge",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=io.StringIO(), force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert captured["planner_assistant_default"] is True
+
+
+def test_parse_forge_enter_command_planner_flags() -> None:
+    from sylliptor_agent_cli.cli_impl.commands.chat_state import (
+        _parse_forge_enter_command,
+    )
+
+    # Bare + goal + resume keep their existing meaning (no explicit planner choice).
+    assert _parse_forge_enter_command(cmd="/forge", arg="").planner_assistant_default is None
+    assert (
+        _parse_forge_enter_command(cmd="/forge", arg="build a page").planner_assistant_default
+        is None
+    )
+    assert (
+        _parse_forge_enter_command(cmd="/forge", arg="build a page").initial_goal == "build a page"
+    )
+    assert _parse_forge_enter_command(cmd="/forge", arg="resume").entry_mode == "resume_pointer"
+
+    # Planner-choice flags set the default and are never treated as a goal.
+    for on_flag in ("--planner", "planner", "PLANNER"):
+        parsed = _parse_forge_enter_command(cmd="/forge", arg=on_flag)
+        assert parsed.planner_assistant_default is True
+        assert parsed.initial_goal == ""
+    for off_flag in ("--no-planner", "no-planner", "No-Planner"):
+        parsed = _parse_forge_enter_command(cmd="/forge", arg=off_flag)
+        assert parsed.planner_assistant_default is False
+        assert parsed.initial_goal == ""
+
+
+def test_chat_forge_planner_flag_overrides_tui_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An explicit "/forge --no-planner" (emitted by the TUI intro popup's native
+    # "Use the planner?" prompt) must force the assistant OFF even though the TUI
+    # interactive default would otherwise turn it on.
+    chat_impl_mod._sync_cli_globals(cli_mod)
+
+    def _dispatch(arg_form: str) -> dict[str, Any]:
+        session = SimpleNamespace(
+            mode="review",
+            stream=False,
+            _sylliptor_tui_interactive=True,
+            client=SimpleNamespace(model="test-model", temperature=1.0),
+            cfg=AppConfig(model="test-model", default_mode="review"),
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_enter_forge_mode(**kwargs: Any) -> bool:
+            captured.update(kwargs)
+            return True
+
+        monkeypatch.setattr(chat_impl_mod, "_enter_forge_mode", fake_enter_forge_mode)
+        result = chat_impl_mod._handle_chat_command(
+            input_text=arg_form,
+            root=tmp_path,
+            session=session,
+            pending_images=[],
+            console=Console(file=io.StringIO(), force_terminal=False),
+            forge_state=cli_mod._ForgeChatState(),
+            plan_mode_state=cli_mod._ChatPlanModeState(),
+        )
+        assert result == "handled"
+        return captured
+
+    assert _dispatch("/forge --no-planner")["planner_assistant_default"] is False
+    assert _dispatch("/forge --planner")["planner_assistant_default"] is True
+
+
+def test_chat_forge_plan_assistant_default_suppresses_noninteractive_notice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(
+        cli_mod,
+        "_prompt_forge_entry_plan_assistant",
+        lambda *, console: (_ for _ in ()).throw(AssertionError("prompt should be skipped")),
+    )
+    monkeypatch.setattr(cli_mod, "_is_non_interactive_terminal", lambda: True)
+    console_file = io.StringIO()
+    forge_state = cli_mod._ForgeChatState()
+
+    assert cli_mod._enter_forge_mode(
+        root=repo,
+        console=Console(file=console_file, force_terminal=False),
+        forge_state=forge_state,
+        planner_assistant_default=True,
+    )
+
+    assert forge_state.assistant_enabled is True
+    rendered = console_file.getvalue()
+    assert "Plan Assistant defaulted off in non-interactive mode" not in rendered
 
 
 def test_chat_forge_entry_uses_session_active_workdir_for_workspace_binding(
@@ -1613,6 +1771,47 @@ def test_plan_mode_approval_loop_finishes_surface_activity_before_action_prompt(
     assert result is None
 
 
+def test_plan_mode_approval_loop_can_use_host_action_prompt(tmp_path: Path, monkeypatch) -> None:
+    buffer = io.StringIO()
+    console = Console(file=buffer, force_terminal=False, width=120)
+    captured: dict[str, Any] = {}
+
+    class _DummySession:
+        stream = False
+        messages: list[dict[str, str]] = []
+        planner_workspace_context = None
+        surface = SimpleNamespace(trace_level="off")
+
+    chat_impl_mod._sync_cli_globals(cli_mod)
+    monkeypatch.setattr(
+        chat_impl_mod,
+        "generate_plan_draft",
+        lambda **_kwargs: "1. Edit note.txt\n2. Run tests",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        chat_impl_mod, "_emit_plan_mode_trace", lambda **_kwargs: None, raising=False
+    )
+
+    def action_prompt(**kwargs: Any) -> str:
+        captured.update(kwargs)
+        return "approve"
+
+    result = chat_impl_mod._run_plan_mode_approval_loop(
+        session=_DummySession(),
+        console=console,
+        user_message="add a note",
+        action_prompt=action_prompt,
+        max_iterations=1,
+    )
+
+    assert result is not None
+    assert "add a note" in result
+    assert "1. Edit note.txt" in result
+    assert captured["user_message"] == "add a note"
+    assert captured["draft"] == "1. Edit note.txt\n2. Run tests"
+
+
 def test_plan_mode_discard_exits_without_execution(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     captured: dict[str, Any] = {"chat_calls": [], "run_turn_calls": []}
@@ -1789,16 +1988,83 @@ def test_forge_task_status_markup_uses_monochrome_status_emphasis() -> None:
     assert cli_mod._forge_task_status_markup("planned") == "[dim]planned[/dim]"
 
 
-def test_forge_task_status_counts_treats_blocked_integration_as_failed() -> None:
+def test_forge_task_status_counts_classifies_satisfied_and_interrupted_tasks() -> None:
     plan = {
         "tasks": [
             {"id": "T01", "status": "done"},
-            {"id": "T02", "status": "blocked_integration"},
-            {"id": "T03", "status": "planned"},
+            {"id": "T02", "status": "already_satisfied"},
+            {"id": "T03", "status": "interrupted"},
+            {"id": "T04", "status": "blocked_integration"},
+            {"id": "T05", "status": "planned"},
         ]
     }
 
-    assert cli_mod._forge_task_status_counts(plan) == (1, 1, 1)
+    assert cli_mod._forge_task_status_counts(plan) == (2, 2, 1)
+
+
+def test_forge_usage_merges_planner_and_execution_logs(tmp_path: Path) -> None:
+    appended: list[tuple[str, dict[str, Any]]] = []
+
+    class _Store:
+        def append(self, event_type: str, payload: dict[str, Any]) -> None:
+            appended.append((event_type, payload))
+
+    session = SimpleNamespace(usage_summary=UsageSummary(), store=_Store())
+    planner_payload = {
+        "event_type": "llm_usage",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "role": "forge_planner",
+        "requested_model": "planner-model",
+        "prompt_tokens": 10,
+        "completion_tokens": 4,
+        "total_tokens": 14,
+        "usage_source": "api",
+    }
+    assert (
+        chat_commands_mod._merge_usage_payloads_into_session(
+            session=session,
+            payloads=[planner_payload],
+        )
+        == 1
+    )
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    worker_payload = {
+        "event_type": "llm_usage",
+        "timestamp": "2026-01-01T00:00:01Z",
+        "role": "swarm_worker:T01",
+        "requested_model": "worker-model",
+        "prompt_tokens": 20,
+        "completion_tokens": 6,
+        "total_tokens": 26,
+        "usage_source": "api",
+    }
+    (logs_dir / "T01.jsonl").write_text(
+        json.dumps({"type": "llm_usage", "payload": worker_payload}) + "\n",
+        encoding="utf-8",
+    )
+
+    paths = SimpleNamespace(execution_logs_dir=logs_dir)
+    assert (
+        chat_commands_mod._merge_forge_execution_usage_into_session(session=session, paths=paths)
+        == 1
+    )
+    assert (
+        chat_commands_mod._merge_forge_execution_usage_into_session(session=session, paths=paths)
+        == 0
+    )
+
+    totals = session.usage_summary.totals()
+    assert totals["calls"] == 2
+    assert totals["prompt_tokens"] == 30
+    assert totals["completion_tokens"] == 10
+    assert totals["total_tokens"] == 40
+    assert [event_type for event_type, _payload in appended] == ["llm_usage", "llm_usage"]
+    assert {payload["role"] for _event_type, payload in appended} == {
+        "forge_planner",
+        "swarm_worker:T01",
+    }
 
 
 def test_forge_plan_markdown_command_is_handled(tmp_path: Path, monkeypatch) -> None:
@@ -3266,9 +3532,7 @@ def test_forge_greek_small_talk_routes_through_planner_when_assistant_on(
     assert requirements == []
 
 
-def test_forge_assistant_off_captures_small_talk_as_requirement(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_forge_assistant_off_sets_empty_goal_from_free_text(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     captured: dict[str, Any] = {"planner_calls": 0, "plan_ref": None}
 
@@ -3330,15 +3594,17 @@ def test_forge_assistant_off_captures_small_talk_as_requirement(
     result = runner.invoke(
         sylliptor_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/forge\nγεια\n/back\nexit\n",
+        input="/forge\na one-page hello world website\n/back\nexit\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
     assert captured["planner_calls"] == 0
-    assert "Captured requirement note." in result.output
+    assert "Project goal set." in result.output
     plan_ref = captured["plan_ref"] or {}
+    assert plan_ref.get("project_goal") == "a one-page hello world website"
+    assert plan_ref.get("summary") == "a one-page hello world website"
     requirements = plan_ref.get("requirements") or []
-    assert requirements == ["γεια"]
+    assert requirements == ["a one-page hello world website"]
 
 
 def test_forge_no_plan_update_without_error_does_not_capture_requirement(
@@ -4873,7 +5139,7 @@ def test_forge_clarification_follow_up_accepts_terse_planning_answer(
     assert "added requirements: 1" in planner_summary
 
 
-def test_forge_planner_failure_falls_back_to_requirement_capture(
+def test_forge_planner_failure_falls_back_to_goal_capture_when_goal_empty(
     tmp_path: Path, monkeypatch
 ) -> None:
     runner = CliRunner()
@@ -4952,26 +5218,20 @@ def test_forge_planner_failure_falls_back_to_requirement_capture(
     )
     assert result.exit_code == 0
     assert (
-        "Captured requirement note because the planner produced no structured update."
-        in result.output
+        "Captured project goal because the planner produced no structured update." in result.output
     )
     plan_ref = captured["plan_ref"] or {}
-    requirements = plan_ref.get("requirements") or []
-    assert requirements == [
-        {
-            "text": "Implement robust planner parsing",
-            "execution_ready": False,
-            "source": "planner_error_fallback",
-        }
-    ]
+    assert plan_ref.get("project_goal") == "Implement robust planner parsing"
+    assert plan_ref.get("summary") == "Implement robust planner parsing"
+    assert plan_ref.get("requirements") == []
     assert plan_ref.get("tasks") == []
-    assert "Plan is empty." not in result.output
-    assert "Execution blocked" in result.output
-    assert "no execution-ready tasks exist" in result.output
+    assert "Plan is empty." in result.output
     assert len(captured["swarm_calls"]) == 0
 
 
-def test_forge_error_fallback_captures_without_local_small_talk_gate(tmp_path: Path) -> None:
+def test_forge_error_fallback_sets_empty_goal_without_local_small_talk_gate(
+    tmp_path: Path,
+) -> None:
     plan = {
         "run_id": "wf",
         "project_goal": "",
@@ -5000,12 +5260,13 @@ def test_forge_error_fallback_captures_without_local_small_talk_gate(tmp_path: P
     )
 
     assert captured is True
-    assert [item["text"] for item in plan["requirements"]] == ["hello"]
+    assert plan["project_goal"] == "hello"
+    assert plan["requirements"] == []
     rendered = console.export_text()
-    assert "Captured requirement note" in rendered
+    assert "Captured project goal" in rendered
 
 
-def test_forge_error_fallback_captures_without_local_meta_gate(tmp_path: Path) -> None:
+def test_forge_error_fallback_sets_empty_goal_without_local_meta_gate(tmp_path: Path) -> None:
     plan = {
         "run_id": "wf",
         "project_goal": "",
@@ -5034,9 +5295,10 @@ def test_forge_error_fallback_captures_without_local_meta_gate(tmp_path: Path) -
     )
 
     assert captured is True
-    assert [item["text"] for item in plan["requirements"]] == ["what's your name?"]
+    assert plan["project_goal"] == "what's your name?"
+    assert plan["requirements"] == []
     rendered = console.export_text()
-    assert "Captured requirement note" in rendered
+    assert "Captured project goal" in rendered
 
 
 def test_forge_planner_trace_progress_compact(tmp_path: Path, monkeypatch) -> None:
@@ -5225,7 +5487,7 @@ def test_trace_compact_uses_truthful_planner_error_trace_and_summary(
 
     notes_text = (plan_dir / "notes" / "user_notes.md").read_text(encoding="utf-8")
     assert "Planner error after 1 transient retry: empty_response" in notes_text
-    assert "Captured requirement note (planner produced no structured update)." in notes_text
+    assert "Captured project goal (planner produced no structured update)." in notes_text
 
 
 def test_forge_trace_off_disables_planner_trace_and_streaming(tmp_path: Path, monkeypatch) -> None:
@@ -5617,8 +5879,9 @@ def test_forge_execute_plan_enrichment_preserves_retry_context_on_final_error(
     assert "Plan enrichment error after 1 transient retry: empty_response" in notes_text
 
 
+@pytest.mark.parametrize("trace_full", [False, True])
 def test_forge_execute_plan_enrichment_keeps_protected_history_immutable(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, trace_full: bool
 ) -> None:
     runner = CliRunner()
     captured: dict[str, Any] = {"planner_calls": [], "swarm_calls": [], "paths": None}
@@ -5635,6 +5898,7 @@ def test_forge_execute_plan_enrichment_keeps_protected_history_immutable(
     class _DummySession:
         store = _DummyStore()
         client = _DummyClient()
+        surface = SimpleNamespace(trace_level="compact")
         stream = False
         mode = "review"
         yes = False
@@ -5734,23 +5998,41 @@ def test_forge_execute_plan_enrichment_keeps_protected_history_immutable(
     monkeypatch.setattr(cli_mod, "run_swarm", fake_run_swarm)
     env = _env(tmp_path)
     env["SYLLIPTOR_FORGE_ENRICH_PLAN"] = "1"
+    input_text = (
+        "/trace full\n" if trace_full else ""
+    ) + "/forge\nImplement feature X\n/execute plan\n/back\nexit\n"
     result = runner.invoke(
         sylliptor_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/forge\nImplement feature X\n/execute plan\n/back\nexit\n",
+        input=input_text,
         env=env,
     )
     assert result.exit_code == 0
     assert len(captured["planner_calls"]) == 1
     assert len(captured["swarm_calls"]) == 1
+    warning_line = (
+        "Plan enrichment: Ignored plan enrichment acceptance_criteria update for T01 "
+        "because that field is already populated."
+    )
+    assert "Refined plan." in result.output
+    if trace_full:
+        assert "Reasoning trace set for this session: full" in result.output
+        assert warning_line in result.output
+    else:
+        assert warning_line not in result.output
+        assert "Plan enrichment: Ignored" not in result.output
     paths = captured["paths"]
     assert paths is not None
     notes_text = paths.notes_path.read_text(encoding="utf-8")
-    assert "Plan enrichment warning:" in notes_text
-    assert (
-        "Ignored plan enrichment acceptance_criteria update for T01 because that field is already populated."
-        in notes_text
-    )
+    if trace_full:
+        assert "Plan enrichment warning:" in notes_text
+        assert (
+            "Ignored plan enrichment acceptance_criteria update for T01 because that field is already populated."
+            in notes_text
+        )
+    else:
+        assert "Plan enrichment warning:" not in notes_text
+        assert "Ignored plan enrichment" not in notes_text
 
 
 def test_forge_execute_plan_enrichment_strips_protected_update_only_follow_up(
@@ -5881,18 +6163,16 @@ def test_forge_execute_plan_enrichment_strips_protected_update_only_follow_up(
     assert result.exit_code == 0
     assert len(captured["planner_calls"]) == 1
     assert len(captured["swarm_calls"]) == 1
-    assert "Plan enrichment:" in result.output
+    assert "Plan enrichment:" not in result.output
+    assert "Ignored plan enrichment" not in result.output
+    assert "Refined plan." not in result.output
     paths = captured["paths"]
     assert paths is not None
     planner_summary = paths.planner_summary_path.read_text(encoding="utf-8")
     assert "enrichment produced no applicable changes" in planner_summary
     notes_text = paths.notes_path.read_text(encoding="utf-8")
-    assert "Plan enrichment warning:" in notes_text
-    assert "Ignored plan enrichment tasks_update fields for T01:" in notes_text
-    assert (
-        "Ignored plan enrichment tasks_update for T01 because it did not add missing execution-readiness fields."
-        in notes_text
-    )
+    assert "Plan enrichment warning:" not in notes_text
+    assert "Ignored plan enrichment" not in notes_text
     notes_body = "\n".join(line.split("] ", 1)[-1] for line in notes_text.splitlines())
     assert "T03" not in notes_body
 

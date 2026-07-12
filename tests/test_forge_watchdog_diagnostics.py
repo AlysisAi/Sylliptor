@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
-import conftest as forge_conftest
+
+def _load_root_conftest() -> ModuleType:
+    module_path = Path(__file__).with_name("conftest.py")
+    spec = importlib.util.spec_from_file_location("_sylliptor_root_test_conftest", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load root test conftest from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+forge_conftest = _load_root_conftest()
 
 
 def _request_for_tmp_path(tmp_path: Path) -> SimpleNamespace:

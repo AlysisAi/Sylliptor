@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -13,6 +14,11 @@ from sylliptor_agent_cli.tools.availability import (
     mark_unavailable,
     register_tool_availability,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_generic_web_search_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_API_KEY", raising=False)
 
 
 def _row_map(cfg: AppConfig) -> dict[str, cli_mod._ToolAvailabilityRow]:
@@ -68,6 +74,7 @@ def test_tool_rows_show_web_search_auto_unavailable_when_runtime_is_not_ready(
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", "0")
     rows = _row_map(
         AppConfig(
             model="gpt-5-mini",
@@ -91,6 +98,7 @@ def test_doctor_table_surfaces_web_search_setup_hint(tmp_path, monkeypatch) -> N
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", "0")
 
     table = cli_mod._doctor_table(
         AppConfig(
@@ -129,6 +137,23 @@ def test_tool_rows_show_web_search_available_when_auto_mode_is_ready(
     assert "provider=openai_responses" in rows["web_search"].notes
     assert "ready for registration in main agent sessions" in rows["web_search"].notes
     assert "OpenAI Responses readiness is conservative" in rows["web_search"].notes
+
+
+def test_tool_rows_show_ready_backend_disabled_by_search_policy(monkeypatch) -> None:
+    monkeypatch.setenv("SYLLIPTOR_API_KEY", "main-key")
+    rows = _row_map(
+        AppConfig(
+            model="gpt-5-mini",
+            base_url="https://api.openai.com/v1",
+            web_search_mode="auto",
+            web_search_policy="off",
+        )
+    )
+
+    assert rows["web_search"].status == "policy-disabled"
+    assert "policy=off" in rows["web_search"].notes
+    assert "prevents registration" in rows["web_search"].notes
+    assert "ready for registration in main agent sessions" not in rows["web_search"].notes
 
 
 def test_tool_rows_show_web_search_available_via_dashscope_chat(
@@ -194,7 +219,7 @@ def test_tool_rows_show_web_search_available_via_tavily_fallback(
     assert "mode=auto" in rows["web_search"].notes
     assert "provider=tavily" in rows["web_search"].notes
     assert "ready for registration in main agent sessions" in rows["web_search"].notes
-    assert "available via TAVILY_API_KEY" in rows["web_search"].notes
+    assert "available via model-independent Tavily adapter" in rows["web_search"].notes
 
 
 def test_tool_rows_treat_legacy_on_mode_as_auto_unavailable(
@@ -206,6 +231,7 @@ def test_tool_rows_treat_legacy_on_mode_as_auto_unavailable(
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", "0")
     rows = _row_map(
         AppConfig(
             base_url="",

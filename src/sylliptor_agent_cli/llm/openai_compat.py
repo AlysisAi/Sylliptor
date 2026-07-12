@@ -5,17 +5,35 @@ import json
 import logging
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
+from ..error_text import sanitize_error_text_for_output
 from ..failure_category import provider_unavailable_retry_reason
 from ..provider_telemetry import ProviderCallTelemetryRecorder
+from ..request_estimation import estimate_provider_payload_tokens
+from .cache_capabilities import (
+    CACHE_CONTROL_FIELD,
+    OPENROUTER_SESSION_ID_FIELD,
+    OPENROUTER_SESSION_ID_HEADER_FIELD,
+    PROMPT_CACHE_KEY_FIELD,
+    PROMPT_CACHE_RETENTION_FIELD,
+    XAI_CONVERSATION_ID_HEADER_FIELD,
+)
+from .cache_control_blocks import (
+    apply_openai_compatible_cache_control_breakpoint,
+    count_cache_control_blocks,
+    strip_cache_control_blocks,
+)
+from .cache_policy import merge_cache_policy_metadata
 from .metadata import (
     DEEPSEEK_REASONING_CONTENT_KEY as _DEEPSEEK_REASONING_CONTENT_KEY,
 )
+from .metadata import MISTRAL_CONTENT_CHUNKS_KEY as _MISTRAL_CONTENT_CHUNKS_KEY
+from .metadata import MISTRAL_PROVIDER_METADATA_KEY as _MISTRAL_PROVIDER_KEY
 from .metadata import (
     OPENROUTER_REASONING_DETAILS_KEY as _OPENROUTER_REASONING_DETAILS_KEY,
 )
@@ -24,6 +42,15 @@ from .metadata import (
 )
 from .metadata import (
     PROVIDER_METADATA_KEY,
+    ProviderRouteIdentity,
+    build_provider_route_identity,
+    canonicalize_extra_headers,
+    credential_scope_fingerprint,
+    endpoint_descriptor,
+    endpoint_label,
+    gate_messages_for_provider_route,
+    merge_canonical_headers,
+    stamp_response_for_route,
     strip_provider_metadata_from_message,
 )
 from .metadata import (
@@ -38,22 +65,49 @@ from .metadata import (
 from .metadata import (
     merge_provider_metadata as _merge_provider_metadata,
 )
+from .protocols import (
+    OPENAI_COMPAT_PROTOCOL,
+    validate_reasoning_trace_adapter_for_protocol,
+)
 from .provider_limits import (
     DEFAULT_PROVIDER_CONCURRENCY_CAPS,
     ProviderRetrySettings,
     best_effort_provider_key,
+    mark_provider_call_non_retryable,
     run_provider_limited_call,
 )
-from .types import LLMError, LLMResponse, LLMUsage, ToolCall
+from .request_plan import LLMRequestPlan, RequestCachePlan
+from .request_shape import build_request_shape_report
+from .temperature_compat import documented_temperature_omit_reason
+from .types import (
+    InputTokenCount,
+    LLMError,
+    LLMResponse,
+    LLMUsage,
+    ReasoningOutput,
+    ReasoningOutputKind,
+    ToolCall,
+    UsageConfidence,
+    UsageContract,
+    UsageSource,
+)
 
 _TEXT_LIKE_CONTENT_PART_TYPES = {"text", "output_text"}
 _DEEPSEEK_PROVIDER_KEY = "deepseek"
 _OPENROUTER_PROVIDER_KEY = "openrouter"
+_QWEN_PROVIDER_KEY = "qwen"
 _GEMINI_PROVIDER_KEY = "gemini"
 _GEMINI_EXTRA_CONTENT_KEY = "extra_content"
 _OPENAI_STYLE_REASONING_EFFORT_PROVIDERS = frozenset({"openai", "azure", "mistral"})
+_REASONING_PROVIDER_BY_ADAPTER: dict[str, str] = {
+    "deepseek_reasoning": _DEEPSEEK_PROVIDER_KEY,
+    "openrouter_reasoning": _OPENROUTER_PROVIDER_KEY,
+    "dashscope_thinking": _QWEN_PROVIDER_KEY,
+    "mistral_thinking": _MISTRAL_PROVIDER_KEY,
+}
 _GEMINI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 _DEFAULT_ACCEPT_ENCODING = "identity"
+_DEFAULT_CONNECT_TIMEOUT_S = 2.0
 _LOGGER = logging.getLogger(__name__)
 _TEMPERATURE_DEFAULT_VALUE = 1.0
 _TEMPERATURE_COMPAT_MODE_DEFAULT = "default_temperature"
@@ -78,13 +132,92 @@ _TEMPERATURE_UNSUPPORTED_TOKENS = (
     "cannot be set",
     "must be omitted",
 )
+_CACHE_PARAM_UNSUPPORTED_STATUS_CODES = {400, 422}
+_CACHE_PARAM_UNSUPPORTED_TOKENS = (
+    "invalid",
+    "unsupported",
+    "not support",
+    "not supported",
+    "not allowed",
+    "unknown",
+    "unrecognized",
+    "unexpected",
+    "extra",
+    "cannot be set",
+    "must be omitted",
+    "forbidden",
+)
+
+
+_CACHE_BODY_FIELDS = (
+    PROMPT_CACHE_KEY_FIELD,
+    PROMPT_CACHE_RETENTION_FIELD,
+    CACHE_CONTROL_FIELD,
+    OPENROUTER_SESSION_ID_FIELD,
+)
+_CACHE_HEADER_FIELDS = (
+    OPENROUTER_SESSION_ID_HEADER_FIELD,
+    XAI_CONVERSATION_ID_HEADER_FIELD,
+)
+_PROMPT_CACHE_FIELDS = (*_CACHE_BODY_FIELDS, *_CACHE_HEADER_FIELDS)
+_TOOL_CHOICE_UNSUPPORTED_STATUS_CODES = {400, 422}
+_TOOL_CHOICE_UNSUPPORTED_TOKENS = (
+    "invalid",
+    "not allowed",
+    "not support",
+    "not supported",
+    "unsupported",
+    "unknown",
+    "unrecognized",
+    "unexpected",
+)
+_TOOL_CALLING_REJECTION_PARAMS = frozenset({"tool", "tools", "function", "functions"})
+_TOOL_CALLING_REJECTION_TERMS = (
+    "tool",
+    "tools",
+    "function",
+    "functions",
+    "function calling",
+    "function_call",
+    "model",
+)
+_PROVIDER_RETRY_WALL_CLOCK_CAP_SECONDS: float | None = None
+_ERROR_BODY_DISPLAY_LIMIT = 1000
 
 
 def _headers_with_default_accept_encoding(headers: dict[str, str]) -> dict[str, str]:
     request_headers = dict(headers)
     if not any(key.lower() == "accept-encoding" for key in request_headers):
-        request_headers["Accept-Encoding"] = _DEFAULT_ACCEPT_ENCODING
+        request_headers["accept-encoding"] = _DEFAULT_ACCEPT_ENCODING
     return request_headers
+
+
+def _httpx_request_timeout(timeout_s: float) -> httpx.Timeout:
+    request_timeout = max(float(timeout_s), 0.001)
+    connect_timeout = min(request_timeout, _DEFAULT_CONNECT_TIMEOUT_S)
+    return httpx.Timeout(request_timeout, connect=connect_timeout)
+
+
+def _iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        cause = current.__cause__
+        context = current.__context__
+        current = cause if cause is not None else context
+
+
+def _is_connect_failure(exc: BaseException) -> bool:
+    return any(
+        isinstance(item, httpx.ConnectError | httpx.ConnectTimeout)
+        for item in _iter_exception_chain(exc)
+    )
+
+
+def _is_read_timeout(exc: BaseException) -> bool:
+    return any(isinstance(item, httpx.ReadTimeout) for item in _iter_exception_chain(exc))
 
 
 def _common_prefix_length(left: str, right: str) -> int:
@@ -272,6 +405,27 @@ def _transport_provider_key(
     return _normalize_provider_key(best_effort_provider_key(base_url=base_url, model=model))
 
 
+def _reasoning_transport_provider_key(
+    *,
+    transport_provider_key: str | None,
+    reasoning_trace_adapter: str | None,
+) -> str | None:
+    """Resolve only the provider dialect used for reasoning state on the wire.
+
+    Automatic selection preserves the existing provider inference. Explicit
+    adapters are authoritative for custom OpenAI-compatible endpoints, while
+    ``none`` and the passive adapter deliberately inject and replay nothing.
+    """
+
+    adapter = validate_reasoning_trace_adapter_for_protocol(
+        protocol=OPENAI_COMPAT_PROTOCOL,
+        adapter=reasoning_trace_adapter,
+    )
+    if adapter == "auto":
+        return _normalize_provider_key(transport_provider_key) or None
+    return _REASONING_PROVIDER_BY_ADAPTER.get(adapter)
+
+
 def _is_deepseek_provider(provider_key: str | None) -> bool:
     return _normalize_provider_key(provider_key) == _DEEPSEEK_PROVIDER_KEY
 
@@ -286,6 +440,10 @@ def _is_gemini_provider(provider_key: str | None) -> bool:
 
 def _is_dashscope_provider(provider_key: str | None) -> bool:
     return _normalize_provider_key(provider_key) in {"qwen", "dashscope"}
+
+
+def _is_mistral_provider(provider_key: str | None) -> bool:
+    return _normalize_provider_key(provider_key) == _MISTRAL_PROVIDER_KEY
 
 
 def _uses_reasoning_effort(provider_key: str | None) -> bool:
@@ -353,6 +511,23 @@ def _openrouter_reasoning_payload(
     return None
 
 
+def _tool_choice_forces_a_call(tool_choice: Any) -> bool:
+    """Whether ``tool_choice`` compels the model to emit a tool call.
+
+    A specific-function object (``{"type": "function", ...}``) or the strings
+    ``"required"`` / ``"any"`` force a call. ``"auto"`` / ``"none"`` / unset do
+    not. Reasoning providers (DeepSeek, OpenRouter/MiMo, DashScope/Qwen, Zhipu
+    GLM) reject a *forced* choice while thinking is on -- the API returns
+    ``400 "Thinking mode does not support this tool_choice"`` -- so the caller
+    omits ``tool_choice`` when the request runs in thinking mode.
+    """
+    if isinstance(tool_choice, dict):
+        return True
+    if isinstance(tool_choice, str):
+        return tool_choice.strip().lower() in {"required", "any"}
+    return False
+
+
 def _deepseek_reasoning_provider_metadata(reasoning_content: str) -> dict[str, Any] | None:
     reasoning = str(reasoning_content or "")
     if not reasoning:
@@ -360,6 +535,33 @@ def _deepseek_reasoning_provider_metadata(reasoning_content: str) -> dict[str, A
     return {
         _DEEPSEEK_PROVIDER_KEY: {
             _DEEPSEEK_REASONING_CONTENT_KEY: reasoning,
+        }
+    }
+
+
+def _qwen_reasoning_provider_metadata(reasoning_content: str) -> dict[str, Any] | None:
+    reasoning = str(reasoning_content or "")
+    if not reasoning:
+        return None
+    return {
+        _QWEN_PROVIDER_KEY: {
+            _DEEPSEEK_REASONING_CONTENT_KEY: reasoning,
+        }
+    }
+
+
+def _is_mistral_thinking_chunk(value: Any) -> bool:
+    return isinstance(value, dict) and str(value.get("type") or "").casefold() == "thinking"
+
+
+def _mistral_content_provider_metadata(content: Any) -> dict[str, Any] | None:
+    if not isinstance(content, list) or not any(
+        _is_mistral_thinking_chunk(chunk) for chunk in content
+    ):
+        return None
+    return {
+        _MISTRAL_PROVIDER_KEY: {
+            _MISTRAL_CONTENT_CHUNKS_KEY: copy.deepcopy(content),
         }
     }
 
@@ -380,6 +582,47 @@ def _openrouter_reasoning_provider_metadata(
     return {_OPENROUTER_PROVIDER_KEY: payload}
 
 
+def _text_from_reasoning_detail(detail: dict[str, Any]) -> tuple[str, ReasoningOutputKind] | None:
+    detail_type = str(detail.get("type") or "").strip().lower()
+    if detail_type == "reasoning.summary":
+        value = detail.get("summary")
+        kind = ReasoningOutputKind.SUMMARY
+    elif detail_type == "reasoning.text":
+        value = detail.get("text")
+        kind = ReasoningOutputKind.PROVIDER_REASONING
+    else:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value, kind
+
+
+def _reasoning_outputs_from_message(
+    message: dict[str, Any],
+    *,
+    provider_key: str | None,
+) -> tuple[ReasoningOutput, ...]:
+    provider = _normalize_provider_key(provider_key) or None
+    outputs: list[ReasoningOutput] = []
+    seen: set[tuple[ReasoningOutputKind, str]] = set()
+
+    details = message.get(_OPENROUTER_REASONING_DETAILS_KEY)
+    if isinstance(details, list):
+        for detail in details:
+            parsed = _text_from_reasoning_detail(detail) if isinstance(detail, dict) else None
+            if parsed is None:
+                continue
+            text, kind = parsed
+            if kind != ReasoningOutputKind.SUMMARY:
+                continue
+            dedupe_key = (kind, text)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            outputs.append(ReasoningOutput(text=text, kind=kind, provider=provider))
+    return tuple(outputs)
+
+
 def _provider_metadata_for_reasoning(
     *,
     provider_key: str | None,
@@ -390,6 +633,9 @@ def _provider_metadata_for_reasoning(
         return _deepseek_reasoning_provider_metadata(
             reasoning if isinstance(reasoning, str) else ""
         )
+    if _is_dashscope_provider(provider_key):
+        reasoning = message.get(_DEEPSEEK_REASONING_CONTENT_KEY)
+        return _qwen_reasoning_provider_metadata(reasoning if isinstance(reasoning, str) else "")
     if _is_openrouter_provider(provider_key):
         reasoning = message.get(_OPENROUTER_REASONING_KEY)
         reasoning_details = message.get(_OPENROUTER_REASONING_DETAILS_KEY)
@@ -397,6 +643,8 @@ def _provider_metadata_for_reasoning(
             reasoning=reasoning if isinstance(reasoning, str) else None,
             reasoning_details=reasoning_details,
         )
+    if _is_mistral_provider(provider_key):
+        return _mistral_content_provider_metadata(message.get("content"))
     return None
 
 
@@ -422,6 +670,30 @@ def _openrouter_reasoning_from_provider_metadata(metadata: Any) -> tuple[str, li
         reasoning if isinstance(reasoning, str) else "",
         list(reasoning_details) if isinstance(reasoning_details, list) else None,
     )
+
+
+def _qwen_reasoning_from_provider_metadata(metadata: Any) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    qwen = metadata.get(_QWEN_PROVIDER_KEY)
+    if not isinstance(qwen, dict):
+        return ""
+    reasoning = qwen.get(_DEEPSEEK_REASONING_CONTENT_KEY)
+    return reasoning if isinstance(reasoning, str) else ""
+
+
+def _mistral_content_from_provider_metadata(metadata: Any) -> list[Any] | None:
+    if not isinstance(metadata, dict):
+        return None
+    mistral = metadata.get(_MISTRAL_PROVIDER_KEY)
+    if not isinstance(mistral, dict):
+        return None
+    content = mistral.get(_MISTRAL_CONTENT_CHUNKS_KEY)
+    if not isinstance(content, list) or not any(
+        _is_mistral_thinking_chunk(chunk) for chunk in content
+    ):
+        return None
+    return copy.deepcopy(content)
 
 
 def _gemini_tool_call_provider_metadata(tool_call: dict[str, Any]) -> dict[str, Any] | None:
@@ -513,27 +785,38 @@ def _message_for_transport(
     message: dict[str, Any],
     *,
     provider_key: str | None,
+    reasoning_provider_key: str | None = None,
 ) -> dict[str, Any]:
     metadata = message.get(PROVIDER_METADATA_KEY)
     copied = strip_provider_metadata_from_message(message)
-    if str(copied.get("role") or "") != "assistant" or not copied.get("tool_calls"):
+    if str(copied.get("role") or "") != "assistant":
         return copied
-    copied["tool_calls"] = _copy_transport_tool_calls(
-        copied.get("tool_calls"),
-        preserve_extra_content=_is_gemini_provider(provider_key),
-    )
-    if _is_deepseek_provider(provider_key):
+    has_tool_calls = bool(copied.get("tool_calls"))
+    if has_tool_calls:
+        copied["tool_calls"] = _copy_transport_tool_calls(
+            copied.get("tool_calls"),
+            preserve_extra_content=_is_gemini_provider(provider_key),
+        )
+        if _is_gemini_provider(provider_key):
+            _reattach_gemini_tool_call_extra_content(copied, metadata)
+    if has_tool_calls and _is_deepseek_provider(reasoning_provider_key):
         reasoning = _deepseek_reasoning_from_provider_metadata(metadata)
         if reasoning:
             copied[_DEEPSEEK_REASONING_CONTENT_KEY] = reasoning
-    elif _is_openrouter_provider(provider_key):
+    elif has_tool_calls and _is_dashscope_provider(reasoning_provider_key):
+        reasoning = _qwen_reasoning_from_provider_metadata(metadata)
+        if reasoning:
+            copied[_DEEPSEEK_REASONING_CONTENT_KEY] = reasoning
+    elif has_tool_calls and _is_openrouter_provider(reasoning_provider_key):
         reasoning, reasoning_details = _openrouter_reasoning_from_provider_metadata(metadata)
         if reasoning:
             copied[_OPENROUTER_REASONING_KEY] = reasoning
         if reasoning_details:
             copied[_OPENROUTER_REASONING_DETAILS_KEY] = reasoning_details
-    elif _is_gemini_provider(provider_key):
-        _reattach_gemini_tool_call_extra_content(copied, metadata)
+    elif _is_mistral_provider(reasoning_provider_key):
+        content = _mistral_content_from_provider_metadata(metadata)
+        if content:
+            copied["content"] = content
     return copied
 
 
@@ -541,11 +824,13 @@ def _messages_for_transport(
     messages: list[dict[str, Any]],
     *,
     provider_key: str | None,
+    reasoning_provider_key: str | None = None,
 ) -> list[dict[str, Any]]:
     return [
         _message_for_transport(
             message,
             provider_key=provider_key,
+            reasoning_provider_key=reasoning_provider_key,
         )
         for message in messages
         if isinstance(message, dict)
@@ -570,21 +855,55 @@ def _normalize_assistant_content_to_text(raw: Any) -> str:
     return ""
 
 
-def _reasoning_fallback_content(message: dict[str, Any]) -> str:
-    """Reasoning text to use as content when the assistant ``content`` is empty.
+def _append_mistral_stream_content(chunks: list[dict[str, Any]], raw: Any) -> None:
+    """Reconstruct replayable Mistral content without exposing ThinkChunk text."""
 
-    Some reasoning models (e.g. Xiaomi MiMo served through the hosted Sylliptor
-    trial proxy) put their whole answer in the reasoning channel and return an
-    empty/whitespace ``content`` for a simple turn like "hi". Left as-is that
-    empty content silently degrades the chat turn to the generic clarification
-    fallback. We surface the reasoning text instead, but only when there is no
-    real content and no tool calls, so normal completions are never altered.
-    """
-    for key in (_OPENROUTER_REASONING_KEY, _DEEPSEEK_REASONING_CONTENT_KEY):
-        reasoning = _normalize_assistant_content_to_text(message.get(key))
-        if reasoning.strip():
-            return reasoning
-    return ""
+    if isinstance(raw, str):
+        incoming: list[Any] = [{"type": "text", "text": raw}] if raw else []
+    elif isinstance(raw, list):
+        incoming = raw
+    else:
+        return
+
+    for item in incoming:
+        if not isinstance(item, dict):
+            continue
+        copied = copy.deepcopy(item)
+        item_type = str(copied.get("type") or "").casefold()
+        if item_type == "text" and chunks:
+            previous = chunks[-1]
+            previous_text = previous.get("text")
+            incoming_text = copied.get("text")
+            if (
+                str(previous.get("type") or "").casefold() == "text"
+                and isinstance(previous_text, str)
+                and isinstance(incoming_text, str)
+            ):
+                previous["text"] = previous_text + incoming_text
+                continue
+        if item_type == "thinking" and chunks:
+            previous = chunks[-1]
+            previous_thinking = previous.get("thinking")
+            incoming_thinking = copied.get("thinking")
+            if (
+                str(previous.get("type") or "").casefold() == "thinking"
+                and previous.get("closed") is not True
+            ):
+                if isinstance(previous_thinking, list) and isinstance(incoming_thinking, list):
+                    previous["thinking"] = previous_thinking + incoming_thinking
+                elif isinstance(previous_thinking, str) and isinstance(incoming_thinking, str):
+                    previous["thinking"] = previous_thinking + incoming_thinking
+                else:
+                    chunks.append(copied)
+                    continue
+                for key, value in copied.items():
+                    if key == "thinking":
+                        continue
+                    if key == "signature" and value is None:
+                        continue
+                    previous[key] = value
+                continue
+        chunks.append(copied)
 
 
 def _parse_arguments(args_s: str) -> dict[str, Any]:
@@ -646,47 +965,51 @@ def _parse_stream_tool_calls(tool_chunks: dict[int, dict[str, Any]]) -> list[Too
 def _parse_usage(raw: Any) -> LLMUsage | None:
     if not isinstance(raw, dict):
         return None
+
+    def _as_non_negative_int(value: Any) -> int | None:
+        try:
+            parsed = int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+        if parsed is None or parsed >= 0:
+            return parsed
+        return None
+
     prompt = raw.get("prompt_tokens")
     completion = raw.get("completion_tokens")
     total = raw.get("total_tokens")
-    try:
-        prompt_i = int(prompt) if prompt is not None else None
-    except (TypeError, ValueError):
-        prompt_i = None
-    try:
-        completion_i = int(completion) if completion is not None else None
-    except (TypeError, ValueError):
-        completion_i = None
-    try:
-        total_i = int(total) if total is not None else None
-    except (TypeError, ValueError):
-        total_i = None
+    prompt_i = _as_non_negative_int(prompt)
+    completion_i = _as_non_negative_int(completion)
+    total_i = _as_non_negative_int(total)
     cached_prompt_tokens_raw = raw.get("cached_prompt_tokens")
     prompt_tokens_details = raw.get("prompt_tokens_details")
     if cached_prompt_tokens_raw is None and isinstance(prompt_tokens_details, dict):
         cached_prompt_tokens_raw = prompt_tokens_details.get("cached_tokens")
-    try:
-        cached_prompt_tokens_i = (
-            int(cached_prompt_tokens_raw) if cached_prompt_tokens_raw is not None else None
-        )
-    except (TypeError, ValueError):
-        cached_prompt_tokens_i = None
+    cached_prompt_tokens_i = _as_non_negative_int(cached_prompt_tokens_raw)
+    completion_tokens_details = raw.get("completion_tokens_details")
+    reasoning_tokens_i = None
+    if isinstance(completion_tokens_details, dict):
+        reasoning_tokens_i = _as_non_negative_int(completion_tokens_details.get("reasoning_tokens"))
     if (
         prompt_i is None
         and completion_i is None
         and total_i is None
         and cached_prompt_tokens_i is None
+        and reasoning_tokens_i is None
     ):
         return None
+    input_tokens_uncached = None
+    if prompt_i is not None and cached_prompt_tokens_i is not None:
+        input_tokens_uncached = max(0, prompt_i - cached_prompt_tokens_i)
     return LLMUsage(
-        prompt_tokens=prompt_i if (prompt_i is None or prompt_i >= 0) else None,
-        completion_tokens=completion_i if (completion_i is None or completion_i >= 0) else None,
-        total_tokens=total_i if (total_i is None or total_i >= 0) else None,
-        cached_prompt_tokens=(
-            cached_prompt_tokens_i
-            if (cached_prompt_tokens_i is None or cached_prompt_tokens_i >= 0)
-            else None
-        ),
+        prompt_tokens=prompt_i,
+        completion_tokens=completion_i,
+        total_tokens=total_i,
+        cached_prompt_tokens=cached_prompt_tokens_i,
+        input_tokens_uncached=input_tokens_uncached,
+        cache_read_input_tokens=cached_prompt_tokens_i,
+        reasoning_tokens=reasoning_tokens_i,
+        raw_provider_usage=copy.deepcopy(raw),
     )
 
 
@@ -698,6 +1021,9 @@ def _is_stream_options_unsupported_error(err: LLMError) -> bool:
 
 
 def _llm_error_status_code(err: LLMError) -> int | None:
+    status_code = getattr(err, "provider_status_code", None)
+    if isinstance(status_code, int):
+        return status_code
     match = re.match(r"LLM error\s+(\d{3}):", str(err or "").strip())
     if match is None:
         return None
@@ -708,6 +1034,9 @@ def _llm_error_status_code(err: LLMError) -> int | None:
 
 
 def _llm_error_body(err: LLMError) -> str:
+    full_body = getattr(err, "provider_error_body", None)
+    if isinstance(full_body, str):
+        return full_body.strip()
     _prefix, sep, body = str(err or "").partition(":")
     return body.strip() if sep else str(err or "").strip()
 
@@ -805,6 +1134,57 @@ def _temperature_unsupported_error(err: LLMError) -> bool:
     return _temperature_error_fields(err) is not None
 
 
+def _tool_choice_unsupported_error(err: LLMError) -> bool:
+    status_code = _llm_error_status_code(err)
+    if status_code not in _TOOL_CHOICE_UNSUPPORTED_STATUS_CODES:
+        return False
+
+    body = _llm_error_body(err)
+    payload = _json_error_payload(body)
+    if not payload:
+        message = body.strip().casefold()
+        return "tool_choice" in message and any(
+            token in message for token in _TOOL_CHOICE_UNSUPPORTED_TOKENS
+        )
+
+    raw_error = payload.get("error")
+    error: dict[str, Any] = raw_error if isinstance(raw_error, dict) else payload
+    param = str(error.get("param") or "").strip().casefold()
+    code = str(error.get("code") or "").strip().casefold()
+    message = str(error.get("message") or "").strip().casefold()
+    combined = f"{param} {code} {message}"
+    if param == "tool_choice":
+        return True
+    return "tool_choice" in combined and any(
+        token in combined for token in _TOOL_CHOICE_UNSUPPORTED_TOKENS
+    )
+
+
+def _tool_calling_unsupported_error(err: LLMError) -> bool:
+    status_code = _llm_error_status_code(err)
+    if status_code is None or status_code < 400 or status_code >= 500 or status_code == 429:
+        return False
+
+    body = _llm_error_body(err)
+    payload = _json_error_payload(body)
+    if not payload:
+        combined = body.strip().casefold()
+    else:
+        raw_error = payload.get("error")
+        error: dict[str, Any] = raw_error if isinstance(raw_error, dict) else payload
+        param = str(error.get("param") or "").strip().casefold()
+        code = str(error.get("code") or "").strip().casefold()
+        message = str(error.get("message") or "").strip().casefold()
+        if param in _TOOL_CALLING_REJECTION_PARAMS:
+            return True
+        combined = f"{param} {code} {message}"
+    if "tool_choice" in combined:
+        return False
+    return any(term in combined for term in _TOOL_CALLING_REJECTION_TERMS) and any(
+        token in combined for token in _TOOL_CHOICE_UNSUPPORTED_TOKENS
+    )
+
+
 def _is_temperature_default_value(value: Any) -> bool:
     try:
         return float(value) == _TEMPERATURE_DEFAULT_VALUE
@@ -828,6 +1208,161 @@ def _temperature_compat_mode_for_error(
     return _TEMPERATURE_COMPAT_MODE_OMIT
 
 
+def _safe_cache_request_field_values(values: Mapping[str, Any] | None) -> dict[str, str]:
+    if not isinstance(values, Mapping):
+        return {}
+    safe: dict[str, str] = {}
+    for field in _PROMPT_CACHE_FIELDS:
+        value = values.get(field)
+        text = str(value or "").strip()
+        if not text or "\r" in text or "\n" in text:
+            continue
+        safe[field] = text
+    return safe
+
+
+def _set_header_if_absent(headers: dict[str, str], field: str, value: str) -> None:
+    if not value:
+        return
+    lowered = field.casefold()
+    if any(str(key).casefold() == lowered for key in headers):
+        return
+    headers[field] = value
+
+
+def _strip_header_case_insensitive(headers: dict[str, str], field: str) -> None:
+    lowered = field.casefold()
+    for key in list(headers):
+        if str(key).casefold() == lowered:
+            headers.pop(key, None)
+
+
+def _cache_fields_in_request(
+    *,
+    payload: Mapping[str, Any],
+    headers: Mapping[str, str],
+) -> tuple[str, ...]:
+    header_keys = {str(key).casefold() for key in headers}
+    fields: list[str] = []
+    for field in _PROMPT_CACHE_FIELDS:
+        if field in _CACHE_HEADER_FIELDS:
+            if field.casefold() in header_keys:
+                fields.append(field)
+        elif field == CACHE_CONTROL_FIELD:
+            if count_cache_control_blocks(payload) > 0:
+                fields.append(field)
+        elif field in payload:
+            fields.append(field)
+    return tuple(fields)
+
+
+def _strip_cache_request_fields(
+    *,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    fields: tuple[str, ...],
+) -> None:
+    for field in fields:
+        if field in _CACHE_HEADER_FIELDS:
+            _strip_header_case_insensitive(headers, field)
+        elif field == CACHE_CONTROL_FIELD:
+            payload.pop(field, None)
+            strip_cache_control_blocks(payload)
+        else:
+            payload.pop(field, None)
+
+
+def _cache_param_rejected_fields(
+    err: LLMError,
+    *,
+    payload: Mapping[str, Any],
+    headers: Mapping[str, str],
+) -> tuple[str, ...]:
+    active_fields = _cache_fields_in_request(payload=payload, headers=headers)
+    if not active_fields:
+        return ()
+    status_code = _llm_error_status_code(err)
+    if status_code not in _CACHE_PARAM_UNSUPPORTED_STATUS_CODES:
+        return ()
+
+    body = _llm_error_body(err)
+    payload_error = _json_error_payload(body)
+    if payload_error:
+        raw_error = payload_error.get("error")
+        error = raw_error if isinstance(raw_error, dict) else payload_error
+        param = str(error.get("param") or "").strip().casefold()
+        code = str(error.get("code") or "").strip().casefold()
+        message = str(error.get("message") or "").strip().casefold()
+        combined = f"{param} {code} {message}"
+        if not combined.strip():
+            # JSON error envelopes without param/code/message (FastAPI/pydantic
+            # detail lists, bare {"error": "<string>"}) still name the field in
+            # the raw body.
+            combined = body.strip().casefold()
+    else:
+        combined = body.strip().casefold()
+
+    rejected = [field for field in active_fields if field.casefold() in combined]
+    if PROMPT_CACHE_KEY_FIELD in rejected and PROMPT_CACHE_RETENTION_FIELD in active_fields:
+        rejected.append(PROMPT_CACHE_RETENTION_FIELD)
+    if (
+        OPENROUTER_SESSION_ID_FIELD in rejected
+        and OPENROUTER_SESSION_ID_HEADER_FIELD in active_fields
+    ):
+        rejected.append(OPENROUTER_SESSION_ID_HEADER_FIELD)
+    if (
+        OPENROUTER_SESSION_ID_HEADER_FIELD in rejected
+        and OPENROUTER_SESSION_ID_FIELD in active_fields
+    ):
+        rejected.append(OPENROUTER_SESSION_ID_FIELD)
+    if rejected:
+        return tuple(dict.fromkeys(rejected))
+
+    has_cache_signal = (
+        "prompt cache" in combined
+        or "prompt_cache" in combined
+        or "cache_control" in combined
+        or "cache control" in combined
+        or "cache routing" in combined
+        or "sticky" in combined
+    )
+    has_unsupported_marker = any(token in combined for token in _CACHE_PARAM_UNSUPPORTED_TOKENS)
+    if has_cache_signal and has_unsupported_marker:
+        return active_fields
+    return ()
+
+
+def _cache_policy_after_fields_disabled(
+    cache_policy: Mapping[str, Any] | None,
+    *,
+    fields: tuple[str, ...],
+    fallback: str,
+) -> dict[str, Any] | None:
+    if not isinstance(cache_policy, Mapping) or not fields:
+        return None if cache_policy is None else dict(cache_policy)
+    disabled = set(fields)
+    updated = dict(cache_policy)
+    for key in ("emitted_fields", "allowed_fields"):
+        value = updated.get(key)
+        if isinstance(value, (list, tuple)):
+            updated[key] = [field for field in value if str(field) not in disabled]
+    existing_disabled = updated.get("disabled_fields")
+    disabled_fields = []
+    if isinstance(existing_disabled, (list, tuple)):
+        disabled_fields.extend(str(field) for field in existing_disabled)
+    disabled_fields.extend(fields)
+    unique_disabled_fields = list(dict.fromkeys(disabled_fields))
+    updated["disabled_fields"] = unique_disabled_fields
+    updated["runtime_disabled_fields"] = unique_disabled_fields
+    updated["capability_downgrade"] = "session_local_provider_rejection"
+    updated["fallback"] = fallback
+    if not updated.get("emitted_fields") and updated.get("status") == "enabled":
+        updated["status"] = "available"
+    updated["enabled"] = bool(updated.get("emitted_fields"))
+    updated["emits_request_fields"] = bool(updated.get("allowed_fields"))
+    return updated
+
+
 def _merge_transport_metadata(
     response: LLMResponse,
     *,
@@ -846,7 +1381,44 @@ def _merge_transport_metadata(
         response_model=response.response_model,
         usage=response.usage,
         provider_metadata=provider_metadata,
+        reasoning=response.reasoning,
     )
+
+
+def _merge_request_plan_metadata(
+    response: LLMResponse,
+    *,
+    request_plan_metadata: dict[str, Any] | None,
+) -> LLMResponse:
+    if not request_plan_metadata:
+        return response
+    provider_metadata = _merge_provider_metadata(
+        response.provider_metadata,
+        {"openai_compat": {"request_plan": request_plan_metadata}},
+    )
+    return LLMResponse(
+        content=response.content,
+        tool_calls=list(response.tool_calls),
+        raw=response.raw,
+        response_model=response.response_model,
+        usage=response.usage,
+        provider_metadata=provider_metadata,
+        reasoning=response.reasoning,
+    )
+
+
+def _display_error_body(body: str) -> str:
+    if len(body) > _ERROR_BODY_DISPLAY_LIMIT:
+        return body[:_ERROR_BODY_DISPLAY_LIMIT] + "...(truncated)"
+    return body
+
+
+def _error_from_status_body(*, status_code: int, body: str) -> LLMError:
+    safe_body = sanitize_error_text_for_output(body)
+    err = LLMError(f"LLM error {status_code}: {_display_error_body(safe_body)}")
+    err.provider_status_code = int(status_code)
+    err.provider_error_body = safe_body
+    return err
 
 
 def _response_with_stream_restart_metadata(
@@ -866,6 +1438,7 @@ def _response_with_stream_restart_metadata(
         response_model=response.response_model,
         usage=response.usage,
         provider_metadata=response.provider_metadata,
+        reasoning=response.reasoning,
     )
 
 
@@ -882,15 +1455,21 @@ class OpenAICompatClient:
         temperature: float = 1.0,
         prompt_cache_key: str | None = None,
         prompt_cache_retention: str | None = None,
+        prompt_cache_request_field_values: Mapping[str, Any] | None = None,
         enable_thinking: bool | None = None,
         reasoning_effort: str | None = None,
         transport: httpx.BaseTransport | None = None,
         extra_headers: dict[str, str] | None = None,
         provider_key: str | None = None,
+        reasoning_trace_adapter: str | None = "auto",
+        usage_contract: UsageContract | None = None,
+        usage_counts_authoritative: bool | None = None,
         provider_concurrency_caps: dict[str, int] | None = None,
         provider_retry_settings: ProviderRetrySettings | None = None,
         provider_sleep_fn: Callable[[float], None] | None = None,
         provider_random_fn: Callable[[], float] | None = None,
+        prompt_cache_policy_metadata: Mapping[str, Any] | None = None,
+        route_identity: ProviderRouteIdentity | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -899,15 +1478,39 @@ class OpenAICompatClient:
         self.temperature = temperature
         self.prompt_cache_key = str(prompt_cache_key or "").strip() or None
         self.prompt_cache_retention = str(prompt_cache_retention or "").strip() or None
+        self.prompt_cache_request_field_values = _safe_cache_request_field_values(
+            prompt_cache_request_field_values
+        )
         self.enable_thinking = enable_thinking
         self.reasoning_effort = str(reasoning_effort or "").strip().lower() or None
         self._transport = transport
-        self.extra_headers = {
-            str(key): str(value)
-            for key, value in (extra_headers or {}).items()
-            if str(key).strip() and str(value).strip()
-        }
+        self.extra_headers = canonicalize_extra_headers(extra_headers)
         self.provider_key = str(provider_key or "").strip() or None
+        self.reasoning_trace_adapter = validate_reasoning_trace_adapter_for_protocol(
+            protocol=OPENAI_COMPAT_PROTOCOL,
+            adapter=reasoning_trace_adapter,
+        )
+        self.route_identity = route_identity or build_provider_route_identity(
+            protocol=OPENAI_COMPAT_PROTOCOL,
+            base_url=self.base_url,
+            provider_key=self.provider_key,
+            model=self.model,
+            credential_scope=credential_scope_fingerprint(self.api_key),
+            routing_headers=self.extra_headers,
+            routing_fields=self.prompt_cache_request_field_values,
+            reasoning_state_adapter=self.reasoning_trace_adapter,
+        )
+        if usage_contract is None:
+            usage_contract = UsageContract(
+                response_usage_confidence=(
+                    UsageConfidence.AUTHORITATIVE
+                    if usage_counts_authoritative
+                    else UsageConfidence.REPORTED
+                ),
+                input_token_count_strategy="openai_compat_provider_payload",
+            )
+        self.usage_contract = usage_contract
+        self.usage_counts_authoritative = usage_contract.response_usage_authoritative
         self.provider_concurrency_caps = dict(
             DEFAULT_PROVIDER_CONCURRENCY_CAPS
             if provider_concurrency_caps is None
@@ -917,9 +1520,20 @@ class OpenAICompatClient:
         self._provider_sleep_fn = provider_sleep_fn
         self._provider_random_fn = provider_random_fn
         self._provider_retry_deadline_allows: Callable[[float], bool] | None = None
-        self._provider_finalization_retry_used = False
+        self.prompt_cache_policy_metadata = (
+            copy.deepcopy(dict(prompt_cache_policy_metadata))
+            if isinstance(prompt_cache_policy_metadata, Mapping)
+            else None
+        )
+        self._disabled_prompt_cache_fields: set[str] = set()
+        self._disabled_prompt_cache_fields_lock = threading.Lock()
+        self._provider_retry_wall_clock_cap_seconds = _PROVIDER_RETRY_WALL_CLOCK_CAP_SECONDS
         self._temperature_compat_modes: dict[tuple[str, str], str] = {}
         self._temperature_compat_lock = threading.Lock()
+        self._tool_choice_compat_disabled: set[tuple[str, str]] = set()
+        self._tool_choice_compat_lock = threading.Lock()
+        self._tool_calling_compat_disabled: set[tuple[str, str, str]] = set()
+        self._tool_calling_compat_lock = threading.Lock()
 
     def _temperature_compat_key(self, provider_key: str | None) -> tuple[str, str]:
         provider = _normalize_provider_key(provider_key) or _normalize_provider_key(self.base_url)
@@ -936,6 +1550,150 @@ class OpenAICompatClient:
         with self._temperature_compat_lock:
             self._temperature_compat_modes[key] = mode
 
+    def _disabled_prompt_cache_fields_snapshot(self) -> tuple[str, ...]:
+        with self._disabled_prompt_cache_fields_lock:
+            return tuple(
+                field
+                for field in _PROMPT_CACHE_FIELDS
+                if field in self._disabled_prompt_cache_fields
+            )
+
+    def _disable_prompt_cache_fields(self, fields: tuple[str, ...]) -> tuple[str, ...]:
+        requested = set(fields)
+        clean_fields = tuple(field for field in _PROMPT_CACHE_FIELDS if field in requested)
+        if not clean_fields:
+            return ()
+        with self._disabled_prompt_cache_fields_lock:
+            for field in clean_fields:
+                self._disabled_prompt_cache_fields.add(field)
+            return tuple(
+                field
+                for field in _PROMPT_CACHE_FIELDS
+                if field in self._disabled_prompt_cache_fields
+            )
+
+    def _active_prompt_cache_request_field_values(
+        self,
+        disabled_fields: tuple[str, ...],
+    ) -> dict[str, str]:
+        disabled = set(disabled_fields)
+        safe_values = _safe_cache_request_field_values(self.prompt_cache_request_field_values)
+        return {field: value for field, value in safe_values.items() if field not in disabled}
+
+    def _tool_choice_compat_key(self, provider_key: str | None) -> tuple[str, str]:
+        provider = _normalize_provider_key(provider_key) or _normalize_provider_key(self.base_url)
+        model = str(self.model or "").strip().casefold()
+        return provider, model
+
+    def _tool_choice_compat_disabled_for(self, key: tuple[str, str]) -> bool:
+        with self._tool_choice_compat_lock:
+            return key in self._tool_choice_compat_disabled
+
+    def _mark_tool_choice_compat_disabled(self, key: tuple[str, str]) -> None:
+        with self._tool_choice_compat_lock:
+            self._tool_choice_compat_disabled.add(key)
+
+    def _tool_calling_compat_key(self, provider_key: str | None) -> tuple[str, str, str]:
+        provider = _normalize_provider_key(provider_key) or _normalize_provider_key(self.base_url)
+        model = str(self.model or "").strip().casefold()
+        base_url = str(self.base_url or "").strip().casefold()
+        return provider, model, base_url
+
+    def _tool_calling_compat_disabled_for(self, key: tuple[str, str, str]) -> bool:
+        with self._tool_calling_compat_lock:
+            return key in self._tool_calling_compat_disabled
+
+    def _mark_tool_calling_compat_disabled(self, key: tuple[str, str, str]) -> None:
+        with self._tool_calling_compat_lock:
+            self._tool_calling_compat_disabled.add(key)
+
+    @property
+    def supports_tool_calling(self) -> bool:
+        provider_key = _transport_provider_key(
+            base_url=self.base_url,
+            provider_key=self.provider_key,
+            model=self.model,
+        )
+        return not self._tool_calling_compat_disabled_for(
+            self._tool_calling_compat_key(provider_key)
+        )
+
+    def count_input_tokens(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
+    ) -> InputTokenCount:
+        """Estimate the prompt-bearing payload that this compatibility route sends.
+
+        OpenAI-compatible wire format does not imply a shared tokenizer or a
+        standard preflight counting endpoint. This method therefore exposes the
+        adapter's provider-transformed payload through the common counting
+        contract while explicitly retaining ``local_estimate`` / ``estimated``
+        provenance. Response usage and overflow recovery remain the authority.
+        """
+
+        del tool_choice  # The chat estimator intentionally excludes control-only fields.
+        messages = gate_messages_for_provider_route(messages, self.route_identity)
+        transport_provider_key = _transport_provider_key(
+            base_url=self.base_url,
+            provider_key=self.provider_key,
+            model=self.model,
+        )
+        reasoning_provider_key = _reasoning_transport_provider_key(
+            transport_provider_key=transport_provider_key,
+            reasoning_trace_adapter=self.reasoning_trace_adapter,
+        )
+        disabled_prompt_cache_fields = self._disabled_prompt_cache_fields_snapshot()
+        active_cache_field_values = self._active_prompt_cache_request_field_values(
+            disabled_prompt_cache_fields
+        )
+        effective_tools = tools
+        if self._tool_calling_compat_disabled_for(
+            self._tool_calling_compat_key(transport_provider_key)
+        ):
+            effective_tools = None
+
+        provider_messages = _messages_for_transport(
+            messages,
+            provider_key=transport_provider_key,
+            reasoning_provider_key=reasoning_provider_key,
+        )
+        if CACHE_CONTROL_FIELD in active_cache_field_values:
+            cache_policy = merge_cache_policy_metadata(
+                self.prompt_cache_policy_metadata,
+                RequestCachePlan(
+                    strategy="openai_prompt_cache",
+                    mode="automatic",
+                    prompt_cache_key=self.prompt_cache_key,
+                    prompt_cache_retention=self.prompt_cache_retention,
+                ).openai_prompt_cache_policy_metadata(),
+            )
+            provider_messages = apply_openai_compatible_cache_control_breakpoint(
+                provider_messages,
+                cache_policy=cache_policy,
+            ).messages
+
+        prompt_payload: dict[str, Any] = {"messages": provider_messages}
+        if effective_tools:
+            prompt_payload["tools"] = effective_tools
+        prompt_payload = _sanitize_transport_value(prompt_payload)
+        return InputTokenCount(
+            input_tokens=estimate_provider_payload_tokens(prompt_payload),
+            source=UsageSource.LOCAL_ESTIMATE,
+            confidence=UsageConfidence.ESTIMATED,
+            raw_provider_usage={
+                "estimator": "cl100k_base",
+                "estimate_basis": "provider_prompt_payload",
+                "provider_key": transport_provider_key,
+                "protocol": "openai_compat",
+                "model": self.model,
+                "message_count": len(prompt_payload.get("messages") or []),
+                "tool_count": len(prompt_payload.get("tools") or []),
+            },
+        )
+
     def chat(
         self,
         *,
@@ -950,13 +1708,16 @@ class OpenAICompatClient:
         max_tokens: int | None = None,
         cancellation_token: Any | None = None,
     ) -> LLMResponse:
+        messages = gate_messages_for_provider_route(messages, self.route_identity)
         url = f"{self.base_url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "sylliptor-agent-cli/0.1.0",
-        }
-        headers.update(self.extra_headers)
+        headers = merge_canonical_headers(
+            {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "sylliptor-agent-cli/0.1.0",
+            },
+            self.extra_headers,
+        )
         headers = _headers_with_default_accept_encoding(headers)
         resolved_temperature = self.temperature if temperature is None else float(temperature)
         transport_provider_key = _transport_provider_key(
@@ -964,17 +1725,62 @@ class OpenAICompatClient:
             provider_key=self.provider_key,
             model=self.model,
         )
+        reasoning_provider_key = _reasoning_transport_provider_key(
+            transport_provider_key=transport_provider_key,
+            reasoning_trace_adapter=self.reasoning_trace_adapter,
+        )
+        deepseek_thinking_enabled = (
+            _deepseek_reasoning_payload_enabled(
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self.reasoning_effort,
+            )
+            if _is_deepseek_provider(reasoning_provider_key)
+            else None
+        )
+        documented_temperature_reason = documented_temperature_omit_reason(
+            self.model,
+            provider_key=reasoning_provider_key,
+            thinking_enabled=deepseek_thinking_enabled,
+        )
         temperature_key = self._temperature_compat_key(transport_provider_key)
         cached_temperature_compat_mode = self._temperature_compat_mode_for(temperature_key)
+        disabled_prompt_cache_fields = self._disabled_prompt_cache_fields_snapshot()
+        active_cache_field_values = self._active_prompt_cache_request_field_values(
+            disabled_prompt_cache_fields
+        )
+        active_prompt_cache_key = (
+            None
+            if PROMPT_CACHE_KEY_FIELD in disabled_prompt_cache_fields
+            else self.prompt_cache_key or active_cache_field_values.get(PROMPT_CACHE_KEY_FIELD)
+        )
+        active_prompt_cache_retention = (
+            None
+            if PROMPT_CACHE_RETENTION_FIELD in disabled_prompt_cache_fields
+            else self.prompt_cache_retention
+            or active_cache_field_values.get(PROMPT_CACHE_RETENTION_FIELD)
+        )
+        tool_choice_key = self._tool_choice_compat_key(transport_provider_key)
+        cached_tool_choice_compat_disabled = self._tool_choice_compat_disabled_for(tool_choice_key)
+        tool_calling_key = self._tool_calling_compat_key(transport_provider_key)
+        cached_tool_calling_compat_disabled = self._tool_calling_compat_disabled_for(
+            tool_calling_key
+        )
         transport_metadata: dict[str, Any] = {}
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": _messages_for_transport(
                 messages,
                 provider_key=transport_provider_key,
+                reasoning_provider_key=reasoning_provider_key,
             ),
         }
-        if cached_temperature_compat_mode == _TEMPERATURE_COMPAT_MODE_DEFAULT:
+        if documented_temperature_reason is not None:
+            transport_metadata["temperature_adjusted"] = True
+            transport_metadata["temperature_adjustment"] = _TEMPERATURE_COMPAT_MODE_OMIT
+            transport_metadata["temperature_adjustment_reason"] = "documented_model_policy"
+            transport_metadata["temperature_omitted"] = True
+            transport_metadata["temperature_omit_reason"] = documented_temperature_reason
+        elif cached_temperature_compat_mode == _TEMPERATURE_COMPAT_MODE_DEFAULT:
             payload["temperature"] = _TEMPERATURE_DEFAULT_VALUE
             transport_metadata["temperature_adjusted"] = True
             transport_metadata["temperature_adjustment"] = _TEMPERATURE_COMPAT_MODE_DEFAULT
@@ -987,45 +1793,78 @@ class OpenAICompatClient:
             transport_metadata["temperature_omit_reason"] = "cached_provider_rejection"
         else:
             payload["temperature"] = resolved_temperature
-        if self.prompt_cache_key:
-            payload["prompt_cache_key"] = self.prompt_cache_key
-        if self.prompt_cache_retention:
-            payload["prompt_cache_retention"] = self.prompt_cache_retention
-        if _is_dashscope_provider(transport_provider_key):
+        if active_prompt_cache_key:
+            payload[PROMPT_CACHE_KEY_FIELD] = active_prompt_cache_key
+        if active_prompt_cache_retention:
+            payload[PROMPT_CACHE_RETENTION_FIELD] = active_prompt_cache_retention
+        openrouter_session_id = active_cache_field_values.get(OPENROUTER_SESSION_ID_FIELD)
+        if openrouter_session_id:
+            payload[OPENROUTER_SESSION_ID_FIELD] = openrouter_session_id
+        _set_header_if_absent(
+            headers,
+            OPENROUTER_SESSION_ID_HEADER_FIELD,
+            active_cache_field_values.get(OPENROUTER_SESSION_ID_HEADER_FIELD, ""),
+        )
+        _set_header_if_absent(
+            headers,
+            XAI_CONVERSATION_ID_HEADER_FIELD,
+            active_cache_field_values.get(XAI_CONVERSATION_ID_HEADER_FIELD, ""),
+        )
+        # Track whether this request runs in thinking/reasoning mode on a provider
+        # that rejects a forced tool_choice while thinking (DeepSeek, OpenRouter/
+        # MiMo, DashScope/Qwen, Zhipu GLM). OpenAI/Gemini-style reasoning accept a
+        # forced choice, so those branches leave this False.
+        thinking_active = False
+        if _is_dashscope_provider(reasoning_provider_key):
             enable_thinking = self.enable_thinking
             if enable_thinking is None:
                 enable_thinking = _reasoning_effort_enables_thinking(self.reasoning_effort)
             if enable_thinking is not None:
                 payload["enable_thinking"] = enable_thinking
-        elif _is_deepseek_provider(transport_provider_key):
-            thinking_enabled = _deepseek_reasoning_payload_enabled(
-                enable_thinking=self.enable_thinking,
-                reasoning_effort=self.reasoning_effort,
-            )
+            thinking_active = enable_thinking is True
+        elif _is_deepseek_provider(reasoning_provider_key):
+            thinking_enabled = deepseek_thinking_enabled
             if thinking_enabled is not None:
                 payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
-        elif _is_openrouter_provider(transport_provider_key):
+            thinking_active = thinking_enabled is True
+        elif _is_openrouter_provider(reasoning_provider_key):
             reasoning = _openrouter_reasoning_payload(
                 enable_thinking=self.enable_thinking,
                 reasoning_effort=self.reasoning_effort,
             )
             if reasoning is not None:
                 payload["reasoning"] = reasoning
-        elif _is_gemini_provider(transport_provider_key):
+            thinking_active = reasoning is not None and reasoning.get("enabled") is not False
+        elif _is_gemini_provider(reasoning_provider_key):
             reasoning_effort = _gemini_reasoning_effort(
                 model=self.model,
                 reasoning_effort=self.reasoning_effort,
             )
             if reasoning_effort:
                 payload["reasoning_effort"] = reasoning_effort
-        elif _uses_reasoning_effort(transport_provider_key):
+        elif _uses_reasoning_effort(reasoning_provider_key):
             if self.reasoning_effort:
                 payload["reasoning_effort"] = self.reasoning_effort
-        elif self.enable_thinking is not None and not self.reasoning_effort:
-            payload["enable_thinking"] = self.enable_thinking
+        # A reasoning model in thinking mode can 400 on any tool_choice parameter.
+        # Omitting it preserves the default "auto" behavior while keeping tools
+        # available to the model.
+        if thinking_active and _tool_choice_forces_a_call(tool_choice):
+            tool_choice = None
+            transport_metadata["tool_choice_omitted"] = True
+            transport_metadata["tool_choice_omit_reason"] = "thinking_mode"
+        elif cached_tool_choice_compat_disabled and tool_choice is not None:
+            tool_choice = None
+            transport_metadata["tool_choice_omitted"] = True
+            transport_metadata["tool_choice_omit_reason"] = "cached_provider_rejection"
+        if cached_tool_calling_compat_disabled and (tools or tool_choice is not None):
+            tools = None
+            tool_choice = None
+            transport_metadata["tools_omitted"] = True
+            transport_metadata["tools_omit_reason"] = "cached_provider_rejection"
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto" if tool_choice is None else tool_choice
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
         elif tool_choice is not None:
             payload["tool_choice"] = tool_choice
         if response_format:
@@ -1035,8 +1874,6 @@ class OpenAICompatClient:
         if stream:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
-        payload = _sanitize_transport_value(payload)
-
         provider_key = (
             transport_provider_key
             or self.provider_key
@@ -1045,6 +1882,91 @@ class OpenAICompatClient:
                 model=self.model,
             )
         )
+        cache_policy = merge_cache_policy_metadata(
+            self.prompt_cache_policy_metadata,
+            RequestCachePlan(
+                strategy=(
+                    "openai_prompt_cache"
+                    if active_prompt_cache_key or active_prompt_cache_retention
+                    else "none"
+                ),
+                mode=(
+                    "automatic"
+                    if active_prompt_cache_key or active_prompt_cache_retention
+                    else "manual"
+                ),
+                prompt_cache_key=active_prompt_cache_key,
+                prompt_cache_retention=active_prompt_cache_retention,
+            ).openai_prompt_cache_policy_metadata(),
+        )
+        if CACHE_CONTROL_FIELD in active_cache_field_values:
+            application = apply_openai_compatible_cache_control_breakpoint(
+                payload.get("messages", []),
+                cache_policy=cache_policy,
+            )
+            payload["messages"] = application.messages
+            if cache_policy is not None:
+                cache_policy = merge_cache_policy_metadata(
+                    cache_policy,
+                    application.policy_metadata(),
+                )
+        if disabled_prompt_cache_fields:
+            cache_policy = _cache_policy_after_fields_disabled(
+                cache_policy,
+                fields=disabled_prompt_cache_fields,
+                fallback="runtime_disabled_rejected_cache_fields",
+            )
+        payload = _sanitize_transport_value(payload)
+        prompt_estimation_payload = {
+            "messages": payload.get("messages", []),
+        }
+        for key in ("tools", "response_format"):
+            if key in payload:
+                prompt_estimation_payload[key] = payload[key]
+        request_shape = build_request_shape_report(
+            messages=messages,
+            tools=tools,
+            cache_policy=cache_policy,
+            provider_payload=prompt_estimation_payload,
+        )
+        input_estimate_tokens = estimate_provider_payload_tokens(prompt_estimation_payload)
+        layout_plan = LLMRequestPlan.from_chat_args(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            stream=stream,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            cache=RequestCachePlan(
+                strategy=(
+                    "openai_prompt_cache"
+                    if active_prompt_cache_key or active_prompt_cache_retention
+                    else "none"
+                ),
+                mode=(
+                    "automatic"
+                    if active_prompt_cache_key or active_prompt_cache_retention
+                    else "manual"
+                ),
+                prompt_cache_key=active_prompt_cache_key,
+                prompt_cache_retention=active_prompt_cache_retention,
+            ),
+        )
+        request_plan_metadata = layout_plan.request_plan_metadata(
+            input_mode="full",
+            continuation_strategy="full_replay",
+            provider_payload=prompt_estimation_payload,
+            sent_provider_payload=prompt_estimation_payload,
+            cache_policy_metadata=cache_policy,
+        )
+        token_reconciliation = {
+            "input_estimate_tokens": input_estimate_tokens,
+            "sent_input_estimate_tokens": input_estimate_tokens,
+            "estimator": "cl100k_base",
+            "estimate_basis": "provider_prompt_payload",
+            "input_mode": "full",
+        }
         telemetry = ProviderCallTelemetryRecorder(
             provider_key=provider_key,
             protocol="openai_compat",
@@ -1052,18 +1974,28 @@ class OpenAICompatClient:
             base_url=self.base_url,
             stream=stream,
             tools=tools,
+            cache_policy=cache_policy,
+            request_plan=request_plan_metadata,
+            request_shape=request_shape,
+            token_reconciliation=token_reconciliation,
             operation="chat_completions",
         )
         telemetry_on_text_delta = telemetry.wrap_text_delta(on_text_delta)
+        telemetry_on_reasoning_delta = telemetry.wrap_reasoning_delta(on_reasoning_delta)
         stream_restart_count = 0
         stream_restart_reason = ""
 
         def _send_request() -> LLMResponse:
+            nonlocal cache_policy, request_plan_metadata, request_shape, token_reconciliation
             nonlocal stream_restart_count, stream_restart_reason
             temperature_retry_count = 0
             temperature_retry_modes: set[str] = set()
+            cache_param_retry_used = False
             try:
-                with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
+                with httpx.Client(
+                    timeout=_httpx_request_timeout(self.timeout_s),
+                    transport=self._transport,
+                ) as client:
                     while True:
                         try:
                             if stream:
@@ -1071,35 +2003,56 @@ class OpenAICompatClient:
                                     "POST", url, headers=headers, json=payload
                                 ) as resp:
                                     attempt_deltas: list[str] = []
-                                    forward_attempt_deltas = cancellation_token is not None
+                                    attempt_reasoning_deltas: list[str] = []
 
-                                    def _on_attempt_delta(
+                                    def _attempt_text_delta(
                                         delta: str,
                                         *,
                                         _attempt_deltas: list[str] = attempt_deltas,
-                                        _forward_attempt_deltas: bool = forward_attempt_deltas,
                                     ) -> None:
                                         _attempt_deltas.append(delta)
-                                        if (
-                                            _forward_attempt_deltas
-                                            and telemetry_on_text_delta is not None
-                                        ):
+                                        if telemetry_on_text_delta is not None:
                                             telemetry_on_text_delta(delta)
+
+                                    def _attempt_reasoning_delta(
+                                        delta: str,
+                                        *,
+                                        _attempt_reasoning_deltas: list[str] = (
+                                            attempt_reasoning_deltas
+                                        ),
+                                    ) -> None:
+                                        _attempt_reasoning_deltas.append(delta)
+                                        if telemetry_on_reasoning_delta is not None:
+                                            telemetry_on_reasoning_delta(delta)
 
                                     try:
                                         response = self._parse_stream_response(
                                             resp,
-                                            on_text_delta=_on_attempt_delta,
-                                            on_reasoning_delta=on_reasoning_delta,
-                                            provider_key=transport_provider_key,
+                                            on_text_delta=(
+                                                _attempt_text_delta
+                                                if on_text_delta is not None
+                                                else None
+                                            ),
+                                            on_reasoning_delta=(
+                                                _attempt_reasoning_delta
+                                                if on_reasoning_delta is not None
+                                                else None
+                                            ),
+                                            provider_key=reasoning_provider_key,
                                             cancellation_token=cancellation_token,
+                                            allow_reasoning_only_answer=(
+                                                _normalize_provider_key(self.provider_key)
+                                                == "sylliptor"
+                                            ),
                                         )
                                     except Exception as stream_error:
-                                        if attempt_deltas:
+                                        retry_reason = provider_unavailable_retry_reason(
+                                            stream_error
+                                        )
+                                        if attempt_deltas or attempt_reasoning_deltas:
                                             stream_restart_count += 1
                                             stream_restart_reason = (
-                                                provider_unavailable_retry_reason(stream_error)
-                                                or "provider_stream_interrupted"
+                                                retry_reason or "provider_stream_interrupted"
                                             )
                                             transport_metadata["stream_restart_count"] = (
                                                 stream_restart_count
@@ -1107,13 +2060,27 @@ class OpenAICompatClient:
                                             transport_metadata["stream_restart_reason"] = (
                                                 stream_restart_reason
                                             )
+                                            # Once public output reached the UI, replaying the
+                                            # request would duplicate text/trace content.
+                                            if isinstance(stream_error, LLMError):
+                                                mark_provider_call_non_retryable(stream_error)
+                                                raise
+                                            interrupted = LLMError(
+                                                "LLM stream interrupted after partial output: "
+                                                f"{stream_error}"
+                                            )
+                                            mark_provider_call_non_retryable(interrupted)
+                                            raise interrupted from stream_error
+                                        if retry_reason == "provider_stream_truncated":
+                                            stream_restart_count += 1
+                                            stream_restart_reason = retry_reason
+                                            transport_metadata["stream_restart_count"] = (
+                                                stream_restart_count
+                                            )
+                                            transport_metadata["stream_restart_reason"] = (
+                                                stream_restart_reason
+                                            )
                                         raise
-                                    if (
-                                        telemetry_on_text_delta is not None
-                                        and not forward_attempt_deltas
-                                    ):
-                                        for delta in attempt_deltas:
-                                            telemetry_on_text_delta(delta)
                                     if stream_restart_count:
                                         response = _response_with_stream_restart_metadata(
                                             response,
@@ -1126,11 +2093,160 @@ class OpenAICompatClient:
                                     raise self._error_from_response(resp)
                                 response = self._parse_non_stream_response(
                                     resp,
-                                    provider_key=transport_provider_key,
+                                    provider_key=reasoning_provider_key,
                                 )
                         except LLMError as e:
                             if stream and _is_stream_options_unsupported_error(e):
                                 payload.pop("stream_options", None)
+                                continue
+                            rejected_cache_fields = _cache_param_rejected_fields(
+                                e,
+                                payload=payload,
+                                headers=headers,
+                            )
+                            if rejected_cache_fields and not cache_param_retry_used:
+                                cache_param_retry_used = True
+                                disabled_fields = self._disable_prompt_cache_fields(
+                                    rejected_cache_fields
+                                )
+                                _strip_cache_request_fields(
+                                    payload=payload,
+                                    headers=headers,
+                                    fields=rejected_cache_fields,
+                                )
+                                cache_policy = _cache_policy_after_fields_disabled(
+                                    cache_policy,
+                                    fields=disabled_fields or rejected_cache_fields,
+                                    fallback="stripped_rejected_cache_fields",
+                                )
+                                prompt_estimation_payload = {
+                                    "messages": payload.get("messages", []),
+                                }
+                                for key in ("tools", "response_format"):
+                                    if key in payload:
+                                        prompt_estimation_payload[key] = payload[key]
+                                request_shape = build_request_shape_report(
+                                    messages=messages,
+                                    tools=tools,
+                                    cache_policy=cache_policy,
+                                    provider_payload=prompt_estimation_payload,
+                                    input_mode="cache_param_fallback",
+                                )
+                                request_plan_metadata = layout_plan.request_plan_metadata(
+                                    input_mode="cache_param_fallback",
+                                    continuation_strategy="full_replay",
+                                    provider_payload=prompt_estimation_payload,
+                                    sent_provider_payload=prompt_estimation_payload,
+                                    cache_policy_metadata=cache_policy,
+                                    extra={"fallback_used": True},
+                                )
+                                fallback_input_estimate = estimate_provider_payload_tokens(
+                                    prompt_estimation_payload
+                                )
+                                token_reconciliation = {
+                                    **token_reconciliation,
+                                    "input_estimate_tokens": fallback_input_estimate,
+                                    "sent_input_estimate_tokens": fallback_input_estimate,
+                                    "input_mode": "cache_param_fallback",
+                                }
+                                telemetry.set_cache_policy(cache_policy)
+                                telemetry.set_request_plan(request_plan_metadata)
+                                telemetry.set_request_shape(request_shape)
+                                telemetry.set_token_reconciliation(token_reconciliation)
+                                transport_metadata["cache_param_fallback_used"] = True
+                                transport_metadata["cache_param_retry_used"] = True
+                                transport_metadata["cache_param_disabled_fields"] = list(
+                                    disabled_fields or rejected_cache_fields
+                                )
+                                _LOGGER.info(
+                                    "llm_cache_parameter_rejected_retrying_without_cache_fields",
+                                    extra={
+                                        "provider_key": provider_key,
+                                        "model": self.model,
+                                        "disabled_fields": list(
+                                            disabled_fields or rejected_cache_fields
+                                        ),
+                                    },
+                                )
+                                continue
+                            if "tool_choice" in payload and _tool_choice_unsupported_error(e):
+                                rejected_tool_choice = payload.pop("tool_choice", None)
+                                self._mark_tool_choice_compat_disabled(tool_choice_key)
+                                transport_metadata["tool_choice_omitted"] = True
+                                transport_metadata["tool_choice_omit_reason"] = (
+                                    "provider_rejected_parameter"
+                                )
+                                transport_metadata["tool_choice_retry_used"] = True
+                                _LOGGER.info(
+                                    "llm_tool_choice_parameter_rejected_retrying_without_it",
+                                    extra={
+                                        "provider_key": provider_key,
+                                        "model": self.model,
+                                        "tool_choice": rejected_tool_choice,
+                                    },
+                                )
+                                continue
+                            if "tools" in payload and _tool_calling_unsupported_error(e):
+                                payload.pop("tools", None)
+                                payload.pop("tool_choice", None)
+                                self._mark_tool_calling_compat_disabled(tool_calling_key)
+                                fallback_prompt_payload: dict[str, Any] = {
+                                    "messages": payload.get("messages", []),
+                                }
+                                if "response_format" in payload:
+                                    fallback_prompt_payload["response_format"] = payload[
+                                        "response_format"
+                                    ]
+                                request_shape = build_request_shape_report(
+                                    messages=messages,
+                                    tools=None,
+                                    cache_policy=cache_policy,
+                                    provider_payload=fallback_prompt_payload,
+                                    input_mode="tool_calling_fallback",
+                                )
+                                fallback_layout = LLMRequestPlan.from_chat_args(
+                                    messages=messages,
+                                    tools=None,
+                                    tool_choice=None,
+                                    response_format=response_format,
+                                    stream=stream,
+                                    temperature=temperature,
+                                    max_tokens=max_tokens,
+                                    cache=layout_plan.cache,
+                                )
+                                request_plan_metadata = fallback_layout.request_plan_metadata(
+                                    input_mode="tool_calling_fallback",
+                                    continuation_strategy="full_replay",
+                                    provider_payload=fallback_prompt_payload,
+                                    sent_provider_payload=fallback_prompt_payload,
+                                    cache_policy_metadata=cache_policy,
+                                    extra={"fallback_used": True},
+                                )
+                                fallback_input_estimate = estimate_provider_payload_tokens(
+                                    fallback_prompt_payload
+                                )
+                                token_reconciliation = {
+                                    **token_reconciliation,
+                                    "input_estimate_tokens": fallback_input_estimate,
+                                    "sent_input_estimate_tokens": fallback_input_estimate,
+                                    "input_mode": "tool_calling_fallback",
+                                }
+                                telemetry.set_request_plan(request_plan_metadata)
+                                telemetry.set_request_shape(request_shape)
+                                telemetry.set_token_reconciliation(token_reconciliation)
+                                transport_metadata["tools_omitted"] = True
+                                transport_metadata["tools_omit_reason"] = (
+                                    "provider_rejected_tool_calling"
+                                )
+                                transport_metadata["tools_retry_used"] = True
+                                _LOGGER.info(
+                                    "llm_tool_calling_rejected_retrying_without_tools",
+                                    extra={
+                                        "provider_key": provider_key,
+                                        "model": self.model,
+                                        "base_url_descriptor": endpoint_descriptor(self.base_url),
+                                    },
+                                )
                                 continue
                             if "temperature" in payload and _temperature_unsupported_error(e):
                                 rejected_temperature = payload.get("temperature")
@@ -1171,29 +2287,56 @@ class OpenAICompatClient:
                                 )
                                 continue
                             raise
+                        if not stream and telemetry_on_reasoning_delta is not None:
+                            for reasoning_output in response.reasoning:
+                                if reasoning_output.kind == ReasoningOutputKind.SUMMARY:
+                                    telemetry_on_reasoning_delta(reasoning_output.text)
                         return _merge_transport_metadata(
-                            response,
+                            _merge_request_plan_metadata(
+                                response,
+                                request_plan_metadata=request_plan_metadata,
+                            ),
                             transport_metadata=transport_metadata,
                         )
             except LLMError:
                 raise
             except httpx.DecodingError as e:
-                raise LLMError(f"LLM response decompression failed: {e}") from e
+                raise LLMError(
+                    f"LLM response decompression failed: {sanitize_error_text_for_output(e)}"
+                ) from e
             except Exception as e:  # noqa: BLE001 - network errors vary
-                raise LLMError(f"LLM request failed: {e}") from e
+                if _is_connect_failure(e):
+                    raise LLMError(
+                        "LLM request failed for "
+                        f"{endpoint_label(self.base_url)}: {sanitize_error_text_for_output(e)}"
+                    ) from e
+                if _is_read_timeout(e):
+                    raise LLMError(
+                        "LLM request failed for "
+                        f"{endpoint_label(self.base_url)}: {sanitize_error_text_for_output(e)}"
+                    ) from e
+                raise LLMError(f"LLM request failed: {sanitize_error_text_for_output(e)}") from e
 
-        return telemetry.run(
-            lambda: run_provider_limited_call(
-                call=_send_request,
-                provider_key=provider_key,
-                provider_concurrency_caps=self.provider_concurrency_caps,
-                retry_settings=self.provider_retry_settings,
-                operation="chat_completions",
-                sleep_fn=self._provider_sleep_fn,
-                random_fn=self._provider_random_fn,
-                on_retry=telemetry.on_retry,
-                retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
-            )
+        return stamp_response_for_route(
+            telemetry.run(
+                lambda: run_provider_limited_call(
+                    call=_send_request,
+                    provider_key=provider_key,
+                    provider_concurrency_caps=self.provider_concurrency_caps,
+                    retry_settings=self.provider_retry_settings,
+                    operation="chat_completions",
+                    sleep_fn=self._provider_sleep_fn,
+                    random_fn=self._provider_random_fn,
+                    on_retry=telemetry.on_retry,
+                    retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
+                    retry_wall_clock_cap_seconds=getattr(
+                        self,
+                        "_provider_retry_wall_clock_cap_seconds",
+                        _PROVIDER_RETRY_WALL_CLOCK_CAP_SECONDS,
+                    ),
+                )
+            ),
+            self.route_identity,
         )
 
     @staticmethod
@@ -1201,23 +2344,26 @@ class OpenAICompatClient:
         resp: httpx.Response,
         *,
         provider_key: str | None,
+        allow_reasoning_only_answer: bool = False,
     ) -> LLMResponse:
         try:
             data = resp.json()
         except Exception as e:  # noqa: BLE001
             raise LLMError("LLM returned non-JSON response") from e
 
-        try:
-            choice0 = data["choices"][0]
-            msg = choice0["message"]
-        except Exception as e:  # noqa: BLE001
-            raise LLMError(f"Unexpected LLM response shape: {data!r}") from e
+        if not isinstance(data, dict):
+            raise LLMError("Unexpected LLM response shape: expected a JSON object")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise LLMError("Unexpected LLM response shape: missing choices[0]")
+        choice0 = choices[0]
+        if not isinstance(choice0, dict) or not isinstance(choice0.get("message"), dict):
+            raise LLMError("Unexpected LLM response shape: missing choices[0].message")
+        msg = choice0["message"]
 
         content = _normalize_assistant_content_to_text(msg.get("content"))
         tool_calls_raw = msg.get("tool_calls") or []
         tool_calls = _parse_tool_calls(tool_calls_raw)
-        if not content.strip() and not tool_calls:
-            content = _reasoning_fallback_content(msg) or content
         response_model = data.get("model") if isinstance(data.get("model"), str) else None
         return LLMResponse(
             content=content,
@@ -1229,14 +2375,16 @@ class OpenAICompatClient:
                 provider_key=provider_key,
                 message=msg,
             ),
+            reasoning=_reasoning_outputs_from_message(msg, provider_key=provider_key),
         )
 
     @staticmethod
     def _error_from_response(resp: httpx.Response) -> LLMError:
-        body = resp.text
-        if len(body) > 1000:
-            body = body[:1000] + "...(truncated)"
-        return LLMError(f"LLM error {resp.status_code}: {body}")
+        try:
+            body = resp.text
+        except Exception:
+            body = "<unable to read response body>"
+        return _error_from_status_body(status_code=resp.status_code, body=body)
 
     def _parse_stream_response(
         self,
@@ -1246,10 +2394,11 @@ class OpenAICompatClient:
         on_reasoning_delta: Callable[[str], None] | None = None,
         provider_key: str | None,
         cancellation_token: Any | None = None,
+        allow_reasoning_only_answer: bool = False,
     ) -> LLMResponse:
         if resp.status_code >= 400:
             body = self._safe_error_body(resp)
-            raise LLMError(f"LLM error {resp.status_code}: {body}")
+            raise _error_from_status_body(status_code=resp.status_code, body=body)
 
         content_parts: list[str] = []
         tool_chunks: dict[int, dict[str, Any]] = {}
@@ -1259,6 +2408,8 @@ class OpenAICompatClient:
         accumulated_content = ""
         reasoning_parts: list[str] = []
         reasoning_details: list[Any] = []
+        reasoning_summary_parts: dict[str, str] = {}
+        mistral_content_chunks: list[dict[str, Any]] = []
         saw_done = False
 
         # Make the (possibly long) initial read interruptible: register the live
@@ -1270,146 +2421,155 @@ class OpenAICompatClient:
         if callable(_set_abort):
             _set_abort(resp.close)
         _stream_iter = resp.iter_lines()
-
-        def _is_cancelled() -> bool:
-            return cancellation_token is not None and getattr(
+        while True:
+            try:
+                line = next(_stream_iter)
+            except StopIteration:
+                break
+            except Exception:
+                if cancellation_token is not None and getattr(
+                    cancellation_token, "is_cancelled", False
+                ):
+                    raise KeyboardInterrupt("cancelled_by_user") from None
+                raise
+            if cancellation_token is not None and getattr(
                 cancellation_token, "is_cancelled", False
-            )
+            ):
+                raise KeyboardInterrupt("cancelled_by_user")
+            if not line:
+                continue
+            if isinstance(line, bytes):
+                text = line.decode("utf-8", errors="ignore")
+            else:
+                text = line
+            if not text.startswith("data:"):
+                continue
+            payload = text[5:].strip()
+            if not payload:
+                continue
+            if payload == "[DONE]":
+                saw_done = True
+                break
 
-        try:
-            while True:
-                try:
-                    line = next(_stream_iter)
-                except StopIteration:
-                    break
-                except Exception:
-                    if _is_cancelled():
-                        raise KeyboardInterrupt("cancelled_by_user") from None
-                    raise
-                if _is_cancelled():
-                    raise KeyboardInterrupt("cancelled_by_user")
-                if not line:
-                    continue
-                if isinstance(line, bytes):
-                    text = line.decode("utf-8", errors="ignore")
-                else:
-                    text = line
-                if not text.startswith("data:"):
-                    continue
-                payload = text[5:].strip()
-                if not payload:
-                    continue
-                if payload == "[DONE]":
-                    saw_done = True
-                    break
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_count += 1
+            model = event.get("model")
+            if isinstance(model, str) and model:
+                response_model = model
+            parsed_usage = _parse_usage(event.get("usage"))
+            if parsed_usage is not None:
+                usage = parsed_usage
 
-                try:
-                    event = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                event_count += 1
-                model = event.get("model")
-                if isinstance(model, str) and model:
-                    response_model = model
-                parsed_usage = _parse_usage(event.get("usage"))
-                if parsed_usage is not None:
-                    usage = parsed_usage
+            choices = event.get("choices") or []
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice0 = choices[0]
+            if not isinstance(choice0, dict):
+                continue
+            delta = choice0.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
 
-                choices = event.get("choices") or []
-                if not isinstance(choices, list) or not choices:
-                    continue
-                choice0 = choices[0]
-                if not isinstance(choice0, dict):
-                    continue
-                delta = choice0.get("delta") or {}
-                if not isinstance(delta, dict):
-                    continue
-
-                reasoning_delta = delta.get(_DEEPSEEK_REASONING_CONTENT_KEY)
-                if not isinstance(reasoning_delta, str):
-                    reasoning_delta = delta.get(_OPENROUTER_REASONING_KEY)
-                if isinstance(reasoning_delta, str) and reasoning_delta:
-                    reasoning_parts.append(reasoning_delta)
+            reasoning_delta = delta.get(_DEEPSEEK_REASONING_CONTENT_KEY)
+            if not isinstance(reasoning_delta, str):
+                reasoning_delta = delta.get(_OPENROUTER_REASONING_KEY)
+            if isinstance(reasoning_delta, str) and reasoning_delta:
+                reasoning_parts.append(reasoning_delta)
+            details_delta = delta.get(_OPENROUTER_REASONING_DETAILS_KEY)
+            if isinstance(details_delta, list) and details_delta:
+                reasoning_details.extend(details_delta)
+                for detail_index, detail in enumerate(details_delta):
+                    parsed = (
+                        _text_from_reasoning_detail(detail) if isinstance(detail, dict) else None
+                    )
+                    if parsed is None:
+                        continue
+                    detail_text, detail_kind = parsed
+                    if detail_kind != ReasoningOutputKind.SUMMARY:
+                        continue
+                    key = str(detail.get("id") or detail.get("index") or f"summary_{detail_index}")
+                    previous = reasoning_summary_parts.get(key, "")
+                    suffix = _stream_delta_suffix(previous=previous, incoming=detail_text)
+                    if not suffix:
+                        continue
+                    reasoning_summary_parts[key] = previous + suffix
                     if on_reasoning_delta is not None:
-                        on_reasoning_delta(reasoning_delta)
-                    if _is_cancelled():
-                        raise KeyboardInterrupt("cancelled_by_user")
-                details_delta = delta.get(_OPENROUTER_REASONING_DETAILS_KEY)
-                if isinstance(details_delta, list) and details_delta:
-                    reasoning_details.extend(details_delta)
+                        on_reasoning_delta(suffix)
 
-                content_delta = _normalize_assistant_content_to_text(delta.get("content"))
-                if content_delta:
-                    content_suffix = _stream_delta_suffix(
-                        previous=accumulated_content,
-                        incoming=content_delta,
-                    )
-                    if content_suffix:
-                        content_parts.append(content_suffix)
-                        accumulated_content += content_suffix
-                        if on_text_delta is not None:
-                            on_text_delta(content_suffix)
-                        if _is_cancelled():
-                            raise KeyboardInterrupt("cancelled_by_user")
+            raw_content_delta = delta.get("content")
+            if _is_mistral_provider(provider_key):
+                _append_mistral_stream_content(mistral_content_chunks, raw_content_delta)
+            content_delta = _normalize_assistant_content_to_text(raw_content_delta)
+            if content_delta:
+                content_suffix = _stream_delta_suffix(
+                    previous=accumulated_content,
+                    incoming=content_delta,
+                )
+                if content_suffix:
+                    content_parts.append(content_suffix)
+                    accumulated_content += content_suffix
+                    if on_text_delta is not None:
+                        on_text_delta(content_suffix)
 
-                tc_delta = delta.get("tool_calls") or []
-                if not isinstance(tc_delta, list):
+            tc_delta = delta.get("tool_calls") or []
+            if not isinstance(tc_delta, list):
+                continue
+            for raw_tc in tc_delta:
+                if not isinstance(raw_tc, dict):
                     continue
-                for raw_tc in tc_delta:
-                    if not isinstance(raw_tc, dict):
-                        continue
-                    idx = raw_tc.get("index")
-                    if not isinstance(idx, int):
-                        continue
-                    entry = tool_chunks.setdefault(
-                        idx,
-                        {"id": "", "name": "", "arguments": "", "provider_metadata": None},
+                idx = raw_tc.get("index")
+                if not isinstance(idx, int):
+                    continue
+                entry = tool_chunks.setdefault(
+                    idx,
+                    {"id": "", "name": "", "arguments": "", "provider_metadata": None},
+                )
+
+                tc_id = raw_tc.get("id")
+                if isinstance(tc_id, str) and tc_id:
+                    entry["id"] = tc_id
+
+                provider_metadata = _gemini_tool_call_provider_metadata(raw_tc)
+                if provider_metadata:
+                    existing_metadata = entry.get("provider_metadata")
+                    entry["provider_metadata"] = _merge_provider_metadata(
+                        existing_metadata if isinstance(existing_metadata, dict) else None,
+                        provider_metadata,
                     )
 
-                    tc_id = raw_tc.get("id")
-                    if isinstance(tc_id, str) and tc_id:
-                        entry["id"] = tc_id
+                fn = raw_tc.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                name = fn.get("name")
+                if isinstance(name, str) and name:
+                    entry["name"] = name
+                args_piece = fn.get("arguments")
+                if isinstance(args_piece, str):
+                    entry["arguments"] += _stream_delta_suffix(
+                        previous=entry["arguments"],
+                        incoming=args_piece,
+                    )
 
-                    provider_metadata = _gemini_tool_call_provider_metadata(raw_tc)
-                    if provider_metadata:
-                        existing_metadata = entry.get("provider_metadata")
-                        entry["provider_metadata"] = _merge_provider_metadata(
-                            existing_metadata if isinstance(existing_metadata, dict) else None,
-                            provider_metadata,
-                        )
-
-                    fn = raw_tc.get("function")
-                    if not isinstance(fn, dict):
-                        continue
-                    name = fn.get("name")
-                    if isinstance(name, str) and name:
-                        entry["name"] = name
-                    args_piece = fn.get("arguments")
-                    if isinstance(args_piece, str):
-                        entry["arguments"] += _stream_delta_suffix(
-                            previous=entry["arguments"],
-                            incoming=args_piece,
-                        )
-        finally:
-            if callable(_clear_abort):
-                _clear_abort()
-        if _is_cancelled():
+        if callable(_clear_abort):
+            _clear_abort()
+        if cancellation_token is not None and getattr(cancellation_token, "is_cancelled", False):
             # Stream ended because the abort closed it (clean EOF, not an error).
             raise KeyboardInterrupt("cancelled_by_user")
         if not saw_done:
             raise LLMError("LLM stream truncated before [DONE]")
         streamed_tool_calls = _parse_stream_tool_calls(tool_chunks)
         streamed_content = "".join(content_parts)
-        if not streamed_content.strip() and not streamed_tool_calls:
-            # Reasoning-only completion (see _reasoning_fallback_content): the
-            # model streamed its answer in the reasoning channel and emitted no
-            # content deltas. Use the accumulated reasoning so the turn does not
-            # degrade to the static clarification fallback.
-            reasoning_text = "".join(reasoning_parts)
-            if reasoning_text.strip():
-                streamed_content = reasoning_text
+        reasoning_message = {
+            _DEEPSEEK_REASONING_CONTENT_KEY: "".join(reasoning_parts),
+            _OPENROUTER_REASONING_KEY: "".join(reasoning_parts),
+            _OPENROUTER_REASONING_DETAILS_KEY: reasoning_details,
+            "content": mistral_content_chunks,
+        }
         return LLMResponse(
             content=streamed_content,
             tool_calls=streamed_tool_calls,
@@ -1418,11 +2578,11 @@ class OpenAICompatClient:
             usage=usage,
             provider_metadata=_provider_metadata_for_reasoning(
                 provider_key=provider_key,
-                message={
-                    _DEEPSEEK_REASONING_CONTENT_KEY: "".join(reasoning_parts),
-                    _OPENROUTER_REASONING_KEY: "".join(reasoning_parts),
-                    _OPENROUTER_REASONING_DETAILS_KEY: reasoning_details,
-                },
+                message=reasoning_message,
+            ),
+            reasoning=_reasoning_outputs_from_message(
+                reasoning_message,
+                provider_key=provider_key,
             ),
         )
 
@@ -1436,6 +2596,4 @@ class OpenAICompatClient:
             body = resp.text
         except Exception:
             body = "<unable to read response body>"
-        if len(body) > 1000:
-            body = body[:1000] + "...(truncated)"
         return body

@@ -42,7 +42,16 @@ from ..profile_presets import (
     preset_selection_label,
     provider_selection_presets,
 )
-from ..profiles import ProfileSpec, add_profile, set_active_profile, update_profile
+from ..profiles import (
+    SUBSCRIPTION_SELECTION_REQUIRED_KEY,
+    ProfileSpec,
+    active_subscription_selection_ready,
+    add_profile,
+    get_profile,
+    set_active_profile,
+    subscription_selection_supported,
+    update_profile,
+)
 from ..provider_diagnostics import provider_diagnostic_warning_lines
 from ..sandbox_doctor import (
     BubblewrapInstallPlan,
@@ -59,6 +68,11 @@ from ..surface.console import make_console
 from ..workspace_binding import WorkspaceBindingError, resolve_workspace_binding
 
 _DEFAULT_WORKSPACE_KEY = "default_workspace_path"
+# Explicit "the user has completed first-run setup" marker. Persisted here (and
+# read by the first-run gate in commands/startup.py) so that whether to route a
+# launch into setup no longer relies on the unreliable "a model happens to be
+# configured" heuristic.
+_ONBOARDED_KEY = "onboarded"
 _CUSTOM_MODEL_VALUE = "__custom_model__"
 _INHERIT_DEFAULT_MODEL_VALUE = "__inherit_default_model__"
 _CUSTOM_PROVIDER_KEY = "custom"
@@ -68,6 +82,9 @@ _VALIDATION_TIMEOUT_S = 8.0
 _GEMINI_VALIDATION_TIMEOUT_S = 20.0
 _GEMINI_VALIDATION_REASONING_EFFORT = "low"
 _ADVANCED_PROVIDER_PRESETS_VALUE = "__advanced_provider_presets__"
+_NATIVE_EXECUTION_VALUE = "__native_execution__"
+_SUBSCRIPTION_EXECUTION_VALUE = "__subscription_execution__"
+_RUNTIME_EXECUTION_PREFIX = "runtime:"
 
 _ValidationStatus = Literal[
     "validated",
@@ -84,6 +101,21 @@ class _SetupCancelled(Exception):
 
 class _GoBack(Exception):
     """Raised by a wizard step when the user pressed Esc to go back."""
+
+
+@dataclass(frozen=True)
+class _ExecutionStepResult:
+    backend: Literal["native", "delegated"]
+    runtime: str | None = None
+    label: str = "API key"
+    description: str = ""
+    auth_hint: str = ""
+
+
+@dataclass(frozen=True)
+class _DelegatedAuthResult:
+    connected: bool
+    summary: str
 
 
 @dataclass(frozen=True)
@@ -153,21 +185,35 @@ def run_setup_wizard() -> bool:
             "Use Ctrl+C to cancel.[/dim]"
         )
 
+    execution_result: _ExecutionStepResult | None = None
     profile_result: _ProfileStepResult | None = None
     api_key_result: _ApiKeyStepResult | None = None
     model_result: _ModelStepResult | None = None
     router_model_result: _RouterModelStepResult | None = None
     workspace_result: _WorkspaceStepResult | None = None
-    steps = ("welcome", "profile", "api_key", "model", "router_model", "workspace")
     step_idx = 0
 
     try:
-        while step_idx < len(steps):
+        while True:
+            steps = _setup_step_names(execution_result)
+            if step_idx >= len(steps):
+                break
             step_name = steps[step_idx]
             try:
                 if step_name == "welcome":
                     _print_welcome(console)
                     _wait_to_begin()
+                elif step_name == "execution":
+                    previous_execution = execution_result
+                    execution_result = _prompt_execution(
+                        console,
+                        previous=previous_execution,
+                    )
+                    if previous_execution is not None and execution_result != previous_execution:
+                        profile_result = None
+                        api_key_result = None
+                        model_result = None
+                        router_model_result = None
                 elif step_name == "profile":
                     previous_profile = profile_result
                     new_profile = _prompt_profile(console, previous=previous_profile)
@@ -218,14 +264,39 @@ def run_setup_wizard() -> bool:
                     raise _SetupCancelled() from None
                 continue
 
+        if execution_result is None or workspace_result is None:
+            raise ConfigError("Setup did not collect all required inputs.")
+
+        if execution_result.backend == "delegated":
+            cfg = _commit_delegated_setup(
+                execution_result=execution_result,
+                workspace_result=workspace_result,
+                console=console,
+            )
+            auth_result = _maybe_connect_delegated_runtime(
+                console=console,
+                cfg=cfg,
+                execution_result=execution_result,
+            )
+            if cfg.execution.backend == "native":
+                _print_provider_diagnostic_warnings(console, cfg)
+                _prompt_and_check_sandbox(console, cfg)
+            _print_delegated_setup_complete(
+                console=console,
+                execution_result=execution_result,
+                workspace_result=workspace_result,
+                auth_result=auth_result,
+                cfg=cfg,
+            )
+            return True
+
         if (
             profile_result is None
             or api_key_result is None
             or model_result is None
             or router_model_result is None
-            or workspace_result is None
         ):
-            raise ConfigError("Setup did not collect all required inputs.")
+            raise ConfigError("Setup did not collect all required native-provider inputs.")
 
         cfg = _commit_setup(
             profile_result=profile_result,
@@ -317,13 +388,12 @@ def _resolve_console() -> Console:
 def _print_welcome(console: Console) -> None:
     body = Group(
         Text("Sylliptor is a coding agent that runs in your terminal."),
-        Text("To get started we need five things:"),
+        Text("First choose how you want to connect Sylliptor to AI models."),
         Text(""),
-        Text(" 1. A provider profile  (OpenAI, DeepSeek, Anthropic, local, or custom)"),
-        Text(" 2. An API key          (from your provider's dashboard)"),
-        Text(" 3. A default model     (picked from the provider's supported presets)"),
-        Text(" 4. A router model      (optional; inherit default or choose a cheaper model)"),
-        Text(" 5. A workspace folder  (the project you want to work on)"),
+        Text(" API key: connect directly to a supported model provider."),
+        Text(" AI subscription: sign in through a supported provider's official client."),
+        Text(""),
+        Text("Both paths ask for the workspace folder you want to work on."),
         Text(""),
         Text("[Enter] begin  [Esc] cancel", style="dim"),
     )
@@ -335,6 +405,137 @@ def _wait_to_begin() -> None:
     value = _esc_aware_text_input("Press Enter to begin", default="", show_default=False)
     if _is_cancel_token(value):
         raise _GoBack()
+
+
+def _runtime_setup_options() -> tuple[Any, ...]:
+    from ..provider_auth import provider_auth_setup_options
+
+    return tuple(provider_auth_setup_options())
+
+
+def _connection_method_picker_rows() -> list[tuple[str, str, str]]:
+    return [
+        (
+            _NATIVE_EXECUTION_VALUE,
+            "Use an API key",
+            "Connect directly to a supported model provider.",
+        ),
+        (
+            _SUBSCRIPTION_EXECUTION_VALUE,
+            "Use an AI subscription",
+            "Sign in through a supported provider's official client.",
+        ),
+    ]
+
+
+def _subscription_picker_rows() -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for option in _runtime_setup_options():
+        runtime_id = str(getattr(option, "id", "") or "").strip()
+        label = str(getattr(option, "label", "") or runtime_id).strip()
+        description = str(getattr(option, "description", "") or "").strip()
+        if not runtime_id or not label:
+            continue
+        rows.append((f"{_RUNTIME_EXECUTION_PREFIX}{runtime_id}", label, description))
+    return rows
+
+
+def _runtime_setup_option(runtime_id: str) -> Any:
+    normalized = str(runtime_id or "").strip()
+    for option in _runtime_setup_options():
+        if str(getattr(option, "id", "") or "").strip() == normalized:
+            return option
+    raise ConfigError(f"Unknown AI subscription connection: {normalized or '(empty)'}")
+
+
+def _execution_result_from_value(value: str) -> _ExecutionStepResult:
+    selected = str(value or "").strip()
+    if selected == _NATIVE_EXECUTION_VALUE:
+        return _ExecutionStepResult(backend="native")
+    if not selected.startswith(_RUNTIME_EXECUTION_PREFIX):
+        raise ConfigError(f"Unknown connection method: {selected or '(empty)'}")
+    runtime_id = selected.removeprefix(_RUNTIME_EXECUTION_PREFIX).strip()
+    option = _runtime_setup_option(runtime_id)
+    return _ExecutionStepResult(
+        backend="delegated",
+        runtime=runtime_id,
+        label=str(getattr(option, "label", "") or runtime_id).strip(),
+        description=str(getattr(option, "description", "") or "").strip(),
+        auth_hint=str(getattr(option, "auth_hint", "") or "").strip(),
+    )
+
+
+def _prompt_execution(
+    console: Console,
+    *,
+    previous: _ExecutionStepResult | None = None,
+) -> _ExecutionStepResult:
+    current_method = (
+        _SUBSCRIPTION_EXECUTION_VALUE
+        if previous is not None and previous.backend == "delegated"
+        else _NATIVE_EXECUTION_VALUE
+    )
+    while True:
+        selected_method = _run_wizard_picker(
+            console=console,
+            title="Connection Method",
+            subtitle="How would you like to connect Sylliptor to AI models?",
+            rows=_connection_method_picker_rows(),
+            current_value=current_method,
+            cancel_hint="back",
+            invalid_hint="Pick a connection method or press Esc to go back.",
+        )
+        if selected_method is None:
+            raise _GoBack()
+        if selected_method == _NATIVE_EXECUTION_VALUE:
+            result = _execution_result_from_value(selected_method)
+            console.print("[green]Connection method selected:[/green] Use an API key")
+            return result
+        if selected_method != _SUBSCRIPTION_EXECUTION_VALUE:
+            raise ConfigError(f"Unknown connection method: {selected_method or '(empty)'}")
+
+        rows = _subscription_picker_rows()
+        if not rows:
+            raise ConfigError("No AI subscription connections are available.")
+        current_runtime = rows[0][0]
+        if previous is not None and previous.backend == "delegated" and previous.runtime:
+            previous_runtime = f"{_RUNTIME_EXECUTION_PREFIX}{previous.runtime}"
+            if any(value == previous_runtime for value, _label, _description in rows):
+                current_runtime = previous_runtime
+        selected_runtime = _run_wizard_picker(
+            console=console,
+            title="AI Subscription",
+            subtitle="Choose the subscription you want to connect.",
+            rows=rows,
+            current_value=current_runtime,
+            cancel_hint="connection methods",
+            invalid_hint="Pick an AI subscription or press Esc to go back.",
+        )
+        if selected_runtime is None:
+            current_method = _SUBSCRIPTION_EXECUTION_VALUE
+            continue
+        result = _execution_result_from_value(selected_runtime)
+        console.print("[green]Connection method selected:[/green] Use an AI subscription")
+        console.print(f"[green]Subscription selected:[/green] {result.label}")
+        return result
+
+
+def _setup_step_names(
+    execution_result: _ExecutionStepResult | None,
+) -> tuple[str, ...]:
+    if execution_result is None:
+        return ("welcome", "execution")
+    if execution_result.backend == "delegated":
+        return ("welcome", "execution", "workspace")
+    return (
+        "welcome",
+        "execution",
+        "profile",
+        "api_key",
+        "model",
+        "router_model",
+        "workspace",
+    )
 
 
 def _prompt_profile(
@@ -363,7 +564,7 @@ def _prompt_profile(
         selected = _run_wizard_picker(
             console=console,
             title="Advanced Provider Profile",
-            subtitle="Pick a compatibility, gateway, local, custom, or legacy provider preset.",
+            subtitle="Pick a local, custom, or legacy OpenAI-compatible provider preset.",
             rows=advanced_rows,
             current_value=advanced_rows[0][0] if advanced_rows else "openai",
             cancel_hint="back",
@@ -417,10 +618,20 @@ def _prompt_custom_profile(previous: ProfileSpec | None = None) -> ProfileSpec:
     headers = _prompt_extra_headers(previous.extra_headers if previous is not None else None)
     return ProfileSpec(
         name=name,
-        protocol="openai_compat",
+        protocol=previous.protocol if previous is not None else "openai_compat",
         base_url=base_url,
+        api_key_env=previous.api_key_env if previous is not None else None,
+        auth_provider=previous.auth_provider if previous is not None else None,
         extra_headers=headers,
+        default_model=previous.default_model if previous is not None else "",
+        reasoning_effort=previous.reasoning_effort if previous is not None else None,
+        reasoning_trace_adapter=(
+            previous.reasoning_trace_adapter if previous is not None else "auto"
+        ),
+        web_search_adapter=previous.web_search_adapter if previous is not None else "auto",
+        web_search_model=previous.web_search_model if previous is not None else "",
         notes=previous.notes if previous is not None else "Custom OpenAI-compatible endpoint.",
+        cache_capability=previous.cache_capability if previous is not None else None,
     )
 
 
@@ -623,6 +834,8 @@ def _validate_api_key(
         api_key_env=profile.api_key_env,
         extra_headers=dict(profile.extra_headers),
         default_model=resolved_validation_model.model,
+        reasoning_effort=profile.reasoning_effort,
+        reasoning_trace_adapter=profile.reasoning_trace_adapter,
         web_search_adapter=profile.web_search_adapter,
         web_search_model=profile.web_search_model,
         notes=profile.notes,
@@ -1014,8 +1227,8 @@ def _router_model_picker_rows(
     rows: list[tuple[str, str, str]] = [
         (
             _INHERIT_DEFAULT_MODEL_VALUE,
-            "Inherit default model",
-            f"Use default model {default_model_result.model}",
+            "Same as default model (recommended)",
+            f"Use {default_model_result.model} now and follow future default-model changes",
         )
     ]
     seen: set[str] = {_INHERIT_DEFAULT_MODEL_VALUE}
@@ -1148,6 +1361,8 @@ def _commit_setup(
     snapshots = [_snapshot_file(config_path()), _snapshot_file(credentials_path())]
     try:
         cfg = load_config()
+        cfg.execution.backend = "native"
+        cfg.execution.runtime = None
         add_profile(cfg, profile_result.profile)
         set_active_profile(cfg, profile_result.profile.name)
         set_config_value(cfg, "model", model_result.model)
@@ -1159,6 +1374,8 @@ def _commit_setup(
         update_profile(cfg, profile_result.profile.name, default_model=model_result.model)
         extra_fields = dict(cfg.extra_fields or {})
         extra_fields[_DEFAULT_WORKSPACE_KEY] = workspace_result.workspace
+        extra_fields[_ONBOARDED_KEY] = True
+        extra_fields.pop("subscription_reconnect_required", None)
         cfg.extra_fields = extra_fields
         save_config(cfg)
         if api_key_result.api_key:
@@ -1175,6 +1392,192 @@ def _commit_setup(
                 f"Failed to save setup: {exc}. Rollback also failed; inspect config and credentials files manually."
             ) from exc
         raise ConfigError(f"Failed to save setup: {exc}") from exc
+
+
+def _commit_delegated_setup(
+    *,
+    execution_result: _ExecutionStepResult,
+    workspace_result: _WorkspaceStepResult,
+    console: Console,
+) -> AppConfig:
+    runtime_id = str(execution_result.runtime or "").strip()
+    if execution_result.backend != "delegated" or not runtime_id:
+        raise ConfigError("AI subscription setup requires a provider connection.")
+
+    snapshots = [_snapshot_file(config_path()), _snapshot_file(credentials_path())]
+    try:
+        from ..config import AgentRuntimeSettings
+
+        option = _runtime_setup_option(runtime_id)
+        cfg = load_config()
+        if _is_direct_subscription(runtime_id):
+            profile = _direct_subscription_profile(cfg, runtime_id)
+            add_profile(cfg, profile, allow_auth_profile_update=True)
+            set_active_profile(cfg, profile.name)
+            cfg.execution.backend = "native"
+            cfg.execution.runtime = None
+            cfg.model = profile.default_model
+            effective_effort = (
+                None if profile.reasoning_effort in {None, "auto"} else profile.reasoning_effort
+            )
+            cfg.llm_reasoning_effort = effective_effort
+            cfg.llm_enable_thinking = (
+                None if effective_effort is None else effective_effort != "none"
+            )
+        else:
+            cfg.execution.backend = "delegated"
+            cfg.execution.runtime = runtime_id
+            if runtime_id not in cfg.agent_runtimes:
+                cfg.agent_runtimes[runtime_id] = AgentRuntimeSettings(
+                    adapter=str(getattr(option, "adapter", "") or "").strip(),
+                    executable=str(getattr(option, "default_executable", "") or "").strip(),
+                )
+        extra_fields = dict(cfg.extra_fields or {})
+        extra_fields[_DEFAULT_WORKSPACE_KEY] = workspace_result.workspace
+        if _is_direct_subscription(runtime_id):
+            extra_fields[_ONBOARDED_KEY] = False
+            extra_fields["subscription_reconnect_required"] = True
+            if not profile.default_model or profile.reasoning_effort is None:
+                extra_fields[SUBSCRIPTION_SELECTION_REQUIRED_KEY] = runtime_id
+        else:
+            extra_fields[_ONBOARDED_KEY] = True
+            extra_fields.pop("subscription_reconnect_required", None)
+        cfg.extra_fields = extra_fields
+        save_config(cfg)
+        console.print("[green]Setup saved.[/green]")
+        return cfg
+    except (ConfigError, OSError, ValueError) as exc:
+        rollback_errors = _rollback_partial_persistence(snapshots)
+        console.print(f"[red]Failed to save setup:[/red] {exc}")
+        if rollback_errors:
+            for error in rollback_errors:
+                console.print(f"[red]Rollback failed:[/red] {error}")
+            raise ConfigError(
+                f"Failed to save setup: {exc}. Rollback also failed; inspect config and credentials files manually."
+            ) from exc
+        raise ConfigError(f"Failed to save setup: {exc}") from exc
+
+
+def _delegated_runtime_id(execution_result: _ExecutionStepResult) -> str:
+    runtime_id = str(execution_result.runtime or "").strip()
+    if execution_result.backend != "delegated" or not runtime_id:
+        raise ConfigError("AI subscription setup requires a provider connection.")
+    return runtime_id
+
+
+def _delegated_auth_result(account: Any) -> _DelegatedAuthResult:
+    connected = bool(
+        getattr(account, "verified", True)
+        and (getattr(account, "authenticated", False) or getattr(account, "connected", False))
+    )
+    label = str(getattr(account, "account_label", "") or "").strip()
+    detail = str(getattr(account, "detail", "") or "").strip()
+    if connected:
+        summary = f"connected as {label}" if label else "connected"
+        if detail and detail.casefold() not in summary.casefold():
+            summary += f" ({detail})"
+        return _DelegatedAuthResult(connected=True, summary=summary)
+    summary = "not connected"
+    if detail:
+        summary += f" ({detail})"
+    return _DelegatedAuthResult(connected=False, summary=summary)
+
+
+def _check_delegated_runtime_connection(
+    cfg: AppConfig,
+    execution_result: _ExecutionStepResult,
+) -> _DelegatedAuthResult:
+    """Read the provider runtime's opaque account status without accessing credentials."""
+
+    runtime_id = _delegated_runtime_id(execution_result)
+    try:
+        if _is_direct_subscription(runtime_id):
+            from ..provider_auth import create_provider_auth
+
+            return _delegated_auth_result(create_provider_auth(runtime_id).account_status())
+        from ..agent_runtimes.service import runtime_connection_snapshot
+
+        snapshot = runtime_connection_snapshot(cfg, runtime_id)
+    except Exception as exc:  # noqa: BLE001 - setup must survive unavailable runtimes
+        return _DelegatedAuthResult(
+            connected=False,
+            summary=f"not connected (status check failed: {exc})",
+        )
+    return _delegated_auth_result(snapshot.account)
+
+
+def _login_delegated_runtime(
+    cfg: AppConfig,
+    execution_result: _ExecutionStepResult,
+) -> _DelegatedAuthResult:
+    """Run provider-owned browser login and return only its opaque account status."""
+
+    runtime_id = _delegated_runtime_id(execution_result)
+    try:
+        if _is_direct_subscription(runtime_id):
+            from ..provider_auth import create_provider_auth
+
+            adapter = create_provider_auth(runtime_id)
+            account = adapter.login(method="browser")
+            if account.connected:
+                _sync_direct_subscription_model(cfg, runtime_id, adapter=adapter)
+            return _delegated_auth_result(account)
+        from ..agent_runtimes.service import login_runtime
+
+        account = login_runtime(cfg, runtime_id, method_id="browser")
+    except Exception as exc:  # noqa: BLE001 - login is optional after config was saved
+        return _DelegatedAuthResult(
+            connected=False,
+            summary=f"not connected ({exc})",
+        )
+    return _delegated_auth_result(account)
+
+
+def _maybe_connect_delegated_runtime(
+    *,
+    console: Console,
+    cfg: AppConfig,
+    execution_result: _ExecutionStepResult,
+) -> _DelegatedAuthResult:
+    runtime_id = _delegated_runtime_id(execution_result)
+    auth_result = _check_delegated_runtime_connection(cfg, execution_result)
+    if auth_result.connected:
+        if _is_direct_subscription(runtime_id):
+            try:
+                _sync_direct_subscription_model(cfg, runtime_id)
+            except Exception as exc:  # noqa: BLE001
+                return _DelegatedAuthResult(
+                    connected=False,
+                    summary=f"connected, but model discovery failed ({exc})",
+                )
+        console.print(f"[green]Subscription account already {auth_result.summary}.[/green]")
+        return auth_result
+
+    console.print()
+    console.print(
+        "[yellow]Provider login is an immediate external side effect. "
+        "Cancelling or going back later does not undo it.[/yellow]"
+    )
+    try:
+        connect = _prompt_yes_no("Connect now? [Y/n]", default=True)
+    except (_GoBack, KeyboardInterrupt, Abort, EOFError):
+        console.print(
+            "[yellow]Your model access settings are already saved; provider sign-in was skipped.[/yellow]"
+        )
+        console.print(f"[dim]Run `sylliptor auth login {runtime_id}` whenever you're ready.[/dim]")
+        return auth_result
+    if not connect:
+        console.print(f"[dim]Run `sylliptor auth login {runtime_id}` whenever you're ready.[/dim]")
+        return auth_result
+
+    console.print("[dim]Starting the provider's browser login…[/dim]")
+    auth_result = _login_delegated_runtime(cfg, execution_result)
+    if auth_result.connected:
+        console.print(f"[green]Subscription account {auth_result.summary}.[/green]")
+    else:
+        console.print(f"[yellow]Subscription account {auth_result.summary}.[/yellow]")
+        console.print(f"[dim]Finish later with `sylliptor auth login {runtime_id}`.[/dim]")
+    return auth_result
 
 
 def _snapshot_file(path: Path) -> _FileSnapshot:
@@ -1455,6 +1858,132 @@ def _print_setup_complete(
     )
 
 
+def _print_delegated_setup_complete(
+    *,
+    console: Console,
+    execution_result: _ExecutionStepResult,
+    workspace_result: _WorkspaceStepResult,
+    auth_result: _DelegatedAuthResult,
+    cfg: AppConfig | None = None,
+) -> None:
+    runtime_id = str(execution_result.runtime or "").strip()
+    auth_hint = execution_result.auth_hint
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("label", no_wrap=True, style="bold")
+    table.add_column("value")
+    table.add_row("Connection:", "AI subscription")
+    table.add_row("Subscription:", execution_result.label)
+    table.add_row("Workspace:", workspace_result.workspace)
+    if cfg is not None and cfg.execution.backend == "native":
+        if active_subscription_selection_ready(cfg):
+            active = get_profile(cfg, str(cfg.extra_fields.get("active_profile") or ""))
+            table.add_row("Model:", active.default_model if active is not None else cfg.model)
+            if active is not None and active.reasoning_effort is not None:
+                table.add_row("Reasoning:", active.reasoning_effort)
+        else:
+            table.add_row("Model setup:", "Choose model and reasoning in /config")
+    table.add_row(
+        "Authentication:",
+        Text(auth_result.summary, style="green" if auth_result.connected else "yellow"),
+    )
+    next_step = (
+        Text("Your AI subscription is connected.", style="dim")
+        if auth_result.connected
+        else Text(
+            f"Next: run `sylliptor auth login {runtime_id}` before using this subscription.",
+            style="yellow",
+        )
+    )
+    console.print()
+    console.print(
+        Panel(
+            Group(
+                table,
+                Text(""),
+                next_step,
+                Text(auth_hint, style="dim") if auth_hint else Text(""),
+                Text(
+                    "Use /config → Default Model to choose the subscription model and reasoning effort.",
+                    style="dim",
+                ),
+            ),
+            title="Setup complete",
+            border_style="green",
+        )
+    )
+
+
+def _is_direct_subscription(runtime_id: str) -> bool:
+    from ..provider_auth import provider_auth_ids
+
+    return str(runtime_id or "").strip() in provider_auth_ids()
+
+
+def _direct_subscription_profile(cfg: AppConfig, runtime_id: str) -> ProfileSpec:
+    if not _is_direct_subscription(runtime_id):
+        raise ConfigError(f"No native subscription profile is registered for {runtime_id!r}.")
+    from ..provider_auth import create_provider_auth
+
+    adapter = create_provider_auth(runtime_id)
+    existing = get_profile(cfg, adapter.profile_name)
+    if existing is not None and existing.auth_provider == runtime_id:
+        return ProfileSpec(
+            name=existing.name,
+            protocol=adapter.protocol,
+            base_url=adapter.base_url,
+            api_key_env=existing.api_key_env,
+            auth_provider=runtime_id,
+            extra_headers=dict(existing.extra_headers),
+            default_model=existing.default_model,
+            reasoning_effort=existing.reasoning_effort,
+            reasoning_trace_adapter=existing.reasoning_trace_adapter,
+            web_search_adapter=existing.web_search_adapter,
+            web_search_model=existing.web_search_model,
+            notes=existing.notes,
+            cache_capability=existing.cache_capability,
+        )
+    return ProfileSpec(
+        name=adapter.profile_name,
+        protocol=adapter.protocol,
+        base_url=adapter.base_url,
+        auth_provider=runtime_id,
+        notes=f"{adapter.display_name}. Uses Sylliptor's native agent loop.",
+    )
+
+
+def _sync_direct_subscription_model(
+    cfg: AppConfig,
+    runtime_id: str,
+    *,
+    adapter: Any | None = None,
+) -> None:
+    """Refresh the catalog and preserve only a /config-confirmed selection."""
+
+    if not _is_direct_subscription(runtime_id):
+        return
+    from ..provider_auth import create_provider_auth
+
+    resolved_adapter = adapter or create_provider_auth(runtime_id)
+    models = resolved_adapter.list_models(refresh=True)
+    if not models:
+        raise ConfigError("The connected subscription account did not advertise any models.")
+    profile_name = str(getattr(resolved_adapter, "profile_name", "") or "").strip()
+    if not profile_name:
+        raise ConfigError(f"Subscription adapter {runtime_id!r} has no profile name.")
+    profile = get_profile(cfg, profile_name)
+    if profile is None:
+        raise ConfigError(f"Subscription profile {profile_name!r} is missing.")
+    confirmation_pending = str(
+        cfg.extra_fields.get(SUBSCRIPTION_SELECTION_REQUIRED_KEY) or ""
+    ).strip().lower() in {"true", runtime_id}
+    selection_ready = subscription_selection_supported(profile, models) and not confirmation_pending
+    cfg.extra_fields[_ONBOARDED_KEY] = selection_ready
+    cfg.extra_fields.pop("subscription_reconnect_required", None)
+    if not selection_ready:
+        cfg.extra_fields[SUBSCRIPTION_SELECTION_REQUIRED_KEY] = runtime_id
+    save_config(cfg)
+
+
 def _api_key_summary_label(api_key_result: _ApiKeyStepResult) -> Text:
     if not api_key_result.api_key:
         return Text("not stored", style="yellow")
@@ -1607,9 +2136,9 @@ def _provider_picker_rows(presets: list[ProfilePreset]) -> list[tuple[str, str, 
     rows.append(
         (
             _ADVANCED_PROVIDER_PRESETS_VALUE,
-            "Advanced / gateway / legacy providers",
-            "Show OpenAI-compatible gateways, local endpoints, custom endpoints, and legacy "
-            "first-party compatibility presets.",
+            "Advanced / local / compatibility providers",
+            "Show local endpoints (Ollama, LM Studio, vLLM), custom URLs, and legacy "
+            "OpenAI-compatible first-party presets.",
         )
     )
     return rows

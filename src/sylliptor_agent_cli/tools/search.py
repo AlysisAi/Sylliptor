@@ -21,6 +21,8 @@ _RG_NO_CONFIG_SUPPORTED: bool | None = None
 _SEARCH_RG_MAX_MATCHES_PER_FILE = 8
 _SEARCH_RG_MAX_MATCH_TEXT_CHARS = 240
 _SEARCH_RG_MAX_OUTPUT_CHARS = 12_000
+_SEARCH_RG_MAX_CONTEXT_LINES = 5
+_SEARCH_RG_MAX_RESULTS = 500
 _RG_PROBE_TIMEOUT_S = 2.0
 _SEARCH_RG_TIMEOUT_S = 15.0
 
@@ -86,18 +88,131 @@ def _matches_globs(rel_path: str, globs: list[str] | None) -> bool:
     return any(fnmatch.fnmatchcase(rel_path, pattern) for pattern in globs)
 
 
-def _iter_candidate_files(*, root: Path, base: Path, globs: list[str] | None):
+def _is_hidden_relpath(rel_path: str) -> bool:
+    return any(part.startswith(".") and part not in {"", ".", ".."} for part in rel_path.split("/"))
+
+
+def _iter_candidate_files(
+    *,
+    root: Path,
+    base: Path,
+    globs: list[str] | None,
+    include_hidden: bool,
+):
     if base.is_file():
         # ripgrep does not apply --glob filtering to an explicitly targeted file path
         yield base
         return
 
-    for path in base.rglob("*"):
-        if not path.is_file():
-            continue
-        rel = _rel_path(base, path)
-        if _matches_globs(rel, globs):
-            yield path
+    for current_root, dirnames, filenames in os.walk(base):
+        if not include_hidden:
+            dirnames[:] = sorted(dirname for dirname in dirnames if not dirname.startswith("."))
+        else:
+            dirnames[:] = sorted(dirnames)
+        for filename in sorted(filenames):
+            path = Path(current_root) / filename
+            if not path.is_file():
+                continue
+            rel = _rel_path(root, path)
+            if not include_hidden and _is_hidden_relpath(rel):
+                continue
+            base_rel = _rel_path(base, path)
+            if _matches_globs(base_rel, globs):
+                yield path
+
+
+def _context_entries_from_lines(
+    lines: list[str],
+    *,
+    line_number: int,
+    before_context: int,
+    after_context: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    before: list[dict[str, Any]] = []
+    after: list[dict[str, Any]] = []
+    text_truncated = False
+    line_index = min(max(0, line_number - 1), len(lines))
+
+    before_start = max(0, line_index - before_context)
+    for index in range(before_start, line_index):
+        clipped_text, clipped = _clip_match_text(lines[index])
+        before.append({"line": index + 1, "text": clipped_text})
+        text_truncated = text_truncated or clipped
+
+    after_end = min(len(lines), line_index + 1 + after_context)
+    for index in range(line_index + 1, after_end):
+        clipped_text, clipped = _clip_match_text(lines[index])
+        after.append({"line": index + 1, "text": clipped_text})
+        text_truncated = text_truncated or clipped
+
+    return before, after, text_truncated
+
+
+def _safe_bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _read_context_lines(
+    *,
+    root: Path,
+    path: Path,
+    cache: dict[str, list[str] | None],
+) -> list[str] | None:
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    key = os.fspath(resolved)
+    if key in cache:
+        return cache[key]
+    try:
+        if resolved.stat().st_size > 1024 * 1024:
+            cache[key] = None
+            return None
+        cache[key] = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        cache[key] = None
+    return cache[key]
+
+
+def _compile_python_matcher(*, pattern: str, literal: bool, case_sensitive: bool):
+    if literal:
+        needle = pattern if case_sensitive else pattern.casefold()
+
+        def _literal_matches(line: str) -> bool:
+            haystack = line if case_sensitive else line.casefold()
+            return needle in haystack
+
+        return _literal_matches
+
+    flags = 0 if case_sensitive else re.IGNORECASE
+    try:
+        rx = re.compile(pattern, flags=flags)
+    except re.error as e:
+        raise SearchError(f"Invalid regex: {e}") from e
+
+    return rx.search
+
+
+def _rg_output_path_to_context_path(*, raw_path: str, root: Path) -> Path:
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path
+    return (root / path).resolve()
+
+
+def _rg_rel_path(*, raw_path: str, root: Path) -> str:
+    path = Path(raw_path)
+    target = path if path.is_absolute() else root / path
+    try:
+        return os.fspath(target.resolve().relative_to(root)).replace("\\", "/")
+    except (OSError, ValueError):
+        return raw_path.replace("\\", "/")
 
 
 def _queue_text_stream_lines(
@@ -149,6 +264,11 @@ def search_rg(
     root_path: str = ".",
     globs: list[str] | None = None,
     max_results: int = 200,
+    before_context: int = 0,
+    after_context: int = 0,
+    literal: bool = False,
+    case_sensitive: bool = True,
+    include_hidden: bool = False,
 ) -> dict[str, Any]:
     root_abs = root.resolve()
     base = (root_abs / root_path).resolve()
@@ -159,14 +279,33 @@ def search_rg(
     if pattern == "":
         raise SearchError("pattern must be a non-empty string")
 
-    safe_max_results = max(1, int(max_results))
+    safe_max_results = _safe_bounded_int(
+        max_results,
+        default=200,
+        minimum=1,
+        maximum=_SEARCH_RG_MAX_RESULTS,
+    )
+    safe_before_context = _safe_bounded_int(
+        before_context,
+        default=0,
+        minimum=0,
+        maximum=_SEARCH_RG_MAX_CONTEXT_LINES,
+    )
+    safe_after_context = _safe_bounded_int(
+        after_context,
+        default=0,
+        minimum=0,
+        maximum=_SEARCH_RG_MAX_CONTEXT_LINES,
+    )
     cleaned_globs = _clean_globs(globs)
     matches: list[dict[str, Any]] = []
     per_file_match_counts: dict[str, int] = defaultdict(int)
+    context_cache: dict[str, list[str] | None] = {}
     output_chars = 0
     truncated = False
     per_file_truncated = False
     match_text_truncated = False
+    context_text_truncated = False
 
     def _timeout_message(*, backend: str) -> str:
         return (
@@ -174,8 +313,15 @@ def search_rg(
             "try a narrower root_path, globs, or pattern"
         )
 
-    def _append_match(*, path: str, line_number: int, line_text: str) -> str:
+    def _append_match(
+        *,
+        path: str,
+        line_number: int,
+        line_text: str,
+        context_lines: list[str] | None = None,
+    ) -> str:
         nonlocal output_chars, truncated, per_file_truncated, match_text_truncated
+        nonlocal context_text_truncated
         if per_file_match_counts[path] >= _SEARCH_RG_MAX_MATCHES_PER_FILE:
             truncated = True
             per_file_truncated = True
@@ -189,6 +335,18 @@ def search_rg(
         if clipped:
             entry["text_truncated"] = True
             match_text_truncated = True
+        if context_lines is not None and (safe_before_context or safe_after_context):
+            before, after, context_clipped = _context_entries_from_lines(
+                context_lines,
+                line_number=int(line_number),
+                before_context=safe_before_context,
+                after_context=safe_after_context,
+            )
+            if before:
+                entry["before_context"] = before
+            if after:
+                entry["after_context"] = after
+            context_text_truncated = context_text_truncated or context_clipped
         entry_chars = len(json.dumps(entry, ensure_ascii=True, separators=(",", ":")))
         if len(matches) >= safe_max_results:
             truncated = True
@@ -205,6 +363,13 @@ def search_rg(
         cmd = ["rg"]
         if _rg_supports_no_config():
             cmd.append("--no-config")
+        if literal:
+            cmd.append("--fixed-strings")
+        if not case_sensitive:
+            cmd.append("--ignore-case")
+        if include_hidden:
+            cmd.append("--hidden")
+            cmd.extend(["--glob", "!.git/**"])
         cmd.extend(
             [
                 "--json",
@@ -278,11 +443,20 @@ def search_rg(
             lines = ((data.get("lines") or {}).get("text")) or ""
             if not path or not line_number:
                 continue
-            try:
-                rel = os.fspath(Path(path).resolve().relative_to(root_abs))
-            except ValueError:
-                rel = path
-            append_status = _append_match(path=rel, line_number=int(line_number), line_text=lines)
+            rel = _rg_rel_path(raw_path=path, root=root_abs)
+            context_lines = None
+            if safe_before_context or safe_after_context:
+                context_lines = _read_context_lines(
+                    root=root_abs,
+                    path=_rg_output_path_to_context_path(raw_path=path, root=root_abs),
+                    cache=context_cache,
+                )
+            append_status = _append_match(
+                path=rel,
+                line_number=int(line_number),
+                line_text=lines,
+                context_lines=context_lines,
+            )
             if append_status == "max_results":
                 terminated_early = True
                 break
@@ -304,14 +478,20 @@ def search_rg(
             "truncated": truncated,
             "per_file_truncated": per_file_truncated,
             "match_text_truncated": match_text_truncated,
+            "context_text_truncated": context_text_truncated,
             "returned_matches": len(matches),
+            "literal": bool(literal),
+            "case_sensitive": bool(case_sensitive),
+            "include_hidden": bool(include_hidden),
+            "before_context": safe_before_context,
+            "after_context": safe_after_context,
         }
 
-    # Python fallback (regex).
-    try:
-        rx = re.compile(pattern)
-    except re.error as e:
-        raise SearchError(f"Invalid regex: {e}") from e
+    matcher = _compile_python_matcher(
+        pattern=pattern,
+        literal=bool(literal),
+        case_sensitive=bool(case_sensitive),
+    )
 
     deadline = time.monotonic() + _SEARCH_RG_TIMEOUT_S
 
@@ -319,7 +499,12 @@ def search_rg(
         if time.monotonic() >= deadline:
             raise SearchError(_timeout_message(backend="python fallback"))
 
-    for p in _iter_candidate_files(root=root_abs, base=base, globs=cleaned_globs):
+    for p in _iter_candidate_files(
+        root=root_abs,
+        base=base,
+        globs=cleaned_globs,
+        include_hidden=bool(include_hidden),
+    ):
         _raise_if_python_timeout()
         if len(matches) >= safe_max_results:
             truncated = True
@@ -335,15 +520,21 @@ def search_rg(
         except OSError:
             continue
         stop_search = False
-        for i, line in enumerate(text.splitlines(), start=1):
+        source_lines = text.splitlines()
+        for i, line in enumerate(source_lines, start=1):
             _raise_if_python_timeout()
             if len(matches) >= safe_max_results:
                 truncated = True
                 stop_search = True
                 break
-            if rx.search(line):
+            if matcher(line):
                 rel = _rel_path(root_abs, p)
-                append_status = _append_match(path=rel, line_number=i, line_text=line)
+                append_status = _append_match(
+                    path=rel,
+                    line_number=i,
+                    line_text=line,
+                    context_lines=source_lines,
+                )
                 if append_status == "max_results":
                     stop_search = True
                     break
@@ -362,5 +553,11 @@ def search_rg(
         "truncated": truncated,
         "per_file_truncated": per_file_truncated,
         "match_text_truncated": match_text_truncated,
+        "context_text_truncated": context_text_truncated,
         "returned_matches": len(matches),
+        "literal": bool(literal),
+        "case_sensitive": bool(case_sensitive),
+        "include_hidden": bool(include_hidden),
+        "before_context": safe_before_context,
+        "after_context": safe_after_context,
     }

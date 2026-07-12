@@ -19,6 +19,7 @@ from sylliptor_agent_cli.mcp import token_store as token_store_mod
 from sylliptor_agent_cli.mcp.errors import (
     McpTokenStoreCorruptError,
     McpTokenStoreMigrationError,
+    McpTokenStoreUnavailableError,
     McpTokenStoreVersionError,
 )
 from sylliptor_agent_cli.mcp.oauth import (
@@ -306,7 +307,7 @@ def test_token_store_keyring_envelope_happy_path_generates_master_key_once(
     )
 
 
-def test_token_store_weak_fallback_round_trip_logs_warning_and_persists_salt(
+def test_token_store_filesystem_random_fallback_round_trip_is_silent_and_private(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     cfg_dir = tmp_path / "cfg"
@@ -319,20 +320,80 @@ def test_token_store_weak_fallback_round_trip_logs_warning_and_persists_salt(
             "alpha", _record(access_token="access-one", refresh_token="refresh-one")
         )
 
-    salt_path = token_store_mod.weak_fallback_salt_path(mcp_oauth_token_store_path())
-    first_salt = salt_path.read_bytes()
+    key_path = token_store_mod.filesystem_master_key_path(mcp_oauth_token_store_path())
+    first_key = key_path.read_bytes()
     loaded = load_oauth_token_record("alpha")
+    loaded_again = load_oauth_token_record("alpha")
     assert loaded is not None
     assert loaded.access_token == "access-one"
-    assert salt_path.read_bytes() == first_salt
-    assert "weak-derived-fallback" in caplog.text
-    assert "weak against same-user compromise" in caplog.text
+    assert loaded_again == loaded
+    assert len(first_key) == 32
+    assert key_path.read_bytes() == first_key
+    assert "weak-derived-fallback" not in caplog.text
     _assert_encrypted_envelope(
-        expected_key_source=token_store_mod.KEY_SOURCE_WEAK_FALLBACK,
+        expected_key_source=token_store_mod.KEY_SOURCE_FILESYSTEM,
         forbidden_values=("access-one", "refresh-one"),
     )
-    if _filesystem_enforces_private_mode(salt_path):
-        assert stat.S_IMODE(salt_path.stat().st_mode) == 0o600
+    if _filesystem_enforces_private_mode(key_path):
+        assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+
+
+def test_filesystem_master_key_creation_is_race_safe(tmp_path: Path) -> None:
+    store_path = tmp_path / "oauth_tokens.json"
+    barrier = threading.Barrier(8)
+    lock = threading.Lock()
+    keys: list[bytes] = []
+    errors: list[BaseException] = []
+
+    def _load_key() -> None:
+        try:
+            barrier.wait(timeout=5)
+            material = token_store_mod._filesystem_key_material(store_path)
+            with lock:
+                keys.append(material.key)
+        except BaseException as exc:  # noqa: BLE001 - preserve worker failure for assertion
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=_load_key) for _ in range(barrier.parties)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(keys) == barrier.parties
+    assert len(set(keys)) == 1
+    key_path = token_store_mod.filesystem_master_key_path(store_path)
+    assert key_path.read_bytes() == keys[0]
+    assert not tuple(tmp_path.glob(f".{key_path.name}.*.tmp"))
+
+
+def test_filesystem_master_key_rejects_invalid_length(tmp_path: Path) -> None:
+    store_path = tmp_path / "oauth_tokens.json"
+    key_path = token_store_mod.filesystem_master_key_path(store_path)
+    key_path.write_bytes(b"too-short")
+
+    with pytest.raises(McpTokenStoreCorruptError, match="invalid length"):
+        token_store_mod._filesystem_key_material(store_path)
+
+
+def test_current_envelope_writer_rejects_legacy_deterministic_key_source(tmp_path: Path) -> None:
+    path = tmp_path / "oauth_tokens.json"
+    legacy_material = token_store_mod._KeyMaterial(
+        token_store_mod.KEY_SOURCE_WEAK_FALLBACK,
+        b"0" * 32,
+    )
+
+    with pytest.raises(McpTokenStoreUnavailableError, match="legacy key source"):
+        token_store_mod._write_encrypted_payload(
+            path,
+            _legacy_payload(),
+            key_material=legacy_material,
+        )
+
+    assert not path.exists()
 
 
 def test_token_store_keyring_read_failure_logs_without_leaking_tokens(
@@ -870,7 +931,7 @@ def test_token_store_delete_wraps_atomic_write_failures(
     assert "mcp_oauth_tokens.json" in message
 
 
-def test_token_store_reencrypts_weak_fallback_when_keyring_becomes_available(
+def test_token_store_reencrypts_filesystem_fallback_when_keyring_becomes_available(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg_dir = tmp_path / "cfg"
@@ -880,7 +941,7 @@ def test_token_store_reencrypts_weak_fallback_when_keyring_becomes_available(
     save_oauth_token_record(
         "alpha", _record(access_token="access-one", refresh_token="refresh-one")
     )
-    _assert_encrypted_envelope(expected_key_source=token_store_mod.KEY_SOURCE_WEAK_FALLBACK)
+    _assert_encrypted_envelope(expected_key_source=token_store_mod.KEY_SOURCE_FILESYSTEM)
 
     _install_memory_keyring(monkeypatch)
     loaded = load_oauth_token_record("alpha")
@@ -889,6 +950,35 @@ def test_token_store_reencrypts_weak_fallback_when_keyring_becomes_available(
     assert loaded.access_token == "access-one"
     _assert_encrypted_envelope(
         expected_key_source=token_store_mod.KEY_SOURCE_KEYRING,
+        forbidden_values=("access-one", "refresh-one"),
+    )
+
+
+def test_token_store_migrates_v1_weak_fallback_to_random_filesystem_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_dir = tmp_path / "cfg"
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(cfg_dir))
+    _disable_keyring(monkeypatch)
+    monkeypatch.setattr(token_store_mod, "_platform_system", lambda: "Linux")
+    current_version = token_store_mod.CURRENT_ENVELOPE_VERSION
+    path = mcp_oauth_token_store_path()
+    monkeypatch.setattr(token_store_mod, "CURRENT_ENVELOPE_VERSION", 1)
+    token_store_mod._write_encrypted_payload(
+        path,
+        _legacy_payload(),
+        key_material=token_store_mod._weak_fallback_key_material(path),
+    )
+    assert _read_store_envelope()["key_source"] == token_store_mod.KEY_SOURCE_WEAK_FALLBACK
+
+    monkeypatch.setattr(token_store_mod, "CURRENT_ENVELOPE_VERSION", current_version)
+    loaded = load_oauth_token_record("alpha")
+
+    assert loaded is not None
+    assert loaded.access_token == "access-one"
+    assert token_store_mod.filesystem_master_key_path(path).exists()
+    _assert_encrypted_envelope(
+        expected_key_source=token_store_mod.KEY_SOURCE_FILESYSTEM,
         forbidden_values=("access-one", "refresh-one"),
     )
 
@@ -903,7 +993,7 @@ def test_token_store_rotation_preferred_key_failure_is_best_effort(
     record = _record(access_token="secret-access", refresh_token="secret-refresh")
     save_oauth_token_record("alpha", record)
     _assert_encrypted_envelope(
-        expected_key_source=token_store_mod.KEY_SOURCE_WEAK_FALLBACK,
+        expected_key_source=token_store_mod.KEY_SOURCE_FILESYSTEM,
         forbidden_values=("secret-access", "secret-refresh"),
     )
     original = mcp_oauth_token_store_path().read_text(encoding="utf-8")
@@ -918,7 +1008,7 @@ def test_token_store_rotation_preferred_key_failure_is_best_effort(
 
     assert loaded == record
     assert mcp_oauth_token_store_path().read_text(encoding="utf-8") == original
-    assert "Skipped MCP OAuth token store rotation after successful decrypt" in caplog.text
+    assert "Skipped OAuth credential store rotation after successful decrypt" in caplog.text
     assert "secret-access" not in caplog.text
     assert "secret-refresh" not in caplog.text
 
@@ -931,7 +1021,11 @@ def test_token_store_rotation_rewrite_failure_is_best_effort(
     record = _record(access_token="secret-access", refresh_token="secret-refresh")
     save_oauth_token_record("alpha", record)
     original = mcp_oauth_token_store_path().read_text(encoding="utf-8")
-    monkeypatch.setattr(token_store_mod, "CURRENT_ENVELOPE_VERSION", 2)
+    monkeypatch.setattr(
+        token_store_mod,
+        "CURRENT_ENVELOPE_VERSION",
+        token_store_mod.CURRENT_ENVELOPE_VERSION + 1,
+    )
 
     def _boom(*args: object, **kwargs: object) -> None:
         raise OSError("disk full")
@@ -943,7 +1037,7 @@ def test_token_store_rotation_rewrite_failure_is_best_effort(
 
     assert loaded == record
     assert mcp_oauth_token_store_path().read_text(encoding="utf-8") == original
-    assert "Skipped MCP OAuth token store rewrite after successful decrypt" in caplog.text
+    assert "Skipped OAuth credential store rewrite after successful decrypt" in caplog.text
     assert "secret-access" not in caplog.text
     assert "secret-refresh" not in caplog.text
 
@@ -953,17 +1047,19 @@ def test_token_store_reencrypts_older_supported_envelope_version(
 ) -> None:
     cfg_dir = tmp_path / "cfg"
     monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(cfg_dir))
+    current_version = token_store_mod.CURRENT_ENVELOPE_VERSION
+    monkeypatch.setattr(token_store_mod, "CURRENT_ENVELOPE_VERSION", 1)
     save_oauth_token_record(
         "alpha", _record(access_token="access-one", refresh_token="refresh-one")
     )
     envelope = _read_store_envelope()
     assert envelope["version"] == 1
-    monkeypatch.setattr(token_store_mod, "CURRENT_ENVELOPE_VERSION", 2)
+    monkeypatch.setattr(token_store_mod, "CURRENT_ENVELOPE_VERSION", current_version)
 
     loaded = load_oauth_token_record("alpha")
 
     assert loaded is not None
-    assert _read_store_envelope()["version"] == 2
+    assert _read_store_envelope()["version"] == current_version
 
 
 def test_redact_token_reports_length_without_leaking_value() -> None:

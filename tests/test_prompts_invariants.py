@@ -31,8 +31,9 @@ def test_sylliptor_prompt_invariants() -> None:
             "zero-test/help/list/build-only",
             "Do not stage changes, create commits, switch branches, merge, rebase, cherry-pick, stash, or push unless the user explicitly asks for that git operation.",
             "Normal implementation work leaves changes in the working tree and reports modified files plus validation run.",
-            "Treat the step budget as limited.",
-            "After edits begin, prioritize integration and verification over returning to broad exploration",
+            "Autonomous execution has no default step ceiling.",
+            "Continue until the request is complete, the user cancels, a genuine blocker is established",
+            "If the runtime provides an explicit remaining-step warning or deadline",
             "Do not execute placeholder commands such as `pip install <dependency_name>`.",
             "If the user explicitly requests behavior tests",
             'For brief social messages (for example "hi", "hello", "thanks")',
@@ -166,7 +167,7 @@ def test_tool_descriptions_capture_canonical_workflow_guidance() -> None:
         "fs_write": "Prefer for new/generated files or full-file replacements.",
         "git_apply_patch": "Prefer for broader, multi-file, or context-heavy edits where unified diff context matters.",
         "verify_run": "Prefer for tests/lint/build.",
-        "web_search": "Prefer this when the task requires live/current/latest external discovery or explicit web browsing.",
+        "web_search": "Decide to use it whenever a reliable answer depends on unstable external facts, authoritative current sources, current high-stakes guidance, current product or service information, or requested internet research.",
         "web_fetch": "Prefer it only for a user-provided URL or one returned by web_search;",
     }
     for tool_name, snippet in expected.items():

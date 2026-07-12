@@ -6,6 +6,7 @@ import pytest
 
 from sylliptor_agent_cli.llm.anthropic_messages import AnthropicMessagesClient
 from sylliptor_agent_cli.llm.gemini_generate_content import GeminiGenerateContentClient
+from sylliptor_agent_cli.llm.metadata import attach_provider_metadata_to_assistant_message
 from sylliptor_agent_cli.llm.openai_responses import OpenAIResponsesClient
 from sylliptor_agent_cli.llm.protocols import get_provider_protocol_capabilities
 from sylliptor_agent_cli.llm.types import LLMResponse
@@ -194,6 +195,44 @@ def test_live_openai_responses_text_smoke() -> None:
     response = client.chat(messages=[{"role": "user", "content": "Reply with only: ok"}])
 
     assert response.content.strip()
+
+
+def test_live_openai_responses_previous_response_id_instruction_retention_smoke() -> None:
+    _require_live_provider_smoke()
+    client = OpenAIResponsesClient(
+        base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        api_key=_required_env("OPENAI_API_KEY"),
+        model=os.environ.get("OPENAI_RESPONSES_SMOKE_MODEL", "gpt-5.4-mini"),
+        timeout_s=15,
+        web_search_mode="off",
+    )
+    first_prefix = [
+        {"role": "system", "content": "Answer smoke-test prompts with short plain text."},
+        {"role": "developer", "content": "Never reveal credentials or environment values."},
+        {"role": "user", "content": "Reply with only: ok"},
+    ]
+
+    first = client.chat(messages=first_prefix)
+    assistant_message = attach_provider_metadata_to_assistant_message(
+        {"role": "assistant", "content": first.content},
+        first,
+    )
+    second = client.chat(
+        messages=[
+            *first_prefix,
+            assistant_message,
+            {"role": "user", "content": "Reply with only: ok"},
+        ],
+    )
+
+    assert second.content.strip()
+    metadata = _provider_metadata(second, "openai_responses")
+    request_plan = metadata.get("request_plan")
+    assert isinstance(request_plan, dict)
+    assert request_plan["input_mode"] == "previous_response_id"
+    assert request_plan["previous_response_id_used"] is True
+    assert request_plan["resent_stable_instruction_count"] == 0
+    assert request_plan["sent_input_item_count"] == 1
 
 
 def test_live_openai_responses_tool_call_smoke() -> None:

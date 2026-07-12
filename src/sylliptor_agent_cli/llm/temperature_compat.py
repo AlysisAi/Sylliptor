@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import re
+
+ANTHROPIC_DEPRECATED_SAMPLING_PARAMETERS = "anthropic_sampling_parameters_deprecated"
+GEMINI_3_DEFAULT_TEMPERATURE = "gemini_3_default_temperature"
+DEEPSEEK_THINKING_TEMPERATURE_UNSUPPORTED = "deepseek_thinking_temperature_unsupported"
+QWEN_QVQ_DEFAULT_TEMPERATURE = "qwen_qvq_default_temperature"
+
+_CLAUDE_OPUS_VERSION_RE = re.compile(r"claude[-_.]opus[-_.](?P<major>\d+)(?:[-_.](?P<minor>\d+))?")
+_CLAUDE_SONNET_VERSION_RE = re.compile(
+    r"claude[-_.]sonnet[-_.](?P<major>\d+)(?:[-_.](?P<minor>\d+))?"
+)
+_GEMINI_3_RE = re.compile(r"(?:^|[/.:_-])gemini[-_.]?3(?:[-_.]|$)")
+_DEEPSEEK_V4_RE = re.compile(r"(?:^|[/.:_-])deepseek[-_.]v?4(?:[-_.]|$)")
+_QWEN_QVQ_RE = re.compile(r"(?:^|[/.:_-])qvq(?:[-_.]|$)")
+
+
+def documented_temperature_omit_reason(
+    model: str,
+    *,
+    provider_key: str | None = None,
+    thinking_enabled: bool | None = None,
+) -> str | None:
+    """Return the documented reason an optional temperature must be omitted.
+
+    The checks deliberately use model-family patterns rather than a closed list of
+    snapshots so provider aliases, gateway-qualified names, and later compatible
+    releases receive the same safe request shape.
+    """
+
+    normalized_model = str(model or "").strip().casefold()
+    if not normalized_model:
+        return None
+
+    opus = _CLAUDE_OPUS_VERSION_RE.search(normalized_model)
+    if opus is not None:
+        major = int(opus.group("major"))
+        minor_text = opus.group("minor")
+        minor = int(minor_text) if minor_text is not None else None
+        # Pre-4.6 snapshot IDs use a date after the major version (for example
+        # claude-opus-4-20250514). Do not mistake that date for a minor release.
+        if major > 4 or (major == 4 and minor is not None and 7 <= minor < 100):
+            return ANTHROPIC_DEPRECATED_SAMPLING_PARAMETERS
+
+    sonnet = _CLAUDE_SONNET_VERSION_RE.search(normalized_model)
+    if sonnet is not None and int(sonnet.group("major")) >= 5:
+        return ANTHROPIC_DEPRECATED_SAMPLING_PARAMETERS
+
+    if _GEMINI_3_RE.search(normalized_model):
+        return GEMINI_3_DEFAULT_TEMPERATURE
+
+    if _QWEN_QVQ_RE.search(normalized_model):
+        return QWEN_QVQ_DEFAULT_TEMPERATURE
+
+    normalized_provider = str(provider_key or "").strip().casefold()
+    if (
+        normalized_provider == "deepseek"
+        and thinking_enabled is not False
+        and _DEEPSEEK_V4_RE.search(normalized_model)
+    ):
+        return DEEPSEEK_THINKING_TEMPERATURE_UNSUPPORTED
+
+    return None
+
+
+__all__ = [
+    "ANTHROPIC_DEPRECATED_SAMPLING_PARAMETERS",
+    "DEEPSEEK_THINKING_TEMPERATURE_UNSUPPORTED",
+    "GEMINI_3_DEFAULT_TEMPERATURE",
+    "QWEN_QVQ_DEFAULT_TEMPERATURE",
+    "documented_temperature_omit_reason",
+]

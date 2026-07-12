@@ -12,6 +12,7 @@ import sylliptor_agent_cli.verify_gate as verify_gate_mod
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.failure_category import FailureCategory
 from sylliptor_agent_cli.repo_scan import scan_workspace
+from sylliptor_agent_cli.verification_command_analysis import VerificationCommandStatus
 from sylliptor_agent_cli.verification_contract import (
     VerificationCommandExecutionMode,
     VerificationCommandValidationStatus,
@@ -24,8 +25,10 @@ from sylliptor_agent_cli.verify_gate import (
     VerifyRunResult,
     _normalize_execution_semantics_parts,
     _verification_family_for_result,
+    assess_verification_command_execution,
     compact_verification_payload,
     is_authoritative_verify_command_selection,
+    is_toolchain_unavailable_verification_output,
     normalize_verify_mode,
     refine_generic_fallback_verify_command_selection,
     resolve_task_aware_verify_command_selection,
@@ -34,6 +37,7 @@ from sylliptor_agent_cli.verify_gate import (
     resolve_verify_commands,
     resolve_verify_sandbox_mode,
     run_task_verification,
+    validation_errors_for_selection,
     verification_selection_payload,
     verify_run_result_to_payload,
 )
@@ -68,15 +72,32 @@ def _verify_cfg(*, mode: str | None = None) -> AppConfig:
     return cfg
 
 
-def test_typed_verification_contract_marks_explicit_pipeline_trusted() -> None:
+def test_legacy_collections_import_collection_error_is_infra_unavailable() -> None:
+    output = """ERROR collecting tests/test_app.py
+tests/test_app.py:2: in <module>
+    from collections import Mapping
+E   ImportError: cannot import name 'Mapping' from 'collections'
+"""
+
+    assert is_toolchain_unavailable_verification_output(output) is True
+    assert (
+        is_toolchain_unavailable_verification_output(
+            "ImportError: cannot import name 'Widget' from 'project.api'"
+        )
+        is False
+    )
+
+
+def test_typed_verification_contract_rejects_explicit_pipeline() -> None:
     specs = build_verification_command_specs(
         ("tool args | tail -n 1",),
         source="task_refinement.explicit_user_command",
         contract_type="task_acceptance",
     )
 
-    assert specs[0].execution_mode == VerificationCommandExecutionMode.TRUSTED_SHELL_EXPRESSION
-    assert specs[0].validation_status == VerificationCommandValidationStatus.VALID
+    assert specs[0].execution_mode == VerificationCommandExecutionMode.INVALID
+    assert specs[0].validation_status == VerificationCommandValidationStatus.INVALID
+    assert specs[0].rejection_reason == "unsafe_pipeline"
     assert specs[0].provenance == "EXPLICIT_USER_COMMAND"
 
 
@@ -89,7 +110,151 @@ def test_typed_verification_contract_rejects_inferred_pipeline() -> None:
 
     assert specs[0].execution_mode == VerificationCommandExecutionMode.INVALID
     assert specs[0].validation_status == VerificationCommandValidationStatus.INVALID
-    assert specs[0].rejection_reason == "untrusted_shell_expression"
+    assert specs[0].rejection_reason == "unsafe_pipeline"
+
+
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        ("true", "vacuous_verifier"),
+        ("/bin/true", "vacuous_verifier"),
+        (":", "vacuous_verifier"),
+        ("exit 0", "vacuous_verifier"),
+        ("echo ok", "non_assertive_observation"),
+        ("printf ok", "non_assertive_observation"),
+        ("python -c 'pass'", "vacuous_verifier"),
+        ("python -c 'print(\"ok\")'", "vacuous_verifier"),
+        ("pytest -q || true", "disallowed_shell_control_flow"),
+        ("pytest -q || :", "disallowed_shell_control_flow"),
+        ("pytest -q; true", "disallowed_shell_control_flow"),
+        ("pytest -q | cat", "unsafe_pipeline"),
+        ("pytest -q | tail -n 1", "unsafe_pipeline"),
+        ("pytest -q | tee verify.log", "unsafe_pipeline"),
+        ("bash -lc 'pytest -q || true'", "disallowed_shell_control_flow"),
+        ("bash -lc 'pytest -q | cat'", "unsafe_pipeline"),
+    ],
+)
+def test_typed_verification_contract_rejects_vacuous_authoritative_commands(
+    command: str,
+    reason: str,
+) -> None:
+    specs = build_verification_command_specs(
+        (command,),
+        source="cli.verify_cmd",
+        contract_type="explicit_override",
+    )
+
+    assert specs[0].execution_mode == VerificationCommandExecutionMode.INVALID
+    assert specs[0].validation_status == VerificationCommandValidationStatus.INVALID
+    assert specs[0].rejection_reason == reason
+
+
+@pytest.mark.parametrize("command", ["pytest -q", "diff expected actual", "grep -q needle file"])
+def test_typed_verification_contract_keeps_assertive_commands(command: str) -> None:
+    specs = build_verification_command_specs(
+        (command,),
+        source="cli.verify_cmd",
+        contract_type="explicit_override",
+    )
+
+    assert specs[0].validation_status == VerificationCommandValidationStatus.VALID
+    assert specs[0].rejection_reason == ""
+
+
+def test_typed_verification_contract_accepts_safe_cd_and_assertive_command() -> None:
+    specs = build_verification_command_specs(
+        ("cd /tmp/project && python -m pytest tests/test_batching.py -v",),
+        source="cli.verify_cmd",
+        contract_type="explicit_override",
+    )
+
+    assert specs[0].execution_mode == VerificationCommandExecutionMode.TRUSTED_SHELL_EXPRESSION
+    assert specs[0].validation_status == VerificationCommandValidationStatus.VALID
+
+
+def test_typed_verification_contract_rejects_safe_cd_to_non_assertive_command() -> None:
+    specs = build_verification_command_specs(
+        ("cd /tmp/project && true",),
+        source="cli.verify_cmd",
+        contract_type="explicit_override",
+    )
+
+    assert specs[0].execution_mode == VerificationCommandExecutionMode.INVALID
+    assert specs[0].validation_status == VerificationCommandValidationStatus.INVALID
+    assert specs[0].rejection_reason == "vacuous_verifier"
+
+
+def test_safe_cd_pytest_counts_as_real_execution() -> None:
+    command = "cd /tmp/project && python -m pytest tests/test_batching.py -v"
+
+    assert _normalize_execution_semantics_parts(command) == [
+        "pytest",
+        "tests/test_batching.py",
+        "-v",
+    ]
+    assert _verification_family_for_result(command) == "pytest"
+
+    assessment = assess_verification_command_execution(
+        command=command,
+        exit_code=0,
+        output="1 passed\n",
+    )
+
+    assert assessment.real_execution is True
+    assert assessment.non_execution_reason is None
+
+
+def test_safe_cd_true_is_not_real_execution() -> None:
+    assessment = assess_verification_command_execution(
+        command="cd /tmp/project && true",
+        exit_code=0,
+        output="",
+    )
+
+    assert assessment.real_execution is False
+    assert assessment.non_execution_reason == "vacuous_verifier"
+
+
+@pytest.mark.parametrize("pipe_tail", ["cat", "tail -n 1", "tee verify.log"])
+def test_masked_pipeline_exit_zero_is_not_passed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pipe_tail: str,
+) -> None:
+    command = f"pytest -q | {pipe_tail}"
+
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        assert cmd == command
+        return _cp(returncode=0, stdout="1 failed\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_task_verification(
+        root=tmp_path,
+        commands=[command],
+        artifact_path=tmp_path / "verify.txt",
+        cfg=_verify_cfg(mode="off"),
+    )
+    payload = verify_run_result_to_payload(root=tmp_path, result=result)
+
+    assert result.all_passed is False
+    assert result.command_results[0].status.value == "not_executed"
+    assert result.command_results[0].non_execution_reason == "unsafe_pipeline"
+    assert payload["all_passed"] is False
+    assert payload["command_results"][0]["status"] == "not_executed"
+
+
+def test_resolved_explicit_vacuous_verify_command_reports_validation_error(
+    tmp_path: Path,
+) -> None:
+    resolved = resolve_verify_command_selection(
+        cfg=AppConfig(model="test-model"),
+        verify_cmd=["true"],
+        root=tmp_path,
+    )
+
+    assert resolved.commands == ("true",)
+    assert validation_errors_for_selection(resolved) == ["true: vacuous_verifier"]
 
 
 def test_verify_gate_explicit_off_runs_commands_and_writes_artifact(
@@ -322,21 +487,198 @@ def test_compact_verification_payload_preserves_primary_failure_hint(tmp_path: P
     assert primary_failure["fallback_used"] is False
 
 
-def test_verify_run_payload_primary_failure_prefers_summary_over_generic_failed_output(
+def test_verify_run_payload_includes_structured_pytest_failure_summary(tmp_path: Path) -> None:
+    artifact = tmp_path / "verify" / "pytest_failure_summary.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("failed\n", encoding="utf-8")
+    output = (
+        "FAILED tests/test_calc.py::test_add - AssertionError: expected 2 == 3\n"
+        "Traceback (most recent call last):\n"
+        '  File "tests/test_calc.py", line 10, in test_add\n'
+        "    assert add(1, 1) == 3\n"
+        '  File "src/calc.py", line 4, in add\n'
+        "    return a + b\n"
+        "E   AssertionError: expected 2 == 3\n"
+    )
+    result = VerifyRunResult(
+        commands=["python -m pytest tests/test_calc.py -q"],
+        command_results=[
+            VerifyCommandResult(
+                command="python -m pytest tests/test_calc.py -q",
+                exit_code=1,
+                output=output,
+            )
+        ],
+        artifact_path=artifact,
+    )
+
+    payload = verify_run_result_to_payload(root=tmp_path, result=result)
+
+    summary = payload["failure_summary"]
+    assert isinstance(summary, dict)
+    assert summary["framework"] == "pytest"
+    assert summary["primary_error"] == "AssertionError: expected 2 == 3"
+    assert summary["likely_next_files"] == ["tests/test_calc.py", "src/calc.py"]
+    failing_tests = summary["failing_tests"]
+    assert isinstance(failing_tests, list)
+    assert failing_tests[0]["id"] == "tests/test_calc.py::test_add"
+    stack_frames = summary["stack_frames"]
+    assert isinstance(stack_frames, list)
+    assert {"path": "src/calc.py", "line": 4, "symbol": "add"} in stack_frames
+    command_summary = payload["command_results"][0]["failure_summary"]
+    assert command_summary == summary
+
+
+def test_verify_run_payload_failure_summary_rejects_escaping_paths_and_preserves_dot_paths(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "verify" / "escaping_failure_summary.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("failed\n", encoding="utf-8")
+    output = (
+        "FAILED ../outside.py::test_secret - AssertionError: leaked path\n"
+        '  File "../outside.py", line 5, in test_secret\n'
+        "    assert False\n"
+        '  File "./.github/workflows/check.py", line 3, in check\n'
+        "    assert False\n"
+        "E   AssertionError: leaked path\n"
+    )
+    result = VerifyRunResult(
+        commands=["python -m pytest -q"],
+        command_results=[
+            VerifyCommandResult(
+                command="python -m pytest -q",
+                exit_code=1,
+                output=output,
+            )
+        ],
+        artifact_path=artifact,
+    )
+
+    payload = verify_run_result_to_payload(root=tmp_path, result=result)
+
+    summary = payload["failure_summary"]
+    assert isinstance(summary, dict)
+    assert summary["failing_tests"] == []
+    assert summary["likely_next_files"] == [".github/workflows/check.py"]
+    assert {"path": ".github/workflows/check.py", "line": 3, "symbol": "check"} in summary[
+        "stack_frames"
+    ]
+    assert "outside.py" not in str(summary)
+
+
+def test_verify_run_payload_normalizes_absolute_pytest_nodeid(tmp_path: Path) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    test_path = tests_dir / "test_calc.py"
+    test_path.write_text("def test_add():\n    assert False\n", encoding="utf-8")
+    artifact = tmp_path / "verify" / "absolute_nodeid_failure_summary.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("failed\n", encoding="utf-8")
+    output = f"FAILED {test_path}::test_add - AssertionError: expected 2 == 3\n"
+    result = VerifyRunResult(
+        commands=["python -m pytest tests/test_calc.py -q"],
+        command_results=[
+            VerifyCommandResult(
+                command="python -m pytest tests/test_calc.py -q",
+                exit_code=1,
+                output=output,
+            )
+        ],
+        artifact_path=artifact,
+    )
+
+    payload = verify_run_result_to_payload(root=tmp_path, result=result)
+
+    summary = payload["failure_summary"]
+    assert isinstance(summary, dict)
+    assert summary["failing_tests"] == [
+        {
+            "id": "tests/test_calc.py::test_add",
+            "path": "tests/test_calc.py",
+            "message": "AssertionError: expected 2 == 3",
+        }
+    ]
+
+
+def test_compact_verification_payload_preserves_failure_summary(tmp_path: Path) -> None:
+    artifact = tmp_path / "verify" / "compact_failure_summary.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("failed\n", encoding="utf-8")
+    result = VerifyRunResult(
+        commands=["pytest tests/test_calc.py -q"],
+        command_results=[
+            VerifyCommandResult(
+                command="pytest tests/test_calc.py -q",
+                exit_code=1,
+                output=(
+                    "FAILED tests/test_calc.py::test_add - AssertionError: expected 2 == 3\n"
+                    '  File "src/calc.py", line 4, in add\n'
+                    "E   AssertionError: expected 2 == 3\n"
+                ),
+            )
+        ],
+        artifact_path=artifact,
+    )
+    payload = verify_run_result_to_payload(root=tmp_path, result=result)
+
+    compact_payload = compact_verification_payload(payload, output_preview_chars=48)
+
+    assert compact_payload is not None
+    summary = compact_payload["failure_summary"]
+    assert isinstance(summary, dict)
+    assert summary["framework"] == "pytest"
+    assert summary["likely_next_files"] == ["tests/test_calc.py", "src/calc.py"]
+    command_summary = compact_payload["command_results"][0]["failure_summary"]
+    assert command_summary == summary
+
+
+def test_verify_run_payload_summarizes_generic_python_traceback(tmp_path: Path) -> None:
+    artifact = tmp_path / "verify" / "python_traceback_summary.txt"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("failed\n", encoding="utf-8")
+    result = VerifyRunResult(
+        commands=["python script.py"],
+        command_results=[
+            VerifyCommandResult(
+                command="python script.py",
+                exit_code=1,
+                output=(
+                    "Traceback (most recent call last):\n"
+                    '  File "script.py", line 2, in <module>\n'
+                    "    main()\n"
+                    '  File "src/app.py", line 7, in main\n'
+                    "    raise RuntimeError('boom')\n"
+                    "RuntimeError: boom\n"
+                ),
+            )
+        ],
+        artifact_path=artifact,
+    )
+
+    payload = verify_run_result_to_payload(root=tmp_path, result=result)
+
+    summary = payload["failure_summary"]
+    assert isinstance(summary, dict)
+    assert summary["framework"] == "python"
+    assert summary["primary_error"] == "RuntimeError: boom"
+    assert {"path": "src/app.py", "line": 7, "symbol": "main"} in summary["stack_frames"]
+
+
+def test_verify_run_payload_primary_failure_uses_actionable_command_output(
     tmp_path: Path,
 ) -> None:
     artifact = tmp_path / "verify" / "primary_failure_summary.txt"
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_text("failed\n", encoding="utf-8")
     result = VerifyRunResult(
-        commands=["go test -run NonExistent ./..."],
+        commands=["go test ./..."],
         command_results=[
             VerifyCommandResult(
-                command="go test -run NonExistent ./...",
-                exit_code=0,
-                output="ok\texample/pkg\t0.002s [no tests to run]\n",
-                real_execution=False,
-                non_execution_reason="go_test_no_tests_to_run",
+                command="go test ./...",
+                exit_code=1,
+                output="package example/pkg failed\n",
+                real_execution=None,
             )
         ],
         artifact_path=artifact,
@@ -346,12 +688,9 @@ def test_verify_run_payload_primary_failure_prefers_summary_over_generic_failed_
     primary_failure = payload["primary_failure"]
 
     assert isinstance(primary_failure, dict)
-    assert primary_failure["command"] == "go test -run NonExistent ./..."
-    assert primary_failure["effective_command"] == "go test -run NonExistent ./..."
-    assert (
-        primary_failure["snippet"]
-        == "verification failed (0/1); failed: go test -run NonExistent ./..."
-    )
+    assert primary_failure["command"] == "go test ./..."
+    assert primary_failure["effective_command"] == "go test ./..."
+    assert primary_failure["snippet"] == "package example/pkg failed"
     assert primary_failure["output_truncated"] is False
     assert primary_failure["fallback_used"] is False
 
@@ -487,12 +826,17 @@ def test_verify_gate_marks_go_no_tests_to_run_as_non_executing(
     )
     payload = verify_run_result_to_payload(root=tmp_path, result=result)
 
-    assert result.all_passed is False
-    assert result.failed_commands == ["go test -run NonExistent ./..."]
+    assert result.all_passed is True
+    assert result.failed_commands == []
     item = result.command_results[0]
+    assert item.status == VerificationCommandStatus.SKIPPED
+    assert item.ok is True
     assert item.real_execution is False
     assert item.non_execution_reason == "go_test_no_tests_to_run"
-    assert payload["all_passed"] is False
+    assert payload["all_passed"] is True
+    assert payload["failed_commands"] == []
+    assert payload["command_results"][0]["status"] == "skipped"
+    assert payload["command_results"][0]["ok"] is True
     assert payload["command_results"][0]["real_execution"] is False
     assert payload["command_results"][0]["non_execution_reason"] == "go_test_no_tests_to_run"
     body = artifact.read_text(encoding="utf-8")
@@ -500,15 +844,16 @@ def test_verify_gate_marks_go_no_tests_to_run_as_non_executing(
     assert "non_execution_reason: go_test_no_tests_to_run" in body
 
 
-def test_verify_gate_marks_pytest_no_tests_collected_as_non_executing(
+def test_verify_gate_treats_pytest_exit_5_no_tests_as_skipped_pass(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         assert cmd == "pytest -q"
+        (tmp_path / ".pytest_cache").mkdir()
         return _cp(
             returncode=5,
-            stdout="============================= test session starts =============================\ncollected 0 items\n",
+            stdout="custom plugin suppressed the collection summary\n",
         )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -522,15 +867,118 @@ def test_verify_gate_marks_pytest_no_tests_collected_as_non_executing(
     )
     payload = verify_run_result_to_payload(root=tmp_path, result=result)
 
-    assert result.all_passed is False
+    assert result.all_passed is True
+    assert result.failed_commands == []
+    assert result.summary == "verification skipped: nothing to verify (1/1)"
     item = result.command_results[0]
+    assert item.status == VerificationCommandStatus.SKIPPED
+    assert item.ok is True
     assert item.real_execution is False
     assert item.non_execution_reason == "pytest_no_tests_collected"
+    assert payload["all_passed"] is True
+    assert payload["failed_commands"] == []
+    assert payload["summary"] == "verification skipped: nothing to verify (1/1)"
+    assert payload["command_results"][0]["status"] == "skipped"
+    assert payload["command_results"][0]["ok"] is True
     assert payload["command_results"][0]["real_execution"] is False
     assert payload["command_results"][0]["non_execution_reason"] == "pytest_no_tests_collected"
+    assert not (tmp_path / ".pytest_cache").exists()
     body = artifact.read_text(encoding="utf-8")
+    assert "status: skipped" in body
     assert "real_execution: false" in body
     assert "non_execution_reason: pytest_no_tests_collected" in body
+
+
+def test_verify_gate_restores_preexisting_pytest_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cache_file = tmp_path / ".pytest_cache" / "v" / "cache" / "nodeids"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_text("preexisting\n", encoding="utf-8")
+    added_file = tmp_path / ".pytest_cache" / "v" / "cache" / "lastfailed"
+
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        assert cmd == "pytest -q"
+        cache_file.write_text("mutated\n", encoding="utf-8")
+        added_file.write_text("new cache entry\n", encoding="utf-8")
+        return _cp(returncode=0, stdout="1 passed\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_task_verification(
+        root=tmp_path,
+        commands=["pytest -q"],
+        artifact_path=tmp_path / "verify" / "T05_cache_restore.txt",
+        cfg=_verify_cfg(mode="off"),
+    )
+
+    assert result.all_passed is True
+    assert cache_file.read_text(encoding="utf-8") == "preexisting\n"
+    assert not added_file.exists()
+
+
+def test_verify_gate_treats_nothing_to_do_as_skipped_pass(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        assert cmd == "make test"
+        return _cp(returncode=0, stdout="make: Nothing to be done for 'test'.\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    artifact = tmp_path / "verify" / "T05_make_nothing_to_do.txt"
+    result = run_task_verification(
+        root=tmp_path,
+        commands=["make test"],
+        artifact_path=artifact,
+        cfg=_verify_cfg(mode="off"),
+    )
+    payload = verify_run_result_to_payload(root=tmp_path, result=result)
+
+    assert result.all_passed is True
+    assert result.failed_commands == []
+    assert result.summary == "verification skipped: nothing to verify (1/1)"
+    item = result.command_results[0]
+    assert item.status == VerificationCommandStatus.SKIPPED
+    assert item.ok is True
+    assert item.real_execution is False
+    assert item.non_execution_reason == "verification_nothing_to_do"
+    assert payload["command_results"][0]["status"] == "skipped"
+    assert payload["command_results"][0]["non_execution_reason"] == ("verification_nothing_to_do")
+
+
+def test_verify_gate_keeps_pytest_exit_1_as_failed_verification(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        assert cmd == "pytest -q"
+        return _cp(returncode=1, stdout="FAILED tests/test_example.py::test_example\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    artifact = tmp_path / "verify" / "T05_pytest_failed.txt"
+    result = run_task_verification(
+        root=tmp_path,
+        commands=["pytest -q"],
+        artifact_path=artifact,
+        cfg=_verify_cfg(mode="off"),
+    )
+    payload = verify_run_result_to_payload(root=tmp_path, result=result)
+
+    assert result.all_passed is False
+    assert result.failed_commands == ["pytest -q"]
+    item = result.command_results[0]
+    assert item.status == VerificationCommandStatus.FAILED
+    assert item.ok is False
+    assert item.real_execution is None
+    assert item.non_execution_reason is None
+    assert payload["all_passed"] is False
+    assert payload["failed_commands"] == ["pytest -q"]
+    assert payload["command_results"][0]["status"] == "failed"
+    assert payload["command_results"][0]["ok"] is False
 
 
 def test_verify_gate_marks_go_no_test_files_as_non_executing(
@@ -552,12 +1000,17 @@ def test_verify_gate_marks_go_no_test_files_as_non_executing(
     )
     payload = verify_run_result_to_payload(root=tmp_path, result=result)
 
-    assert result.all_passed is False
-    assert result.failed_commands == ["go test ./..."]
+    assert result.all_passed is True
+    assert result.failed_commands == []
     item = result.command_results[0]
+    assert item.status == VerificationCommandStatus.SKIPPED
+    assert item.ok is True
     assert item.real_execution is False
     assert item.non_execution_reason == "go_test_no_test_files"
-    assert payload["all_passed"] is False
+    assert payload["all_passed"] is True
+    assert payload["failed_commands"] == []
+    assert payload["command_results"][0]["status"] == "skipped"
+    assert payload["command_results"][0]["ok"] is True
     assert payload["command_results"][0]["real_execution"] is False
     assert payload["command_results"][0]["non_execution_reason"] == "go_test_no_test_files"
     body = artifact.read_text(encoding="utf-8")
@@ -640,7 +1093,7 @@ def test_verify_gate_marks_mixed_go_no_tests_to_run_and_real_execution_as_real(
     assert result.command_results[0].non_execution_reason is None
 
 
-def test_verify_gate_allows_compound_go_test_and_build_with_no_test_files_output(
+def test_verify_gate_rejects_compound_go_test_and_build_with_no_test_files_output(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -661,18 +1114,19 @@ def test_verify_gate_allows_compound_go_test_and_build_with_no_test_files_output
     )
     payload = verify_run_result_to_payload(root=tmp_path, result=result)
 
-    assert result.all_passed is True
+    assert result.all_passed is False
     item = result.command_results[0]
-    assert item.real_execution is None
-    assert item.non_execution_reason is None
-    assert payload["all_passed"] is True
-    assert payload["command_results"][0]["real_execution"] is None
+    assert item.real_execution is False
+    assert item.non_execution_reason == "disallowed_shell_control_flow"
+    assert payload["all_passed"] is False
+    assert payload["command_results"][0]["real_execution"] is False
+    assert payload["command_results"][0]["status"] == "not_executed"
     body = artifact.read_text(encoding="utf-8")
-    assert "real_execution: unknown" in body
-    assert "non_execution_reason:" not in body
+    assert "status: not_executed" in body
+    assert "non_execution_reason: disallowed_shell_control_flow" in body
 
 
-def test_verify_gate_allows_compound_go_test_and_build_with_no_tests_to_run_output(
+def test_verify_gate_rejects_compound_go_test_and_build_with_no_tests_to_run_output(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -693,18 +1147,19 @@ def test_verify_gate_allows_compound_go_test_and_build_with_no_tests_to_run_outp
     )
     payload = verify_run_result_to_payload(root=tmp_path, result=result)
 
-    assert result.all_passed is True
+    assert result.all_passed is False
     item = result.command_results[0]
-    assert item.real_execution is None
-    assert item.non_execution_reason is None
-    assert payload["all_passed"] is True
-    assert payload["command_results"][0]["real_execution"] is None
+    assert item.real_execution is False
+    assert item.non_execution_reason == "disallowed_shell_control_flow"
+    assert payload["all_passed"] is False
+    assert payload["command_results"][0]["real_execution"] is False
+    assert payload["command_results"][0]["status"] == "not_executed"
     body = artifact.read_text(encoding="utf-8")
-    assert "real_execution: unknown" in body
-    assert "non_execution_reason:" not in body
+    assert "status: not_executed" in body
+    assert "non_execution_reason: disallowed_shell_control_flow" in body
 
 
-def test_verify_gate_allows_wrapped_shell_compound_go_verification(
+def test_verify_gate_rejects_wrapped_shell_compound_go_verification(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -725,15 +1180,16 @@ def test_verify_gate_allows_wrapped_shell_compound_go_verification(
     )
     payload = verify_run_result_to_payload(root=tmp_path, result=result)
 
-    assert result.all_passed is True
+    assert result.all_passed is False
     item = result.command_results[0]
-    assert item.real_execution is None
-    assert item.non_execution_reason is None
-    assert payload["all_passed"] is True
-    assert payload["command_results"][0]["real_execution"] is None
+    assert item.real_execution is False
+    assert item.non_execution_reason == "disallowed_shell_control_flow"
+    assert payload["all_passed"] is False
+    assert payload["command_results"][0]["real_execution"] is False
+    assert payload["command_results"][0]["status"] == "not_executed"
     body = artifact.read_text(encoding="utf-8")
-    assert "real_execution: unknown" in body
-    assert "non_execution_reason:" not in body
+    assert "status: not_executed" in body
+    assert "non_execution_reason: disallowed_shell_control_flow" in body
 
 
 def test_verify_mode_and_command_resolution() -> None:
@@ -771,6 +1227,23 @@ def test_verify_command_resolution_prefers_repo_inference_over_generic_default_f
         "npm --prefix packages/web test",
         "mvn -f services/orders/pom.xml test",
     ]
+
+
+def test_managed_host_unavailable_empty_config_uses_repo_inference(tmp_path: Path) -> None:
+    _write_repo_files(tmp_path, {"tests/test_app.py": "def test_ok(): pass\n"})
+    scan = scan_workspace(context=resolve_workspace_context(tmp_path))
+    cfg = AppConfig(model="test-model", verify_commands=[])
+    cfg.extra_fields = {"managed_host_verifier_unavailable": True}
+
+    resolved = resolve_verify_command_selection(
+        cfg=cfg,
+        verify_cmd=None,
+        root=tmp_path,
+        repo_scan=scan,
+    )
+
+    assert resolved.source == "repo_scan.likely_test_commands"
+    assert resolved.commands
 
 
 def test_verify_command_resolution_infers_plain_python_layout_without_manifest(
@@ -3030,16 +3503,15 @@ def test_verify_run_payload_hides_external_artifact_path_from_model(tmp_path: Pa
     assert payload["artifact_location"] == "external_session_store"
     assert payload["fallback_used"] is False
     assert payload["fallback_count"] == 0
-    assert payload["command_results"] == [
-        {
-            "command": "pytest -q",
-            "effective_command": "pytest -q",
-            "exit_code": 1,
-            "ok": False,
-            "real_execution": None,
-            "output_preview": "assertion failed\n",
-            "output_chars": 17,
-            "output_truncated": False,
-            "fallback_used": False,
-        }
-    ]
+    command_payload = payload["command_results"][0]
+    assert command_payload["command"] == "pytest -q"
+    assert command_payload["effective_command"] == "pytest -q"
+    assert command_payload["exit_code"] == 1
+    assert command_payload["status"] == "failed"
+    assert command_payload["ok"] is False
+    assert command_payload["real_execution"] is None
+    assert command_payload["output_preview"] == "assertion failed\n"
+    assert command_payload["output_chars"] == 17
+    assert command_payload["output_truncated"] is False
+    assert command_payload["fallback_used"] is False
+    assert command_payload["failure_summary"]["primary_error"] == "assertion failed"

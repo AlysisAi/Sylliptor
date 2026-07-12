@@ -6,17 +6,31 @@ from typing import Any
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse, ToolCall
+from sylliptor_agent_cli.llm.protocols import ReasoningTraceCapability
+from sylliptor_agent_cli.llm.types import ReasoningOutputKind
 from sylliptor_agent_cli.runtime_kind import RuntimeKind
 from sylliptor_agent_cli.session_store import read_session_events
+from sylliptor_agent_cli.surface.noop_surface import NoopSurface
 from sylliptor_agent_cli.tools.registry import build_unknown_tool_recovery_payload
 
 
 class _FakeClient:
     model = "test-model"
     temperature = 0.2
+    reasoning_trace_capability = ReasoningTraceCapability(
+        output_kind=ReasoningOutputKind.SUMMARY,
+        supports_streaming=True,
+        supports_buffered=True,
+    )
 
-    def __init__(self, responses: list[LLMResponse]) -> None:
+    def __init__(
+        self,
+        responses: list[LLMResponse],
+        *,
+        reasoning_chunks: list[list[str]] | None = None,
+    ) -> None:
         self._responses = responses
+        self._reasoning_chunks = list(reasoning_chunks or [])
         self.calls = 0
 
     def chat(
@@ -26,12 +40,25 @@ class _FakeClient:
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
         on_text_delta=None,  # type: ignore[no-untyped-def]
+        on_reasoning_delta=None,  # type: ignore[no-untyped-def]
         temperature: float | None = None,
     ) -> LLMResponse:
-        _ = messages, tools, stream, on_text_delta, temperature
-        response = self._responses[self.calls]
+        _ = messages, tools, on_text_delta, temperature
+        call_index = self.calls
+        response = self._responses[call_index]
         self.calls += 1
+        if stream and callable(on_reasoning_delta) and call_index < len(self._reasoning_chunks):
+            for chunk in self._reasoning_chunks[call_index]:
+                on_reasoning_delta(chunk)
         return response
+
+
+class _ReasoningSurface(NoopSurface):
+    def __init__(self) -> None:
+        self.reasoning_tokens: list[str] = []
+
+    def on_reasoning_token(self, token: str) -> None:
+        self.reasoning_tokens.append(token)
 
 
 def _session(tmp_path: Path, *, session_id: str):
@@ -81,7 +108,7 @@ def test_unknown_tool_returns_available_names_and_nearest_suggestions(tmp_path: 
 
 
 def test_registered_schema_compatible_alias_executes_target_tool(tmp_path: Path) -> None:
-    (tmp_path / "README.md").write_text("hello alias\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("hello alias\n", encoding="utf-8", newline="\n")
     session_id = "unknown-tool-safe-alias"
     session = _session(tmp_path, session_id=session_id)
     session.client = _FakeClient(
@@ -210,3 +237,33 @@ def test_unknown_tool_recovery_runs_inside_subagent_child_session(tmp_path: Path
     assert result["requested_tool_name"] == "fs_reed"
     assert "fs_read" in result["available_tool_names"]
     assert "fs_read" in result["nearest_tool_suggestions"]
+
+
+def test_streaming_subagent_child_session_forwards_reasoning(tmp_path: Path) -> None:
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="code_only", stream=True),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="override-key",
+        runtime_kind=RuntimeKind.SUBAGENT,
+        subagents_enabled=False,
+        subagent_depth=1,
+        session_log_dir_override=tmp_path / "sessions",
+        session_id_override="streaming-subagent-child-reasoning",
+    )
+    surface = _ReasoningSurface()
+    session.surface = surface
+    session.client = _FakeClient(
+        [LLMResponse(content="subagent done", tool_calls=[], raw={})],
+        reasoning_chunks=[["thinking ", "inside child"]],
+    )  # type: ignore[assignment]
+
+    try:
+        assert session.run_turn("Read README.md.") == 0
+    finally:
+        session.close()
+
+    assert "".join(surface.reasoning_tokens) == "thinking inside child"

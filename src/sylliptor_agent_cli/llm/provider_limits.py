@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import errno
 import logging
 import random
+import socket
+import ssl
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -15,8 +18,8 @@ T = TypeVar("T")
 
 DEFAULT_PROVIDER_CONCURRENCY_CAPS: dict[str, int] = {"qwen": 4}
 DEFAULT_PROVIDER_RETRY_MAX_RETRIES = 5
-DEFAULT_PROVIDER_RETRY_BASE_DELAY_SECONDS = 1.0
-DEFAULT_PROVIDER_RETRY_MAX_DELAY_SECONDS = 30.0
+DEFAULT_PROVIDER_RETRY_BASE_DELAY_SECONDS = 10.0
+DEFAULT_PROVIDER_RETRY_MAX_DELAY_SECONDS = 120.0
 
 _LOGGER = logging.getLogger(__name__)
 _JITTER_RATIO = 0.25
@@ -146,6 +149,8 @@ def run_provider_limited_call(
     random_fn: Callable[[], float] | None = None,
     on_retry: Callable[[int, str, float], None] | None = None,
     retry_deadline_allows: Callable[[float], bool] | None = None,
+    retry_wall_clock_cap_seconds: float | None = None,
+    clock_fn: Callable[[], float] | None = None,
 ) -> T:
     settings = retry_settings or ProviderRetrySettings()
     canonical_key = canonical_provider_key(provider_key)
@@ -153,6 +158,8 @@ def run_provider_limited_call(
     semaphore = _semaphore_for(canonical_key, cap) if canonical_key and cap else None
     sleep = sleep_fn or time.sleep
     jitter = random_fn or random.random
+    clock = clock_fn or time.monotonic
+    retry_started_at = clock()
     retries_used = 0
 
     while True:
@@ -169,6 +176,24 @@ def run_provider_limited_call(
             ):
                 raise
             wait_seconds = _retry_delay_seconds(settings, retries_used, jitter)
+            if _retry_wall_clock_cap_blocks(
+                retry_reason=retry_reason,
+                retry_started_at=retry_started_at,
+                wait_seconds=wait_seconds,
+                cap_seconds=retry_wall_clock_cap_seconds,
+                clock=clock,
+            ):
+                _LOGGER.info(
+                    "provider_retry_wall_clock_cap_blocked",
+                    extra={
+                        "operation": operation,
+                        "provider_key": canonical_key,
+                        "retry_attempt": retries_used + 1,
+                        "wait_seconds": wait_seconds,
+                        "retry_reason": retry_reason,
+                    },
+                )
+                raise
             if retry_deadline_allows is not None and not retry_deadline_allows(wait_seconds):
                 _LOGGER.info(
                     "provider_retry_deadline_blocked",
@@ -202,10 +227,103 @@ def run_provider_limited_call(
         sleep(wait_seconds)
 
 
+def _retry_wall_clock_cap_blocks(
+    *,
+    retry_reason: str,
+    retry_started_at: float,
+    wait_seconds: float,
+    cap_seconds: float | None,
+    clock: Callable[[], float],
+) -> bool:
+    if (
+        retry_reason not in {"provider_unavailable", "provider_stream_truncated"}
+        or cap_seconds is None
+    ):
+        return False
+    try:
+        cap = float(cap_seconds)
+    except (TypeError, ValueError):
+        return False
+    if cap <= 0:
+        return True
+    elapsed = max(0.0, float(clock()) - float(retry_started_at))
+    return elapsed + max(0.0, float(wait_seconds)) > cap
+
+
 def _provider_retry_reason(exc: Exception) -> str | None:
     if is_provider_throttling_error(exc):
         return "provider_throttled"
+    transport_reason = _transient_transport_retry_reason(exc)
+    if transport_reason is not None:
+        return transport_reason
     return provider_unavailable_retry_reason(exc)
+
+
+_TRANSIENT_TRANSPORT_ERRNOS = {
+    value
+    for value in (
+        getattr(socket, "EAI_AGAIN", None),
+        getattr(socket, "EAI_FAIL", None),
+        getattr(socket, "EAI_NONAME", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ECONNREFUSED", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "EHOSTUNREACH", None),
+        getattr(errno, "ENETUNREACH", None),
+        getattr(errno, "ETIMEDOUT", None),
+    )
+    if value is not None
+}
+_TRANSIENT_TRANSPORT_MARKERS = (
+    "connection aborted",
+    "connection refused",
+    "connection reset",
+    "getaddrinfo failed",
+    "handshake operation timed out",
+    "name or service not known",
+    "name resolution",
+    "network is unreachable",
+    "nodename nor servname",
+    "temporary failure in name resolution",
+    "timed out",
+)
+
+
+def _transient_transport_retry_reason(exc: BaseException) -> str | None:
+    for item in _iter_exception_chain(exc):
+        if isinstance(item, (socket.timeout, TimeoutError)):
+            return "provider_unavailable"
+        if isinstance(item, ssl.SSLError) and _has_transient_transport_marker(item):
+            return "provider_unavailable"
+        if isinstance(
+            item,
+            (ConnectionAbortedError, ConnectionRefusedError, ConnectionResetError),
+        ):
+            return "provider_unavailable"
+        if isinstance(item, OSError):
+            if getattr(item, "errno", None) in _TRANSIENT_TRANSPORT_ERRNOS:
+                return "provider_unavailable"
+            if _has_transient_transport_marker(item):
+                return "provider_unavailable"
+    return None
+
+
+def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        cause = current.__cause__
+        context = current.__context__
+        current = cause if cause is not None else context
+    return chain
+
+
+def _has_transient_transport_marker(exc: BaseException) -> bool:
+    message = str(exc or "").casefold()
+    return any(marker in message for marker in _TRANSIENT_TRANSPORT_MARKERS)
 
 
 PROVIDER_NON_RETRYABLE_ATTR = "_provider_call_non_retryable"

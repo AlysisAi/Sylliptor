@@ -11,7 +11,9 @@ from sylliptor_agent_cli.llm.openai_responses import (
     WebSearchResponse,
     WebSearchSource,
 )
+from sylliptor_agent_cli.profiles import ProfileSpec, add_profile, set_active_profile
 from sylliptor_agent_cli.sylliptor_cloud import DEFAULT_PROXY_BASE_URL
+from sylliptor_agent_cli.tools import web_search as web_search_module
 from sylliptor_agent_cli.tools.web_search import (
     _OPENROUTER_WEB_MIN_TIMEOUT_S,
     WebSearchError,
@@ -20,6 +22,12 @@ from sylliptor_agent_cli.tools.web_search import (
     resolve_web_search_runtime_status,
     web_search,
 )
+from sylliptor_agent_cli.tools.web_search_ddgs import DdgsSearchError
+
+
+@pytest.fixture(autouse=True)
+def _clear_generic_web_search_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_API_KEY", raising=False)
 
 
 def _public_resolver(_host: str, _port: int) -> list[str]:
@@ -122,6 +130,59 @@ def test_web_search_returns_structured_openai_result_and_dedupes_sources() -> No
             "end_index": 12,
         }
     ]
+
+
+def test_subscription_auth_makes_native_responses_web_search_ready() -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def web_search(self, **_kwargs: object) -> WebSearchResponse:
+            return WebSearchResponse(
+                answer="Subscription search result",
+                citations=[],
+                sources=[],
+                queries=["subscription query"],
+                raw={"id": "resp_search"},
+                response_id="resp_search",
+                model="gpt-5.4",
+            )
+
+    profile = ProfileSpec(
+        name="chatgpt-codex",
+        protocol="openai_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        auth_provider="openai-codex",
+        default_model="gpt-5.4",
+        reasoning_effort="high",
+        web_search_adapter="openai_responses",
+    )
+    cfg = AppConfig(
+        model=profile.default_model,
+        base_url=profile.base_url,
+        web_search_mode="native",
+        web_search_adapter="openai_responses",
+    )
+    cfg.extra_fields = {"profiles": {}, "active_profile": ""}
+    add_profile(cfg, profile)
+    set_active_profile(cfg, profile.name)
+
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="")
+    result = web_search(
+        query="subscription query",
+        cfg=cfg,
+        api_key="",
+        client_factory=_FakeClient,
+        session_id="session-subscription",
+    )
+
+    assert status.registration_ready is True
+    assert status.api_key_available is True
+    assert result["answer"] == "Subscription search result"
+    assert captured["provider_auth"].provider_id == "openai-codex"
+    assert captured["session_id"] == "session-subscription"
 
 
 def test_web_search_auto_status_prefers_openai_when_conservatively_ready(
@@ -257,6 +318,27 @@ def test_web_search_auto_status_uses_dashscope_chat_for_qwen_us_endpoint(
     assert runtime.provider == "dashscope_chat"
 
 
+def test_web_search_auto_status_supports_qwen37_responses_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    cfg = AppConfig(
+        model="qwen3.7-plus",
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        web_search_mode="auto",
+    )
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="main-key")
+    runtime = resolve_web_search_runtime(cfg=cfg, api_key="main-key", strict=True)
+
+    assert status.registration_ready is True
+    assert status.provider == "dashscope_chat"
+    assert status.model == "qwen3.7-plus"
+    assert runtime is not None
+    assert runtime.provider == "dashscope_chat"
+
+
 @pytest.mark.parametrize(
     ("base_url", "model", "expected_provider"),
     [
@@ -267,6 +349,7 @@ def test_web_search_auto_status_uses_dashscope_chat_for_qwen_us_endpoint(
             "doubao-seed-1-6-250615",
             "volcengine_web_search",
         ),
+        ("https://api.minimax.io/v1", "MiniMax-M2.7", "minimax_coding_plan"),
     ],
 )
 def test_web_search_auto_status_uses_native_chinese_provider_adapters(
@@ -286,6 +369,26 @@ def test_web_search_auto_status_uses_native_chinese_provider_adapters(
     assert status.provider == expected_provider
     assert runtime is not None
     assert runtime.provider == expected_provider
+
+
+def test_web_search_auto_status_uses_cohere_hosted_connector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    cfg = AppConfig(
+        model="command-a-plus-05-2026",
+        base_url="https://api.cohere.ai/compatibility/v1",
+        web_search_mode="auto",
+    )
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="cohere-key")
+    runtime = resolve_web_search_runtime(cfg=cfg, api_key="cohere-key", strict=True)
+
+    assert status.registration_ready is True
+    assert status.provider == "cohere_web_search"
+    assert runtime is not None
+    assert runtime.provider == "cohere_web_search"
 
 
 def test_is_openrouter_base_url_recognizes_sylliptor_trial_proxy() -> None:
@@ -512,6 +615,26 @@ def test_web_search_explicit_tavily_override_without_key_is_not_ready(
         resolve_web_search_runtime(cfg=cfg, api_key="main-key", strict=True)
 
 
+def test_tavily_accepts_generic_web_search_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_API_KEY", "external-search-key")
+    cfg = _configured_cfg(
+        mode="external",
+        base_url="https://api.deepseek.com/v1",
+    )
+    cfg.web_search_adapter = "tavily"
+
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="deepseek-key")
+    runtime = resolve_web_search_runtime(cfg=cfg, api_key="deepseek-key", strict=True)
+
+    assert status.registration_ready is True
+    assert status.provider == "tavily"
+    assert runtime is not None
+    assert runtime.api_key == "external-search-key"
+
+
 def test_web_search_auto_can_fall_back_from_openai_to_tavily_in_same_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -634,6 +757,7 @@ def test_web_search_auto_reports_combined_error_when_all_backends_fail(
 ) -> None:
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
     monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", "0")
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "api.openai.com":
@@ -653,6 +777,152 @@ def test_web_search_auto_reports_combined_error_when_all_backends_fail(
             transport=httpx.MockTransport(handler),
             resolver=_public_resolver,
         )
+
+
+def test_web_search_auto_falls_back_to_keyless_ddgs_when_native_and_tavily_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.openai.com":
+            return httpx.Response(400, json={"error": {"message": "OpenAI failure"}})
+        if request.url.host == "api.tavily.com":
+            return httpx.Response(502, json={"error": "Tavily failure"})
+        raise AssertionError(f"unexpected host: {request.url.host}")
+
+    def _fake_ddgs_search(**kwargs: object) -> dict[str, object]:
+        assert kwargs["query"] == "failing docs"
+        return {
+            "query": "failing docs",
+            "answer": "",
+            "citations": [
+                {
+                    "title": "Keyless result",
+                    "url": "https://docs.example.com/keyless",
+                    "start_index": None,
+                    "end_index": None,
+                }
+            ],
+            "sources": [{"url": "https://docs.example.com/keyless", "title": "Keyless result"}],
+            "queries": ["failing docs"],
+            "model": None,
+            "backend": "ddgs",
+            "allowed_domains": [],
+            "external_web_access": True,
+            "response_id": None,
+            "sources_truncated": False,
+        }
+
+    monkeypatch.setattr(web_search_module, "ddgs_search", _fake_ddgs_search)
+
+    result = web_search(
+        query="failing docs",
+        cfg=_configured_cfg(),
+        api_key="main-key",
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+    )
+
+    assert result["backend"] == "ddgs"
+    assert result["backend_adapter"] == "ddgs"
+    assert result["search_protocol"] == "ddgs"
+    assert result["provider_hosted_search"] is False
+    assert result["external_search_provider"] == "ddgs"
+    assert result["sources"][0]["url"] == "https://docs.example.com/keyless"
+    # Every result carries host wall-clock provenance so the model can anchor
+    # "today"/"current" reasoning to real time (parseable, timezone-aware ISO).
+    from datetime import datetime as _datetime
+
+    retrieved_at = _datetime.fromisoformat(result["retrieved_at"])
+    assert retrieved_at.tzinfo is not None
+
+
+def test_web_search_auto_combined_error_includes_keyless_ddgs_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.openai.com":
+            return httpx.Response(400, json={"error": {"message": "OpenAI failure"}})
+        if request.url.host == "api.tavily.com":
+            return httpx.Response(502, json={"error": "Tavily failure"})
+        raise AssertionError(f"unexpected host: {request.url.host}")
+
+    def _failing_ddgs_search(**_kwargs: object) -> dict[str, object]:
+        raise DdgsSearchError("keyless (ddgs) search failed: rate limited")
+
+    monkeypatch.setattr(web_search_module, "ddgs_search", _failing_ddgs_search)
+
+    with pytest.raises(
+        WebSearchError,
+        match=(
+            "web_search failed across auto backends: "
+            "openai_responses: Responses error 400: OpenAI failure; "
+            "tavily: Tavily error 502: Tavily failure; "
+            r"ddgs: keyless \(ddgs\) search failed: rate limited"
+        ),
+    ):
+        web_search(
+            query="failing docs",
+            cfg=_configured_cfg(),
+            api_key="main-key",
+            transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
+        )
+
+
+def test_web_search_keyless_ddgs_serves_provider_without_native_search_and_no_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The DeepSeek scenario: chat key only, unknown base_url, no external key."""
+
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    def _fake_ddgs_search(**kwargs: object) -> dict[str, object]:
+        assert kwargs["query"] == "latest python release"
+        return {
+            "query": "latest python release",
+            "answer": "",
+            "citations": [],
+            "sources": [{"url": "https://python.org/downloads", "title": "Downloads"}],
+            "queries": ["latest python release"],
+            "model": None,
+            "backend": "ddgs",
+            "allowed_domains": [],
+            "external_web_access": True,
+            "response_id": None,
+            "sources_truncated": False,
+        }
+
+    monkeypatch.setattr(web_search_module, "ddgs_search", _fake_ddgs_search)
+
+    cfg = AppConfig(
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com/v1",
+        web_search_mode="auto",
+    )
+    runtime = resolve_web_search_runtime(cfg=cfg, api_key="deepseek-key")
+    assert runtime is not None
+    assert runtime.provider == "ddgs"
+
+    result = web_search(
+        query="latest python release",
+        cfg=cfg,
+        api_key="deepseek-key",
+        resolver=_public_resolver,
+    )
+
+    assert result["backend"] == "ddgs"
+    assert result["provider_hosted_search"] is False
+    assert result["sources"][0]["url"] == "https://python.org/downloads"
 
 
 def test_web_search_tavily_output_contract_stays_stable(
@@ -686,6 +956,12 @@ def test_web_search_tavily_output_contract_stays_stable(
         resolver=_public_resolver,
     )
 
+    # Time-varying host provenance: assert shape separately, compare the rest
+    # of the contract exactly.
+    from datetime import datetime as _datetime
+
+    retrieved_at = result.pop("retrieved_at")
+    assert _datetime.fromisoformat(retrieved_at).tzinfo is not None
     assert result == {
         "query": "migration guide",
         "answer": "Read the migration guide.",
@@ -1210,32 +1486,23 @@ def test_web_search_dispatches_to_zhipu_web_search_backend(
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        assert str(request.url) == "https://open.bigmodel.cn/api/paas/v4/web_search"
         body = json.loads(request.content.decode("utf-8"))
-        assert body["model"] == "glm-4.6"
-        assert body["stream"] is False
-        assert body["tools"] == [
-            {
-                "type": "web_search",
-                "web_search": {
-                    "enable": True,
-                    "search_engine": "search_pro",
-                    "search_query": "zhipu search",
-                    "search_result": True,
-                    "count": 5,
-                    "search_recency_filter": "noLimit",
-                    "content_size": "medium",
-                    "search_domain_filter": "docs.example.com",
-                },
-            }
-        ]
+        assert body == {
+            "search_query": "zhipu search",
+            "search_engine": "search_pro",
+            "search_intent": False,
+            "count": 5,
+            "search_recency_filter": "noLimit",
+            "content_size": "medium",
+            "search_domain_filter": "docs.example.com",
+        }
         return httpx.Response(
             200,
             json={
                 "id": "glm_1",
-                "model": "glm-4.6",
-                "choices": [{"message": {"content": "Zhipu searched the web."}}],
-                "web_search": [
+                "search_intent": [{"query": "zhipu search", "keywords": "zhipu search"}],
+                "search_result": [
                     {
                         "title": "GLM Docs",
                         "link": "https://docs.example.com/glm",
@@ -1261,7 +1528,7 @@ def test_web_search_dispatches_to_zhipu_web_search_backend(
     )
 
     assert result["backend"] == "zhipu_web_search"
-    assert result["answer"] == "Zhipu searched the web."
+    assert result["answer"] == ""
     assert result["sources"] == [
         {
             "url": "https://docs.example.com/glm",
@@ -1574,6 +1841,112 @@ def test_web_search_dispatches_to_mistral_conversations_backend(
     ]
 
 
+def test_web_search_dispatches_to_minimax_token_plan_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.minimax.io/v1/coding_plan/search"
+        assert request.headers["MM-API-Source"] == "Minimax-MCP"
+        assert json.loads(request.content.decode("utf-8")) == {"q": "MiniMax search"}
+        return httpx.Response(
+            200,
+            json={
+                "id": "minimax_search_1",
+                "organic": [
+                    {
+                        "title": "MiniMax Docs",
+                        "link": "https://docs.example.com/minimax",
+                        "snippet": "MiniMax search documentation.",
+                    }
+                ],
+                "related_searches": [{"query": "MiniMax Token Plan"}],
+                "base_resp": {"status_code": 0, "status_msg": "success"},
+            },
+        )
+
+    result = web_search(
+        query="MiniMax search",
+        cfg=AppConfig(
+            model="MiniMax-M2.7",
+            base_url="https://api.minimax.io/v1",
+            web_search_adapter="minimax_coding_plan",
+        ),
+        api_key="minimax-token-plan-key",
+        allowed_domains=["docs.example.com"],
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+    )
+
+    assert result["backend"] == "minimax_coding_plan"
+    assert result["queries"] == ["MiniMax search", "MiniMax Token Plan"]
+    assert result["sources"] == [
+        {
+            "url": "https://docs.example.com/minimax",
+            "title": "MiniMax Docs",
+            "snippet": "MiniMax search documentation.",
+        }
+    ]
+
+
+def test_web_search_dispatches_to_cohere_hosted_connector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.cohere.com/v1/chat"
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["model"] == "command-a-plus-05-2026"
+        assert body["connectors"] == [{"id": "web-search"}]
+        assert body["prompt_truncation"] == "AUTO"
+        return httpx.Response(
+            200,
+            json={
+                "response_id": "cohere_search_1",
+                "text": "Cohere searched the web.",
+                "search_queries": [{"text": "Cohere hosted search"}],
+                "citations": [{"start": 0, "end": 6, "document_ids": ["web-search_1:0"]}],
+                "documents": [
+                    {
+                        "id": "web-search_1:0",
+                        "title": "Cohere Docs",
+                        "url": "https://docs.example.com/cohere",
+                        "snippet": "Cohere connector documentation.",
+                    }
+                ],
+            },
+        )
+
+    result = web_search(
+        query="Cohere search",
+        cfg=AppConfig(
+            model="command-a-plus-05-2026",
+            base_url="https://api.cohere.ai/compatibility/v1",
+            web_search_adapter="cohere_web_search",
+        ),
+        api_key="cohere-key",
+        allowed_domains=["docs.example.com"],
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+    )
+
+    assert result["backend"] == "cohere_web_search"
+    assert result["answer"] == "Cohere searched the web."
+    assert result["queries"] == ["Cohere hosted search"]
+    assert result["citations"] == [
+        {
+            "title": "Cohere Docs",
+            "url": "https://docs.example.com/cohere",
+            "start_index": 0,
+            "end_index": 6,
+        }
+    ]
+
+
 def test_web_search_rejects_external_web_access_false_for_dashscope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1639,6 +2012,7 @@ def test_resolve_web_search_runtime_status_reports_auto_unavailable_notes_are_in
 ) -> None:
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", "0")
     cfg = AppConfig(
         base_url="https://example-proxy.invalid/v1",
         web_search_mode="auto",
@@ -1660,8 +2034,30 @@ def test_resolve_web_search_runtime_status_reports_auto_unavailable_notes_are_in
     assert any("missing model" in note for note in status.notes)
     assert any("missing API key" in note for note in status.notes)
     assert any("missing TAVILY_API_KEY" in note for note in status.notes)
+    assert any("keyless web search is disabled" in note for note in status.notes)
     assert "TAVILY_API_KEY" in status.setup_hint
     assert "provider-agnostic fallback" in status.setup_hint
+
+
+def test_resolve_web_search_runtime_status_reports_keyless_ddgs_ready_without_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", raising=False)
+    cfg = AppConfig(
+        model="deepseek-chat",
+        base_url="https://api.deepseek.com/v1",
+        web_search_mode="auto",
+    )
+
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key=None)
+
+    assert status.mode == "auto"
+    assert status.provider == "ddgs"
+    assert status.registration_ready is True
+    assert status.availability_label == "available"
+    assert "Keyless web search" in status.setup_hint
 
 
 def test_resolve_web_search_runtime_status_reports_ready_setup_hint(
@@ -1769,6 +2165,7 @@ def test_resolve_web_search_runtime_strict_mode_rejects_missing_requirements(
 ) -> None:
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", "0")
     for key, value in env.items():
         monkeypatch.setenv(key, value)
 

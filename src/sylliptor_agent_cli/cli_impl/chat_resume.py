@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..runtime_kind import RuntimeKind
+from ..step_budget import normalize_step_budget_policy, step_budget_is_autonomous
 from ..surface.styles import STYLE_CONTENT, STYLE_EMPHASIS
 
 _PROTECTED_GLOBAL_NAMES: set[str] = set()
@@ -487,6 +488,7 @@ def _resume_chat_session(
     history_messages = _load_chat_resume_messages(target_path)
     resume_context_message = _build_chat_resume_context_message(target_path)
     start_payload = _load_chat_resume_session_start(target_path)
+    runtime_settings = _load_chat_resume_runtime_settings(target_path)
     active_workdir_relpath = _load_chat_resume_active_workdir_relpath(target_path)
 
     current_mode = str(getattr(session, "mode", "review") or "review").strip().lower()
@@ -504,8 +506,12 @@ def _resume_chat_session(
     resume_cfg = clone_cfg(cfg)
 
     start_step_budget_policy = str(start_payload.get("step_budget_policy") or "").strip().lower()
-    if start_step_budget_policy in {"adaptive", "fixed"}:
-        resume_cfg.step_budget_policy = start_step_budget_policy
+    if start_step_budget_policy in {"autonomous", "limited", "adaptive", "fixed"}:
+        resume_cfg.step_budget_policy = normalize_step_budget_policy(start_step_budget_policy)
+    else:
+        resume_cfg.step_budget_policy = normalize_step_budget_policy(
+            getattr(resume_cfg, "step_budget_policy", "autonomous")
+        )
     stored_task_max_steps = _resume_optional_positive_int(start_payload.get("task_max_steps"))
     if stored_task_max_steps is not None:
         resume_cfg.task_max_steps = stored_task_max_steps
@@ -524,9 +530,13 @@ def _resume_chat_session(
 
     raw_enable_chat_turn_step_budget = start_payload.get("enable_chat_turn_step_budget")
     enable_chat_turn_step_budget = (
-        raw_enable_chat_turn_step_budget
-        if isinstance(raw_enable_chat_turn_step_budget, bool)
-        else True
+        True
+        if step_budget_is_autonomous(resume_cfg.step_budget_policy)
+        else (
+            raw_enable_chat_turn_step_budget
+            if isinstance(raw_enable_chat_turn_step_budget, bool)
+            else True
+        )
     )
     chat_turn_fixed_override = _resume_optional_positive_int(
         start_payload.get("chat_turn_fixed_override")
@@ -555,8 +565,63 @@ def _resume_chat_session(
     usage_hud_enabled = _chat_usage_hud_enabled(session)
 
     start_model = str(start_payload.get("model") or "").strip()
-    if start_model:
+    model_restore_reason = "no historical model recorded"
+    historical_model_restored = False
+    try:
+        from ..llm.metadata import endpoint_descriptor_matches
+        from ..profiles import get_active_profile, resolve_effective_base_url
+
+        current_profile = get_active_profile(resume_cfg)
+        current_provider_base_url = resolve_effective_base_url(
+            cfg=resume_cfg,
+            profile=current_profile,
+        ).rstrip("/")
+        connection_identity_keys = (
+            "profile_name",
+            "protocol",
+            "auth_provider",
+            "reasoning_trace_adapter",
+        )
+        has_connection_identity = all(key in start_payload for key in connection_identity_keys)
+        if "provider_base_url_descriptor" in start_payload:
+            endpoint_matches = endpoint_descriptor_matches(
+                current_provider_base_url,
+                start_payload.get("provider_base_url_descriptor"),
+            )
+            has_connection_identity = has_connection_identity and isinstance(
+                start_payload.get("provider_base_url_descriptor"), dict
+            )
+        else:
+            # Legacy sessions only have a raw URL. It may contain credentials
+            # and is not a trustworthy resume identity, so model restoration
+            # and provider continuation both fail closed.
+            has_connection_identity = False
+            endpoint_matches = False
+        connection_matches = has_connection_identity and (
+            str(start_payload.get("profile_name") or "") == current_profile.name
+            and str(start_payload.get("protocol") or "") == current_profile.protocol
+            and endpoint_matches
+            and str(start_payload.get("auth_provider") or "")
+            == str(current_profile.auth_provider or "")
+            and str(start_payload.get("reasoning_trace_adapter") or "auto")
+            == current_profile.reasoning_trace_adapter
+        )
+    except Exception:  # noqa: BLE001 - legacy/corrupt identity must fail closed
+        has_connection_identity = False
+        connection_matches = False
+
+    if start_model and connection_matches:
         resume_cfg.model = start_model
+        historical_model_restored = True
+        model_restore_reason = "stored provider connection matches the active connection"
+    elif start_model and has_connection_identity:
+        model_restore_reason = (
+            "stored provider connection differs from the active connection; using the current model"
+        )
+    elif start_model:
+        model_restore_reason = (
+            "legacy session has no verified provider identity; using the current model"
+        )
 
     raw_temp = start_payload.get("temperature")
     if raw_temp is not None:
@@ -586,7 +651,7 @@ def _resume_chat_session(
             continue
         setattr(resume_cfg, key, parsed_value)
 
-    raw_stream = start_payload.get("stream")
+    raw_stream = runtime_settings.get("stream")
     if isinstance(raw_stream, bool):
         resume_cfg.stream = raw_stream
 
@@ -647,6 +712,35 @@ def _resume_chat_session(
     except Exception as e:  # noqa: BLE001
         return False, f"[red]Failed to resume session:[/red] {e}", []
 
+    # Provider-owned continuation state is only valid on the exact route that
+    # produced it.  Require both the session-level connection/model identity
+    # above and the per-message route stamp to match the newly created client.
+    # Legacy sessions, clients without a route identity, and any mismatch fail
+    # closed while retaining public message content and tool calls for ordinary
+    # full-history replay.
+    from ..llm.metadata import (
+        ProviderRouteIdentity,
+        gate_messages_for_provider_route,
+        strip_provider_metadata_from_messages,
+    )
+
+    active_route_identity = getattr(getattr(new_session, "client", None), "route_identity", None)
+    if historical_model_restored and isinstance(active_route_identity, ProviderRouteIdentity):
+        history_messages = gate_messages_for_provider_route(
+            history_messages,
+            active_route_identity,
+        )
+    else:
+        history_messages = strip_provider_metadata_from_messages(history_messages)
+
+    restored_trace_level = str(runtime_settings.get("trace_level") or "compact")
+    trace_setter = getattr(getattr(new_session, "surface", None), "set_trace_level", None)
+    if callable(trace_setter):
+        try:
+            trace_setter(restored_trace_level)
+        except Exception:
+            pass
+
     resume_context_loaded = _insert_chat_resume_context_message(
         new_session,
         resume_context_message or "",
@@ -664,6 +758,8 @@ def _resume_chat_session(
             "loaded_messages": len(history_messages),
             "resume_context_loaded": resume_context_loaded,
             "resume_context_chars": len(resume_context_message or ""),
+            "historical_model_restored": historical_model_restored,
+            "model_restore_reason": model_restore_reason,
         },
     )
 
@@ -691,6 +787,8 @@ def _resume_chat_session(
     turn_count = sum(1 for msg in history_messages if msg.get("role") == "user")
     suffix = "" if turn_count == 1 else "s"
     message = f"Resumed session: {requested_id} ({turn_count} turn{suffix} loaded)."
+    if start_model and not historical_model_restored:
+        message += " The current provider and model were kept for safety."
     if close_warning:
         message += f" [yellow]Warning:[/yellow] {close_warning}."
     return (True, message, history_messages)

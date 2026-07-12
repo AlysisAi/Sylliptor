@@ -15,7 +15,7 @@ from sylliptor_agent_cli.config import AppConfig, clone_cfg
 from sylliptor_agent_cli.runtime_kind import RuntimeKind
 from sylliptor_agent_cli.session_store import SessionStore, read_session_events
 from sylliptor_agent_cli.surface.noop_surface import NoopSurface
-from sylliptor_agent_cli.verify_gate import ResolvedVerifyCommands
+from sylliptor_agent_cli.verify_gate import ResolvedVerifyCommands, VerifyRunResult
 
 
 def _store(root: Path, *, session_id: str = "verify-test") -> SessionStore:
@@ -161,30 +161,33 @@ def test_verify_run_uses_configured_commands_and_writes_artifact(
         "fallback_used": False,
     }
     command_results = result["command_results"]
-    assert command_results == [
-        {
-            "command": "pytest -q",
-            "effective_command": "pytest -q",
-            "exit_code": 0,
-            "ok": True,
-            "real_execution": True,
-            "output_preview": "tests ok\n",
-            "output_chars": 9,
-            "output_truncated": False,
-            "fallback_used": False,
-        },
-        {
-            "command": "ruff check .",
-            "effective_command": "ruff check .",
-            "exit_code": 1,
-            "ok": False,
-            "real_execution": None,
-            "output_preview": "lint failed\n",
-            "output_chars": 12,
-            "output_truncated": False,
-            "fallback_used": False,
-        },
-    ]
+    assert command_results[0] == {
+        "command": "pytest -q",
+        "effective_command": "pytest -q",
+        "exit_code": 0,
+        "status": "passed",
+        "ok": True,
+        "real_execution": True,
+        "output_preview": "tests ok\n",
+        "output_chars": 9,
+        "output_truncated": False,
+        "fallback_used": False,
+    }
+    failed_command = dict(command_results[1])
+    failure_summary = failed_command.pop("failure_summary")
+    assert failed_command == {
+        "command": "ruff check .",
+        "effective_command": "ruff check .",
+        "exit_code": 1,
+        "status": "failed",
+        "ok": False,
+        "real_execution": None,
+        "output_preview": "lint failed\n",
+        "output_chars": 12,
+        "output_truncated": False,
+        "fallback_used": False,
+    }
+    assert failure_summary["primary_error"] == "lint failed"
 
     artifact_rel = result["artifact_path"]
     assert artifact_rel == "sessions/verify-test/verify/step001_verify_run.txt"
@@ -197,6 +200,33 @@ def test_verify_run_uses_configured_commands_and_writes_artifact(
     assert "## Command 1" in body
     assert "## Command 2" in body
     assert "lint failed" in body
+
+
+def test_verify_run_treats_pytest_exit_5_no_tests_as_skipped_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        assert cmd == "pytest -q"
+        (tmp_path / ".pytest_cache").mkdir()
+        return _cp(returncode=5, stdout="custom plugin suppressed the collection summary\n")
+
+    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+
+    cfg = AppConfig(model="test-model")
+    cfg.verify_commands = ["pytest -q"]
+    tools = _build_tools(tmp_path, cfg=cfg)
+
+    result = tools["verify_run"].run({})
+
+    assert result["all_passed"] is True
+    assert result["failed_commands"] == []
+    assert result["summary"] == "verification skipped: nothing to verify (1/1)"
+    assert result["command_results"][0]["status"] == "skipped"
+    assert result["command_results"][0]["ok"] is True
+    assert result["command_results"][0]["real_execution"] is False
+    assert result["command_results"][0]["non_execution_reason"] == "pytest_no_tests_collected"
+    assert not (tmp_path / ".pytest_cache").exists()
 
 
 def test_verify_run_respects_session_log_dir_override_outside_root(
@@ -834,6 +864,53 @@ def test_interactive_python_repo_without_tests_marks_verification_unavailable(
     assert result["all_passed"] is True
 
 
+def test_verify_run_ignores_model_commands_when_verification_contract_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_commands: list[list[str]] = []
+
+    def fake_run_task_verification(
+        *,
+        root: Path,
+        commands: list[str],
+        artifact_path: Path,
+        cfg: AppConfig,
+    ) -> VerifyRunResult:
+        _ = root, cfg
+        observed_commands.append(list(commands))
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text("verification skipped: no commands\n", encoding="utf-8")
+        return VerifyRunResult(
+            commands=list(commands), command_results=[], artifact_path=artifact_path
+        )
+
+    monkeypatch.setattr(agent_loop_mod, "run_task_verification", fake_run_task_verification)
+    tools = _build_tools(
+        tmp_path,
+        cfg=AppConfig(model="test-model", verify_commands=[]),
+        verify_command_selection=ResolvedVerifyCommands(
+            commands=tuple(),
+            source="repo_scan.no_authoritative_commands",
+            reason="no configured verification command",
+            contract_type="unavailable",
+        ),
+    )
+
+    result = tools["verify_run"].run(
+        {"commands": ['python -c "from calc import divide; divide(1, 0)"']}
+    )
+
+    assert observed_commands == [[]]
+    assert result["commands"] == []
+    assert result["summary"] == "verification skipped: no commands"
+    assert result["all_passed"] is True
+    assert result["ignored_model_verification_commands"] == [
+        'python -c "from calc import divide; divide(1, 0)"'
+    ]
+    assert result["verification_skip_reason"] == "verification_contract_unavailable"
+
+
 def test_interactive_plain_non_python_turn_does_not_require_generic_pytest(
     tmp_path: Path,
 ) -> None:
@@ -1244,6 +1321,78 @@ def test_verify_run_allows_override_commands(
     assert result["summary"] == "verification passed (2/2)"
 
 
+@pytest.mark.parametrize(
+    "requested_command",
+    [
+        "python -m pytest -q && ruff check src",
+        "python -m pytest -q; ruff check src",
+    ],
+)
+def test_verify_run_splits_simple_chained_override_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested_command: str,
+) -> None:
+    calls: list[str] = []
+
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(cmd))
+        return _cp(returncode=0, stdout="ok\n")
+
+    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+
+    tools = _build_tools(tmp_path)
+
+    result = tools["verify_run"].run({"commands": [requested_command]})
+
+    assert calls == ["python -m pytest -q", "ruff check src"]
+    assert result["commands"] == ["python -m pytest -q", "ruff check src"]
+    assert result["all_passed"] is True
+
+
+def test_verify_run_splits_chained_override_before_contract_matching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append(str(cmd))
+        return _cp(returncode=0, stdout="ok\n")
+
+    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+
+    tools = _build_tools(
+        tmp_path,
+        effective_verification_commands=["pytest -q", "ruff check src"],
+    )
+
+    result = tools["verify_run"].run({"commands": ["python -m pytest -q && ruff check src"]})
+
+    assert calls == ["python -m pytest -q", "ruff check src"]
+    assert result["commands"] == ["python -m pytest -q", "ruff check src"]
+    assert result["all_passed"] is True
+
+
+def test_verify_run_rejects_non_verifier_inside_simple_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_loop_mod,
+        "run_task_verification",
+        lambda **_kwargs: pytest.fail("verify engine should not run for unsafe commands"),
+    )
+
+    tools = _build_tools(tmp_path)
+
+    with pytest.raises(
+        verify_gate_mod.VerifyError,
+        match="disallowed_shell_control_flow",
+    ):
+        tools["verify_run"].run({"commands": ["pytest -q && echo ok"]})
+
+
 def test_verify_run_rejects_incompatible_override_against_effective_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1336,7 +1485,7 @@ def test_verify_run_allows_targeted_pytest_variants_against_effective_contract(
     assert result["all_passed"] is True
 
 
-def test_verify_run_marks_go_no_tests_to_run_as_failed_verification(
+def test_verify_run_marks_go_no_tests_to_run_as_skipped_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1359,16 +1508,16 @@ def test_verify_run_marks_go_no_tests_to_run_as_failed_verification(
     result = tools["verify_run"].run({"commands": ["go test -run NonExistent ./..."]})
 
     assert calls == ["go test -run NonExistent ./..."]
-    assert result["all_passed"] is False
-    assert result["failed_commands"] == ["go test -run NonExistent ./..."]
-    assert result["summary"] == (
-        "verification failed (0/1); failed: go test -run NonExistent ./..."
-    )
+    assert result["all_passed"] is True
+    assert result["failed_commands"] == []
+    assert result["summary"] == "verification skipped: nothing to verify (1/1)"
+    assert result["command_results"][0]["status"] == "skipped"
+    assert result["command_results"][0]["ok"] is True
     assert result["command_results"][0]["real_execution"] is False
     assert result["command_results"][0]["non_execution_reason"] == "go_test_no_tests_to_run"
 
 
-def test_verify_run_marks_go_no_test_files_as_failed_verification(
+def test_verify_run_marks_go_no_test_files_as_skipped_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1391,9 +1540,11 @@ def test_verify_run_marks_go_no_test_files_as_failed_verification(
     result = tools["verify_run"].run({"commands": ["go test ./..."]})
 
     assert calls == ["go test ./..."]
-    assert result["all_passed"] is False
-    assert result["failed_commands"] == ["go test ./..."]
-    assert result["summary"] == "verification failed (0/1); failed: go test ./..."
+    assert result["all_passed"] is True
+    assert result["failed_commands"] == []
+    assert result["summary"] == "verification skipped: nothing to verify (1/1)"
+    assert result["command_results"][0]["status"] == "skipped"
+    assert result["command_results"][0]["ok"] is True
     assert result["command_results"][0]["real_execution"] is False
     assert result["command_results"][0]["non_execution_reason"] == "go_test_no_test_files"
 
@@ -1431,7 +1582,7 @@ def test_verify_run_accepts_mixed_go_package_output_with_real_execution(
     assert result["command_results"][0].get("non_execution_reason") is None
 
 
-def test_verify_run_marks_unittest_zero_tests_as_failed_verification(
+def test_verify_run_marks_unittest_zero_tests_as_skipped_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1457,12 +1608,16 @@ def test_verify_run_marks_unittest_zero_tests_as_failed_verification(
     result = tools["verify_run"].run({})
 
     assert calls == ["python -m unittest discover -s tests"]
-    assert result["all_passed"] is False
+    assert result["all_passed"] is True
+    assert result["failed_commands"] == []
+    assert result["summary"] == "verification skipped: nothing to verify (1/1)"
+    assert result["command_results"][0]["status"] == "skipped"
+    assert result["command_results"][0]["ok"] is True
     assert result["command_results"][0]["real_execution"] is False
     assert result["command_results"][0]["non_execution_reason"] == "unittest_no_tests_run"
 
 
-def test_verify_run_marks_maven_zero_tests_as_failed_verification(
+def test_verify_run_marks_maven_zero_tests_as_skipped_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1488,7 +1643,11 @@ def test_verify_run_marks_maven_zero_tests_as_failed_verification(
     result = tools["verify_run"].run({})
 
     assert calls == ["mvn test"]
-    assert result["all_passed"] is False
+    assert result["all_passed"] is True
+    assert result["failed_commands"] == []
+    assert result["summary"] == "verification skipped: nothing to verify (1/1)"
+    assert result["command_results"][0]["status"] == "skipped"
+    assert result["command_results"][0]["ok"] is True
     assert result["command_results"][0]["real_execution"] is False
     assert result["command_results"][0]["non_execution_reason"] == "maven_test_zero_tests"
 
@@ -1665,7 +1824,7 @@ def test_verify_run_rejects_non_executing_override_against_effective_contract(
 
     with pytest.raises(
         verify_gate_mod.VerifyError,
-        match="verify_run commands must stay within the session's effective verification contract.",
+        match="non_assertive_verification_mode",
     ):
         tools["verify_run"].run({"commands": [requested_command]})
 
@@ -1735,23 +1894,21 @@ def test_verify_run_rejects_compound_shell_command(
 
     with pytest.raises(
         verify_gate_mod.VerifyError,
-        match="verification commands must be single commands without shell control flow or chaining.",
+        match="disallowed_shell_control_flow",
     ):
         tools["verify_run"].run({"commands": ["pytest -q || true"]})
 
 
-def test_verify_run_executes_explicit_trusted_pipeline(
+def test_verify_run_rejects_explicit_trusted_pipeline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[str] = []
-
-    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
-        calls.append(str(cmd))
-        return _cp(returncode=0, stdout="ok\n")
-
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
-    pipeline = "printf 'a\\nb\\n' | tail -n 1"
+    monkeypatch.setattr(
+        agent_loop_mod,
+        "run_task_verification",
+        lambda **_kwargs: pytest.fail("verify engine should not run for unsafe pipeline"),
+    )
+    pipeline = "tool args | tail -n 1"
     tools = _build_tools(
         tmp_path,
         verify_command_selection=ResolvedVerifyCommands(
@@ -1761,14 +1918,8 @@ def test_verify_run_executes_explicit_trusted_pipeline(
         ),
     )
 
-    result = tools["verify_run"].run({})
-
-    assert calls == [pipeline]
-    assert result["commands"] == [pipeline]
-    assert result["all_passed"] is True
-    specs = result["verification_command_specs"]
-    assert specs[0]["execution_mode"] == "TRUSTED_SHELL_EXPRESSION"
-    assert specs[0]["provenance"] == "EXPLICIT_USER_COMMAND"
+    with pytest.raises(verify_gate_mod.VerifyError, match="unsafe_pipeline"):
+        tools["verify_run"].run({})
 
 
 def test_verify_run_rejects_arbitrary_model_pipeline(
@@ -1784,37 +1935,28 @@ def test_verify_run_rejects_arbitrary_model_pipeline(
 
     with pytest.raises(
         verify_gate_mod.VerifyError,
-        match="verification commands must be single commands without shell control flow or chaining.",
+        match="unsafe_pipeline",
     ):
         tools["verify_run"].run({"commands": ["printf ok | cat"]})
 
 
-def test_verify_run_authoritative_trusted_pipeline_remains_locked(
+def test_verify_run_authoritative_pipeline_fails_fast(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[str] = []
-
-    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
-        calls.append(str(cmd))
-        return _cp(returncode=0, stdout="ok\n")
-
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
-    pipeline = "printf ok | cat"
+    monkeypatch.setattr(
+        agent_loop_mod,
+        "run_task_verification",
+        lambda **_kwargs: pytest.fail("verify engine should not run for unsafe pipeline"),
+    )
+    pipeline = "tool args | tail -n 1"
     tools = _build_tools(
         tmp_path,
         authoritative_verification_commands=[pipeline],
     )
 
-    result = tools["verify_run"].run({"commands": [pipeline]})
-    assert result["all_passed"] is True
-    assert calls == [pipeline]
-
-    with pytest.raises(
-        verify_gate_mod.VerifyError,
-        match="Managed verification commands are locked",
-    ):
-        tools["verify_run"].run({"commands": ["printf ok | tail -n 1"]})
+    with pytest.raises(verify_gate_mod.VerifyError, match="unsafe_pipeline"):
+        tools["verify_run"].run({"commands": [pipeline]})
 
 
 def test_verify_run_malformed_authoritative_command_fails_fast(

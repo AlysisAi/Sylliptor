@@ -12,6 +12,7 @@ _VALID_MODES = {"off", "warn", "strict"}
 _VALID_BACKENDS = {"auto", "bwrap", "docker"}
 _VALID_NETWORK = {"off", "on"}
 _VALID_BWRAP_PROFILES = {"compat", "hardened"}
+_VALID_PREVIEW_ACCESS = {"auto", "local", "lan"}
 DEFAULT_SHELL_SANDBOX_DOCKER_IMAGE = default_sandbox_docker_image("dev")
 
 
@@ -20,6 +21,7 @@ class ShellSandboxSettings:
     mode: str = "strict"
     backend: str = "auto"
     network: str = "off"
+    preview_access: str = "auto"
     bwrap_profile: str = "hardened"
     docker_image: str = DEFAULT_SHELL_SANDBOX_DOCKER_IMAGE
     clear_env: bool = True
@@ -157,6 +159,7 @@ def resolve_shell_sandbox_settings(cfg: AppConfig) -> ShellSandboxSettings:
     mode = "strict"
     backend = "auto"
     network = "off"
+    preview_access = "auto"
     bwrap_profile = "hardened"
     docker_image = DEFAULT_SHELL_SANDBOX_DOCKER_IMAGE
     clear_env = True
@@ -193,6 +196,12 @@ def resolve_shell_sandbox_settings(cfg: AppConfig) -> ShellSandboxSettings:
         field_name="shell_sandbox.network",
         allowed=_VALID_NETWORK,
         default=network,
+    )
+    preview_access = _parse_choice(
+        cfg_map.get("preview_access"),
+        field_name="shell_sandbox.preview_access",
+        allowed=_VALID_PREVIEW_ACCESS,
+        default=preview_access,
     )
     bwrap_profile = _parse_choice(
         cfg_map.get("bwrap_profile"),
@@ -279,6 +288,12 @@ def resolve_shell_sandbox_settings(cfg: AppConfig) -> ShellSandboxSettings:
         allowed=_VALID_NETWORK,
         default=network,
     )
+    preview_access = _parse_choice(
+        env_get("SYLLIPTOR_SHELL_SANDBOX_PREVIEW_ACCESS"),
+        field_name="SYLLIPTOR_SHELL_SANDBOX_PREVIEW_ACCESS",
+        allowed=_VALID_PREVIEW_ACCESS,
+        default=preview_access,
+    )
     bwrap_profile = _parse_choice(
         env_get("SYLLIPTOR_SHELL_SANDBOX_BWRAP_PROFILE"),
         field_name="SYLLIPTOR_SHELL_SANDBOX_BWRAP_PROFILE",
@@ -350,6 +365,7 @@ def resolve_shell_sandbox_settings(cfg: AppConfig) -> ShellSandboxSettings:
         mode=mode,
         backend=backend,
         network=network,
+        preview_access=preview_access,
         bwrap_profile=bwrap_profile,
         docker_image=docker_image,
         clear_env=clear_env,

@@ -129,6 +129,37 @@ def test_search_rg_includes_no_config_when_supported(tmp_path: Path, monkeypatch
     assert "-e" in cmd
 
 
+def test_search_rg_rg_backend_passes_new_search_options(tmp_path: Path, monkeypatch) -> None:
+    captured: list[_FakePopen] = []
+
+    def fake_popen(argv, **_kwargs):  # type: ignore[no-untyped-def]
+        proc = _FakePopen(argv=list(argv), returncode=1)
+        captured.append(proc)
+        return proc
+
+    monkeypatch.setattr(search_mod, "_rg_available", lambda: True)
+    monkeypatch.setattr(search_mod, "_rg_supports_no_config", lambda: False)
+    monkeypatch.setattr(search_mod.subprocess, "Popen", fake_popen)
+
+    out = search_mod.search_rg(
+        root=tmp_path,
+        pattern="Needle.*",
+        literal=True,
+        case_sensitive=False,
+        include_hidden=True,
+    )
+
+    assert out["backend"] == "rg"
+    assert out["literal"] is True
+    assert out["case_sensitive"] is False
+    assert out["include_hidden"] is True
+    cmd = captured[0].args
+    assert "--fixed-strings" in cmd
+    assert "--ignore-case" in cmd
+    assert "--hidden" in cmd
+    assert "!.git/**" in cmd
+
+
 def test_search_rg_timeout_returns_tool_error(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(search_mod, "_rg_available", lambda: True)
     monkeypatch.setattr(search_mod, "_rg_supports_no_config", lambda: False)
@@ -254,6 +285,52 @@ def test_search_rg_python_fallback_respects_globs(tmp_path: Path, monkeypatch) -
 
     assert out["backend"] == "python"
     assert out["matches"] == [{"path": "src/a.py", "line": 1, "text": "TODO a"}]
+
+
+def test_search_rg_python_fallback_supports_literal_case_context_and_hidden(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(search_mod, "_rg_available", lambda: False)
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "a.txt").write_text("before\nNeedle.*\nafter\n", encoding="utf-8")
+    (root / ".hidden.txt").write_text("needle.* hidden\n", encoding="utf-8")
+
+    out = search_mod.search_rg(
+        root=tmp_path,
+        pattern="needle.*",
+        root_path="src",
+        literal=True,
+        case_sensitive=False,
+        before_context=1,
+        after_context=1,
+    )
+
+    assert out["backend"] == "python"
+    assert out["matches"] == [
+        {
+            "path": "src/a.txt",
+            "line": 2,
+            "text": "Needle.*",
+            "before_context": [{"line": 1, "text": "before"}],
+            "after_context": [{"line": 3, "text": "after"}],
+        }
+    ]
+    assert out["before_context"] == 1
+    assert out["after_context"] == 1
+    assert out["context_text_truncated"] is False
+
+    hidden_out = search_mod.search_rg(
+        root=tmp_path,
+        pattern="needle.*",
+        root_path="src",
+        literal=True,
+        case_sensitive=False,
+        include_hidden=True,
+    )
+
+    assert any(match["path"] == "src/.hidden.txt" for match in hidden_out["matches"])
 
 
 def test_search_rg_rg_backend_stops_early_after_reaching_max_results(

@@ -34,6 +34,7 @@ from .config import (
     save_config,
     save_persisted_profile_key,
 )
+from .host_browser import open_url
 from .profile_presets import get_preset, make_profile_from_preset
 from .profiles import ProfileSpec, add_profile, get_profile, set_active_profile
 
@@ -442,10 +443,12 @@ def _exchange_error_message(exc: urllib.error.HTTPError) -> str:
 def _activate_sylliptor_profile(cfg: AppConfig, *, email: str | None) -> LoginResult:
     """Create + activate the `sylliptor` profile, keeping any model the user chose.
 
-    On the first connect there is no `sylliptor` profile yet, so the default model
-    is MiMo. On later logins we preserve whatever model the user has since selected
-    in `/config` (e.g. another model the proxy serves) instead of clobbering it back
-    to MiMo — otherwise re-logging in would silently undo their choice.
+    We never auto-select a model here. The hosted MiMo trial is no longer
+    provisioned, so on first connect the default model is left EMPTY and the user
+    picks one (``/model`` in chat or ``sylliptor config set model``); defaulting to a
+    MiMo id would point at a model we no longer serve. On later logins we preserve
+    whatever model the user has since selected instead of clobbering it, so
+    re-logging in never undoes their choice.
     """
     preset = get_preset(cloud.PROFILE_KEY)
     if preset is not None:
@@ -455,15 +458,17 @@ def _activate_sylliptor_profile(cfg: AppConfig, *, email: str | None) -> LoginRe
 
     existing = get_profile(cfg, cloud.PROFILE_KEY)
     existing_model = str(getattr(existing, "default_model", "") or "").strip() if existing else ""
-    # The legacy bare "mimo" placeholder is not a real model id; migrate sessions
-    # that still carry it (logged in before the named models existed) up to the
-    # flagship default instead of preserving a name no model actually has.
+    # The legacy bare "mimo" placeholder is not a real model id; drop it so the
+    # profile no longer carries a name that maps to a model we no longer serve.
     if existing_model.casefold() == "mimo":
         existing_model = ""
-    chosen_model = existing_model or cloud.SYLLIPTOR_MIMO_MODEL
+    # No default model: the free MiMo trial is gone, so we never auto-select MiMo
+    # (or anything). The user chooses a model after login; an unset model surfaces a
+    # clear "Model is not set" prompt instead of silently routing to a dead model.
+    chosen_model = existing_model
 
     # Always pin to the live proxy URL (env-overridable for tests); keep the user's
-    # chosen model, defaulting to MiMo only when none has been set yet.
+    # chosen model (empty until they pick one — we no longer default to MiMo).
     profile = ProfileSpec(
         name=profile.name,
         protocol=profile.protocol,
@@ -471,6 +476,12 @@ def _activate_sylliptor_profile(cfg: AppConfig, *, email: str | None) -> LoginRe
         api_key_env=None,
         extra_headers=dict(profile.extra_headers),
         default_model=chosen_model,
+        reasoning_effort=(existing.reasoning_effort if existing is not None else None),
+        reasoning_trace_adapter=(
+            existing.reasoning_trace_adapter
+            if existing is not None
+            else profile.reasoning_trace_adapter
+        ),
         web_search_adapter=profile.web_search_adapter,
         web_search_model=profile.web_search_model,
         notes=profile.notes,
@@ -489,9 +500,7 @@ def _activate_sylliptor_profile(cfg: AppConfig, *, email: str | None) -> LoginRe
 
 
 def _open_browser(url: str) -> bool:
-    import webbrowser
-
-    return bool(webbrowser.open(url))
+    return open_url(url)
 
 
 def _safe_open(opener: Callable[[str], bool], url: str) -> bool:

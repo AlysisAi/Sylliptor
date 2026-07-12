@@ -52,9 +52,11 @@ def forge_plan(
         help="Allow guarded broad workspaces instead of choosing a narrower project folder.",
     ),
 ) -> None:
+    cli = _cli_module()
+    cli._require_active_subscription_ready(model=None, base_url=None)
     from ..forge import forge_plan_impl
 
-    return forge_plan_impl(_cli_module(), path, create_path, allow_broad_workspace, cli_ctx=ctx)
+    return forge_plan_impl(cli, path, create_path, allow_broad_workspace, cli_ctx=ctx)
 
 
 @forge_app.command("attach")
@@ -206,6 +208,7 @@ def forge_review(
     ),
 ) -> None:
     console = _console()
+    _cli_module()._require_active_subscription_ready(model=model, base_url=base_url)
     cfg = _patchable("load_config", load_config)()
     effective = clone_cfg(cfg)
     if base_url is not None:
@@ -380,10 +383,12 @@ def forge_swarm(
         help="In auto mode, skip confirmations for sensitive commands (hard blocks still apply).",
     ),
 ) -> None:
+    cli = _cli_module()
+    cli._require_active_subscription_ready(model=model, base_url=base_url)
     from ..forge import forge_swarm_impl
 
     return forge_swarm_impl(
-        _cli_module(),
+        cli,
         path,
         allow_broad_workspace,
         parallel,
@@ -498,10 +503,12 @@ def forge_exec(
         help="In auto mode, skip confirmations for sensitive commands (hard blocks still apply).",
     ),
 ) -> None:
+    cli = _cli_module()
+    cli._require_active_subscription_ready(model=model, base_url=base_url)
     from ..forge import forge_exec_impl
 
     return forge_exec_impl(
-        _cli_module(),
+        cli,
         task_id,
         path,
         mode,

@@ -241,6 +241,7 @@ def test_create_feedback_bundle_collects_retained_session_and_current_run(tmp_pa
         FailureCategory.INFRA_UNAVAILABLE.value: 1,
         FailureCategory.PROVIDER_UNAVAILABLE.value: 0,
         FailureCategory.PROVIDER_THROTTLED.value: 1,
+        FailureCategory.PROVIDER_ERROR.value: 0,
         FailureCategory.PLANNER_FAILED.value: 1,
         FailureCategory.IMPLEMENTATION_FAILED.value: 1,
         FailureCategory.VERIFICATION_FAILED.value: 1,
@@ -463,15 +464,15 @@ def test_create_feedback_bundle_includes_canonical_web_research_artifact(
     assert manifest["session"]["included_web_research_artifact"] is True
     assert exported["schema_version"] == 2
     assert exported["deduped_normalized_queries"] == ["docs example"]
-    assert exported["deduped_normalized_user_urls"] == ["https://docs.example.com/start"]
+    assert exported["deduped_normalized_user_urls"] == ["https://docs.example.com"]
     assert exported["deduped_normalized_search_source_urls"] == [
-        "https://docs.example.com/start",
-        "https://docs.example.com/guide",
+        "https://docs.example.com",
+        "https://docs.example.com",
     ]
-    assert exported["deduped_normalized_fetch_urls"] == ["https://docs.example.com/start"]
-    assert exported["deduped_normalized_final_fetch_urls"] == ["https://docs.example.com/final"]
-    assert exported["fetches"][0]["requested_url"] == "https://docs.example.com/start"
-    assert exported["fetches"][0]["final_url"] == "https://docs.example.com/final"
+    assert exported["deduped_normalized_fetch_urls"] == ["https://docs.example.com"]
+    assert exported["deduped_normalized_final_fetch_urls"] == ["https://docs.example.com"]
+    assert exported["fetches"][0]["requested_url"] == "https://docs.example.com"
+    assert exported["fetches"][0]["final_url"] == "https://docs.example.com"
     assert exported["fetches"][0]["provenance_classification"] == "user_provided"
     assert exported["searches"][0]["backend"] == "openai_responses"
     assert exported["searches"][0]["returned_sources"][0]["domain"] == "docs.example.com"
@@ -564,8 +565,8 @@ def test_create_feedback_bundle_merges_newer_web_artifact_ahead_of_log(
     )
 
     assert exported["deduped_normalized_search_source_urls"] == [
-        "https://docs.example.com/start",
-        "https://docs.example.com/guide",
+        "https://docs.example.com",
+        "https://docs.example.com",
     ]
     assert [entry["normalized_query"] for entry in exported["searches"]] == [
         "docs example start",
@@ -749,12 +750,12 @@ def test_create_feedback_bundle_active_resumed_session_keeps_cumulative_web_hist
     )
     score = json.loads((result.bundle_dir / "session_score.json").read_text(encoding="utf-8"))
 
-    assert exported["deduped_normalized_user_urls"] == ["https://docs.example.com/spec"]
-    assert exported["deduped_normalized_search_source_urls"] == ["https://docs.example.com/guide"]
-    assert exported["deduped_normalized_fetch_urls"] == ["https://docs.example.com/guide"]
-    assert exported["deduped_normalized_final_fetch_urls"] == ["https://docs.example.com/final"]
+    assert exported["deduped_normalized_user_urls"] == ["https://docs.example.com"]
+    assert exported["deduped_normalized_search_source_urls"] == ["https://docs.example.com"]
+    assert exported["deduped_normalized_fetch_urls"] == ["https://docs.example.com"]
+    assert exported["deduped_normalized_final_fetch_urls"] == ["https://docs.example.com"]
     assert snapshot["web_research_sources"]["deduped_normalized_search_source_urls"] == [
-        "https://docs.example.com/guide"
+        "https://docs.example.com"
     ]
     assert score["web_search_calls"] == 1
     assert score["web_fetch_calls"] == 1
@@ -820,6 +821,219 @@ def test_create_feedback_bundle_redacts_secrets_in_exported_files(tmp_path: Path
     assert "[REDACTED]" in feedback_md
 
 
+def test_feedback_bundle_strips_reasoning_and_continuation_from_json_exports(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    session_id = "sess_reasoning_export"
+    raw_reasoning = "RAW_REASONING_SENTINEL"
+    reasoning_detail = "REASONING_DETAIL_SENTINEL"
+    encrypted_state = "ENCRYPTED_STATE_SENTINEL"
+    provider_signature = "PROVIDER_SIGNATURE_SENTINEL"
+    continuation_state = "CONTINUATION_STATE_SENTINEL"
+    safe_diagnostic_signature = "non-sensitive-schema-hash"
+    log_path, artifact_root = _write_retained_session(
+        sessions_dir=sessions_dir,
+        session_id=session_id,
+        extra_events=[
+            {
+                "type": "assistant_message",
+                "session_id": session_id,
+                "payload": {
+                    "content": "Public answer.",
+                    "model": "model-x",
+                    "usage": {
+                        "completion_tokens": 8,
+                        "reasoning_tokens": 5,
+                    },
+                    "reasoning_effort": "high",
+                    "reasoning_trace_adapter": "auto",
+                    "signature": safe_diagnostic_signature,
+                    "trace_event": {
+                        "type": "reasoning_trace_changed",
+                        "level": "full",
+                    },
+                    "message": {
+                        "role": "assistant",
+                        "content": "Public answer.",
+                        "reasoning_content": raw_reasoning,
+                        "reasoning": raw_reasoning,
+                        "reasoning_details": [{"type": "reasoning.text", "text": reasoning_detail}],
+                        "_sylliptor_provider_metadata": {
+                            "openai_responses": {
+                                "response_id": "resp_private",
+                                "output_items": [
+                                    {
+                                        "type": "reasoning",
+                                        "encrypted_content": encrypted_state,
+                                    }
+                                ],
+                            }
+                        },
+                    },
+                    "provider_response": {
+                        "content": [
+                            {"type": "text", "text": "Public provider diagnostic."},
+                            {
+                                "type": "thinking",
+                                "thinking": raw_reasoning,
+                                "signature": provider_signature,
+                            },
+                            {
+                                "thought": True,
+                                "text": reasoning_detail,
+                                "thoughtSignature": provider_signature,
+                            },
+                            {
+                                "type": "thinking_delta",
+                                "thinking": raw_reasoning,
+                            },
+                            {
+                                "type": "signature_delta",
+                                "signature": provider_signature,
+                            },
+                            {
+                                "type": "response.reasoning_summary_text.delta",
+                                "delta": reasoning_detail,
+                            },
+                        ],
+                        "previous_response_id": "resp_previous_private",
+                        "continuation_state": continuation_state,
+                        "thought_signature": provider_signature,
+                    },
+                },
+            }
+        ],
+    )
+    (artifact_root / "tool_outputs" / "provider.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "model": "model-x",
+                "total_thought_tokens": 5,
+                "signature": safe_diagnostic_signature,
+                "reasoning_summary": reasoning_detail,
+                "encrypted_content": encrypted_state,
+                "blocks": [
+                    {"type": "text", "text": "Public artifact diagnostic."},
+                    {
+                        "type": "reasoning.summary",
+                        "summary": [{"type": "summary_text", "text": reasoning_detail}],
+                    },
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    cfg = AppConfig(session_log_dir=os.fspath(sessions_dir))
+
+    result = create_feedback_bundle(
+        workspace_root=workspace,
+        cfg=cfg,
+        latest=True,
+    )
+
+    exported_events = _read_jsonl(result.bundle_dir / "session" / "log.jsonl")
+    exported_event = next(
+        event for event in exported_events if event["type"] == "assistant_message"
+    )
+    payload = exported_event["payload"]
+    exported_artifact = json.loads(
+        (result.bundle_dir / "session" / "artifacts" / "tool_outputs" / "provider.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert payload["content"] == "Public answer."
+    assert payload["model"] == "model-x"
+    assert payload["usage"] == {"completion_tokens": 8, "reasoning_tokens": 5}
+    assert payload["reasoning_effort"] == "high"
+    assert payload["reasoning_trace_adapter"] == "auto"
+    assert payload["signature"] == safe_diagnostic_signature
+    assert payload["trace_event"] == {
+        "type": "reasoning_trace_changed",
+        "level": "full",
+    }
+    assert payload["message"] == {"role": "assistant", "content": "Public answer."}
+    assert payload["provider_response"] == {
+        "content": [{"type": "text", "text": "Public provider diagnostic."}]
+    }
+    assert exported_artifact == {
+        "blocks": [{"text": "Public artifact diagnostic.", "type": "text"}],
+        "model": "model-x",
+        "signature": safe_diagnostic_signature,
+        "status": "ok",
+        "total_thought_tokens": 5,
+    }
+
+    exported_text = (result.bundle_dir / "session" / "log.jsonl").read_text(
+        encoding="utf-8"
+    ) + json.dumps(exported_artifact, sort_keys=True)
+    with zipfile.ZipFile(result.zip_path) as zf:
+        zipped_text = zf.read("session/log.jsonl").decode("utf-8") + zf.read(
+            "session/artifacts/tool_outputs/provider.json"
+        ).decode("utf-8")
+    for sentinel in (
+        raw_reasoning,
+        reasoning_detail,
+        encrypted_state,
+        provider_signature,
+        continuation_state,
+        "resp_private",
+        "resp_previous_private",
+    ):
+        assert sentinel not in exported_text
+        assert sentinel not in zipped_text
+    assert _read_jsonl(log_path)[-1]["payload"]["message"]["reasoning_content"] == raw_reasoning
+
+
+def test_feedback_bundle_omits_malformed_structured_artifacts_fail_closed(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _log_path, artifact_root = _write_retained_session(
+        sessions_dir=sessions_dir,
+        session_id="sess_malformed_export",
+    )
+    malformed_reasoning = "MALFORMED_REASONING_SENTINEL"
+    (artifact_root / "tool_outputs" / "broken.json").write_text(
+        f'{{"reasoning_content": "{malformed_reasoning}"',
+        encoding="utf-8",
+    )
+    (artifact_root / "tool_outputs" / "broken.jsonl").write_bytes(
+        b'\xff{"reasoning_content":"MALFORMED_REASONING_SENTINEL"}\n'
+    )
+    cfg = AppConfig(session_log_dir=os.fspath(sessions_dir))
+
+    result = create_feedback_bundle(
+        workspace_root=workspace,
+        cfg=cfg,
+        latest=True,
+    )
+
+    exported_json_path = (
+        result.bundle_dir / "session" / "artifacts" / "tool_outputs" / "broken.json"
+    )
+    exported_jsonl_path = (
+        result.bundle_dir / "session" / "artifacts" / "tool_outputs" / "broken.jsonl"
+    )
+    assert json.loads(exported_json_path.read_text(encoding="utf-8")) == {
+        "redacted": "Invalid structured artifact omitted from support bundle."
+    }
+    assert _read_jsonl(exported_jsonl_path) == [
+        {"redacted": "Invalid structured artifact omitted from support bundle."}
+    ]
+    assert malformed_reasoning not in exported_json_path.read_text(encoding="utf-8")
+    assert malformed_reasoning not in exported_jsonl_path.read_text(encoding="utf-8")
+
+
 def test_create_feedback_bundle_sanitizes_freeform_paths_in_exported_session_jsonl(
     tmp_path: Path,
 ) -> None:
@@ -867,6 +1081,84 @@ def test_create_feedback_bundle_sanitizes_freeform_paths_in_exported_session_jso
     assert os.fspath(workspace) not in content
     assert "/etc/hosts" not in content
     assert "[redacted host path: completions]" not in content
+
+
+def test_create_feedback_bundle_strips_secrets_from_legacy_session_urls(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    session_id = "sess_legacy_urls"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "type": "session_start",
+            "session_id": session_id,
+            "payload": {
+                "base_url": (
+                    "https://legacy-user:legacy-pa'ssword@legacy.example.test:8443/"
+                    "signed/session<path"
+                ),
+                "provider_base_url": (
+                    "https://provider-user:provider-password@provider.example.test/"
+                    "opaque/provider-path?sig=provider-query-secret"
+                ),
+            },
+        },
+        {
+            "type": "error",
+            "session_id": session_id,
+            "payload": {
+                "message": (
+                    "Provider failed at "
+                    "https://error-user:error-pa'ssword@api.example.test:9443/"
+                    "private/error<path?token=error-query-secret#error-fragment. "
+                    "Authorization: Bearer PRIVATE_FEEDBACK_BEARER_123456 "
+                    "api_key=PRIVATE_FEEDBACK_API_KEY_123456"
+                )
+            },
+        },
+    ]
+    (sessions_dir / f"{session_id}.jsonl").write_text(
+        "".join(json.dumps(event, ensure_ascii=True) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    cfg = AppConfig(session_log_dir=os.fspath(sessions_dir))
+
+    result = create_feedback_bundle(
+        workspace_root=workspace,
+        cfg=cfg,
+        latest=True,
+    )
+
+    exported_path = result.bundle_dir / "session" / "log.jsonl"
+    exported_events = _read_jsonl(exported_path)
+    assert exported_events[0]["payload"] == {
+        "base_url": "https://legacy.example.test:8443",
+        "provider_base_url": "https://provider.example.test",
+    }
+    assert exported_events[1]["payload"]["message"] == (
+        "Provider failed at https://api.example.test:9443. Authorization: [REDACTED]"
+    )
+    serialized = exported_path.read_text(encoding="utf-8")
+    for secret in (
+        "legacy-user",
+        "legacy-pa'ssword",
+        "signed/session<path",
+        "provider-user",
+        "provider-password",
+        "opaque/provider-path",
+        "provider-query-secret",
+        "error-user",
+        "error-pa'ssword",
+        "private/error<path",
+        "error-query-secret",
+        "error-fragment",
+        "PRIVATE_FEEDBACK_BEARER",
+        "PRIVATE_FEEDBACK_API_KEY",
+    ):
+        assert secret not in serialized
 
 
 def test_create_feedback_bundle_sanitizes_freeform_paths_in_copied_json_artifacts(
@@ -1709,3 +2001,55 @@ def test_report_create_rejects_conflicting_github_flags(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "Use either --github or --local-only" in result.output
+
+
+def test_resolve_session_source_latest_skips_foreign_owner_sessions(tmp_path: Path) -> None:
+    import time
+    import uuid
+
+    from sylliptor_agent_cli.feedback_report import _resolve_session_source
+    from sylliptor_agent_cli.session_store import local_session_owner
+
+    sessions_dir = tmp_path / "sessions"
+
+    own_log, _own_artifacts = _write_retained_session(
+        sessions_dir=sessions_dir,
+        session_id="sess_own",
+    )
+    foreign_log, _foreign_artifacts = _write_retained_session(
+        sessions_dir=sessions_dir,
+        session_id="sess_foreign",
+    )
+
+    def _stamp_owner(log_path: Path, owner: str) -> None:
+        events = [
+            json.loads(line)
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        for event in events:
+            event["owner"] = owner
+        log_path.write_text(
+            "".join(json.dumps(event, ensure_ascii=True) + "\n" for event in events),
+            encoding="utf-8",
+        )
+
+    own_owner = local_session_owner()
+    assert own_owner is not None
+    _stamp_owner(own_log, own_owner)
+    _stamp_owner(foreign_log, f"foreign-user@foreign-host-{uuid.uuid4().hex}")
+
+    # Foreign session is the newest on disk; the latest-default must skip it.
+    now = time.time()
+    os.utime(own_log, (now - 3600, now - 3600))
+    os.utime(foreign_log, (now, now))
+
+    cfg = AppConfig(session_log_dir=os.fspath(sessions_dir))
+    resolved = _resolve_session_source(
+        cfg=cfg,
+        active_session=None,
+        pending_images=None,
+        session_id=None,
+        latest=True,
+    )
+    assert resolved.session_id == "sess_own"

@@ -675,3 +675,144 @@ def test_hooks_enable_errors_on_unknown_id(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "not found" in result.output
+
+
+def _write_owned_session_log(
+    sessions_dir: Path,
+    *,
+    session_id: str,
+    owner: str | None,
+    ts: str,
+) -> None:
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    stamp = {"owner": owner} if owner else {}
+    events = [
+        {
+            "type": "session_start",
+            "ts": ts,
+            "session_id": session_id,
+            **stamp,
+            "payload": {"mode": "auto"},
+        },
+    ]
+    (sessions_dir / f"{session_id}.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+
+def _write_minimal_hook_audit_artifact(
+    sessions_dir: Path,
+    *,
+    session_id: str,
+    hook_id: str,
+) -> None:
+    artifact_path = hook_audit_artifact_path(sessions_dir=sessions_dir, session_id=session_id)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_event = build_hook_audit_event(
+        session_id=session_id,
+        context=HookInvocationContext(
+            event_name="TurnComplete",
+            source_path="/tmp/workspace/.sylliptor/hooks.json",
+            source_scope="project",
+            matcher="",
+            hook_id=hook_id,
+            priority=0,
+            failure_policy="warn",
+            command="echo stop",
+            timeout_s=5.0,
+            trusted=True,
+            returncode=0,
+            blocked=False,
+            modified_input=False,
+            modified_input_fields=(),
+            modified_prompt=False,
+            modified_prompt_chars=0,
+            additional_system_message_count=0,
+            additional_user_message_count=0,
+            stdout_chars=0,
+            stderr_chars=0,
+            duration_ms=12,
+            status="ok",
+            warnings=(),
+        ),
+    )
+    artifact_path.write_text(json.dumps(artifact_event) + "\n", encoding="utf-8")
+
+
+def test_hooks_trace_latest_default_skips_foreign_owner_sessions(tmp_path: Path) -> None:
+    import uuid
+
+    from sylliptor_agent_cli.session_store import local_session_owner
+
+    runner = CliRunner()
+    cfg_dir = tmp_path / "config"
+    data_dir = tmp_path / "data"
+    sessions_dir = data_dir / "sessions"
+
+    # Foreign session is NEWEST by the log's own timestamp; without the owner
+    # filter the latest-session default would read its artifact.
+    foreign_id = "sess_foreign"
+    _write_owned_session_log(
+        sessions_dir,
+        session_id=foreign_id,
+        owner=f"foreign-user@foreign-host-{uuid.uuid4().hex}",
+        ts="2026-07-11T12:00:00+00:00",
+    )
+    _write_minimal_hook_audit_artifact(
+        sessions_dir, session_id=foreign_id, hook_id="foreign.hook.id"
+    )
+
+    own_id = "sess_own"
+    _write_owned_session_log(
+        sessions_dir,
+        session_id=own_id,
+        owner=local_session_owner(),
+        ts="2026-07-10T12:00:00+00:00",
+    )
+    _write_minimal_hook_audit_artifact(sessions_dir, session_id=own_id, hook_id="own.hook.id")
+
+    result = runner.invoke(
+        cli_mod.app,
+        ["hooks", "trace"],
+        env={
+            "SYLLIPTOR_CONFIG_DIR": os.fspath(cfg_dir),
+            "SYLLIPTOR_DATA_DIR": os.fspath(data_dir),
+        },
+        terminal_width=200,
+    )
+
+    normalized_output = "".join(result.output.split())
+    assert result.exit_code == 0
+    assert "own.hook.id" in normalized_output
+    assert "foreign.hook.id" not in normalized_output
+
+
+def test_hooks_trace_latest_default_explains_hidden_foreign_sessions(tmp_path: Path) -> None:
+    import uuid
+
+    runner = CliRunner()
+    cfg_dir = tmp_path / "config"
+    data_dir = tmp_path / "data"
+    sessions_dir = data_dir / "sessions"
+
+    _write_owned_session_log(
+        sessions_dir,
+        session_id="sess_foreign",
+        owner=f"foreign-user@foreign-host-{uuid.uuid4().hex}",
+        ts="2026-07-11T12:00:00+00:00",
+    )
+
+    result = runner.invoke(
+        cli_mod.app,
+        ["hooks", "trace"],
+        env={
+            "SYLLIPTOR_CONFIG_DIR": os.fspath(cfg_dir),
+            "SYLLIPTOR_DATA_DIR": os.fspath(data_dir),
+        },
+        terminal_width=200,
+    )
+
+    assert result.exit_code == 0
+    assert "No sessions owned by this account" in result.output
+    assert "different account" in result.output

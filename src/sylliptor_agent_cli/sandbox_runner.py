@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import platform
@@ -699,6 +700,7 @@ def _build_docker_argv(
     read_only_rootfs: bool,
     protect_repo_meta: bool,
     env_allowlist: tuple[str, ...],
+    published_ports: tuple[tuple[str, int, int], ...] = (),
 ) -> tuple[list[str], dict[str, str]]:
     """Build docker run argv + parent-process env. Pure function."""
 
@@ -735,6 +737,17 @@ def _build_docker_argv(
         args.extend(["--cpus", cpus])
     if read_only_rootfs:
         args.extend(["--read-only", "--tmpfs", "/tmp:rw,exec,nosuid,nodev"])
+    for host, host_port, container_port in published_ports:
+        try:
+            publish_address = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError("Docker published-port host must be an IP address") from exc
+        if not publish_address.is_loopback:
+            raise ValueError("Docker published ports must bind to a loopback address")
+        if not (0 < host_port <= 65535 and 0 < container_port <= 65535):
+            raise ValueError("Docker published ports must be between 1 and 65535")
+        formatted_host = f"[{host}]" if ":" in host else host
+        args.extend(["--publish", f"{formatted_host}:{host_port}:{container_port}/tcp"])
     if network == "off":
         args.extend(["--network", "none"])
     if os.name == "posix" and hasattr(os, "getuid") and hasattr(os, "getgid"):

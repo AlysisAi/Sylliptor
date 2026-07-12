@@ -3,7 +3,7 @@
 Two lines, each split left/right against the terminal width::
 
     ◇ sylliptor · <Model>              context <P>% · <N> tokens · $<cost>
-    <user> · <workspace> · ⎇ <branch>            auto-approve on · shift+tab
+    <user> · <workspace> · ⎇ <branch>            approvals: auto · shift+tab
 
 The left side is clipped (with an ellipsis) when it would collide with the
 right side, so the layout never wraps. Returned as prompt_toolkit
@@ -76,13 +76,17 @@ def _line1(state: TuiState) -> tuple[Fragments, Fragments]:
         ("class:tui.footer.dim", _DOT),
         ("class:tui.footer.model", pretty_model_label(state.model_name)),
     ]
-    right: Fragments = [
-        ("class:tui.footer.context", f"context {state.context_pct:.0f}%"),
-        ("class:tui.footer.dim", _DOT),
-        ("class:tui.footer.value", f"{state.tokens:,} tokens"),
-        ("class:tui.footer.dim", _DOT),
-        ("class:tui.footer.value", _format_cost(state)),
-    ]
+    right: Fragments = []
+    if state.usage_hud_enabled:
+        right.extend(
+            [
+                ("class:tui.footer.context", f"ctx {state.context_pct:.0f}% left"),
+                ("class:tui.footer.dim", _DOT),
+                ("class:tui.footer.value", f"session {state.tokens:,} tok"),
+                ("class:tui.footer.dim", _DOT),
+                ("class:tui.footer.value", _format_cost(state)),
+            ]
+        )
     return left, right
 
 
@@ -120,14 +124,14 @@ def _line2(state: TuiState) -> tuple[Fragments, Fragments]:
             left.append(("class:tui.footer.dim", _DOT))
         left.append(("class:tui.footer.branch", f"{_BRANCH_MARK} {state.branch}"))
 
-    # Right tail: auto-approve state + the global shift+tab hint. (The mouse-mode
-    # "copy (F2: scroll)" chip used to lead here but was removed as footer noise;
-    # F2 still toggles wheel-scroll/copy, with a transient reminder when scroll is on.)
+    # Right tail: sensitive-action approval policy + the global shift+tab hint.
+    # This is deliberately separate from the execution mode badge: "fast" can
+    # auto-run normal operations while approval-gated sensitive actions still ask.
     right: Fragments = []
     if state.auto_approve:
-        right.append(("class:tui.footer.autoapprove.on", "auto-approve on"))
+        right.append(("class:tui.footer.autoapprove.on", "sensitive: auto"))
     else:
-        right.append(("class:tui.footer.autoapprove.off", "auto-approve off"))
+        right.append(("class:tui.footer.autoapprove.off", "sensitive: ask"))
     right.append(("class:tui.footer.dim", f"{_DOT}shift+tab"))
     return left, right
 

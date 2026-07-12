@@ -7,6 +7,7 @@ from datetime import datetime
 from functools import lru_cache
 from importlib import resources
 from typing import Any
+from urllib.parse import urlparse
 
 from .model_metadata_utils import (
     model_name_variants,
@@ -20,6 +21,7 @@ _PROVIDER_TOKEN_RE = re.compile(r"[a-z0-9]+")
 _GENERIC_PROVIDER_TOKENS = {
     "api",
     "apis",
+    "ai",
     "app",
     "coding",
     "compat",
@@ -59,6 +61,11 @@ class LiteLLMStaticMetadata:
     output_cost_per_token: float | None
     raw_metadata: dict[str, Any]
     error: str | None
+    cache_read_input_cost_per_token: float | None = None
+    cache_creation_input_cost_per_token: float | None = None
+    cache_creation_5m_input_cost_per_token: float | None = None
+    cache_creation_1h_input_cost_per_token: float | None = None
+    reasoning_output_cost_per_token: float | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +91,11 @@ def _empty_metadata(error: str) -> LiteLLMStaticMetadata:
         supports_vision=None,
         input_cost_per_token=None,
         output_cost_per_token=None,
+        cache_read_input_cost_per_token=None,
+        cache_creation_input_cost_per_token=None,
+        cache_creation_5m_input_cost_per_token=None,
+        cache_creation_1h_input_cost_per_token=None,
+        reasoning_output_cost_per_token=None,
         raw_metadata={},
         error=error,
     )
@@ -115,13 +127,42 @@ def _provider_tokens(*values: str) -> set[str]:
     return tokens
 
 
-def _preferred_provider_tokens(base_url: str | None) -> set[str]:
-    if base_url is None:
-        return set()
-    normalized = normalize_base_url(base_url)
-    if not normalized:
-        return set()
-    return _provider_tokens(normalized)
+def _preferred_provider_tokens(
+    base_url: str | None,
+    provider_hint: str | None,
+) -> set[str]:
+    values: list[str] = []
+    normalized = normalize_base_url(base_url) if base_url is not None else ""
+    if normalized:
+        try:
+            hostname = urlparse(normalized).hostname
+        except ValueError:
+            hostname = None
+        values.append(hostname or normalized)
+    if str(provider_hint or "").strip():
+        values.append(str(provider_hint))
+    return _provider_tokens(*values)
+
+
+def _catalog_route_token_sets(
+    *,
+    key: str,
+    raw_metadata: dict[str, Any],
+) -> tuple[set[str], set[str]]:
+    """Return route/provider identity without treating the model family as a route.
+
+    A model name such as ``sambanova/MiniMax-M2.7`` contains both a route and a
+    model family. Matching the whole key makes a MiniMax endpoint look compatible
+    with SambaNova merely because the model suffix contains ``MiniMax``. Only the
+    catalog provider and the first route namespace participate in route matching;
+    nested model-family namespaces do not.
+    """
+
+    key_route = key.split("/", 1)[0] if "/" in key else ""
+    return (
+        _provider_tokens(key_route),
+        _provider_tokens(str(raw_metadata.get("litellm_provider") or "")),
+    )
 
 
 def _is_model_catalog_entry(key: Any, value: Any) -> bool:
@@ -136,22 +177,28 @@ def _candidate_rank(
     raw_metadata: dict[str, Any],
     direct_match: bool,
     preferred_provider_tokens: set[str],
-) -> tuple[int, int, int, int]:
-    provider_tokens = _provider_tokens(
-        key,
-        str(raw_metadata.get("litellm_provider") or ""),
+) -> tuple[int, int, int, int, int]:
+    key_route_tokens, metadata_provider_tokens = _catalog_route_token_sets(
+        key=key,
+        raw_metadata=raw_metadata,
     )
-    provider_score = len(provider_tokens & preferred_provider_tokens)
+    key_route_score = len(key_route_tokens & preferred_provider_tokens)
+    metadata_provider_score = len(metadata_provider_tokens & preferred_provider_tokens)
     return (
+        key_route_score,
+        metadata_provider_score,
         1 if direct_match else 0,
-        provider_score,
         -key.count("/"),
         -len(key),
     )
 
 
 def _lookup_model_info(
-    model_cost: dict[str, Any], requested_model: str, *, base_url: str | None = None
+    model_cost: dict[str, Any],
+    requested_model: str,
+    *,
+    base_url: str | None = None,
+    provider_hint: str | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
     lower_index: dict[str, list[str]] = {}
     alias_index: dict[str, list[str]] = {}
@@ -162,8 +209,8 @@ def _lookup_model_info(
         for alias in model_name_variants(key):
             alias_index.setdefault(alias.casefold(), []).append(key)
 
-    preferred_provider_tokens = _preferred_provider_tokens(base_url)
-    candidates: list[tuple[tuple[int, int, int, int], str, dict[str, Any]]] = []
+    preferred_provider_tokens = _preferred_provider_tokens(base_url, provider_hint)
+    candidates: list[tuple[tuple[int, int, int, int, int], str, dict[str, Any]]] = []
     seen: set[str] = set()
     for variant in model_name_variants(requested_model):
         direct = model_cost.get(variant)
@@ -220,6 +267,16 @@ def _lookup_model_info(
                 )
             )
     if candidates:
+        # A known preset route must never silently borrow limits or prices from
+        # another host that happens to expose the same model name. Custom routes
+        # keep the historical best-effort behavior because no route identity is
+        # available unless the user configures one.
+        if str(provider_hint or "").strip():
+            candidates = [
+                candidate for candidate in candidates if candidate[0][0] > 0 or candidate[0][1] > 0
+            ]
+        if not candidates:
+            return None
         _rank, key, metadata = max(candidates, key=lambda item: item[0])
         return key, metadata
     return None
@@ -247,6 +304,14 @@ def _resolve_capacity_metadata(
         return raw_input, raw_output
 
     return None, raw_output
+
+
+def _first_non_negative_float(raw_metadata: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = parse_non_negative_float(raw_metadata.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _parse_full_hex_digest(value: Any, *, digits: int) -> str | None:
@@ -379,7 +444,10 @@ def get_bundled_model_catalog_provenance() -> BundledModelCatalogProvenance:
 
 
 def resolve_litellm_static_metadata(
-    model_name: str, *, base_url: str | None = None
+    model_name: str,
+    *,
+    base_url: str | None = None,
+    provider_hint: str | None = None,
 ) -> LiteLLMStaticMetadata:
     try:
         model_cost = _load_bundled_model_catalog()
@@ -388,7 +456,12 @@ def resolve_litellm_static_metadata(
     except ValueError:
         return _empty_metadata("bundled model catalog invalid")
 
-    match = _lookup_model_info(model_cost, model_name, base_url=base_url)
+    match = _lookup_model_info(
+        model_cost,
+        model_name,
+        base_url=base_url,
+        provider_hint=provider_hint,
+    )
     if match is None:
         return _empty_metadata("model not found in bundled model catalog")
 
@@ -397,6 +470,53 @@ def resolve_litellm_static_metadata(
     supports_vision = parse_bool(raw_metadata.get("supports_vision"))
     input_cost_per_token = parse_non_negative_float(raw_metadata.get("input_cost_per_token"))
     output_cost_per_token = parse_non_negative_float(raw_metadata.get("output_cost_per_token"))
+    cache_read_input_cost_per_token = _first_non_negative_float(
+        raw_metadata,
+        "cache_read_input_cost_per_token",
+        "cache_read_input_token_cost",
+        "input_cache_read_cost_per_token",
+        "input_cached_read_cost_per_token",
+        "cache_read_cost_per_token",
+    )
+    cache_creation_input_cost_per_token = _first_non_negative_float(
+        raw_metadata,
+        "cache_creation_input_cost_per_token",
+        "cache_creation_input_token_cost",
+        "cache_write_input_cost_per_token",
+        "cache_write_input_token_cost",
+        "input_cache_write_cost_per_token",
+        "input_cache_creation_cost_per_token",
+    )
+    cache_creation_5m_input_cost_per_token = _first_non_negative_float(
+        raw_metadata,
+        "cache_creation_5m_input_cost_per_token",
+        "cache_creation_5m_input_token_cost",
+        "cache_creation_input_cost_per_token_5m",
+        "cache_creation_input_token_cost_5m",
+        "input_cache_write_5m_cost_per_token",
+    )
+    cache_creation_1h_input_cost_per_token = _first_non_negative_float(
+        raw_metadata,
+        "cache_creation_input_token_cost_above_1hr",
+        "cache_creation_1h_input_cost_per_token",
+        "cache_creation_1h_input_token_cost",
+        "cache_creation_input_cost_per_token_1h",
+        "cache_creation_input_token_cost_1h",
+        "input_cache_write_1h_cost_per_token",
+    )
+    reasoning_output_cost_per_token = _first_non_negative_float(
+        raw_metadata,
+        "output_cost_per_reasoning_token",
+        "reasoning_output_cost_per_token",
+        "output_reasoning_cost_per_token",
+        "reasoning_token_cost_per_token",
+        "reasoning_cost_per_token",
+    )
+
+    metadata_with_provenance = dict(raw_metadata)
+    metadata_with_provenance["catalog_model_key"] = model_key
+    if str(provider_hint or "").strip():
+        metadata_with_provenance["catalog_provider_hint"] = str(provider_hint).strip()
 
     return LiteLLMStaticMetadata(
         model_key=model_key,
@@ -405,6 +525,11 @@ def resolve_litellm_static_metadata(
         supports_vision=supports_vision,
         input_cost_per_token=input_cost_per_token,
         output_cost_per_token=output_cost_per_token,
-        raw_metadata=dict(raw_metadata),
+        cache_read_input_cost_per_token=cache_read_input_cost_per_token,
+        cache_creation_input_cost_per_token=cache_creation_input_cost_per_token,
+        cache_creation_5m_input_cost_per_token=cache_creation_5m_input_cost_per_token,
+        cache_creation_1h_input_cost_per_token=cache_creation_1h_input_cost_per_token,
+        reasoning_output_cost_per_token=reasoning_output_cost_per_token,
+        raw_metadata=metadata_with_provenance,
         error=None,
     )

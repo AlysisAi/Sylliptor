@@ -137,6 +137,8 @@ def score_session_events(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "completion_tokens": 0,
         "total_tokens": 0,
         "cost_usd": 0.0,
+        "known_cost_calls": 0,
+        "unknown_cost_calls": 0,
         "tool_counts": {},
         "tool_category_counts": {},
         "tool_risk_counts": {},
@@ -293,7 +295,15 @@ def score_session_events(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
             metrics["prompt_tokens"] += _as_int(payload.get("prompt_tokens"))
             metrics["completion_tokens"] += _as_int(payload.get("completion_tokens"))
             metrics["total_tokens"] += _as_int(payload.get("total_tokens"))
-            metrics["cost_usd"] += _as_float(payload.get("cost_usd"))
+            # Only sum metered costs. An unmetered call (cost_usd == null) must
+            # not be silently counted as $0.00, or the persisted session score
+            # reports a fake definitive total; track it separately instead.
+            cost_value = payload.get("cost_usd")
+            if cost_value is None:
+                metrics["unknown_cost_calls"] += 1
+            else:
+                metrics["cost_usd"] += _as_float(cost_value)
+                metrics["known_cost_calls"] += 1
 
     metrics["tool_counts"] = dict(sorted(tool_counts.items()))
     metrics["tool_category_counts"] = dict(sorted(tool_category_counts.items()))

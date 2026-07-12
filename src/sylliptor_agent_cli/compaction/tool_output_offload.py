@@ -38,6 +38,16 @@ def _truncated_preview(content: str, limit: int) -> tuple[str, int]:
     return (content[:limit] + "...(truncated)", limit)
 
 
+def _path_is_under_root(*, path: Path, root: Path | None) -> bool:
+    if root is None:
+        return False
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 class ToolOutputOffloader:
     def __init__(
         self,
@@ -46,18 +56,49 @@ class ToolOutputOffloader:
         workspace_root: Path | None,
         threshold_chars: int,
         preview_chars: int,
+        workspace_artifacts_enabled: bool = True,
     ) -> None:
         self._artifact_layout = artifact_layout
         self._session_artifact_root = artifact_layout.filesystem_root.resolve()
         self._workspace_root = workspace_root.resolve() if workspace_root is not None else None
         self._threshold_chars = max(1, int(threshold_chars))
         self._preview_chars = max(1, int(preview_chars))
-        self._base_dir = self._session_artifact_root / "tool_outputs"
+        self._workspace_artifacts_enabled = bool(workspace_artifacts_enabled)
 
     def _transcript_shape_threshold_chars(self) -> int:
-        return min(
-            self._threshold_chars,
-            max((self._preview_chars * 3), self._preview_chars + 256),
+        return self._threshold_chars
+
+    def _storage_layout(self) -> SessionArtifactLayout:
+        if _path_is_under_root(path=self._session_artifact_root, root=self._workspace_root):
+            return self._artifact_layout
+        if self._workspace_root is None or not self._workspace_artifacts_enabled:
+            return self._artifact_layout
+        return SessionArtifactLayout(
+            filesystem_root=self._workspace_root / ".sylliptor",
+            locator_prefix=".sylliptor",
+        )
+
+    @staticmethod
+    def _full_output_guidance(
+        *,
+        original_chars: int,
+        preview_chars: int,
+        artifact_locator: str | None,
+        fs_read_path: str | None,
+        artifact_readable_via_fs: bool,
+        artifact_location: str | None,
+    ) -> str:
+        readable_path = str(fs_read_path or artifact_locator or "").strip()
+        if artifact_readable_via_fs and readable_path:
+            return (
+                f"Truncated to {preview_chars} of {original_chars} chars. "
+                f"Full output saved to {artifact_location or 'workspace_root'} at "
+                f"{readable_path} - use fs_read on that path to view all of it."
+            )
+        return (
+            f"Truncated to {preview_chars} of {original_chars} chars; the rest is not "
+            "readable via fs. Re-run the command narrowed (grep/head/sed/awk) to get "
+            "the specific slice you need."
         )
 
     def _build_transcript_stub(
@@ -76,6 +117,7 @@ class ToolOutputOffloader:
         artifact_saved: bool = False,
         artifact_readable_via_fs: bool = False,
         artifact_location: str | None = None,
+        fs_read_path: str | None = None,
         error: str | None = None,
     ) -> str:
         payload: dict[str, Any] = {
@@ -97,6 +139,17 @@ class ToolOutputOffloader:
             payload["artifact_saved"] = artifact_saved
             payload["artifact_readable_via_fs"] = artifact_readable_via_fs
             payload["artifact_location"] = artifact_location
+            if artifact_readable_via_fs and fs_read_path:
+                payload["fs_read_path"] = fs_read_path
+        if original_chars > preview_chars:
+            payload["full_output"] = self._full_output_guidance(
+                original_chars=original_chars,
+                preview_chars=preview_chars,
+                artifact_locator=artifact_locator,
+                fs_read_path=fs_read_path,
+                artifact_readable_via_fs=artifact_readable_via_fs,
+                artifact_location=artifact_location,
+            )
         if error:
             payload["error"] = error
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
@@ -105,8 +158,9 @@ class ToolOutputOffloader:
         safe_tool = _safe_component(tool_name)
         safe_call_id = _safe_component(tool_call_id)
         filename = f"step{max(0, int(step))}_{safe_tool}_{safe_call_id}.json"
-        candidate = self._artifact_layout.artifact_fs_path("tool_outputs", filename).resolve()
-        candidate.relative_to(self._session_artifact_root)
+        storage_layout = self._storage_layout()
+        candidate = storage_layout.artifact_fs_path("tool_outputs", filename).resolve()
+        candidate.relative_to(storage_layout.filesystem_root.resolve())
         return candidate
 
     def maybe_offload(
@@ -180,10 +234,16 @@ class ToolOutputOffloader:
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            artifact_ref = self._artifact_layout.model_reference_for_path(
+            storage_layout = self._storage_layout()
+            artifact_ref = storage_layout.model_reference_for_path(
                 artifact_path=artifact_abs,
                 workspace_root=self._workspace_root,
             )
+            fs_read_path = None
+            if artifact_ref.artifact_readable_via_fs and self._workspace_root is not None:
+                fs_read_path = (
+                    artifact_abs.resolve().relative_to(self._workspace_root.resolve()).as_posix()
+                )
             content_for_message = self._build_transcript_stub(
                 tool_name=tool_name,
                 tool_call_id=tool_call_id,
@@ -198,6 +258,7 @@ class ToolOutputOffloader:
                 artifact_saved=True,
                 artifact_readable_via_fs=artifact_ref.artifact_readable_via_fs,
                 artifact_location=artifact_ref.artifact_location,
+                fs_read_path=fs_read_path,
             )
             return OffloadResult(
                 content_for_message=content_for_message,

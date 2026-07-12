@@ -1,22 +1,35 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import tempfile
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from sylliptor_agent_cli.llm.base import ChatClient
+from sylliptor_agent_cli.llm.base import ChatClient, count_input_tokens_if_supported
+from sylliptor_agent_cli.llm.cache_control_blocks import cacheable_prefix_message_count
 from sylliptor_agent_cli.llm.metadata import (
     PROVIDER_METADATA_KEY,
     strip_provider_metadata_from_message,
 )
-from sylliptor_agent_cli.llm.types import LLMError
+from sylliptor_agent_cli.llm.types import (
+    InputTokenCount,
+    LLMError,
+    UsageConfidence,
+    UsageSource,
+)
 from sylliptor_agent_cli.model_registry import ModelRegistry
 from sylliptor_agent_cli.request_estimation import (
+    RequestTokenBreakdown,
+    estimate_message_tokens,
+    estimate_request_token_breakdown,
     estimate_request_tokens,
+    estimate_tool_schema_tokens,
+    request_contains_media,
     sanitize_messages_for_estimation,
 )
 from sylliptor_agent_cli.session_artifacts import SessionArtifactLayout
@@ -26,7 +39,11 @@ from sylliptor_agent_cli.token_budget import (
     estimate_tokens,
     trim_text_to_budget,
 )
-from sylliptor_agent_cli.usage_tracker import UsageSummary, build_usage_record
+from sylliptor_agent_cli.usage_tracker import (
+    UsageSummary,
+    build_usage_record,
+    usage_context_from_client_response,
+)
 
 from .importance import ScoredTurn, estimate_turn_tokens, extract_text, score_turn
 from .settings import CompactionSettings
@@ -34,6 +51,10 @@ from .settings import CompactionSettings
 MEMORY_MARKER = "<<<SYLLIPTOR_CONVERSATION_MEMORY_JSON>>>"
 PINS_MARKER = "<<<SYLLIPTOR_CONVERSATION_PINS_JSON>>>"
 CompactionProfileName = Literal["chat", "execution"]
+RequestMessagesBuilder = Callable[
+    [list[dict[str, Any]]],
+    list[dict[str, Any]],
+]
 
 
 @dataclass(frozen=True)
@@ -59,6 +80,303 @@ class _ExecutionCompactionPreview:
     pins_message_index: int | None
     predicted_used_tokens: int
     dropped_without_summary: bool
+
+
+@dataclass(frozen=True)
+class _CacheAwareCompactionDecision:
+    adjusted_trigger_ratio: float
+    calibrated_used_tokens: int
+    reasons: tuple[str, ...]
+    prompt_estimate_error_ratio_p90: float | None
+    cache_hit_ratio: float | None
+    tool_schema_share: float
+    inline_tool_transcript_share: float
+
+
+@dataclass(frozen=True)
+class _CachePrefixCompactionShape:
+    stable_prefix_message_count: int
+    protected_prefix_message_count: int
+    pinned_prefix_message_count: int
+    cacheable_prefix_estimated_tokens: int
+    cacheable_surface_estimated_tokens: int
+    dynamic_suffix_estimated_tokens: int
+    dynamic_suffix_share: float
+    min_cacheable_tokens: int
+    cacheable_prefix_preserved: bool
+    reasons: tuple[str, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "stable_prefix_message_count": self.stable_prefix_message_count,
+            "protected_prefix_message_count": self.protected_prefix_message_count,
+            "pinned_prefix_message_count": self.pinned_prefix_message_count,
+            "cacheable_prefix_estimated_tokens": self.cacheable_prefix_estimated_tokens,
+            "cacheable_surface_estimated_tokens": self.cacheable_surface_estimated_tokens,
+            "dynamic_suffix_estimated_tokens": self.dynamic_suffix_estimated_tokens,
+            "dynamic_suffix_share": self.dynamic_suffix_share,
+            "min_cacheable_tokens": self.min_cacheable_tokens,
+            "cacheable_prefix_preserved": self.cacheable_prefix_preserved,
+            "reasons": list(self.reasons),
+        }
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(max(0, numerator) / denominator, 4)
+
+
+def _cache_prefix_compaction_shape(
+    *,
+    settings: CompactionSettings,
+    messages: list[dict[str, Any]],
+    tool_list: list[dict[str, Any]] | None,
+    request_breakdown: RequestTokenBreakdown,
+    pinned_prefix_len: int,
+    cache_policy: Mapping[str, Any] | None = None,
+) -> _CachePrefixCompactionShape:
+    clean_messages = [message for message in messages if isinstance(message, dict)]
+    stable_prefix_len = min(cacheable_prefix_message_count(clean_messages), len(clean_messages))
+    pinned_prefix = min(max(0, int(pinned_prefix_len)), len(clean_messages))
+    prefix_messages = clean_messages[:stable_prefix_len]
+    prefix_tokens = estimate_message_tokens(prefix_messages)
+    tool_schema_tokens = estimate_tool_schema_tokens(tool_list or [])
+    surface_tokens = prefix_tokens + tool_schema_tokens
+    min_tokens = _cache_policy_min_tokens(cache_policy)
+    cache_enabled = _cache_policy_enabled(cache_policy)
+    dynamic_suffix_tokens = max(0, request_breakdown.total_tokens - surface_tokens)
+    dynamic_suffix_share = _ratio(dynamic_suffix_tokens, request_breakdown.total_tokens)
+    protect_prefix = (
+        bool(settings.cache_aware_compaction)
+        and cache_enabled
+        and stable_prefix_len > pinned_prefix
+        and stable_prefix_len > 0
+        and prefix_tokens >= min_tokens
+        and dynamic_suffix_share >= 0.25
+    )
+    protected_prefix = stable_prefix_len if protect_prefix else pinned_prefix
+    reasons: list[str] = []
+    if not cache_enabled:
+        reasons.append("cache_disabled_or_unavailable")
+    if stable_prefix_len <= 0:
+        reasons.append("no_cacheable_prefix")
+    if stable_prefix_len > pinned_prefix:
+        if protect_prefix:
+            reasons.append("cacheable_prefix_protected")
+        else:
+            reasons.append("cacheable_prefix_compaction_tradeoff")
+    if stable_prefix_len > 0 and prefix_tokens < min_tokens:
+        reasons.append("cacheable_prefix_below_min_tokens")
+    if dynamic_suffix_share >= 0.25:
+        reasons.append("large_dynamic_suffix")
+    return _CachePrefixCompactionShape(
+        stable_prefix_message_count=stable_prefix_len,
+        protected_prefix_message_count=protected_prefix,
+        pinned_prefix_message_count=pinned_prefix,
+        cacheable_prefix_estimated_tokens=prefix_tokens,
+        cacheable_surface_estimated_tokens=surface_tokens,
+        dynamic_suffix_estimated_tokens=dynamic_suffix_tokens,
+        dynamic_suffix_share=dynamic_suffix_share,
+        min_cacheable_tokens=min_tokens,
+        cacheable_prefix_preserved=protected_prefix >= stable_prefix_len
+        if stable_prefix_len
+        else True,
+        reasons=tuple(dict.fromkeys(reasons)),
+    )
+
+
+def _cache_policy_min_tokens(cache_policy: Mapping[str, Any] | None) -> int:
+    if not isinstance(cache_policy, Mapping):
+        return 0
+    for key in ("min_tokens", "min_cacheable_tokens"):
+        try:
+            value = int(cache_policy.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            return value
+    return 0
+
+
+def _cache_policy_enabled(cache_policy: Mapping[str, Any] | None) -> bool:
+    if not isinstance(cache_policy, Mapping):
+        return False
+    status = str(cache_policy.get("status") or "").strip().lower()
+    if status in {"disabled", "unsupported", "off"}:
+        return False
+    if cache_policy.get("enabled") is True:
+        return True
+    return status == "enabled"
+
+
+def _cache_aware_compaction_decision(
+    *,
+    settings: CompactionSettings,
+    request_breakdown: RequestTokenBreakdown,
+    calibration: dict[str, Any],
+    prefix_shape: _CachePrefixCompactionShape | None = None,
+) -> _CacheAwareCompactionDecision:
+    used_tokens = request_breakdown.total_tokens
+    adjusted_trigger_ratio = settings.trigger_ratio
+    reasons: list[str] = []
+    estimate_ratio_raw = calibration.get("prompt_estimate_error_ratio_p90")
+    estimate_ratio = (
+        float(estimate_ratio_raw) if isinstance(estimate_ratio_raw, int | float) else None
+    )
+    estimate_multiplier = 1.0
+    if settings.cache_aware_compaction and estimate_ratio is not None:
+        # The snapshot is scoped to this provider/protocol/operation and uses a
+        # recent p90. Preserve the observed tokenizer gap instead of truncating
+        # every provider to one universal correction ceiling.
+        estimate_multiplier = max(1.0, estimate_ratio)
+        if estimate_multiplier >= 1.15:
+            adjusted_trigger_ratio -= min(0.10, (estimate_multiplier - 1.0) * 0.35)
+            reasons.append("provider_estimate_undercount")
+    calibrated_used_tokens = math.ceil(used_tokens * estimate_multiplier)
+    total_for_share = max(1, used_tokens)
+    tool_schema_share = request_breakdown.tool_schema_tokens / total_for_share
+    inline_tool_share = request_breakdown.inline_tool_transcript_tokens / total_for_share
+    cache_hit_raw = calibration.get("cache_hit_ratio")
+    cache_hit_ratio = float(cache_hit_raw) if isinstance(cache_hit_raw, int | float) else None
+    if settings.cache_aware_compaction:
+        if (
+            cache_hit_ratio is not None
+            and int(calibration.get("records") or 0) >= 3
+            and cache_hit_ratio < 0.05
+        ):
+            adjusted_trigger_ratio -= 0.04
+            reasons.append("low_recent_cache_hit_ratio")
+        if inline_tool_share >= 0.25:
+            adjusted_trigger_ratio -= 0.05
+            reasons.append("large_inline_tool_transcript")
+        if tool_schema_share >= 0.20:
+            adjusted_trigger_ratio -= 0.03
+            reasons.append("large_tool_schema_share")
+        if prefix_shape is not None:
+            if prefix_shape.dynamic_suffix_share >= 0.25:
+                adjusted_trigger_ratio -= 0.03
+                reasons.append("large_dynamic_suffix")
+        # The cache-aware floor must never raise the trigger above the
+        # user-configured trigger_ratio.
+        effective_floor = min(settings.cache_aware_min_trigger_ratio, settings.trigger_ratio)
+        adjusted_trigger_ratio = max(
+            effective_floor,
+            min(settings.trigger_ratio, adjusted_trigger_ratio),
+        )
+    return _CacheAwareCompactionDecision(
+        adjusted_trigger_ratio=adjusted_trigger_ratio,
+        calibrated_used_tokens=calibrated_used_tokens,
+        reasons=tuple(reasons),
+        prompt_estimate_error_ratio_p90=estimate_ratio,
+        cache_hit_ratio=cache_hit_ratio,
+        tool_schema_share=tool_schema_share,
+        inline_tool_transcript_share=inline_tool_share,
+    )
+
+
+def _with_request_total(
+    breakdown: RequestTokenBreakdown,
+    *,
+    total_tokens: int,
+) -> RequestTokenBreakdown:
+    normalized_total = max(0, int(total_tokens))
+    delta = normalized_total - breakdown.total_tokens
+    if delta == 0:
+        return breakdown
+
+    fields = {
+        "bootstrap_prompt_tokens": breakdown.bootstrap_prompt_tokens,
+        "tool_schema_tokens": breakdown.tool_schema_tokens,
+        "live_conversation_history_tokens": breakdown.live_conversation_history_tokens,
+        "inline_tool_transcript_tokens": breakdown.inline_tool_transcript_tokens,
+        "memory_summary_tokens": breakdown.memory_summary_tokens,
+        "pins_tokens": breakdown.pins_tokens,
+    }
+    if delta > 0:
+        fields["live_conversation_history_tokens"] += delta
+    else:
+        remaining = -delta
+        for key in (
+            "live_conversation_history_tokens",
+            "inline_tool_transcript_tokens",
+            "memory_summary_tokens",
+            "pins_tokens",
+            "bootstrap_prompt_tokens",
+            "tool_schema_tokens",
+        ):
+            removable = min(fields[key], remaining)
+            fields[key] -= removable
+            remaining -= removable
+            if remaining <= 0:
+                break
+
+    return RequestTokenBreakdown(
+        bootstrap_prompt_tokens=fields["bootstrap_prompt_tokens"],
+        tool_schema_tokens=fields["tool_schema_tokens"],
+        live_conversation_history_tokens=fields["live_conversation_history_tokens"],
+        inline_tool_transcript_tokens=fields["inline_tool_transcript_tokens"],
+        memory_summary_tokens=fields["memory_summary_tokens"],
+        pins_tokens=fields["pins_tokens"],
+        tool_schema_budget=breakdown.tool_schema_budget,
+    )
+
+
+def _estimate_compaction_request_breakdown(
+    *,
+    messages: list[dict[str, Any]],
+    tool_list: list[dict[str, Any]] | None,
+    pinned_prefix_len: int,
+) -> RequestTokenBreakdown:
+    breakdown = estimate_request_token_breakdown(
+        messages=messages,
+        tool_list=tool_list,
+        pinned_prefix_len=pinned_prefix_len,
+    )
+    legacy_total = estimate_request_tokens(messages, tool_list)
+    return _with_request_total(breakdown, total_tokens=legacy_total)
+
+
+def _conservative_input_measurement(
+    *,
+    baseline_tokens: int,
+    measurement: InputTokenCount | None,
+    estimate_multiplier: float = 1.0,
+) -> tuple[int, str, str]:
+    """Merge optional preflight data without downgrading a safer estimate."""
+
+    baseline = max(0, int(baseline_tokens))
+    if measurement is None:
+        return (
+            baseline,
+            UsageSource.LOCAL_ESTIMATE.value,
+            UsageConfidence.ESTIMATED.value,
+        )
+    if measurement.confidence == UsageConfidence.AUTHORITATIVE:
+        return (
+            measurement.input_tokens,
+            measurement.source.value,
+            measurement.confidence.value,
+        )
+    multiplier = (
+        max(1.0, float(estimate_multiplier)) if math.isfinite(float(estimate_multiplier)) else 1.0
+    )
+    adjusted_measurement_tokens = math.ceil(measurement.input_tokens * multiplier)
+    if adjusted_measurement_tokens >= baseline:
+        return (
+            adjusted_measurement_tokens,
+            (measurement.source.value if multiplier == 1.0 else UsageSource.MIXED.value),
+            (
+                measurement.confidence.value
+                if multiplier == 1.0
+                else UsageConfidence.ESTIMATED.value
+            ),
+        )
+    return (
+        baseline,
+        UsageSource.MIXED.value,
+        UsageConfidence.ESTIMATED.value,
+    )
 
 
 @dataclass(frozen=True)
@@ -295,6 +613,12 @@ class ConversationCompactor:
         usage_role: str,
         pinned_prefix_len: int,
         profile: CompactionProfileName = "chat",
+        input_token_counter: Callable[
+            [list[dict[str, Any]], list[dict[str, Any]] | None],
+            InputTokenCount | None,
+        ]
+        | None = None,
+        calibration_filters: Mapping[str, Any] | None = None,
     ) -> None:
         self._root = root.resolve()
         self._store = store
@@ -303,6 +627,9 @@ class ConversationCompactor:
         self._model_registry = model_registry
         self._usage_summary = usage_summary
         self._usage_role = usage_role
+        self._input_token_counter = input_token_counter
+        self._calibration_filters: dict[str, str] = {}
+        self.update_calibration_filters(calibration_filters)
         self._artifact_layout = artifact_layout
         self._profile = _resolve_compaction_profile(profile=profile, settings=settings)
         self._history_dir = self._artifact_layout.artifact_fs_path("history")
@@ -317,6 +644,141 @@ class ConversationCompactor:
             pins=[],
             pins_message_index=None,
         )
+        self._restore_state_from_artifacts()
+
+    def update_calibration_filters(
+        self,
+        calibration_filters: Mapping[str, Any] | None,
+    ) -> None:
+        """Refresh route identity after an in-session provider reconfiguration."""
+
+        self._calibration_filters = {
+            key: str(value or "").strip()
+            for key, value in (calibration_filters or {}).items()
+            if key
+            in {
+                "provider_key",
+                "protocol",
+                "base_url_host",
+                "operation",
+                "request_mode",
+                "cache_strategy",
+            }
+            and str(value or "").strip()
+        }
+
+    def _restore_state_from_artifacts(self) -> None:
+        """Restore durable compaction metadata for resumed sessions."""
+
+        restored_summary: dict[str, Any] = {}
+        restored_pins: list[dict[str, Any]] = []
+        try:
+            if self._summary_path.exists():
+                raw_summary = json.loads(self._summary_path.read_text(encoding="utf-8"))
+                normalized = _normalize_summary(raw_summary, {})
+                if normalized is not None:
+                    restored_summary = normalized
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._store.append(
+                "compaction_warning",
+                {"warning": "summary_restore_failed", "error": str(exc)},
+            )
+        try:
+            if self._pins_path.exists():
+                raw_pins = json.loads(self._pins_path.read_text(encoding="utf-8"))
+                candidates = raw_pins.get("pins") if isinstance(raw_pins, dict) else None
+                if isinstance(candidates, list):
+                    restored_pins = self._bounded_pins(
+                        [dict(pin) for pin in candidates if isinstance(pin, dict)]
+                    )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._store.append(
+                "compaction_warning",
+                {"warning": "pins_restore_failed", "error": str(exc)},
+            )
+
+        history_chunk_index = 0
+        try:
+            for path in self._history_dir.glob("chunk_*.jsonl"):
+                match = re.fullmatch(r"chunk_(\d+)\.jsonl", path.name)
+                if match is not None:
+                    history_chunk_index = max(history_chunk_index, int(match.group(1)))
+        except OSError as exc:
+            self._store.append(
+                "compaction_warning",
+                {"warning": "history_restore_failed", "error": str(exc)},
+            )
+
+        self.state.summary = restored_summary
+        self.state.pins = restored_pins
+        self.state.history_chunk_index = history_chunk_index
+        if restored_summary or restored_pins or history_chunk_index:
+            self._store.append(
+                "compaction_state_restored",
+                {
+                    "history_chunk_index": history_chunk_index,
+                    "summary_restored": bool(restored_summary),
+                    "pins_count": len(restored_pins),
+                },
+            )
+
+    def _record_compactor_usage(
+        self,
+        *,
+        response: Any,
+        messages: list[dict[str, Any]],
+        operation: str,
+    ) -> None:
+        usage = getattr(response, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        usage_context = usage_context_from_client_response(
+            client=self.compactor_client,
+            response=response,
+            operation=operation,
+        )
+        if prompt_tokens is None:
+            try:
+                counted_input = count_input_tokens_if_supported(
+                    client=self.compactor_client,
+                    messages=messages,
+                    tools=None,
+                )
+            except Exception as exc:  # noqa: BLE001 -- accounting fallback is optional
+                self._store.append(
+                    "compaction_warning",
+                    {
+                        "warning": "provider_input_token_count_failed",
+                        "operation": operation,
+                        "error": str(exc),
+                    },
+                )
+            else:
+                if counted_input is not None:
+                    prompt_tokens = counted_input.input_tokens
+                    usage_context["api_usage_source_detail"] = counted_input.source.value
+                    usage_context["api_usage_confidence"] = counted_input.confidence.value
+                    usage_context["api_prompt_tokens_authoritative"] = (
+                        counted_input.confidence.value == "authoritative"
+                    )
+        usage_record = build_usage_record(
+            role=f"{self._usage_role}:compactor",
+            requested_model=self.compactor_client.model,
+            response_model=getattr(response, "response_model", None),
+            messages=messages,
+            response_content=str(getattr(response, "content", "") or ""),
+            response_tool_calls=[],
+            api_prompt_tokens=prompt_tokens,
+            api_completion_tokens=(getattr(usage, "completion_tokens", None) if usage else None),
+            api_total_tokens=getattr(usage, "total_tokens", None) if usage else None,
+            api_usage=usage,
+            api_cached_prompt_tokens=(
+                getattr(usage, "cached_prompt_tokens", None) if usage else None
+            ),
+            registry=self._model_registry,
+            **usage_context,
+        )
+        self._usage_summary.add_record(usage_record)
+        self._store.append("llm_usage", usage_record.to_payload())
 
     def _is_memory_message(self, msg: dict[str, Any]) -> bool:
         if str(msg.get("role") or "") != "user":
@@ -364,6 +826,19 @@ class ConversationCompactor:
             artifact_path=artifact_path,
             workspace_root=self._root,
         )
+
+    @staticmethod
+    def _provider_request_messages(
+        messages: list[dict[str, Any]],
+        *,
+        request_messages_builder: RequestMessagesBuilder | None,
+    ) -> list[dict[str, Any]]:
+        if request_messages_builder is None:
+            return list(messages)
+        built = request_messages_builder(list(messages))
+        if not isinstance(built, list) or not all(isinstance(item, dict) for item in built):
+            raise TypeError("request_messages_builder must return a list of message objects")
+        return list(built)
 
     @staticmethod
     def _history_chunk_payload(*, idx: int, message: dict[str, Any]) -> dict[str, Any]:
@@ -891,22 +1366,11 @@ class ConversationCompactor:
             )
             return scored_turns
 
-        usage = response.usage
-        usage_record = build_usage_record(
-            role=f"{self._usage_role}:compactor",
-            requested_model=self.compactor_client.model,
-            response_model=response.response_model,
+        self._record_compactor_usage(
+            response=response,
             messages=prompt_messages,
-            response_content=response.content or "",
-            response_tool_calls=[],
-            api_prompt_tokens=(usage.prompt_tokens if usage else None),
-            api_completion_tokens=(usage.completion_tokens if usage else None),
-            api_total_tokens=(usage.total_tokens if usage else None),
-            api_cached_prompt_tokens=(usage.cached_prompt_tokens if usage else None),
-            registry=self._model_registry,
+            operation="importance_llm",
         )
-        self._usage_summary.add_record(usage_record)
-        self._store.append("llm_usage", usage_record.to_payload())
 
         text = (response.content or "").strip()
         try:
@@ -991,22 +1455,11 @@ class ConversationCompactor:
             )
             return None
 
-        usage = response.usage
-        usage_record = build_usage_record(
-            role=f"{self._usage_role}:compactor",
-            requested_model=self.compactor_client.model,
-            response_model=response.response_model,
+        self._record_compactor_usage(
+            response=response,
             messages=prompt_messages,
-            response_content=response.content or "",
-            response_tool_calls=[],
-            api_prompt_tokens=(usage.prompt_tokens if usage else None),
-            api_completion_tokens=(usage.completion_tokens if usage else None),
-            api_total_tokens=(usage.total_tokens if usage else None),
-            api_cached_prompt_tokens=(usage.cached_prompt_tokens if usage else None),
-            registry=self._model_registry,
+            operation="compactor_llm",
         )
-        self._usage_summary.add_record(usage_record)
-        self._store.append("llm_usage", usage_record.to_payload())
 
         text = (response.content or "").strip()
         parsed: Any
@@ -1084,10 +1537,23 @@ class ConversationCompactor:
         target_state.memory_message_index = insert_at
         return filtered
 
-    def _turn_ranges(self, messages: list[dict[str, Any]]) -> list[tuple[int, int]]:
+    def _turn_ranges(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        protected_prefix_len: int | None = None,
+    ) -> list[tuple[int, int]]:
         turn_ranges: list[tuple[int, int]] = []
         start_idx: int | None = None
-        scan_start = min(self.state.pinned_prefix_len, len(messages))
+        scan_start = min(
+            max(
+                0,
+                self.state.pinned_prefix_len
+                if protected_prefix_len is None
+                else protected_prefix_len,
+            ),
+            len(messages),
+        )
         for idx in range(scan_start, len(messages)):
             msg = messages[idx]
             if self._is_memory_message(msg) or self._is_pins_message(msg):
@@ -1140,8 +1606,21 @@ class ConversationCompactor:
         tool_calls = msg.get("tool_calls")
         return isinstance(tool_calls, list) and len(tool_calls) > 0
 
-    def _first_execution_user_idx(self, messages: list[dict[str, Any]]) -> int | None:
-        scan_start = min(self.state.pinned_prefix_len, len(messages))
+    def _first_execution_user_idx(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        protected_prefix_len: int | None = None,
+    ) -> int | None:
+        scan_start = min(
+            max(
+                0,
+                self.state.pinned_prefix_len
+                if protected_prefix_len is None
+                else protected_prefix_len,
+            ),
+            len(messages),
+        )
         for idx in range(scan_start, len(messages)):
             msg = messages[idx]
             if self._is_memory_message(msg) or self._is_pins_message(msg):
@@ -1224,8 +1703,13 @@ class ConversationCompactor:
     def _build_execution_bundles(
         self,
         messages: list[dict[str, Any]],
+        *,
+        protected_prefix_len: int | None = None,
     ) -> tuple[list[_ExecutionBundle], int, int]:
-        first_user_idx = self._first_execution_user_idx(messages)
+        first_user_idx = self._first_execution_user_idx(
+            messages,
+            protected_prefix_len=protected_prefix_len,
+        )
         if first_user_idx is None:
             return [], len(messages), len(messages)
 
@@ -1410,6 +1894,7 @@ class ConversationCompactor:
         used_tokens: int,
         focus: str | None,
         history_rel_path: str,
+        request_messages_builder: RequestMessagesBuilder | None,
     ) -> _ExecutionCompactionPreview | None:
         compactor_budget = self._compactor_request_budget(ratio=0.85)
         prepared_chunk = self._prepare_chunk_messages_for_compactor(
@@ -1436,10 +1921,15 @@ class ConversationCompactor:
             )
             new_summary = self._call_compactor(prompt_messages=retry_prompt_messages)
 
-        dropped_without_summary = False
         if new_summary is None:
-            dropped_without_summary = True
-            new_summary = deepcopy(self.state.summary)
+            self._store.append(
+                "compaction_warning",
+                {
+                    "warning": "compactor_failed_preserved_chunk",
+                    "history_path": history_rel_path,
+                },
+            )
+            return None
 
         extracted_pins = self._extract_pins_for_chunk(
             history_rel_path=history_rel_path,
@@ -1462,7 +1952,11 @@ class ConversationCompactor:
             pins=trial_state.pins,
             state=trial_state,
         )
-        predicted_used_tokens = estimate_request_tokens(updated_messages, tool_list)
+        provider_messages = self._provider_request_messages(
+            updated_messages,
+            request_messages_builder=request_messages_builder,
+        )
+        predicted_used_tokens = estimate_request_tokens(provider_messages, tool_list)
         if predicted_used_tokens >= used_tokens:
             removable_tokens = estimate_turn_tokens(chunk_messages)
             self._store.append(
@@ -1486,12 +1980,26 @@ class ConversationCompactor:
             memory_message_index=trial_state.memory_message_index,
             pins_message_index=trial_state.pins_message_index,
             predicted_used_tokens=predicted_used_tokens,
-            dropped_without_summary=dropped_without_summary,
+            dropped_without_summary=False,
         )
 
-    def _build_chat_chunk_plan(self, messages: list[dict[str, Any]]) -> _ChunkPlan | None:
-        turns = self._turn_ranges(messages)
-        keep_recent = self._settings.recent_user_turns_to_keep
+    def _build_chat_chunk_plan(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        protected_prefix_len: int | None = None,
+        hard_pressure: bool = False,
+    ) -> _ChunkPlan | None:
+        turns = self._turn_ranges(messages, protected_prefix_len=protected_prefix_len)
+        # Under a confirmed provider overflow, preserve the active/latest user
+        # turn but allow older turns inside the normal recent window to be
+        # compacted. A fixed recent-turn barrier must never make recovery
+        # impossible merely because the conversation has fewer than N turns.
+        keep_recent = (
+            min(1, self._settings.recent_user_turns_to_keep)
+            if hard_pressure
+            else self._settings.recent_user_turns_to_keep
+        )
         if len(turns) <= keep_recent:
             return None
         eligible_turns = turns[:-keep_recent] if keep_recent > 0 else turns
@@ -1587,8 +2095,16 @@ class ConversationCompactor:
             return None
         return chunk_plan
 
-    def _build_execution_chunk_plans(self, messages: list[dict[str, Any]]) -> list[_ChunkPlan]:
-        bundles, safe_boundary, sequence_end = self._build_execution_bundles(messages)
+    def _build_execution_chunk_plans(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        protected_prefix_len: int | None = None,
+    ) -> list[_ChunkPlan]:
+        bundles, safe_boundary, sequence_end = self._build_execution_bundles(
+            messages,
+            protected_prefix_len=protected_prefix_len,
+        )
         if not bundles:
             return []
         tail_bundle_idx = self._execution_tail_bundle_index(bundles)
@@ -1719,16 +2235,37 @@ class ConversationCompactor:
                 plans.append(plan)
         return plans
 
-    def _build_execution_chunk_plan(self, messages: list[dict[str, Any]]) -> _ChunkPlan | None:
-        plans = self._build_execution_chunk_plans(messages)
+    def _build_execution_chunk_plan(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        protected_prefix_len: int | None = None,
+    ) -> _ChunkPlan | None:
+        plans = self._build_execution_chunk_plans(
+            messages,
+            protected_prefix_len=protected_prefix_len,
+        )
         if plans:
             return plans[0]
         return None
 
-    def _build_chunk_plan(self, messages: list[dict[str, Any]]) -> _ChunkPlan | None:
+    def _build_chunk_plan(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        protected_prefix_len: int | None = None,
+        hard_pressure: bool = False,
+    ) -> _ChunkPlan | None:
         if self._profile.selection_mode == "execution_activity":
-            return self._build_execution_chunk_plan(messages)
-        return self._build_chat_chunk_plan(messages)
+            return self._build_execution_chunk_plan(
+                messages,
+                protected_prefix_len=protected_prefix_len,
+            )
+        return self._build_chat_chunk_plan(
+            messages,
+            protected_prefix_len=protected_prefix_len,
+            hard_pressure=hard_pressure,
+        )
 
     def _pin_kind(self, turn: ScoredTurn) -> str:
         reasons_cf = {reason.casefold() for reason in turn.reasons}
@@ -1814,8 +2351,11 @@ class ConversationCompactor:
         messages: list[dict[str, Any]],
         tool_list: list[dict[str, Any]] | None,
         main_model: str,
+        cache_policy: Mapping[str, Any] | None = None,
         focus: str | None = None,
         force: bool = False,
+        hard_pressure: bool = False,
+        request_messages_builder: RequestMessagesBuilder | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
         working = list(messages)
         changed = False
@@ -1827,35 +2367,188 @@ class ConversationCompactor:
                 model_meta,
                 safety_margin=self._settings.safety_margin_tokens,
             )
-            used_tokens = estimate_request_tokens(working, tool_list)
-            trigger_tokens = int(budget * self._settings.trigger_ratio)
+            provider_request_messages = self._provider_request_messages(
+                working,
+                request_messages_builder=request_messages_builder,
+            )
+            request_has_media = request_contains_media(provider_request_messages)
+            request_breakdown = _estimate_compaction_request_breakdown(
+                messages=provider_request_messages,
+                tool_list=tool_list,
+                pinned_prefix_len=self.state.pinned_prefix_len,
+            )
+            used_tokens = request_breakdown.total_tokens
+            prefix_shape = _cache_prefix_compaction_shape(
+                settings=self._settings,
+                messages=working,
+                tool_list=tool_list,
+                request_breakdown=request_breakdown,
+                pinned_prefix_len=self.state.pinned_prefix_len,
+                cache_policy=cache_policy,
+            )
+            calibration = self._usage_summary.recent_calibration_snapshot(
+                requested_model=main_model,
+                provider_key=self._calibration_filters.get("provider_key"),
+                protocol=self._calibration_filters.get("protocol"),
+                base_url_host=self._calibration_filters.get("base_url_host"),
+                operation=self._calibration_filters.get("operation"),
+                request_mode=self._calibration_filters.get("request_mode"),
+                cache_strategy=(
+                    str(cache_policy.get("strategy") or "").strip()
+                    if isinstance(cache_policy, Mapping)
+                    else self._calibration_filters.get("cache_strategy")
+                ),
+                limit=20,
+            )
+            cache_aware = _cache_aware_compaction_decision(
+                settings=self._settings,
+                request_breakdown=request_breakdown,
+                calibration=calibration,
+                prefix_shape=prefix_shape,
+            )
+            adjusted_trigger_ratio = cache_aware.adjusted_trigger_ratio
+            calibrated_used_tokens = cache_aware.calibrated_used_tokens
+            comparison_tokens = (
+                max(used_tokens, calibrated_used_tokens)
+                if self._settings.cache_aware_compaction
+                else used_tokens
+            )
+            trigger_tokens = int(budget * adjusted_trigger_ratio)
             target_tokens = int(budget * self._settings.target_ratio)
+            input_measurement: InputTokenCount | None = None
+            # Client-owned measurement is reserved for the policy-defined
+            # uncertainty band between target and trigger. Native transports can
+            # call an exact provider endpoint; compatible transports return an
+            # explicitly estimated provider-shaped payload without extra I/O.
+            input_measurement_required = (
+                forced_once
+                or comparison_tokens >= target_tokens
+                or hard_pressure
+                or request_has_media
+            )
+            if self._input_token_counter is not None and input_measurement_required:
+                try:
+                    input_measurement = self._input_token_counter(
+                        provider_request_messages,
+                        tool_list,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- optional preflight must degrade safely
+                    self._store.append(
+                        "compaction_warning",
+                        {
+                            "warning": "input_token_measurement_failed",
+                            "error": str(exc),
+                        },
+                    )
+            (
+                comparison_tokens,
+                comparison_source,
+                comparison_confidence,
+            ) = _conservative_input_measurement(
+                baseline_tokens=comparison_tokens,
+                measurement=input_measurement,
+                estimate_multiplier=(
+                    cache_aware.prompt_estimate_error_ratio_p90
+                    if self._settings.cache_aware_compaction
+                    and cache_aware.prompt_estimate_error_ratio_p90 is not None
+                    else 1.0
+                ),
+            )
+            media_input_uncertain = request_has_media and (
+                input_measurement is None
+                or input_measurement.confidence != UsageConfidence.AUTHORITATIVE
+            )
+            effective_trigger_tokens = (
+                min(trigger_tokens, target_tokens) if media_input_uncertain else trigger_tokens
+            )
 
             self._store.append(
                 "compaction_check",
                 {
                     "used_tokens": used_tokens,
+                    "calibrated_used_tokens": calibrated_used_tokens,
                     "budget_tokens": budget,
                     "trigger_ratio": self._settings.trigger_ratio,
+                    "adjusted_trigger_ratio": adjusted_trigger_ratio,
                     "target_ratio": self._settings.target_ratio,
                     "trigger_tokens": trigger_tokens,
+                    "effective_trigger_tokens": effective_trigger_tokens,
                     "target_tokens": target_tokens,
+                    "comparison_tokens": comparison_tokens,
+                    "token_count_source": comparison_source,
+                    "token_count_confidence": comparison_confidence,
+                    "input_measurement_tokens": (
+                        input_measurement.input_tokens if input_measurement is not None else None
+                    ),
+                    "media_input_uncertain": media_input_uncertain,
                     "main_model": main_model,
+                    "cache_aware": {
+                        "enabled": self._settings.cache_aware_compaction,
+                        "reasons": list(cache_aware.reasons),
+                        "prompt_estimate_error_ratio_p90": (
+                            cache_aware.prompt_estimate_error_ratio_p90
+                        ),
+                        "cache_hit_ratio": cache_aware.cache_hit_ratio,
+                        "tool_schema_share": cache_aware.tool_schema_share,
+                        "inline_tool_transcript_share": (cache_aware.inline_tool_transcript_share),
+                        "request_shape": prefix_shape.to_payload(),
+                    },
                 },
             )
 
-            if not force and used_tokens <= trigger_tokens:
-                return working, changed
-            if force and forced_once and used_tokens <= target_tokens:
+            if forced_once:
+                if comparison_tokens <= target_tokens:
+                    return working, changed
+            elif not force and not hard_pressure and comparison_tokens <= effective_trigger_tokens:
                 return working, changed
 
             execution_chunk_plans: list[_ChunkPlan] | None = None
             chunk_plan: _ChunkPlan | None
+            protected_prefix_len = prefix_shape.protected_prefix_message_count
             if self._profile.name == "execution":
-                execution_chunk_plans = self._build_execution_chunk_plans(working)
+                execution_chunk_plans = self._build_execution_chunk_plans(
+                    working,
+                    protected_prefix_len=protected_prefix_len,
+                )
+                if (
+                    not execution_chunk_plans
+                    and protected_prefix_len > self.state.pinned_prefix_len
+                ):
+                    execution_chunk_plans = self._build_execution_chunk_plans(
+                        working,
+                        protected_prefix_len=self.state.pinned_prefix_len,
+                    )
+                    if execution_chunk_plans:
+                        self._store.append(
+                            "compaction_warning",
+                            {
+                                "warning": "cache_prefix_protection_relaxed_no_safe_suffix",
+                                "protected_prefix_message_count": protected_prefix_len,
+                                "pinned_prefix_message_count": self.state.pinned_prefix_len,
+                            },
+                        )
                 chunk_plan = execution_chunk_plans[0] if execution_chunk_plans else None
             else:
-                chunk_plan = self._build_chunk_plan(working)
+                chunk_plan = self._build_chunk_plan(
+                    working,
+                    protected_prefix_len=protected_prefix_len,
+                    hard_pressure=hard_pressure,
+                )
+                if chunk_plan is None and protected_prefix_len > self.state.pinned_prefix_len:
+                    chunk_plan = self._build_chunk_plan(
+                        working,
+                        protected_prefix_len=self.state.pinned_prefix_len,
+                        hard_pressure=hard_pressure,
+                    )
+                    if chunk_plan is not None:
+                        self._store.append(
+                            "compaction_warning",
+                            {
+                                "warning": "cache_prefix_protection_relaxed_no_safe_suffix",
+                                "protected_prefix_message_count": protected_prefix_len,
+                                "pinned_prefix_message_count": self.state.pinned_prefix_len,
+                            },
+                        )
 
             if chunk_plan is None:
                 self._store.append(
@@ -1864,6 +2557,11 @@ class ConversationCompactor:
                         "warning": "no_compaction_chunk_available",
                         "used_tokens": used_tokens,
                         "trigger_tokens": trigger_tokens,
+                        "protected_prefix_message_count": (
+                            prefix_shape.protected_prefix_message_count
+                        ),
+                        "stable_prefix_message_count": prefix_shape.stable_prefix_message_count,
+                        "cache_prefix_reasons": list(prefix_shape.reasons),
                     },
                 )
                 return working, changed
@@ -1885,6 +2583,7 @@ class ConversationCompactor:
                         used_tokens=used_tokens,
                         focus=focus,
                         history_rel_path=predicted_history_rel_path,
+                        request_messages_builder=request_messages_builder,
                     )
                     if preview is not None:
                         selected_plan = candidate_plan
@@ -1929,26 +2628,21 @@ class ConversationCompactor:
                         "chunk_strategy": selected_plan.strategy,
                         "pins_count": len(self.state.pins),
                         "dropped_without_summary_update": preview.dropped_without_summary,
+                        "active_conversation_messages": deepcopy(
+                            preview.updated_messages[self.state.pinned_prefix_len :]
+                        ),
                     },
                 )
                 working = preview.updated_messages
                 changed = True
                 forced_once = True
-                new_used_tokens = preview.predicted_used_tokens
-                if new_used_tokens <= target_tokens:
-                    return working, changed
+                # Re-enter the loop so the provider-bound request is verified
+                # after compaction instead of trusting a prediction alone.
                 continue
 
             chunk_messages = working[chunk_plan.start : chunk_plan.end]
             next_history_path = self._history_path(self.state.history_chunk_index + 1)
             predicted_history_rel_path = self.artifact_display_reference(next_history_path)
-            history_path = self._write_history_chunk(
-                chunk_messages=chunk_messages,
-                first_idx=chunk_plan.start,
-            )
-            if history_path is None:
-                return working, changed
-            history_rel_path = self.artifact_display_reference(history_path)
 
             compactor_budget = self._compactor_request_budget(ratio=0.85)
             prepared_chunk = self._prepare_chunk_messages_for_compactor(
@@ -1975,53 +2669,39 @@ class ConversationCompactor:
                 )
                 new_summary = self._call_compactor(prompt_messages=retry_prompt_messages)
 
-            dropped_without_summary = False
             if new_summary is None:
-                dropped_without_summary = True
                 self._store.append(
                     "compaction_warning",
                     {
-                        "warning": "compactor_failed_drop_chunk",
-                        "history_path": history_rel_path,
+                        "warning": "compactor_failed_preserved_chunk",
+                        "history_path": predicted_history_rel_path,
                     },
                 )
-                new_summary = self.state.summary
-
-            self.state.summary = new_summary
-            self._write_summary_file(new_summary)
+                return working, changed
 
             new_pins = self._extract_pins_for_chunk(
-                history_rel_path=history_rel_path,
+                history_rel_path=predicted_history_rel_path,
                 scored_turns=chunk_plan.scored_turns,
             )
+            next_pins = list(self.state.pins)
             if new_pins:
-                self.state.pins = self._bounded_pins([*self.state.pins, *new_pins])
-                self._write_pins_file(self.state.pins)
+                next_pins = self._bounded_pins([*self.state.pins, *new_pins])
 
             reduced_messages = working[: chunk_plan.start] + working[chunk_plan.end :]
+            trial_state = self._clone_state()
+            trial_state.summary = deepcopy(new_summary)
+            trial_state.pins = deepcopy(next_pins)
             updated_messages = self._upsert_context_messages(
                 reduced_messages,
                 summary=new_summary,
-                pins=self.state.pins,
+                pins=next_pins,
+                state=trial_state,
             )
-            summary_json = json.dumps(new_summary, separators=(",", ":"), ensure_ascii=False)
-            self._store.append(
-                "conversation_summary_updated",
-                {
-                    "summary_bytes": len(summary_json.encode("utf-8")),
-                    "history_chunk_index": self.state.history_chunk_index,
-                    "history_path": history_rel_path,
-                    "chunk_strategy": chunk_plan.strategy,
-                    "pins_count": len(self.state.pins),
-                    "dropped_without_summary_update": dropped_without_summary,
-                },
+            provider_updated_messages = self._provider_request_messages(
+                updated_messages,
+                request_messages_builder=request_messages_builder,
             )
-
-            new_used_tokens = estimate_request_tokens(updated_messages, tool_list)
-            working = updated_messages
-            changed = True
-            forced_once = True
-
+            new_used_tokens = estimate_request_tokens(provider_updated_messages, tool_list)
             if new_used_tokens >= used_tokens:
                 self._store.append(
                     "compaction_warning",
@@ -2033,8 +2713,42 @@ class ConversationCompactor:
                 )
                 return working, changed
 
-            if new_used_tokens <= target_tokens:
+            artifact_commit = self._commit_execution_artifacts(
+                chunk_messages=chunk_messages,
+                first_idx=chunk_plan.start,
+                summary=new_summary,
+                pins=next_pins,
+            )
+            if artifact_commit is None:
                 return working, changed
+            history_rel_path = self.artifact_display_reference(artifact_commit.history_path)
+            self.state.history_chunk_index = artifact_commit.history_chunk_index
+            self.state.summary = deepcopy(new_summary)
+            self.state.pins = deepcopy(next_pins)
+            self.state.memory_message_index = trial_state.memory_message_index
+            self.state.pins_message_index = trial_state.pins_message_index
+            summary_json = json.dumps(new_summary, separators=(",", ":"), ensure_ascii=False)
+            self._store.append(
+                "conversation_summary_updated",
+                {
+                    "summary_bytes": len(summary_json.encode("utf-8")),
+                    "history_chunk_index": self.state.history_chunk_index,
+                    "history_path": history_rel_path,
+                    "chunk_strategy": chunk_plan.strategy,
+                    "pins_count": len(self.state.pins),
+                    "dropped_without_summary_update": False,
+                    "active_conversation_messages": deepcopy(
+                        updated_messages[self.state.pinned_prefix_len :]
+                    ),
+                },
+            )
+
+            working = updated_messages
+            changed = True
+            forced_once = True
+            # Re-enter the loop so provider-side counting can verify the exact
+            # post-compaction request before it is allowed onto the wire.
+            continue
 
     def maybe_compact(
         self,
@@ -2042,14 +2756,18 @@ class ConversationCompactor:
         messages: list[dict[str, Any]],
         tool_list: list[dict[str, Any]] | None,
         main_model: str,
+        cache_policy: Mapping[str, Any] | None = None,
         focus: str | None = None,
+        request_messages_builder: RequestMessagesBuilder | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
         return self._compact_loop(
             messages=messages,
             tool_list=tool_list,
             main_model=main_model,
+            cache_policy=cache_policy,
             focus=focus,
             force=False,
+            request_messages_builder=request_messages_builder,
         )
 
     def compact_now(
@@ -2058,13 +2776,125 @@ class ConversationCompactor:
         messages: list[dict[str, Any]],
         tool_list: list[dict[str, Any]] | None,
         main_model: str,
+        cache_policy: Mapping[str, Any] | None = None,
         focus: str | None = None,
+        request_messages_builder: RequestMessagesBuilder | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
         self._store.append("compaction_forced", {"focus": (focus or "").strip()})
         return self._compact_loop(
             messages=messages,
             tool_list=tool_list,
             main_model=main_model,
+            cache_policy=cache_policy,
             focus=focus,
             force=True,
+            request_messages_builder=request_messages_builder,
         )
+
+    def compact_for_overflow(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tool_list: list[dict[str, Any]] | None,
+        main_model: str,
+        cache_policy: Mapping[str, Any] | None = None,
+        focus: str | None = None,
+        request_messages_builder: RequestMessagesBuilder | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Recover from a provider-confirmed context overflow without data loss."""
+
+        self._store.append(
+            "compaction_forced",
+            {"focus": (focus or "").strip(), "reason": "provider_context_overflow"},
+        )
+        return self._compact_loop(
+            messages=messages,
+            tool_list=tool_list,
+            main_model=main_model,
+            cache_policy=cache_policy,
+            focus=focus,
+            force=True,
+            hard_pressure=True,
+            request_messages_builder=request_messages_builder,
+        )
+
+    def request_fits_input_budget(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tool_list: list[dict[str, Any]] | None,
+        main_model: str,
+        cache_policy: Mapping[str, Any] | None = None,
+        request_messages_builder: RequestMessagesBuilder | None = None,
+    ) -> bool:
+        """Verify that a rebuilt request fits the model's usable input budget."""
+
+        provider_messages = self._provider_request_messages(
+            messages,
+            request_messages_builder=request_messages_builder,
+        )
+        request_has_media = request_contains_media(provider_messages)
+        model_meta = self._model_registry.get(main_model)
+        budget = compute_input_budget(
+            model_meta,
+            safety_margin=self._settings.safety_margin_tokens,
+        )
+        local_used_tokens = estimate_request_tokens(provider_messages, tool_list)
+        calibration = self._usage_summary.recent_calibration_snapshot(
+            requested_model=main_model,
+            provider_key=self._calibration_filters.get("provider_key"),
+            protocol=self._calibration_filters.get("protocol"),
+            base_url_host=self._calibration_filters.get("base_url_host"),
+            operation=self._calibration_filters.get("operation"),
+            request_mode=self._calibration_filters.get("request_mode"),
+            cache_strategy=(
+                str(cache_policy.get("strategy") or "").strip()
+                if isinstance(cache_policy, Mapping)
+                else self._calibration_filters.get("cache_strategy")
+            ),
+            limit=20,
+        )
+        ratio_raw = calibration.get("prompt_estimate_error_ratio_p90")
+        ratio = float(ratio_raw) if isinstance(ratio_raw, int | float) else 1.0
+        if not math.isfinite(ratio) or ratio <= 0 or not self._settings.cache_aware_compaction:
+            ratio = 1.0
+        calibrated_used_tokens = math.ceil(local_used_tokens * max(1.0, ratio))
+        counted: InputTokenCount | None = None
+        if self._input_token_counter is not None:
+            try:
+                counted = self._input_token_counter(provider_messages, tool_list)
+            except Exception as exc:  # noqa: BLE001 - preflight measurement is optional
+                self._store.append(
+                    "compaction_warning",
+                    {
+                        "warning": "overflow_retry_input_measurement_failed",
+                        "error": str(exc),
+                    },
+                )
+        used_tokens, token_count_source, token_count_confidence = _conservative_input_measurement(
+            baseline_tokens=max(local_used_tokens, calibrated_used_tokens),
+            measurement=counted,
+            estimate_multiplier=ratio,
+        )
+        media_input_uncertain = request_has_media and (
+            counted is None or counted.confidence != UsageConfidence.AUTHORITATIVE
+        )
+        verification_budget_tokens = (
+            int(budget * self._settings.target_ratio) if media_input_uncertain else budget
+        )
+        self._store.append(
+            "compaction_budget_verification",
+            {
+                "used_tokens": used_tokens,
+                "local_used_tokens": local_used_tokens,
+                "calibrated_used_tokens": calibrated_used_tokens,
+                "budget_tokens": budget,
+                "verification_budget_tokens": verification_budget_tokens,
+                "fits": used_tokens <= verification_budget_tokens,
+                "token_count_source": token_count_source,
+                "token_count_confidence": token_count_confidence,
+                "input_measurement_tokens": (counted.input_tokens if counted is not None else None),
+                "media_input_uncertain": media_input_uncertain,
+            },
+        )
+        return used_tokens <= verification_budget_tokens

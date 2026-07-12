@@ -29,6 +29,7 @@ sylliptor chat
 sylliptor run "Explain this repository."
 sylliptor setup
 sylliptor tools
+sylliptor auth list
 sylliptor update check
 ```
 
@@ -85,6 +86,16 @@ sylliptor run --mode readonly "Explain this repository."
 sylliptor chat --mode auto
 ```
 
+The default `autonomous` step-budget policy has no fixed step limit. Set
+`--max-steps` for one command, or restore configured limits with:
+
+```bash
+sylliptor config set step_budget_policy limited
+```
+
+Execution modes, approvals, deadlines, sandbox policy, and provider limits
+still apply.
+
 Session policy also records a `runtime_kind` such as `interactive_chat`,
 `one_shot`, or `forge_exec`; extension systems use that runtime kind when
 deciding which tools or catalogs may be exposed.
@@ -140,12 +151,14 @@ Common keys:
 - `default_mode`
 - `max_steps`
 - `task_max_steps`
+- `step_budget_policy`
 - `stream`
 - `routing_mode`
 - `role_models.router`
 - `subagents_enabled`
 - `custom_tools_enabled`
 - `web_search_mode`
+- `web_search_policy`
 - `web_search_adapter`
 - `web_search_base_url`
 - `web_search_model`
@@ -155,6 +168,8 @@ Common keys:
 - `update_check_enabled`
 - `update_check_interval_hours`
 - `update_check_timeout_s`
+- `update_prompt_enabled`
+- `prompt_cache_mode`
 
 Useful environment overrides:
 
@@ -169,6 +184,8 @@ Useful environment overrides:
 - `SYLLIPTOR_WEB_SEARCH_BASE_URL`
 - `SYLLIPTOR_WEB_SEARCH_MODEL`
 - `SYLLIPTOR_WEB_SEARCH_TIMEOUT_S`
+- `SYLLIPTOR_WEB_SEARCH_KEYLESS`
+- `SYLLIPTOR_UPDATE_PROMPT_ENABLED`
 - `TAVILY_API_KEY`
 
 `role_models.router` overrides the model used for lightweight routing. Leave it
@@ -193,6 +210,18 @@ sylliptor profile list
 OpenAI, Anthropic, and Gemini profiles can use their native API protocols.
 Other provider and gateway profiles use the OpenAI-compatible protocol.
 
+Subscription-backed connections are managed separately from static API keys:
+
+```bash
+sylliptor auth list
+sylliptor auth login openai-codex
+sylliptor auth status openai-codex
+sylliptor auth logout openai-codex
+```
+
+Choose the subscription model in `/config`. See
+[Providers and models](providers.md) for details.
+
 Presets are convenience templates, not hard constraints. Custom profiles can
 point at model provider endpoints.
 
@@ -205,11 +234,13 @@ Common tool families:
 
 - filesystem reads, writes, edits, moves, copies, and deletes
 - repository text search and symbol lookup
+- compact repository mapping and focused test discovery
 - git history inspection
 - shell command execution, background terminals, and durable service helpers
 - verification command execution
 - web fetch and optional web search
 - session history and local artifacts
+- constrained static workspace previews
 
 Use:
 
@@ -225,10 +256,9 @@ for the current built-in tool catalog and configuration-dependent availability.
 document retrieval. Use it for URLs explicitly provided by the user, returned
 by search, or discovered from trusted fetched or local content.
 
-`web_search` is a discovery tool. It appears only when search is enabled and a
-supported backend is ready. In this public build, web search is available
-through supported provider-native search adapters and external backends such as
-Tavily when configured.
+`web_search` is a discovery tool. In auto mode it can use a supported provider
+adapter, configured external backend, or keyless DDGS fallback. Set
+`web_search_policy=off` to remove it from the model's tools.
 
 Other chat provider profiles can still be valid model providers without being
 native `web_search` backends.
@@ -310,6 +340,13 @@ sylliptor sessions score <session_id>
 sylliptor sessions score --latest 5
 ```
 
+Session pickers and implicit latest-session operations default to the current
+local owner. Show all retained sessions with:
+
+```bash
+sylliptor sessions list --all
+```
+
 Feedback bundles can be created from retained session artifacts:
 
 ```bash
@@ -324,6 +361,9 @@ or upload archives automatically.
 
 Sylliptor checks for newer releases in a non-blocking, cache-backed way when
 enabled. It never installs updates silently.
+
+Interactive launches may prompt when a cached check finds a newer release.
+Set `update_prompt_enabled=false` to disable only that prompt.
 
 ```bash
 sylliptor update check
@@ -354,6 +394,7 @@ running it.
 
 - [Architecture](architecture.md): high-level system structure.
 - [Quickstart](quickstart.md): first setup and first run.
+- [Providers and models](providers.md): model access and subscription login.
 - [Credentials](credentials.md): API key precedence and storage.
 - [Security model](security_model.md): trust boundaries and sandboxing.
 - [Shell sandbox](shell_sandbox.md): Docker and Bubblewrap setup.

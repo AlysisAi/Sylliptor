@@ -93,6 +93,38 @@ def test_score_session_events_collects_core_metrics() -> None:
     assert repeated and repeated[0]["count"] == 2
 
 
+def test_score_session_events_tracks_unmetered_cost_separately() -> None:
+    events = [
+        {
+            "type": "llm_usage",
+            "payload": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "cost_usd": 0.02,
+            },
+        },
+        {
+            "type": "llm_usage",
+            "payload": {
+                "prompt_tokens": 50,
+                "completion_tokens": 10,
+                "total_tokens": 60,
+                "cost_usd": None,
+            },
+        },
+    ]
+
+    score = score_session_events(events)
+
+    assert score["llm_usage_events"] == 2
+    assert score["total_tokens"] == 180
+    # The unmetered call must not be silently counted as $0.00.
+    assert round(score["cost_usd"], 6) == 0.02
+    assert score["known_cost_calls"] == 1
+    assert score["unknown_cost_calls"] == 1
+
+
 def test_score_session_log_defaults_session_id_to_filename(tmp_path: Path) -> None:
     path = tmp_path / "demo_session.jsonl"
     events = [

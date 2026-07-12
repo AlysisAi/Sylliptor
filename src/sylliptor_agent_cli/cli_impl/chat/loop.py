@@ -2,6 +2,7 @@
 # Dependencies are injected at runtime from sylliptor_agent_cli.cli to preserve monkeypatch surfaces.
 from __future__ import annotations
 
+import copy
 import os
 import re
 from pathlib import Path
@@ -10,6 +11,9 @@ from typing import Any
 import typer
 
 from ...compaction.conversation_compactor import CompactionState
+from ...error_text import sanitize_error_text_for_output
+from ...failure_category import exit_code_for_failure
+from ...run_outcome import INFRASTRUCTURE_FAILURE_EXIT_CODE
 from ...runtime_kind import RuntimeKind
 from ...surface.console import safe_plain_error
 from .state import _ChatExecutionRequest, _ChatPlanModeState, _ForgeChatState
@@ -35,6 +39,37 @@ def _path_binding_source(path_source: Any, path: Any) -> str:
     if path not in (None, ".", Path(".")):
         return "explicit_path"
     return "cwd"
+
+
+_RAW_BENCHMARK_PROFILE_NAMES: set[str] = {
+    "benchmark",
+    "bench",
+    "raw-agent",
+    "raw_agent",
+    "raw-benchmark",
+    "raw_benchmark",
+    "raw-agent-benchmark",
+    "raw_agent_benchmark",
+}
+_RAW_BENCHMARK_MIN_MAX_STEPS = 80
+
+
+def _raw_benchmark_profile_requested(*, benchmark: bool) -> bool:
+    if benchmark:
+        return True
+    profile = os.environ.get("SYLLIPTOR_RUN_PROFILE", "")
+    return profile.strip().lower() in _RAW_BENCHMARK_PROFILE_NAMES
+
+
+def _apply_raw_benchmark_profile(cfg: Any) -> None:
+    cfg.default_mode = "auto"
+    cfg.routing_mode = "code_only"
+    cfg.subagents_enabled = False
+    cfg.skills_enabled = False
+    cfg.skills_auto_invoke = False
+    cfg.custom_tools_enabled = False
+    cfg.web_search_mode = "off"
+    cfg.max_steps = max(int(getattr(cfg, "max_steps", 0) or 0), _RAW_BENCHMARK_MIN_MAX_STEPS)
 
 
 _SUBAGENT_DEFAULT_TASKS: dict[str, str] = {
@@ -65,6 +100,40 @@ _CHAT_WORKDIR_FALSE_POSITIVE_TARGETS = {"definition"}
 _STRICT_SHELL_SANDBOX_UNAVAILABLE_PREFIX = (
     "Shell sandbox strict mode is enabled, but no usable backend is available:"
 )
+
+
+def _strip_rich_markup(text: Any) -> str:
+    """Best-effort strip of Rich console markup for plain transcript display."""
+    raw = str(text or "")
+    try:
+        from rich.text import Text
+
+        return Text.from_markup(raw).plain
+    except Exception:
+        return re.sub(r"\[/?[a-zA-Z][^\]]*\]", "", raw)
+
+
+def _print_chat_missing_model_guidance(console: Any) -> None:
+    console.print("[yellow]No model is configured yet.[/yellow]")
+    console.print(
+        "Run `sylliptor setup` for guided setup, or `sylliptor login` to start the free MiMo trial."
+    )
+    console.print("You can also set one directly with `sylliptor config set model <MODEL>`.")
+
+
+def _sync_tui_session_state(
+    tui_state: Any, session: Any, *, include_exec_mode: bool = False
+) -> None:
+    if include_exec_mode:
+        tui_state.exec_mode = str(getattr(session, "mode", "") or "").strip()
+    try:
+        usage_enabled = globals().get("_chat_usage_hud_enabled")
+        if callable(usage_enabled):
+            tui_state.usage_hud_enabled = bool(usage_enabled(session))
+        else:
+            tui_state.usage_hud_enabled = bool(getattr(session, "_usage_hud_enabled", True))
+    except Exception:
+        pass
 
 
 def _is_default_shell_sandbox_startup_failure(*, cfg: Any, error: Exception) -> bool:
@@ -711,8 +780,187 @@ def _apply_chat_effective_mode(
         emit_mode_changed(next_mode)
 
 
+class _ConfigReloadRequiresRestart(RuntimeError):
+    """Raised when a saved config cannot be applied to the current session topology."""
+
+
+_ROUTE_LOCAL_CLIENT_OPTIONAL_FLAGS = (
+    "_reasoning_summary_supported",
+    "_thinking_display_supported",
+    "_thought_summaries_supported",
+    "_thinking_summaries_supported",
+    "_input_token_count_available",
+    "_cached_content_create_disabled_reason",
+)
+_ROUTE_LOCAL_CLIENT_FALSE_FLAGS = ("_temperature_omit_after_rejection",)
+_ROUTE_LOCAL_CLIENT_ZERO_FIELDS = ("_cached_content_create_transient_failures",)
+_ROUTE_LOCAL_CLIENT_CONTAINERS = (
+    ("_cached_content_by_signature", None),
+    ("_disabled_prompt_cache_fields", "_disabled_prompt_cache_fields_lock"),
+    ("_temperature_compat_modes", "_temperature_compat_lock"),
+    ("_tool_choice_compat_disabled", "_tool_choice_compat_lock"),
+    ("_tool_calling_compat_disabled", "_tool_calling_compat_lock"),
+)
+
+
+def _reset_route_local_client_capabilities(client: Any, *, route_changed: bool) -> None:
+    if not route_changed:
+        return
+    for field_name in _ROUTE_LOCAL_CLIENT_OPTIONAL_FLAGS:
+        if hasattr(client, field_name):
+            setattr(client, field_name, None)
+    for field_name in _ROUTE_LOCAL_CLIENT_FALSE_FLAGS:
+        if hasattr(client, field_name):
+            setattr(client, field_name, False)
+    for field_name in _ROUTE_LOCAL_CLIENT_ZERO_FIELDS:
+        if hasattr(client, field_name):
+            setattr(client, field_name, 0)
+    for field_name, lock_field_name in _ROUTE_LOCAL_CLIENT_CONTAINERS:
+        container = getattr(client, field_name, None)
+        clear = getattr(container, "clear", None)
+        if not callable(clear):
+            continue
+        lock = getattr(client, lock_field_name, None) if lock_field_name else None
+        if lock is None:
+            clear()
+            continue
+        with lock:
+            clear()
+
+
+_RELOAD_SESSION_FIELDS = (
+    "cfg",
+    "routing_mode",
+    "max_steps",
+    "api_key",
+    "api_key_source",
+    "model_registry",
+)
+_RELOAD_CLIENT_FIELDS = (
+    "base_url",
+    "provider_auth",
+    "api_key",
+    "model",
+    "timeout_s",
+    "temperature",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "prompt_cache_request_field_values",
+    "prompt_cache_policy_metadata",
+    "prompt_cache_control_enabled",
+    "prompt_cache_control_ttl",
+    "explicit_cached_content_enabled",
+    "cached_content_ttl",
+    "cached_content_min_tokens",
+    "cached_content_ttl_seconds",
+    "cached_content_refresh_margin_seconds",
+    "_cached_content_by_signature",
+    "_cached_content_create_disabled_reason",
+    "_cached_content_create_transient_failures",
+    "enable_thinking",
+    "reasoning_effort",
+    "extra_headers",
+    "provider_key",
+    "reasoning_trace_adapter",
+    "route_identity",
+    "reasoning_trace_capability",
+    "provider_concurrency_caps",
+    "provider_retry_settings",
+    *_ROUTE_LOCAL_CLIENT_OPTIONAL_FLAGS,
+    *_ROUTE_LOCAL_CLIENT_FALSE_FLAGS,
+    *_ROUTE_LOCAL_CLIENT_ZERO_FIELDS,
+    *tuple(field_name for field_name, _lock_name in _ROUTE_LOCAL_CLIENT_CONTAINERS),
+)
+_RELOAD_MISSING = object()
+
+
+def _reload_snapshot_value(value: Any) -> Any:
+    if isinstance(value, (dict, list, set, tuple)):
+        return copy.deepcopy(value)
+    return value
+
+
+def _reload_clients(session: Any) -> list[Any]:
+    candidates = [
+        getattr(session, "client", None),
+        getattr(session, "router_client", None),
+        getattr(
+            getattr(session, "conversation_compactor", None),
+            "compactor_client",
+            None,
+        ),
+    ]
+    clients: list[Any] = []
+    seen: set[int] = set()
+    for client in candidates:
+        if client is None or id(client) in seen:
+            continue
+        seen.add(id(client))
+        clients.append(client)
+    return clients
+
+
+def _snapshot_config_reload_state(
+    session: Any,
+) -> tuple[dict[str, Any], list[tuple[Any, dict[str, Any]]]]:
+    session_snapshot = {
+        field_name: (
+            _reload_snapshot_value(getattr(session, field_name))
+            if hasattr(session, field_name)
+            else _RELOAD_MISSING
+        )
+        for field_name in _RELOAD_SESSION_FIELDS
+    }
+    client_snapshots = [
+        (
+            client,
+            {
+                field_name: (
+                    _reload_snapshot_value(getattr(client, field_name))
+                    if hasattr(client, field_name)
+                    else _RELOAD_MISSING
+                )
+                for field_name in _RELOAD_CLIENT_FIELDS
+            },
+        )
+        for client in _reload_clients(session)
+    ]
+    return session_snapshot, client_snapshots
+
+
+def _restore_config_reload_state(
+    session: Any,
+    snapshot: tuple[dict[str, Any], list[tuple[Any, dict[str, Any]]]],
+) -> None:
+    session_snapshot, client_snapshots = snapshot
+    for field_name, value in session_snapshot.items():
+        if value is _RELOAD_MISSING:
+            if hasattr(session, field_name):
+                delattr(session, field_name)
+            continue
+        setattr(session, field_name, _reload_snapshot_value(value))
+    for client, fields in client_snapshots:
+        for field_name, value in fields.items():
+            if value is _RELOAD_MISSING:
+                if hasattr(client, field_name):
+                    delattr(client, field_name)
+                continue
+            setattr(client, field_name, _reload_snapshot_value(value))
+
+
 def _apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> None:
+    snapshot = _snapshot_config_reload_state(session)
+    try:
+        _apply_config_menu_changes_to_session_mutating(session=session, cfg=cfg)
+    except Exception:
+        _restore_config_reload_state(session, snapshot)
+        raise
+
+
+def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConfig) -> None:
+    from ...agent.routing import _resolve_routing_mode
     from ...config import (
+        AppConfig,
         ConfigError,
         clone_cfg,
         resolve_api_key,
@@ -723,17 +971,70 @@ def _apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> No
         resolve_prompt_cache_retention,
         resolve_role_temperature,
     )
+    from ...llm.cache_capabilities import resolve_effective_cache_capability
+    from ...llm.cache_policy import build_prompt_cache_namespace, resolve_prompt_cache_policy
+    from ...llm.metadata import (
+        build_provider_route_identity,
+        canonicalize_extra_headers,
+        credential_scope_fingerprint,
+    )
+    from ...llm.protocols import (
+        ANTHROPIC_MESSAGES_PROTOCOL,
+        GEMINI_INTERACTIONS_PROTOCOL,
+        OPENAI_COMPAT_PROTOCOL,
+        get_provider_protocol_capabilities,
+        resolve_reasoning_trace_capability,
+    )
     from ...llm.provider_limits import resolve_provider_retry_settings
     from ...model_registry import ModelRegistry, resolve_model_provider_key
-    from ...model_router import ROLE_CODING, ROLE_COMPACTOR, resolve_model_for_role
+    from ...model_router import (
+        ROLE_CODING,
+        ROLE_COMPACTOR,
+        ROLE_ROUTER,
+        resolve_model_for_role,
+    )
+    from ...profile_presets import find_preset_for_profile
     from ...profiles import get_active_profile, resolve_effective_base_url
+    from ...provider_auth import create_provider_auth
+
+    next_routing_mode = _resolve_routing_mode(cfg)
+    current_routing_mode = str(getattr(session, "routing_mode", "") or "").strip().lower()
+    if current_routing_mode not in {"auto", "code_only"}:
+        current_cfg = getattr(session, "cfg", None)
+        current_routing_mode = (
+            _resolve_routing_mode(current_cfg)
+            if isinstance(current_cfg, AppConfig)
+            else next_routing_mode
+        )
+    if current_routing_mode != next_routing_mode:
+        raise _ConfigReloadRequiresRestart(
+            "Routing mode changed from "
+            f"{current_routing_mode!r} to {next_routing_mode!r}; restart chat to rebuild "
+            "the router client safely."
+        )
 
     session.cfg = clone_cfg(cfg)
+    session.routing_mode = next_routing_mode
+    fixed_step_override = getattr(session, "chat_turn_fixed_override", None)
+    session.max_steps = int(
+        fixed_step_override if fixed_step_override is not None else session.cfg.max_steps
+    )
     active_profile = get_active_profile(session.cfg)
     effective_base_url = resolve_effective_base_url(cfg=session.cfg, profile=active_profile)
+    protocol = str(active_profile.protocol or OPENAI_COMPAT_PROTOCOL).strip()
     resolved_key = resolve_api_key(session.cfg)
     session.api_key = str(resolved_key.key or "")
-    session.api_key_source = resolved_key.source
+    session.api_key_source = (
+        f"provider-auth:{active_profile.auth_provider}"
+        if active_profile.auth_provider
+        else resolved_key.source
+    )
+    provider_auth = (
+        create_provider_auth(active_profile.auth_provider) if active_profile.auth_provider else None
+    )
+    route_session_scope = credential_scope_fingerprint(
+        getattr(getattr(session, "store", None), "session_id", None)
+    )
 
     timeout_s = resolve_llm_timeout_s(session.cfg)
     enable_thinking = resolve_llm_enable_thinking(session.cfg)
@@ -742,22 +1043,151 @@ def _apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> No
     prompt_cache_retention = resolve_prompt_cache_retention(session.cfg)
     coding_temperature = resolve_role_temperature(session.cfg, role=ROLE_CODING)
     provider_retry_settings = resolve_provider_retry_settings(session.cfg)
+    model_registry = ModelRegistry(cfg=session.cfg, api_key=session.api_key)
+    session.model_registry = model_registry
 
     def _apply_client_config(
         client: Any,
         *,
         model: str,
+        role: str,
         temperature: float | None = None,
         disable_reasoning: bool = False,
     ) -> None:
+        existing_route_identity = getattr(client, "route_identity", None)
         client.base_url = effective_base_url
+        if hasattr(client, "provider_auth"):
+            client.provider_auth = provider_auth
         client.api_key = session.api_key
         client.model = model
         client.timeout_s = timeout_s
         if temperature is not None:
             client.temperature = temperature
-        client.prompt_cache_key = prompt_cache_key
-        client.prompt_cache_retention = prompt_cache_retention
+        provider_key = resolve_model_provider_key(
+            cfg=session.cfg,
+            model_name=model,
+            base_url=effective_base_url,
+            profile_name=active_profile.name,
+        )
+        capabilities = get_provider_protocol_capabilities(
+            provider_key=provider_key,
+            protocol=protocol,
+        )
+        preset = find_preset_for_profile(active_profile)
+        cache_capability = resolve_effective_cache_capability(
+            provider_key=provider_key,
+            protocol=protocol,
+            model=model,
+            base_url=effective_base_url,
+            transport_capabilities=capabilities,
+            preset_cache_capability=(preset.cache_capability if preset is not None else None),
+            profile_cache_capability=active_profile.cache_capability,
+        )
+        cache_policy = resolve_prompt_cache_policy(
+            cfg=session.cfg,
+            capabilities=capabilities,
+            provider_key=provider_key,
+            protocol=protocol,
+            model=model,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
+            prompt_cache_namespace=build_prompt_cache_namespace(
+                workspace_root=getattr(session, "root", None),
+                role=role,
+                profile_name=active_profile.name,
+            ),
+            cache_capability=cache_capability,
+        )
+        credential_scope = credential_scope_fingerprint(session.api_key)
+        if provider_auth is not None:
+            auth_scope = getattr(provider_auth, "route_credential_scope", None)
+            if callable(auth_scope):
+                credential_scope = str(auth_scope() or "").strip() or credential_scope
+        protocol_revision = ""
+        if protocol == ANTHROPIC_MESSAGES_PROTOCOL:
+            from ...llm import anthropic_messages
+
+            protocol_revision = anthropic_messages.ANTHROPIC_MESSAGES_ROUTE_REVISION
+        elif protocol == GEMINI_INTERACTIONS_PROTOCOL:
+            from ...llm import gemini_interactions
+
+            protocol_revision = gemini_interactions.GEMINI_INTERACTIONS_ROUTE_REVISION
+        next_route_identity = build_provider_route_identity(
+            protocol=protocol,
+            base_url=effective_base_url,
+            provider_key=provider_key,
+            model=model,
+            profile_name=active_profile.name,
+            auth_provider=active_profile.auth_provider,
+            credential_scope=credential_scope,
+            routing_headers=active_profile.extra_headers,
+            routing_fields=dict(cache_policy.request_field_values),
+            reasoning_state_adapter=active_profile.reasoning_trace_adapter,
+            protocol_revision=protocol_revision,
+            session_scope=(
+                route_session_scope
+                or str(getattr(existing_route_identity, "session_scope", "") or "")
+            ),
+        )
+        route_changed = (
+            str(getattr(existing_route_identity, "fingerprint", "") or "")
+            != next_route_identity.fingerprint
+        )
+        client.route_identity = next_route_identity
+        _reset_route_local_client_capabilities(client, route_changed=route_changed)
+        client.prompt_cache_key = cache_policy.prompt_cache_key
+        client.prompt_cache_retention = cache_policy.prompt_cache_retention
+        if hasattr(client, "prompt_cache_request_field_values"):
+            client.prompt_cache_request_field_values = dict(cache_policy.request_field_values)
+        if hasattr(client, "prompt_cache_policy_metadata"):
+            client.prompt_cache_policy_metadata = cache_policy.telemetry_metadata()
+        if hasattr(client, "prompt_cache_control_enabled"):
+            client.prompt_cache_control_enabled = cache_policy.anthropic_cache_control_enabled
+        if hasattr(client, "prompt_cache_control_ttl"):
+            client.prompt_cache_control_ttl = cache_policy.anthropic_cache_control_ttl
+        if hasattr(client, "explicit_cached_content_enabled") or hasattr(
+            client,
+            "cached_content_ttl",
+        ):
+            previous_enabled = bool(getattr(client, "explicit_cached_content_enabled", False))
+            previous_ttl = str(getattr(client, "cached_content_ttl", "") or "")
+            previous_min_tokens = getattr(client, "cached_content_min_tokens", None)
+            next_enabled = bool(cache_policy.gemini_explicit_cached_content_enabled)
+            next_ttl = str(cache_policy.gemini_cached_content_ttl or "3600s").strip() or "3600s"
+            next_min_tokens = (
+                int(cache_policy.min_cacheable_tokens)
+                if cache_policy.min_cacheable_tokens is not None
+                else previous_min_tokens
+            )
+            apply_cache_settings = getattr(client, "apply_cache_settings", None)
+            if callable(apply_cache_settings):
+                apply_cache_settings(
+                    enabled=next_enabled,
+                    ttl=next_ttl,
+                    min_tokens=(
+                        max(0, int(next_min_tokens)) if next_min_tokens is not None else None
+                    ),
+                )
+            else:
+                if hasattr(client, "explicit_cached_content_enabled"):
+                    client.explicit_cached_content_enabled = next_enabled
+                if hasattr(client, "cached_content_ttl"):
+                    client.cached_content_ttl = next_ttl
+                if hasattr(client, "cached_content_min_tokens") and next_min_tokens is not None:
+                    client.cached_content_min_tokens = max(0, int(next_min_tokens))
+                if (
+                    previous_enabled != next_enabled
+                    or previous_ttl != next_ttl
+                    or previous_min_tokens != next_min_tokens
+                ):
+                    cached_content_by_signature = getattr(
+                        client,
+                        "_cached_content_by_signature",
+                        None,
+                    )
+                    clear_cached_content = getattr(cached_content_by_signature, "clear", None)
+                    if callable(clear_cached_content):
+                        clear_cached_content()
         # The router/classification client is built reasoning-off in session.py so
         # latency-sensitive routing/non-repo turns stay fast on slow reasoning
         # models (e.g. Xiaomi MiMo via the trial proxy). Re-applying the
@@ -771,14 +1201,24 @@ def _apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> No
             client.enable_thinking = enable_thinking
             client.reasoning_effort = reasoning_effort
         if hasattr(client, "extra_headers"):
-            client.extra_headers = dict(active_profile.extra_headers)
+            client.extra_headers = canonicalize_extra_headers(active_profile.extra_headers)
         if hasattr(client, "provider_key"):
-            client.provider_key = resolve_model_provider_key(
-                cfg=session.cfg,
-                model_name=model,
-                base_url=effective_base_url,
-                profile_name=active_profile.name,
-            )
+            client.provider_key = provider_key
+        if hasattr(client, "reasoning_trace_adapter"):
+            client.reasoning_trace_adapter = active_profile.reasoning_trace_adapter
+        model_meta = model_registry.get(model, include_provider_auth=False)
+        model_supports_reasoning = model_meta.supports_reasoning
+        model_capability_source = model_meta.field_sources.get("supports_reasoning")
+        if active_profile.auth_provider and active_profile.reasoning_effort is not None:
+            model_supports_reasoning = True
+            model_capability_source = "profile:reasoning_effort"
+        client.reasoning_trace_capability = resolve_reasoning_trace_capability(
+            provider_key=provider_key,
+            protocol=protocol,
+            adapter_override=active_profile.reasoning_trace_adapter,
+            model_supports_reasoning=model_supports_reasoning,
+            model_capability_source=model_capability_source,
+        )
         if hasattr(client, "provider_concurrency_caps"):
             client.provider_concurrency_caps = dict(session.cfg.provider_concurrency_caps)
         if hasattr(client, "provider_retry_settings"):
@@ -789,14 +1229,22 @@ def _apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> No
         _apply_client_config(
             client,
             model=str(session.cfg.model or ""),
+            role=ROLE_CODING,
             temperature=coding_temperature,
         )
 
     router_client = getattr(session, "router_client", None)
-    if router_client is not None:
+    if next_routing_mode == "auto" and router_client is not None:
+        router_model = resolve_model_for_role(
+            cfg=session.cfg,
+            role=ROLE_ROUTER,
+            plan=None,
+        )
         _apply_client_config(
             router_client,
-            model=str(session.cfg.model or ""),
+            model=router_model,
+            role=ROLE_ROUTER,
+            temperature=0.0,
             disable_reasoning=True,
         )
 
@@ -815,10 +1263,10 @@ def _apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> No
         _apply_client_config(
             compactor_client,
             model=compactor_model,
+            role=ROLE_COMPACTOR,
             temperature=resolve_role_temperature(session.cfg, role=ROLE_COMPACTOR),
         )
 
-    session.model_registry = ModelRegistry(cfg=session.cfg, api_key=session.api_key)
     _rebuild_session_tools_for_mode(
         session=session,
         mode=str(getattr(session, "mode", "review") or "review"),
@@ -879,6 +1327,11 @@ def _clear_chat_conversation(*, session: Any, pending_images: list[str]) -> None
     store.append("conversation_cleared", {"trigger": "user_command"})
 
     session.messages = startup_messages
+    invalidate_request_context = getattr(session, "invalidate_request_context", None)
+    if callable(invalidate_request_context):
+        invalidate_request_context(reason="conversation_cleared")
+    elif hasattr(session, "request_context_measurement"):
+        session.request_context_measurement = None
     refresh_session_workspace_binding_context_message(session)
     refresh_session_environment_context_message(session)
 
@@ -933,6 +1386,23 @@ def _planner_workspace_context_for_session(*, session: Any) -> dict[str, Any] | 
     return payload
 
 
+def _should_defer_forge_planner_submission(*, forge_state: Any, text: str) -> bool:
+    """Return whether a Forge submission will perform a planner model call.
+
+    Plain text in Forge is planner input only while the planner assistant is
+    enabled. Slash/colon commands remain on the synchronous command path because
+    they are local state operations (except explicitly deferred commands such as
+    ``/execute plan``).
+    """
+    trimmed = str(text or "").strip()
+    return bool(
+        trimmed
+        and trimmed[:1] not in "/:"
+        and getattr(forge_state, "ui_mode", None) == "forge"
+        and getattr(forge_state, "assistant_enabled", False)
+    )
+
+
 def _finish_chat_surface_activity(*, session: Any) -> None:
     surface = getattr(session, "surface", None)
     handler = getattr(surface, "on_assistant_message_done", None)
@@ -950,6 +1420,7 @@ def _run_plan_mode_approval_loop(
     console: Console,
     user_message: str,
     max_iterations: int | None = None,
+    action_prompt: Any | None = None,
 ) -> str | None:
     limit = max_iterations if max_iterations is not None else MAX_PLAN_ITERATIONS
     if limit <= 0:
@@ -1065,7 +1536,10 @@ def _run_plan_mode_approval_loop(
         _render_plan_draft(console=console, draft=draft)
         console.print("")
 
-        action = _prompt_plan_mode_action(console=console)
+        if action_prompt is not None:
+            action = action_prompt(console=console, user_message=user_message, draft=draft)
+        else:
+            action = _prompt_plan_mode_action(console=console)
         if action is None:
             return None
         if action == "approve":
@@ -1129,7 +1603,7 @@ def chat(
     max_steps: int | None = typer.Option(
         None,
         "--max-steps",
-        help="Max steps override (per user turn).",
+        help="Optional safety limit on agent iterations for each user turn.",
     ),
     subagents: bool | None = typer.Option(
         None,
@@ -1207,22 +1681,123 @@ def chat(
         effective.max_steps = max_steps
     if subagents is not None:
         effective.subagents_enabled = subagents
-    _apply_interactive_chat_step_budget_floor(
-        effective,
-        max_steps_provided=max_steps_provided,
-    )
 
     effective_mode = (mode.value if mode else effective.default_mode) or "review"
+    delegated_execution = effective.execution.backend == "delegated"
+
+    # Keep the interactive shell available while a selected subscription is
+    # disconnected, so the user can authenticate without falling back to the
+    # classic prompt.
+    tui_enabled_now = False
+    if not non_interactive:
+        try:
+            from ..tui import is_tui_enabled as _tui_enabled
+
+            tui_enabled_now = bool(_tui_enabled())
+        except Exception:
+            tui_enabled_now = False
+
+    # Offer a newer release before any setup/workspace screens. No-op unless a
+    # cached check found one; at most once per process (bare `sylliptor`
+    # launches already ran it from the root callback).
+    if not non_interactive:
+        from ..commands.update import maybe_prompt_update_at_startup
+
+        maybe_prompt_update_at_startup(console=console)
+
+    def _read_subscription_availability() -> Any:
+        if delegated_execution:
+            return None
+        from ..commands.startup import _subscription_availability
+
+        return _subscription_availability(effective)
+
+    subscription_availability = _read_subscription_availability()
+    subscription_blocked = bool(
+        subscription_availability is not None
+        and subscription_availability.active
+        and not subscription_availability.ready
+    )
+
+    if not delegated_execution and not effective.model and not subscription_blocked:
+        should_run_setup = False
+        should_run_setup_fn = globals().get("_should_run_first_run_setup_wizard")
+        if callable(should_run_setup_fn):
+            try:
+                should_run_setup = bool(should_run_setup_fn())
+            except Exception:
+                should_run_setup = False
+        setup_fn = globals().get("_maybe_run_first_run_setup_wizard")
+        if not non_interactive and should_run_setup and callable(setup_fn):
+            console.print("[yellow]No model is configured yet. Starting first-run setup.[/yellow]")
+            if not bool(setup_fn()):
+                return
+            effective = clone_cfg(load_config())
+            if base_url is not None:
+                effective.base_url = base_url
+            if model is not None:
+                effective.model = model
+            if temperature is not None:
+                _apply_temperature_override(effective, temperature)
+            if stream_provided and stream is not None:
+                effective.stream = stream
+            else:
+                effective.stream = True
+            if max_steps is not None:
+                effective.max_steps = max_steps
+            if subagents is not None:
+                effective.subagents_enabled = subagents
+            effective_mode = (mode.value if mode else effective.default_mode) or "review"
+            delegated_execution = effective.execution.backend == "delegated"
+            subscription_availability = _read_subscription_availability()
+            subscription_blocked = bool(
+                subscription_availability is not None
+                and subscription_availability.active
+                and not subscription_availability.ready
+            )
+        if not delegated_execution and not effective.model and not subscription_blocked:
+            _print_chat_missing_model_guidance(console)
+            raise typer.Exit(code=2)
+    if subscription_blocked and (non_interactive or not tui_enabled_now):
+        style = "red" if subscription_availability.is_error else "yellow"
+        console.print(f"[{style}]{subscription_availability.message}[/{style}]")
+        raise typer.Exit(code=1)
+    if delegated_execution and mode is None and str(effective_mode).strip().lower() == "fullaccess":
+        effective_mode = "review"
+        console.print(
+            "[yellow]Delegated runtimes do not inherit the native fullaccess default; "
+            "using review (read-only). Pass --mode auto to allow workspace writes.[/yellow]"
+        )
     binding_source = _path_binding_source(path_source, requested_path)
 
     try:
-        if not effective.model:
-            raise ConfigError("Model is not set. Run: sylliptor config set model <MODEL>")
-        api_key_override = _resolve_api_key_override(
-            api_key=api_key,
-            api_key_env=api_key_env,
-            api_key_stdin=api_key_stdin,
-        )
+        api_key_override = None
+        if delegated_execution:
+            from ...agent_runtimes.host import (
+                prepare_delegated_runtime,
+                run_delegated_chat,
+                validate_delegated_cli_options,
+            )
+
+            validate_delegated_cli_options(
+                base_url=base_url,
+                temperature=temperature,
+                max_steps=max_steps,
+                subagents=subagents,
+                verify_cmd=verify_cmd,
+                api_key_env=api_key_env,
+                api_key_stdin=api_key_stdin,
+                api_key=api_key,
+                stream=stream if stream_provided else None,
+                yes=yes,
+                diagnostic_log=diagnostic_log,
+            )
+        else:
+            api_key_override = _resolve_api_key_override(
+                api_key=api_key,
+                api_key_env=api_key_env,
+                api_key_stdin=api_key_stdin,
+            )
         workspace_binding = _resolve_startup_workspace_binding(
             requested_path=requested_path,
             console=console,
@@ -1234,12 +1809,21 @@ def chat(
         )
         session_root = workspace_binding.workspace_context.workspace_root
         focus_path = workspace_binding.workspace_context.focus_path
+        if delegated_execution:
+            prepare_delegated_runtime(effective, model=model)
+            run_delegated_chat(
+                cfg=effective,
+                cwd=session_root,
+                mode=effective_mode,
+                initial_images=tuple(path.resolve() for path in (image or ())),
+                no_log=no_log,
+                console=console,
+            )
+            return
         # Full-screen TUI is the default interactive chat surface. Users can
         # set SYLLIPTOR_TUI=0 to fall back to the classic prompt loop below.
         if not non_interactive:
-            from ..tui import is_tui_enabled as _tui_enabled
-
-            if _tui_enabled():
+            if tui_enabled_now:
                 import getpass as _getpass
 
                 from ...git_ops import current_branch as _current_branch
@@ -1262,6 +1846,13 @@ def chat(
                     _branch = ""
                 _tui_state = _TuiState(
                     model_name=str(effective.model or ""),
+                    connection_status=(
+                        "model selection required"
+                        if subscription_blocked and subscription_availability.selection_required
+                        else "subscription not connected"
+                        if subscription_blocked
+                        else ""
+                    ),
                     username=_username,
                     workspace=_workspace,
                     branch=_branch,
@@ -1295,7 +1886,9 @@ def chat(
                         subagents_enabled=effective.subagents_enabled,
                         workspace_binding=workspace_binding,
                     )
+                    built._sylliptor_tui_interactive = True
                     _set_chat_usage_hud_enabled(built, _resolve_usage_hud_default(effective))
+                    _sync_tui_session_state(_tui_state, built)
                     _refresh_chat_hud_context_cache(built)
                     _tui_box["session"] = built
                     return built
@@ -1322,8 +1915,17 @@ def chat(
                             totals = summary.totals()
                             _tui_state.tokens = int(totals.get("total_tokens") or 0)
                             cost = _known_cost_value(totals)
+                            unknown_calls = int(totals.get("unknown_cost_calls") or 0)
                             if cost is not None:
                                 _tui_state.cost_usd = float(cost)
+                            elif unknown_calls > 0:
+                                # Real usage but pricing is unavailable → honest "n/a",
+                                # never a fake $0.0000 (e.g. the unmetered MiMo trial).
+                                _tui_state.cost_usd = None
+                            else:
+                                # Nothing metered and nothing unmetered yet → $0.0000.
+                                _tui_state.cost_usd = 0.0
+                            _tui_state.cost_unknown_calls = unknown_calls
                     except Exception:
                         pass
 
@@ -1335,8 +1937,15 @@ def chat(
                     from ..tui.config_flow import ConfigFlow
 
                     built = _tui_box.get("session")
-                    root = str(getattr(built, "root", "") or "") if built is not None else ""
-                    return ConfigFlow(current_workspace=root)
+                    root = (
+                        str(getattr(built, "root", "") or "")
+                        if built is not None
+                        else str(session_root)
+                    )
+                    flow = ConfigFlow(current_workspace=root)
+                    if subscription_blocked and subscription_availability.selection_required:
+                        flow.open_default_model()
+                    return flow
 
                 def _tui_on_config_saved() -> bool:
                     # After the overlay saves, reload the live session from disk so the
@@ -1346,14 +1955,49 @@ def chat(
                     # user the running session was NOT updated (parity with classic).
                     built = _tui_box.get("session")
                     if built is None:
+                        from prompt_toolkit.application.current import get_app
+
+                        get_app().exit(result=("restart_config", str(session_root)))
                         return True
                     try:
-                        reloaded = load_config()
+                        from ...config import clone_cfg
+                        from ...profiles import connection_fingerprint
+
+                        reloaded = clone_cfg(load_config())
+                        # Command-line connection overrides remain authoritative for
+                        # this invocation. Reapply them before fingerprinting so a
+                        # routing-only save is not mistaken for a persisted connection
+                        # change, and before the live reload so /config cannot silently
+                        # replace the active CLI model or endpoint.
+                        if base_url is not None:
+                            reloaded.base_url = base_url
+                        if model is not None:
+                            reloaded.model = model
+                        if connection_fingerprint(reloaded) != connection_fingerprint(built.cfg):
+                            from prompt_toolkit.application.current import get_app
+
+                            get_app().exit(
+                                result=(
+                                    "restart_config",
+                                    str(getattr(built, "root", "") or "."),
+                                )
+                            )
+                            return True
                         _apply_config_menu_changes_to_session(session=built, cfg=reloaded)
                         _tui_state.model_name = str(getattr(reloaded, "model", "") or "")
                         new_mode = str(getattr(built, "mode", "") or "").strip()
                         if new_mode:
                             _tui_state.exec_mode = new_mode
+                    except _ConfigReloadRequiresRestart:
+                        from prompt_toolkit.application.current import get_app
+
+                        get_app().exit(
+                            result=(
+                                "restart_routing_config",
+                                str(getattr(built, "root", "") or "."),
+                            )
+                        )
+                        return True
                     except Exception:
                         return False
                     try:
@@ -1422,15 +2066,87 @@ def chat(
                                     except Exception:
                                         pass
                                 try:
-                                    surface.end_forge()
+                                    if cancelled:
+                                        interrupt_forge = getattr(surface, "interrupt_forge", None)
+                                        if callable(interrupt_forge):
+                                            interrupt_forge()
+                                    else:
+                                        surface.end_forge()
                                 except Exception:
                                     pass
+
+                    return _run
+
+                def _tui_make_forge_planner_execute(command_text: str, width: int):
+                    """Build the worker job for a plain Forge planner message."""
+
+                    def _run(token: Any) -> None:
+                        import io as _io
+
+                        from rich.console import Console as _RichConsole
+
+                        built = _tui_box.get("session")
+                        if built is None:
+                            return
+                        surface = getattr(built, "surface", None)
+                        buf = _io.StringIO()
+                        cap = _RichConsole(
+                            file=buf,
+                            force_terminal=False,
+                            no_color=True,
+                            highlight=False,
+                            width=max(20, min(int(width or 100), 120)),
+                        )
+                        try:
+                            _handle_chat_command(
+                                input_text=command_text,
+                                root=focus_path,
+                                session=built,
+                                pending_images=[],
+                                console=cap,
+                                forge_state=_tui_forge_state,
+                                plan_mode_state=_tui_plan_state,
+                                plan_mode_escape_supported=False,
+                            )
+                        except Exception as _planner_exc:  # noqa: BLE001
+                            if surface is not None and not getattr(token, "is_cancelled", False):
+                                try:
+                                    surface.append_system(f"Forge planner failed: {_planner_exc}")
+                                except Exception:
+                                    pass
+                            return
+
+                        if surface is None or getattr(token, "is_cancelled", False):
+                            return
+                        output = buf.getvalue().rstrip("\n")
+                        if output:
+                            try:
+                                surface.append_system(output)
+                            except Exception:
+                                pass
 
                     return _run
 
                 def _tui_command_runner(
                     sess: Any, text: str, width: int
                 ) -> tuple[str, str, str | None, dict[str, Any] | None]:
+                    # A plain Forge message with the planner enabled performs a
+                    # network/model call. Return a worker job immediately so the
+                    # input buffer can repaint cleared and the TUI stays responsive.
+                    if _should_defer_forge_planner_submission(
+                        forge_state=_tui_forge_state,
+                        text=text,
+                    ):
+                        return (
+                            "run",
+                            "",
+                            text.strip(),
+                            {
+                                "_deferred_execute": _tui_make_forge_planner_execute(
+                                    text.strip(), width
+                                )
+                            },
+                        )
                     # "/execute plan" inside Forge runs the swarm — defer it to the
                     # worker thread (not the synchronous runner, which would freeze
                     # the UI) with a live forge view instead of a flat captured dump.
@@ -1445,8 +2161,51 @@ def chat(
                             "run",
                             "",
                             text.strip(),
-                            {"_forge_execute": _tui_make_forge_execute(text.strip())},
+                            {"_deferred_execute": _tui_make_forge_execute(text.strip())},
                         )
+                    # Typed "/resume <index|id>" applies natively (resolve → swap →
+                    # reload transcript) instead of the capture path (whose history
+                    # render no-ops with console=None and which can't run the picker).
+                    # Bare "/resume" never reaches here — the picker intercepts it.
+                    _resume_split = text.strip().split(maxsplit=1)
+                    if (
+                        len(_resume_split) == 2
+                        and _resume_split[0].lower() == "/resume"
+                        and _resume_split[1].strip()
+                    ):
+                        ctx = _tui_resume_context()
+                        if ctx is not None:
+                            _built_r, sessions_dir_r, current_id_r, ws_r, git_r = ctx
+                            raw_arg = _resume_split[1].strip()
+                            try:
+                                candidates_r = _collect_chat_resume_candidates(
+                                    sessions_dir=sessions_dir_r,
+                                    current_session_id=current_id_r,
+                                    workspace_root=ws_r,
+                                    git_root=git_r,
+                                )
+                            except Exception:  # noqa: BLE001
+                                candidates_r = []
+                            target_id = _resolve_chat_resume_target(
+                                raw_value=raw_arg, sessions=candidates_r
+                            )
+                            if target_id is None and not raw_arg.isdigit():
+                                target_id = _resolve_chat_resume_direct_session_id(
+                                    raw_value=raw_arg, sessions_dir=sessions_dir_r
+                                )
+                            if target_id is None:
+                                return (
+                                    "handled",
+                                    "Invalid session. Use /resume for the picker or "
+                                    "/resume <index|session_id>.",
+                                    None,
+                                    None,
+                                )
+                            # _tui_resume_apply writes the outcome (and reloads the
+                            # transcript) itself, so return empty output to avoid a
+                            # duplicate line.
+                            _tui_resume_apply(target_id)
+                            return ("handled", "", None, None)
                     # Route a submission through the chat command handler with a
                     # capture console so its output renders into the TUI transcript
                     # instead of corrupting the alt-screen. stdin is swapped to EOF
@@ -1465,6 +2224,29 @@ def chat(
                         width=max(20, min(int(width or 100), 120)),
                     )
                     saved_stdin = _sys.stdin
+                    plan_mode_action_prompt = None
+                    surface_for_plan = getattr(sess, "surface", None)
+                    defer_plan_mode_approval = getattr(
+                        surface_for_plan, "defer_plan_mode_approval", None
+                    )
+                    if callable(defer_plan_mode_approval):
+
+                        def _tui_plan_mode_action_prompt(
+                            *, console: Any, user_message: str, draft: str
+                        ) -> str | None:
+                            console.print(_plan_mode_actions_panel())
+                            console.print("Select option [1/2/3]:")
+                            defer_plan_mode_approval(
+                                user_message=user_message,
+                                draft=draft,
+                                approved_instruction=instruction_with_approved_plan(
+                                    user_message=user_message,
+                                    approved_plan=draft,
+                                ),
+                            )
+                            return None
+
+                        plan_mode_action_prompt = _tui_plan_mode_action_prompt
                     try:
                         _sys.stdin = _io.StringIO("")
                         result = _handle_chat_command(
@@ -1476,15 +2258,16 @@ def chat(
                             forge_state=_tui_forge_state,
                             plan_mode_state=_tui_plan_state,
                             plan_mode_escape_supported=False,
+                            plan_mode_action_prompt=plan_mode_action_prompt,
                         )
                     except Exception as _cmd_exc:  # noqa: BLE001
                         return ("handled", f"Command error: {_cmd_exc}", None, None)
                     finally:
                         _sys.stdin = saved_stdin
                     output = buf.getvalue().rstrip("\n")
-                    # Keep the footer mode badge in sync after any command that may
-                    # have changed it (e.g. "/mode fast" applied inline).
-                    _tui_state.exec_mode = str(getattr(sess, "mode", "") or "").strip()
+                    # Keep footer badges in sync after local commands such as
+                    # /mode and /usage HUD.
+                    _sync_tui_session_state(_tui_state, sess, include_exec_mode=True)
                     # The forge state machine flips ui_mode inside _enter_forge_mode
                     # (and back to "chat" on /back / /done); this single sync drives
                     # the FORGE footer badge + the forge-specific input placeholder.
@@ -1632,20 +2415,65 @@ def chat(
                     except Exception:  # noqa: BLE001
                         return None
 
+                def _tui_forge_planner_choice(value: Any) -> dict[str, Any]:
+                    # A pick from the "Use the planner?" prompt → enter Forge with the
+                    # plan assistant forced on/off. Submitting the flagged /forge form
+                    # runs the full entry pipeline (workspace binding + footer sync);
+                    # the flag is parsed into planner_assistant_default, never a goal.
+                    choice = str(value or "").strip().lower()
+                    submit = "/forge --planner" if choice == "yes" else "/forge --no-planner"
+                    return {"submit": submit}
+
+                def _tui_forge_planner_prompt() -> dict[str, Any]:
+                    # on_confirm for the /forge intro popup: instead of entering Forge
+                    # directly, open a native picker asking whether to use the planner
+                    # assistant (the classic stdin prompt can't run in the alt-screen).
+                    return {
+                        "picker": {
+                            "title": "Use the planner assistant?",
+                            "hint": "↑↓ move · Enter select · Esc cancel",
+                            "rows": [
+                                {
+                                    "value": "yes",
+                                    "label": "Yes — use the planner assistant",
+                                    "description": (
+                                        "Draft and refine the plan together before building."
+                                    ),
+                                    "current": True,
+                                },
+                                {
+                                    "value": "no",
+                                    "label": "No — plan it myself",
+                                    "description": (
+                                        "Enter Forge and shape the plan with /goal and /task."
+                                    ),
+                                },
+                            ],
+                            "on_select": _tui_forge_planner_choice,
+                        }
+                    }
+
                 def _tui_forge_intro_panel(arg: str = "") -> dict[str, Any] | None:
-                    # Plain /forge opens a guidance popup explaining how Forge works;
-                    # its Enter (confirm) routes "/forge" to the command runner to enter
-                    # the planning session, Esc cancels. "/forge resume" and re-entry
-                    # while already in Forge return None so they fall through to the
-                    # runner and resume directly (no intro).
+                    # Plain /forge opens a guidance popup explaining how Forge works.
+                    # Its Enter runs on_confirm, which opens the native "Use the
+                    # planner?" picker; the pick enters Forge with the assistant on/off.
+                    # "/forge <goal>" / "/forge resume" (arg present) and re-entry while
+                    # already in Forge return None so they fall through to the runner
+                    # and enter directly (no intro, no planner prompt).
                     if arg.strip():
                         return None
                     if _tui_forge_state.ui_mode == "forge":
                         return None
                     try:
-                        return _chat_forge_intro_panel_spec()
+                        spec = _chat_forge_intro_panel_spec()
                     except Exception:  # noqa: BLE001 - never crash the UI on a panel
                         return None
+                    # Swap the bare confirm-command for the planner prompt so the user
+                    # chooses the planner natively before Forge actually enters.
+                    spec.pop("confirm", None)
+                    spec["on_confirm"] = _tui_forge_planner_prompt
+                    spec["hint"] = "↵ Enter — choose planner   ·   Esc — cancel"
+                    return spec
 
                 # --- Forge read-only panels (only fire inside a Forge session) ---
                 def _tui_forge_plan_and_paths() -> tuple[Any, Any] | None:
@@ -1815,6 +2643,27 @@ def chat(
                     except Exception:  # noqa: BLE001
                         return None
 
+                def _tui_login_select(value: str) -> dict[str, Any]:
+                    return {"exit": ("login_connection", str(value))}
+
+                def _tui_login_picker() -> dict[str, Any]:
+                    from ..commands.auth import login_connection_rows
+
+                    rows = [
+                        {
+                            "label": label,
+                            "description": description,
+                            "value": connection_id,
+                        }
+                        for connection_id, label, description in login_connection_rows()
+                    ]
+                    return {
+                        "title": "Log in",
+                        "hint": "Choose how Sylliptor should connect",
+                        "rows": rows,
+                        "on_select": _tui_login_select,
+                    }
+
                 _tui_panel_providers = {
                     "/status": _tui_status_panel,
                     "/usage": _tui_usage_panel,
@@ -1856,7 +2705,11 @@ def chat(
                     _chat_mode_rows,
                     _chat_trace_rows,
                 )
-                from ..commands.startup import _chat_trace_level, _set_chat_trace_level
+                from ..commands.startup import (
+                    _chat_trace_level,
+                    _set_chat_stream_enabled,
+                    _set_chat_trace_level,
+                )
 
                 _FULLACCESS_WARNING = (
                     "full (fullaccess) disables write/shell safety guards and approval prompts."
@@ -1909,6 +2762,46 @@ def chat(
                             }
                         )
                     return {"title": "Mode", "rows": rows, "on_select": _tui_mode_select}
+
+                # TUI-native /stream picker: bare /stream opens a selectable popup;
+                # "/stream on|off|status" still applies inline via the command runner.
+                def _tui_stream_select(value: str) -> list[tuple[str, str]] | None:
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    enabled = value == "on"
+                    current = bool(getattr(built, "stream", True))
+                    if enabled == current:
+                        return [("system", f"Streaming already set: {value}")]
+                    _set_chat_stream_enabled(session=built, enabled=enabled)
+                    return [("system", f"Streaming → {value}")]
+
+                def _tui_stream_picker() -> dict[str, Any] | None:
+                    built = _tui_box.get("session")
+                    enabled = bool(getattr(built, "stream", True)) if built is not None else True
+                    return {
+                        "title": "Streaming",
+                        "rows": [
+                            {
+                                "label": "on",
+                                "description": (
+                                    "Render answers and available safe reasoning summaries live "
+                                    "(recommended)."
+                                ),
+                                "value": "on",
+                                "current": enabled,
+                            },
+                            {
+                                "label": "off",
+                                "description": (
+                                    "Buffer answers and summaries until each response completes."
+                                ),
+                                "value": "off",
+                                "current": not enabled,
+                            },
+                        ],
+                        "on_select": _tui_stream_select,
+                    }
 
                 # TUI-native /trace picker: bare /trace opens a selectable popup;
                 # "/trace <level>" still applies inline via the command runner.
@@ -2045,10 +2938,149 @@ def chat(
                         "hint": "↑↓ select · Enter · Esc cancel",
                     }
 
+                # TUI-native /resume picker: bare /resume opens a selectable list of
+                # previous sessions (label = relative time, description = preview);
+                # choosing one swaps the live session in place and reloads the prior
+                # conversation into the transcript so the user "enters" it. The typed
+                # form "/resume <index|id>" is intercepted in the command runner so it
+                # applies natively too (no flat capture dump).
+                from ...session_store import resolve_sessions_dir
+                from ..commands.chat_resume_helpers import (
+                    _chat_resume_picker_spec,
+                    _collect_chat_resume_candidates,
+                    _resolve_chat_resume_direct_session_id,
+                    _resolve_chat_resume_target,
+                    _resume_chat_session,
+                )
+
+                def _tui_resume_context() -> tuple[Any, Path, str, Any, Any] | None:
+                    # (live session, sessions dir, current session id, current
+                    # workspace_root, current git_root) or None when there is no
+                    # session / no resolvable sessions directory. The workspace
+                    # roots scope the candidate list so /resume only shows this
+                    # workspace's chats.
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    store = getattr(built, "store", None)
+                    sessions_dir_raw = getattr(store, "sessions_dir", None)
+                    if sessions_dir_raw is not None:
+                        sessions_dir = Path(sessions_dir_raw)
+                    else:
+                        cfg = getattr(built, "cfg", None)
+                        if not isinstance(cfg, AppConfig):
+                            return None
+                        sessions_dir = resolve_sessions_dir(cfg)
+                    return (
+                        built,
+                        sessions_dir,
+                        str(getattr(store, "session_id", "") or ""),
+                        getattr(store, "workspace_root", None),
+                        getattr(store, "git_root", None),
+                    )
+
+                def _tui_resume_apply(target_session_id: str) -> None:
+                    # Swap the live session to the chosen one (mutated in place, so the
+                    # app's session reference + surface stay valid), reload its history
+                    # into the transcript, and refresh the footer HUD/model/mode. Writes
+                    # the outcome line straight to the transcript (with a role chosen to
+                    # stay visible) rather than returning it, so the picker and the typed
+                    # paths behave identically.
+                    built = _tui_box.get("session")
+                    surface = getattr(built, "surface", None) if built is not None else None
+
+                    def _note(text: str, role: str = "system") -> None:
+                        appender = getattr(surface, "append_note", None)
+                        if callable(appender):
+                            try:
+                                appender(text, role=role)
+                            except Exception:  # noqa: BLE001 - feedback is best-effort
+                                pass
+
+                    if built is None:
+                        return
+                    store = getattr(built, "store", None)
+                    current_before = str(getattr(store, "session_id", "") or "")
+                    try:
+                        resumed, message, history = _resume_chat_session(
+                            session=built, target_session_id=str(target_session_id)
+                        )
+                    except Exception as exc:  # noqa: BLE001 - never crash the UI
+                        _note(f"Resume failed: {exc}", role="error")
+                        return
+                    plain = _strip_rich_markup(message)
+                    if not resumed:
+                        _note(plain or "Resume failed.", role="error")
+                        return
+                    current_after = str(
+                        getattr(getattr(built, "store", None), "session_id", "") or ""
+                    )
+                    if current_after == current_before:
+                        # No-op resume (the chosen session is already active): do NOT
+                        # wipe the transcript — just report it. (The picker excludes the
+                        # current session, but a typed "/resume <current-id>" can land
+                        # here via the direct-id fallback.)
+                        _note(plain or "Session already active.", role="system")
+                        return
+                    # Real swap: reload the prior conversation + refresh HUD/footer.
+                    loader = getattr(surface, "replace_history", None)
+                    if callable(loader):
+                        try:
+                            loader(history)
+                        except Exception:  # noqa: BLE001 - reload is best-effort
+                            pass
+                    try:
+                        _tui_on_turn_complete()  # refresh tokens/cost/context
+                    except Exception:
+                        pass
+                    _tui_state.exec_mode = str(getattr(built, "mode", "") or "").strip()
+                    new_model = str(getattr(getattr(built, "cfg", None), "model", "") or "")
+                    if new_model:
+                        _tui_state.model_name = new_model
+                    # If the reloaded history had nothing visible (e.g. an interrupted
+                    # session with only tool turns), the transcript is now empty and the
+                    # welcome landing would hide a "system" line — use the assistant role
+                    # so the confirmation flips the pane and is actually seen.
+                    has_visible = any(
+                        isinstance(m, dict)
+                        and str(m.get("role") or "").strip().lower() in ("user", "assistant")
+                        and isinstance(m.get("content"), str)
+                        and m["content"].strip()
+                        for m in (history or [])
+                    )
+                    _note(plain or "Resumed.", role="system" if has_visible else "assistant")
+
+                def _tui_resume_select(value: str) -> None:
+                    _tui_resume_apply(str(value))
+                    return None
+
+                def _tui_resume_picker() -> dict[str, Any] | None:
+                    ctx = _tui_resume_context()
+                    if ctx is None:
+                        return None
+                    _built, sessions_dir, current_session_id, ws_pick, git_pick = ctx
+                    try:
+                        candidates = _collect_chat_resume_candidates(
+                            sessions_dir=sessions_dir,
+                            current_session_id=current_session_id,
+                            workspace_root=ws_pick,
+                            git_root=git_pick,
+                        )
+                        spec = _chat_resume_picker_spec(sessions=candidates)
+                    except Exception:  # noqa: BLE001 - never crash the UI on a picker
+                        return None
+                    if spec is None:
+                        return None  # nothing to resume → runner prints guidance
+                    spec["on_select"] = _tui_resume_select
+                    return spec
+
                 _tui_picker_providers = {
+                    "/login": _tui_login_picker,
                     "/mode": _tui_mode_picker,
+                    "/stream": _tui_stream_picker,
                     "/trace": _tui_trace_picker,
                     "/subagent": _tui_subagent_picker,
+                    "/resume": _tui_resume_picker,
                     "/plan": _tui_forge_plan_picker,
                     "/assistant": _tui_forge_assistant_picker,
                     "/assets": _tui_assets_picker,
@@ -2059,15 +3091,27 @@ def chat(
                 try:
                     _tui_result, _ = _run_tui(
                         _tui_state,
-                        session_builder=_tui_session_builder,
-                        on_turn_complete=_tui_on_turn_complete,
-                        on_hud_refresh=_tui_on_turn_complete,
+                        session_builder=None if subscription_blocked else _tui_session_builder,
+                        on_turn_complete=None if subscription_blocked else _tui_on_turn_complete,
+                        on_hud_refresh=None if subscription_blocked else _tui_on_turn_complete,
                         command_runner=_tui_command_runner,
                         panel_providers=_tui_panel_providers,
                         picker_providers=_tui_picker_providers,
                         completer=_tui_completer,
                         config_flow_factory=_tui_config_flow_factory,
                         on_config_saved=_tui_on_config_saved,
+                        unavailable_message=(
+                            subscription_availability.message if subscription_blocked else None
+                        ),
+                        subscription_provider_id=(
+                            subscription_availability.provider_id
+                            if subscription_blocked
+                            and not subscription_availability.selection_required
+                            else None
+                        ),
+                        open_config_on_start=bool(
+                            subscription_blocked and subscription_availability.selection_required
+                        ),
                     )
                     _tui_ok = True
                 except Exception as _tui_exc:  # pragma: no cover - defensive fallback
@@ -2082,26 +3126,59 @@ def chat(
                         except Exception:
                             pass
                 if _tui_ok:
+                    if (
+                        isinstance(_tui_result, tuple)
+                        and len(_tui_result) == 2
+                        and _tui_result[0] == "login_connection"
+                    ):
+                        from ..commands.auth import login_connection_interactively
+                        from ..commands.startup import _run_default_chat_action
+
+                        login_connection_interactively(
+                            str(_tui_result[1]),
+                            console=console,
+                        )
+                        _run_default_chat_action(
+                            path=Path(str(session_root)),
+                            allow_broad_workspace=True,
+                            mode=mode,
+                            model=None,
+                            base_url=None,
+                            temperature=temperature,
+                            stream=stream,
+                            max_steps=max_steps,
+                            subagents=subagents,
+                            no_log=no_log,
+                            verify_cmd=verify_cmd,
+                            yes=yes,
+                        )
+                        return
                     # "Switch project" from /config exits with this sentinel; relaunch a
                     # fresh chat bound to the chosen folder (the old session is already
                     # closed above). We forward this session's execution-posture flags
                     # (mode/yes/no_log/verify_cmd/…) so switching project doesn't
-                    # silently reset auto-approve/mode/logging. NOTE: this re-enters
+                    # silently reset approval policy/mode/logging. NOTE: this re-enters
                     # chat() (one frame per switch); switching is a deliberate,
                     # heavyweight manual action so the depth is bounded in practice.
                     if (
                         isinstance(_tui_result, tuple)
                         and len(_tui_result) == 2
-                        and _tui_result[0] == "switch_workspace"
+                        and _tui_result[0]
+                        in {
+                            "switch_workspace",
+                            "restart_config",
+                            "restart_routing_config",
+                        }
                     ):
                         from ..commands.startup import _run_default_chat_action
 
+                        connection_restart = _tui_result[0] == "restart_config"
                         _run_default_chat_action(
                             path=Path(str(_tui_result[1])),
                             allow_broad_workspace=True,
                             mode=mode,
-                            model=model,
-                            base_url=base_url,
+                            model=None if connection_restart else model,
+                            base_url=None if connection_restart else base_url,
                             temperature=temperature,
                             stream=stream,
                             max_steps=max_steps,
@@ -2111,6 +3188,13 @@ def chat(
                             yes=yes,
                         )
                     return
+        if subscription_blocked:
+            # The TUI failed after we intentionally deferred session construction.
+            # Do not fall through and create the same guaranteed-to-fail session in
+            # classic chat; preserve the actionable blocker instead.
+            style = "red" if subscription_availability.is_error else "yellow"
+            console.print(f"[{style}]{subscription_availability.message}[/{style}]")
+            raise typer.Exit(code=1)
         printWelcome(
             console=console,
             workspace=focus_path if focus_path != session_root else session_root,
@@ -2406,7 +3490,11 @@ def run(
         "--stream/--no-stream",
         help="Enable streamed assistant output.",
     ),
-    max_steps: int | None = typer.Option(None, "--max-steps", help="Max steps override."),
+    max_steps: int | None = typer.Option(
+        None,
+        "--max-steps",
+        help="Optional safety limit on agent iterations.",
+    ),
     subagents: bool | None = typer.Option(
         None,
         "--subagents/--no-subagents",
@@ -2443,6 +3531,14 @@ def run(
         "--yes",
         help="In auto mode, skip confirmations for sensitive commands (hard blocks still apply).",
     ),
+    benchmark: bool = typer.Option(
+        False,
+        "--benchmark",
+        help=(
+            "Use the raw benchmark/autonomy run profile: auto mode, code-only routing, "
+            "longer fixed step budget, and no subagents/skills/custom tools/web by default."
+        ),
+    ),
     deadline_seconds: float | None = typer.Option(
         None,
         "--deadline-seconds",
@@ -2476,6 +3572,9 @@ def run(
         max_steps_provided = _parameter_value_was_provided(max_steps, max_steps_source)
 
     effective = clone_cfg(cfg)
+    raw_benchmark_profile = _raw_benchmark_profile_requested(benchmark=benchmark)
+    if raw_benchmark_profile:
+        _apply_raw_benchmark_profile(effective)
     if base_url is not None:
         effective.base_url = base_url
     if model is not None:
@@ -2493,16 +3592,50 @@ def run(
         effective.subagents_enabled = subagents
 
     effective_mode = (mode.value if mode else effective.default_mode) or "review"
+    effective_yes = bool(yes or raw_benchmark_profile)
+    fixed_step_override = (
+        effective.max_steps if (max_steps_provided or raw_benchmark_profile) else None
+    )
+    delegated_execution = effective.execution.backend == "delegated"
+    if delegated_execution and mode is None and str(effective_mode).strip().lower() == "fullaccess":
+        effective_mode = "review"
+        console.print(
+            "[yellow]Delegated runtimes do not inherit the native fullaccess default; "
+            "using review (read-only). Pass --mode auto to allow workspace writes.[/yellow]"
+        )
     binding_source = _path_binding_source(path_source, path)
 
     try:
-        if not effective.model:
+        if not delegated_execution and not effective.model:
             raise ConfigError("Model is not set. Run: sylliptor config set model <MODEL>")
-        api_key_override = _resolve_api_key_override(
-            api_key=api_key,
-            api_key_env=api_key_env,
-            api_key_stdin=api_key_stdin,
-        )
+        api_key_override = None
+        if delegated_execution:
+            from ...agent_runtimes.host import (
+                prepare_delegated_runtime,
+                run_delegated_once,
+                validate_delegated_cli_options,
+            )
+
+            validate_delegated_cli_options(
+                base_url=base_url,
+                temperature=temperature,
+                max_steps=max_steps,
+                subagents=subagents,
+                verify_cmd=verify_cmd,
+                api_key_env=api_key_env,
+                api_key_stdin=api_key_stdin,
+                api_key=api_key,
+                stream=stream,
+                yes=yes,
+                benchmark=raw_benchmark_profile,
+                diagnostic_log=diagnostic_log,
+            )
+        else:
+            api_key_override = _resolve_api_key_override(
+                api_key=api_key,
+                api_key_env=api_key_env,
+                api_key_stdin=api_key_stdin,
+            )
         workspace_binding = _resolve_startup_workspace_binding(
             requested_path=path,
             console=console,
@@ -2512,31 +3645,61 @@ def run(
             source=binding_source,
             action=WorkspaceAction.CHAT,
         )
-        code = run_agent(
-            cfg=effective,
-            root=workspace_binding.workspace_context.workspace_root,
-            instruction=instruction,
-            image_paths=[os.fspath(p) for p in (image or [])],
-            mode=effective_mode,
-            runtime_kind=RuntimeKind.ONE_SHOT,
-            yes=yes,
-            max_steps=effective.max_steps,
-            no_log=no_log,
-            api_key_override=api_key_override,
-            console=console,
-            surface=_make_rich_surface(console=console),
-            non_interactive=non_interactive,
-            usage_role="run",
-            subagents_enabled=effective.subagents_enabled,
-            one_shot_execution=True,
-            enable_chat_turn_step_budget=True,
-            chat_turn_fixed_override=(effective.max_steps if max_steps_provided else None),
-            verify_cmd=verify_cmd,
-            workspace_binding=workspace_binding,
-            run_deadline_seconds=deadline_seconds,
-            require_run_deadline=require_deadline,
-            crash_diagnostic_log_path=diagnostic_log,
-        )
+        if delegated_execution:
+            from ...config import resolve_run_deadline
+
+            resolved_deadline = resolve_run_deadline(
+                effective,
+                cli_deadline_seconds=deadline_seconds,
+            )
+            delegated_deadline = resolved_deadline.seconds
+            if require_deadline and delegated_deadline is None:
+                raise ConfigError(
+                    "Managed-host run requires a finite run deadline. Pass --deadline-seconds, "
+                    "set SYLLIPTOR_RUN_DEADLINE_SECONDS, or configure run_deadline_seconds."
+                )
+            prepare_delegated_runtime(
+                effective,
+                model=model,
+                deadline_seconds=delegated_deadline,
+            )
+            code = run_delegated_once(
+                cfg=effective,
+                cwd=workspace_binding.workspace_context.workspace_root,
+                instruction=instruction,
+                mode=effective_mode,
+                image_paths=tuple(image_path.resolve() for image_path in (image or ())),
+                no_log=no_log,
+                console=console,
+            )
+        else:
+            code = run_agent(
+                cfg=effective,
+                root=workspace_binding.workspace_context.workspace_root,
+                instruction=instruction,
+                image_paths=[os.fspath(p) for p in (image or [])],
+                mode=effective_mode,
+                runtime_kind=RuntimeKind.ONE_SHOT,
+                yes=effective_yes,
+                max_steps=effective.max_steps,
+                no_log=no_log,
+                api_key_override=api_key_override,
+                console=console,
+                surface=_make_rich_surface(console=console),
+                non_interactive=non_interactive,
+                usage_role="run",
+                subagents_enabled=effective.subagents_enabled,
+                one_shot_execution=True,
+                enable_chat_turn_step_budget=True,
+                chat_turn_fixed_override=fixed_step_override,
+                enable_tool_output_offload=(True if raw_benchmark_profile else None),
+                compaction_profile="execution",
+                verify_cmd=verify_cmd,
+                workspace_binding=workspace_binding,
+                run_deadline_seconds=deadline_seconds,
+                require_run_deadline=require_deadline,
+                crash_diagnostic_log_path=diagnostic_log,
+            )
     except ConfigError as e:
         console.print(f"[red]Config error:[/red] {e}")
         raise typer.Exit(code=2) from e
@@ -2546,22 +3709,28 @@ def run(
     except Exception as e:  # noqa: BLE001
         # Prefer friendly Sylliptor MiMo trial copy (trial_expired, rate-limit, ...)
         # over a raw ``LLM error 402: {...}`` dump; any other error renders as-is.
-        message = str(e)
+        message = sanitize_error_text_for_output(e)
         try:
             from ...llm.openai_compat import sylliptor_trial_error_message
 
-            message = sylliptor_trial_error_message(e) or message
+            message = sanitize_error_text_for_output(sylliptor_trial_error_message(e) or message)
         except Exception:  # noqa: BLE001
             pass
+        exit_code = exit_code_for_failure(e)
+        label = (
+            "Infrastructure error after retries"
+            if exit_code == INFRASTRUCTURE_FAILURE_EXIT_CODE
+            else "Error"
+        )
         try:
-            console.print(f"[red]Error:[/red] {message}")
+            console.print(f"[red]{label}:[/red] {message}")
         except Exception as render_exc:  # noqa: BLE001 - CLI error rendering must not double-crash.
             safe_plain_error(
                 stream=getattr(console, "file", None),
                 error_type=type(render_exc).__name__,
-                message=str(e),
+                message=sanitize_error_text_for_output(e),
             )
-        raise typer.Exit(code=1) from e
+        raise typer.Exit(code=exit_code) from e
 
     raise typer.Exit(code=code)
 

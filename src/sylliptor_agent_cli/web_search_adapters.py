@@ -13,7 +13,10 @@ VOLCENGINE_WEB_SEARCH_ADAPTER = "volcengine_web_search"
 PERPLEXITY_SONAR_ADAPTER = "perplexity_sonar"
 GROQ_COMPOUND_ADAPTER = "groq_compound"
 MISTRAL_CONVERSATIONS_ADAPTER = "mistral_conversations"
+MINIMAX_CODING_PLAN_ADAPTER = "minimax_coding_plan"
+COHERE_WEB_SEARCH_ADAPTER = "cohere_web_search"
 TAVILY_ADAPTER = "tavily"
+DDGS_ADAPTER = "ddgs"
 
 NATIVE_WEB_SEARCH_ADAPTERS: frozenset[str] = frozenset(
     {
@@ -29,9 +32,11 @@ NATIVE_WEB_SEARCH_ADAPTERS: frozenset[str] = frozenset(
         PERPLEXITY_SONAR_ADAPTER,
         GROQ_COMPOUND_ADAPTER,
         MISTRAL_CONVERSATIONS_ADAPTER,
+        MINIMAX_CODING_PLAN_ADAPTER,
+        COHERE_WEB_SEARCH_ADAPTER,
     }
 )
-EXTERNAL_WEB_SEARCH_ADAPTERS: frozenset[str] = frozenset({TAVILY_ADAPTER})
+EXTERNAL_WEB_SEARCH_ADAPTERS: frozenset[str] = frozenset({TAVILY_ADAPTER, DDGS_ADAPTER})
 
 VALID_WEB_SEARCH_ADAPTERS: frozenset[str] = frozenset(
     {

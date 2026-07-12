@@ -221,6 +221,34 @@ def test_shell_wait_tool_returns_output_and_preserves_cursor(
         session.close()
 
 
+def test_shell_wait_unknown_process_id_returns_recovery_payload(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    session = _session_with_runner(monkeypatch, tmp_path, _FakeBackgroundRunner(auto_exit=False))
+    try:
+        started = session.tools["shell_background"].run({"cmd": "fake"})
+        result = session.tools["shell_wait"].run(
+            {
+                "process_id": "missing",
+                "since": 0,
+                "until": "either",
+                "wait_seconds": 1,
+            }
+        )
+
+        assert result["status"] == "unknown_process_id"
+        assert result["unknown_process_id"] is True
+        assert result["requested_process_id"] == "missing"
+        assert result["known_process_ids"] == [started["process_id"]]
+        assert result["known_processes"][0]["process_id"] == started["process_id"]
+        assert result["waited"] is False
+        assert result["wait_seconds_effective"] == 0.0
+        assert result["recovery"]["recommended_tool"] == "shell_list"
+    finally:
+        session.close()
+
+
 def test_shell_wait_is_available_in_interactive_chat_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

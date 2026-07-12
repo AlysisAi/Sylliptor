@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from sylliptor_agent_cli.cli_impl import config_menu as config_menu_mod
 from sylliptor_agent_cli.cli_impl.tui import config_flow as flow_mod
 from sylliptor_agent_cli.cli_impl.tui.config_flow import ConfigFlow
 from sylliptor_agent_cli.config import (
@@ -23,6 +24,8 @@ from sylliptor_agent_cli.config import (
     load_persisted_profile_keys,
 )
 from sylliptor_agent_cli.profile_presets import PROFILE_PRESETS, make_profile_from_preset
+from sylliptor_agent_cli.profiles import ProfileSpec
+from sylliptor_agent_cli.provider_auth import ProviderAccountStatus, ProviderModel
 
 # --------------------------------------------------------------------------- helpers
 
@@ -47,6 +50,13 @@ def _cfg(**overrides: Any) -> AppConfig:
     return AppConfig(**base)
 
 
+def _open_router(flow: ConfigFlow) -> None:
+    flow.choose("router")
+    assert flow.stage == "limits_router_loading"
+    flow.run_busy()
+    assert flow.stage == "limits_router_model"
+
+
 def _cfg_with_profiles(active: str = "openai") -> AppConfig:
     openai = make_profile_from_preset(
         next(p for p in PROFILE_PRESETS if p.key == "openai"), name="openai"
@@ -58,6 +68,23 @@ def _cfg_with_profiles(active: str = "openai") -> AppConfig:
     cfg.extra_fields = {
         "profiles": {"openai": openai.to_dict(), "anthropic": anthropic.to_dict()},
         "active_profile": active,
+    }
+    return cfg
+
+
+def _cfg_with_subscription_profile() -> AppConfig:
+    profile = ProfileSpec(
+        name="chatgpt-codex",
+        protocol="openai_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        auth_provider="openai-codex",
+        default_model="gpt-5.4",
+        reasoning_effort="high",
+    )
+    cfg = AppConfig(model=profile.default_model)
+    cfg.extra_fields = {
+        "profiles": {profile.name: profile.to_dict()},
+        "active_profile": profile.name,
     }
     return cfg
 
@@ -75,13 +102,132 @@ def test_menu_lists_sections_and_actions():
         "profile",
         "api_key",
         "default",
+        "web_search",
+        "cache",
         "router",
         "sandbox",
+        "execution",
         "advanced",
         "__save__",
         "__cancel__",
     ]
     assert not flow.state.dirty
+
+
+def test_execution_backend_flow_creates_native_subscription_profile():
+    flow = ConfigFlow(cfg=_cfg(model="native-model"))
+
+    flow.choose("execution")
+    assert flow.stage == "execution_backend"
+    access_screen = flow.screen()
+    assert access_screen.title == "Model Access"
+    assert access_screen.subtitle == "How would you like to connect Sylliptor to AI models?"
+    assert [row.value for row in access_screen.rows] == ["native", "delegated"]
+    assert [row.label for row in access_screen.rows] == [
+        "Use an API key",
+        "Use an AI subscription",
+    ]
+    assert all("Codex" not in row.label for row in access_screen.rows)
+
+    flow.choose("delegated")
+    assert flow.stage == "execution_runtime"
+    runtime_screen = flow.screen()
+    assert runtime_screen.title == "AI Subscription"
+    assert "openai-codex" in [row.value for row in runtime_screen.rows]
+
+    flow.choose("openai-codex")
+    assert flow.stage == "subscription_account"
+    flow.choose("back")
+    assert flow.stage == "menu"
+    assert flow.state.execution_backend == "delegated"
+    assert flow.state.execution_runtime == "openai-codex"
+    assert flow.state.agent_runtimes == {}
+    assert flow.state.active_profile == "chatgpt-codex"
+    rows = {row.value: row for row in flow.screen().rows}
+    assert "inactive" not in rows["profile"].label.lower()
+    assert "not used" in rows["api_key"].label.lower()
+    assert "inactive" not in rows["default"].label.lower()
+    assert rows["execution"].label == "Model Access"
+    assert rows["execution"].description.startswith("AI subscription · ChatGPT Codex subscription")
+
+
+def test_execution_backend_flow_saves_native_subscription_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    _config_env(tmp_path, monkeypatch)
+    cfg = _cfg(model="native-model", base_url="https://native.example/v1")
+    flow = ConfigFlow(cfg=cfg)
+
+    flow.choose("execution")
+    flow.choose("delegated")
+    flow.choose("openai-codex")
+    flow.choose("back")
+    flow.choose("__save__")
+    flow.run_busy()
+
+    saved = load_config()
+    assert flow.stage == "done" and flow.saved is True
+    assert saved.execution.backend == "native"
+    assert saved.execution.runtime is None
+    assert saved.agent_runtimes == {}
+    assert saved.extra_fields["active_profile"] == "chatgpt-codex"
+    assert saved.extra_fields["profiles"]["chatgpt-codex"]["auth_provider"] == "openai-codex"
+    assert saved.model == ""
+    assert saved.base_url == "https://chatgpt.com/backend-api/codex"
+    assert saved.extra_fields["subscription_model_selection_required"] == "openai-codex"
+
+
+def test_model_access_manages_subscription_account(monkeypatch: pytest.MonkeyPatch):
+    class FakeSubscriptionAuth:
+        def __init__(self) -> None:
+            self.connected = False
+            self.login_calls = 0
+            self.logout_calls = 0
+
+        def account_status(self) -> ProviderAccountStatus:
+            return ProviderAccountStatus(
+                connected=self.connected,
+                account_label="developer@example.test" if self.connected else None,
+                detail="Connected." if self.connected else "Not connected.",
+            )
+
+        def login(self, *, method: str, output_write) -> ProviderAccountStatus:  # type: ignore[no-untyped-def]
+            assert method == "browser"
+            self.login_calls += 1
+            self.connected = True
+            return self.account_status()
+
+        def logout(self) -> ProviderAccountStatus:
+            self.logout_calls += 1
+            self.connected = False
+            return ProviderAccountStatus(connected=False, detail="Disconnected locally.")
+
+    adapter = FakeSubscriptionAuth()
+    monkeypatch.setattr(flow_mod, "create_provider_auth", lambda _provider_id: adapter)
+    flow = ConfigFlow(cfg=_cfg_with_subscription_profile())
+
+    flow.choose("execution")
+    flow.choose("delegated")
+    flow.choose("openai-codex")
+    assert flow.stage == "subscription_account"
+    assert [row.value for row in flow.screen().rows] == ["connect", "back"]
+
+    flow.choose("connect")
+    assert flow.stage == "subscription_connecting"
+    flow.run_busy()
+    assert flow.stage == "subscription_account"
+    assert adapter.login_calls == 1
+    assert [row.value for row in flow.screen().rows] == ["connect", "disconnect", "back"]
+
+    flow.choose("disconnect")
+    assert flow.stage == "subscription_disconnect_confirm"
+    flow.confirm(True)
+    assert flow.stage == "subscription_disconnecting"
+    flow.run_busy()
+    assert flow.stage == "subscription_account"
+    assert adapter.logout_calls == 1
+    assert [row.value for row in flow.screen().rows] == ["connect", "back"]
 
 
 def test_advanced_submenu_holds_subagent_and_forge():
@@ -92,6 +238,20 @@ def test_advanced_submenu_holds_subagent_and_forge():
     assert values == ["subagents", "forge", "back"]
     flow.choose("back")
     assert flow.stage == "menu"
+
+
+def test_router_override_is_not_counted_as_advanced_subagent_override():
+    base_flow = ConfigFlow(cfg=_cfg())
+    cfg = _cfg()
+    cfg.extra_fields = {"role_models": {"router": "cheap-router"}}
+    flow = ConfigFlow(cfg=cfg)
+
+    assert flow._advanced_summary() == base_flow._advanced_summary()
+    flow.choose("advanced")
+    subagent_row = next(row for row in flow.screen().rows if row.value == "subagents")
+    base_flow.choose("advanced")
+    base_subagent_row = next(row for row in base_flow.screen().rows if row.value == "subagents")
+    assert subagent_row.description == base_subagent_row.description
 
 
 def test_menu_choose_save_and_cancel_route():
@@ -139,6 +299,34 @@ def test_default_model_full_flow():
     assert flow.state.thinking_label == "high"
 
 
+def test_default_model_picker_preselects_current_subscription_model(monkeypatch):
+    cfg = _cfg_with_subscription_profile()
+    profile_data = cfg.extra_fields["profiles"]["chatgpt-codex"]
+    profile_data["default_model"] = "gpt-5.6-luna"
+    cfg.model = "gpt-5.6-luna"
+    monkeypatch.setattr(
+        flow_mod,
+        "_default_model_rows",
+        lambda _state: [
+            ("gpt-5.6-sol", "GPT 5.6 Sol", ""),
+            ("gpt-5.6-luna", "GPT 5.6 Luna", ""),
+            (flow_mod._CUSTOM_MODEL_VALUE, "Custom model…", ""),
+        ],
+    )
+
+    flow = ConfigFlow(cfg=cfg)
+    flow.choose("default")
+
+    screen = flow.screen()
+    assert flow.stage == "model"
+    assert flow.index == 1
+    assert screen.rows[flow.index].value == "gpt-5.6-luna"
+    assert [row.current for row in screen.rows] == [False, True, False]
+
+    flow.choose_current()
+    assert flow.state.fields["model"] == "gpt-5.6-luna"
+
+
 def test_default_model_custom_path():
     flow = ConfigFlow(cfg=_cfg())
     flow.choose("default")
@@ -160,38 +348,132 @@ def test_model_timeout_rejects_non_positive():
     assert flow.status_tone == "err"
 
 
-# --------------------------------------------------------------------------- execution limits
+# --------------------------------------------------------------------------- context & cache
 
 
-def test_execution_limits_full_flow():
+def test_web_search_flow_and_save(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
     flow = ConfigFlow(cfg=_cfg())
-    flow.choose("router")
+
+    flow.choose("web_search")
+    assert flow.stage == "web_search_policy"
+    assert [row.value for row in flow.screen().rows] == ["auto", "off"]
+    flow.choose("off")
+    assert flow.stage == "web_search_mode"
+    assert [row.value for row in flow.screen().rows] == [
+        "auto",
+        "external",
+        "native",
+        "off",
+    ]
+    flow.choose("external")
+
+    assert flow.stage == "menu"
+    assert flow.state.fields["web_search_policy"] == "off"
+    assert flow.state.fields["web_search_mode"] == "external"
+    flow.choose("__save__")
+    flow.run_busy()
+
+    saved = load_config()
+    assert flow.stage == "done" and flow.saved is True
+    assert saved.web_search_policy == "off"
+    assert saved.web_search_mode == "external"
+
+
+def test_context_cache_full_flow_and_save(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+    flow = ConfigFlow(cfg=_cfg())
+
+    flow.choose("cache")
+    assert flow.stage == "cache_mode"
+    flow.choose("auto")
+    assert flow.stage == "cache_key"
+    flow.submit_input("repo-main")
+    assert flow.stage == "cache_retention"
+    flow.submit_input("24h")
+    assert flow.stage == "cache_anthropic_enabled"
+    flow.choose("true")
+    assert flow.stage == "cache_anthropic_ttl"
+    flow.choose("1h")
+    assert flow.stage == "cache_compaction_enabled"
+    flow.choose("false")
+    assert flow.stage == "cache_compaction_min_trigger"
+    flow.submit_input("0.78")
+
+    assert flow.stage == "menu"
+    assert flow.state.fields["prompt_cache_mode"] == "auto"
+    assert flow.state.fields["prompt_cache_key"] == "repo-main"
+    assert flow.state.fields["prompt_cache_retention"] == "24h"
+    assert flow.state.fields["anthropic_prompt_cache_enabled"] == "true"
+    assert flow.state.fields["anthropic_prompt_cache_ttl"] == "1h"
+    assert flow.state.fields["cache_aware_compaction"] == "false"
+    assert flow.state.fields["cache_aware_min_trigger_ratio"] == "0.78"
+    flow.choose("__save__")
+    flow.run_busy()
+
+    saved = load_config()
+    assert flow.stage == "done" and flow.saved is True
+    assert saved.prompt_cache_mode == "auto"
+    assert saved.prompt_cache_key == "repo-main"
+    assert saved.prompt_cache_retention == "24h"
+    assert saved.anthropic_prompt_cache_enabled is True
+    assert saved.anthropic_prompt_cache_ttl == "1h"
+    assert saved.extra_fields["compaction"]["cache_aware_compaction"] is False
+    assert saved.extra_fields["compaction"]["cache_aware_min_trigger_ratio"] == 0.78
+
+
+def test_context_cache_screen_shows_effective_cache_capability():
+    flow = ConfigFlow(cfg=_cfg_with_profiles(active="openai"))
+
+    flow.choose("cache")
+    screen = flow.screen()
+
+    assert screen.stage == "cache_mode"
+    assert "Effective:" in screen.subtitle
+    assert "openai_prompt_cache" in screen.subtitle
+
+
+def test_context_cache_clear_inputs():
+    flow = ConfigFlow(
+        cfg=_cfg(
+            prompt_cache_mode="manual",
+            prompt_cache_key="repo-main",
+            prompt_cache_retention="24h",
+        )
+    )
+
+    flow.choose("cache")
+    flow.choose("manual")
+    flow.submit_input("clear")
+    flow.submit_input("clear")
+
+    assert flow.state.fields["prompt_cache_key"] == ""
+    assert flow.state.fields["prompt_cache_retention"] == ""
+
+
+# --------------------------------------------------------------------------- routing
+
+
+def test_routing_flow_returns_without_budget_questions():
+    flow = ConfigFlow(cfg=_cfg())
+    _open_router(flow)
+    flow.choose(flow_mod._INHERIT_DEFAULT_MODEL_VALUE)
     assert flow.stage == "limits_routing"
     flow.choose("code_only")
-    assert flow.stage == "limits_budget"
-    flow.choose("fixed")
-    assert flow.stage == "limits_max_steps"
-    flow.submit_input("30")
-    assert flow.stage == "limits_task_steps"
-    flow.submit_input("120")
-    assert flow.stage == "limits_subagent_steps"
-    flow.submit_input("20")
     assert flow.stage == "menu"
     assert flow.state.fields["routing_mode"] == "code_only"
-    assert flow.state.fields["step_budget_policy"] == "fixed"
-    assert flow.state.fields["max_steps"] == "30"
-    assert flow.state.fields["task_max_steps"] == "120"
-    assert flow.state.fields["subagent_max_steps"] == "20"
+    assert flow.state.fields["step_budget_policy"] == "autonomous"
 
 
-def test_limits_rejects_bad_int_and_stays():
+def test_routing_flow_has_no_budget_input_stage():
     flow = ConfigFlow(cfg=_cfg())
-    flow.choose("router")
+    _open_router(flow)
+    assert flow.screen().rows[0].value == flow_mod._INHERIT_DEFAULT_MODEL_VALUE
+    flow.choose(flow_mod._INHERIT_DEFAULT_MODEL_VALUE)
     flow.choose("auto")
-    flow.choose("adaptive")
-    flow.submit_input("notanint")
-    assert flow.stage == "limits_max_steps"
-    assert flow.status_tone == "err"
+    assert flow.stage == "menu"
+    assert "limits_budget" not in flow_mod._STAGE_MODE
+    assert "limits_max_steps" not in flow_mod._STAGE_MODE
 
 
 # --------------------------------------------------------------------------- subagent / forge
@@ -226,6 +508,199 @@ def test_subagent_temperature_validation():
     assert flow.status_tone == "err"
 
 
+def test_router_model_native_picker_custom_save_preserves_unknown_role_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    cfg = _cfg_with_profiles(active="openai")
+    cfg.extra_fields["role_models"] = {
+        "router": "current-router",
+        "comprehension": "vision-reader",
+    }
+    flow = ConfigFlow(cfg=cfg)
+
+    _open_router(flow)
+    values = [row.value for row in flow.screen().rows]
+    assert values[0] == flow_mod._INHERIT_DEFAULT_MODEL_VALUE
+    assert values[1] == "current-router"
+    assert any(value.startswith("gpt-") for value in values[2:-1])
+    assert values[-1] == flow_mod._CUSTOM_MODEL_VALUE
+    assert next(row for row in flow.screen().rows if row.value == "current-router").current
+
+    flow.choose(flow_mod._CUSTOM_MODEL_VALUE)
+    assert flow.stage == "limits_custom_router_model"
+    flow.submit_input("cheap-router")
+    assert flow.stage == "limits_routing"
+    flow.choose("auto")
+    assert flow.stage == "menu"
+    flow.choose("__save__")
+    flow.run_busy()
+
+    assert flow.stage == "done" and flow.saved is True
+    assert load_config().extra_fields["role_models"] == {
+        "comprehension": "vision-reader",
+        "router": "cheap-router",
+    }
+
+
+def test_gemini_router_picker_includes_live_account_models(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from sylliptor_agent_cli.profile_presets import get_preset
+    from sylliptor_agent_cli.provider_model_catalog import ProviderModelOption
+
+    _config_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-key")
+    preset = get_preset("gemini")
+    assert preset is not None
+    profile = make_profile_from_preset(preset, name="gemini")
+    cfg = AppConfig(model=profile.default_model, base_url=profile.base_url)
+    cfg.extra_fields = {
+        "profiles": {profile.name: profile.to_dict()},
+        "active_profile": profile.name,
+    }
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.provider_model_catalog.discover_provider_models",
+        lambda **_kwargs: (
+            ProviderModelOption(
+                id="gemini-live-router",
+                label="Gemini Live Router",
+                description="available to this API key",
+            ),
+        ),
+    )
+    flow = ConfigFlow(cfg=cfg)
+
+    _open_router(flow)
+    rows = flow.screen().rows
+
+    assert rows[0].value == flow_mod._INHERIT_DEFAULT_MODEL_VALUE
+    assert "gemini-live-router" in [row.value for row in rows]
+    live_row = next(row for row in rows if row.value == "gemini-live-router")
+    assert live_row.label == "Gemini Live Router"
+    flow.choose("gemini-live-router")
+    assert flow.state.role_models["router"] == "gemini-live-router"
+    assert flow.stage == "limits_routing"
+
+
+def test_large_router_catalog_is_searchable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from sylliptor_agent_cli.provider_model_catalog import ProviderModelOption
+
+    _config_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-test-key")
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.provider_model_catalog.discover_provider_models",
+        lambda **_kwargs: tuple(
+            ProviderModelOption(
+                id=f"live-router-{index:03d}",
+                label=f"Live Router {index:03d}",
+                description="live provider model",
+            )
+            for index in range(150)
+        ),
+    )
+    flow = ConfigFlow(cfg=_cfg_with_profiles(active="openai"))
+
+    _open_router(flow)
+    initial_values = [row.value for row in flow.screen().rows]
+
+    assert initial_values[1] == flow_mod._SEARCH_ROUTER_MODELS
+    assert "live-router-149" not in initial_values
+    flow.choose(flow_mod._SEARCH_ROUTER_MODELS)
+    assert flow.stage == "limits_router_search"
+    flow.submit_input("router-149")
+    search_values = [row.value for row in flow.screen().rows]
+    assert "live-router-149" in search_values
+    flow.choose("live-router-149")
+    assert flow.state.role_models["router"] == "live-router-149"
+    assert flow.stage == "limits_routing"
+
+
+def test_router_model_inherit_and_esc_navigation() -> None:
+    cfg = _cfg()
+    cfg.extra_fields = {"role_models": {"router": "current-router", "coding": "coder"}}
+    flow = ConfigFlow(cfg=cfg)
+
+    _open_router(flow)
+    flow.choose(flow_mod._CUSTOM_MODEL_VALUE)
+    assert flow.stage == "limits_custom_router_model"
+    flow.back()
+    assert flow.stage == "limits_router_model"
+    flow.choose(flow_mod._INHERIT_DEFAULT_MODEL_VALUE)
+    assert flow.stage == "limits_routing"
+    assert flow.state.role_models["router"] == ""
+    assert flow.state.role_models["coding"] == "coder"
+    flow.back()
+    assert flow.stage == "limits_router_model"
+    flow.back()
+    assert flow.stage == "menu"
+
+
+def test_subscription_router_picker_uses_live_catalog_without_custom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _cfg_with_subscription_profile()
+    cfg.extra_fields["role_models"] = {"router": "stale-saved-router"}
+    monkeypatch.setattr(
+        config_menu_mod,
+        "_subscription_models_for_state",
+        lambda _state: (
+            ProviderModel(id="live-router", label="Live Router", description="fast"),
+            ProviderModel(id="live-alt", label="Live Alt"),
+        ),
+    )
+    flow = ConfigFlow(cfg=cfg)
+
+    _open_router(flow)
+    values = [row.value for row in flow.screen().rows]
+    assert values == [
+        flow_mod._INHERIT_DEFAULT_MODEL_VALUE,
+        "live-router",
+        "live-alt",
+    ]
+    assert flow_mod._CUSTOM_MODEL_VALUE not in values
+    assert "stale-saved-router" not in values
+    flow.choose("live-router")
+    assert flow.stage == "limits_routing"
+    assert flow.state.role_models["router"] == "live-router"
+
+
+def test_subscription_router_picker_keeps_saved_fallback_when_catalog_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _cfg_with_subscription_profile()
+    cfg.extra_fields["role_models"] = {"router": "saved-router"}
+    monkeypatch.setattr(config_menu_mod, "_subscription_models_for_state", lambda _state: ())
+    flow = ConfigFlow(cfg=cfg)
+
+    _open_router(flow)
+    rows = flow.screen().rows
+    assert [row.value for row in rows] == [
+        flow_mod._INHERIT_DEFAULT_MODEL_VALUE,
+        "saved-router",
+    ]
+    assert rows[1].current is True
+    assert "catalog unavailable" in rows[1].description
+
+
+def test_subscription_subagent_overrides_hide_unsupported_temperature_controls():
+    flow = ConfigFlow(cfg=_cfg_with_subscription_profile())
+    flow.choose("advanced")
+    flow.choose("subagents")
+
+    assert all(kind == "model" for _role, kind in flow._sub_steps)
+    assert "temperature is managed by the AI subscription" in flow.screen().subtitle
+
+    flow.submit_input("subscription-mini")
+    assert flow.field_key() == "subagent_field:1"
+    assert flow.state.role_models.get("coding") == "subscription-mini"
+
+
 def test_subagent_esc_reverts():
     flow = ConfigFlow(cfg=_cfg())
     flow.choose("advanced")
@@ -243,13 +718,47 @@ def test_forge_overrides_sequence():
     flow.choose("forge")
     assert flow.stage == "forge_field" and flow.field_key() == "forge_field:0"
     flow.submit_input("forge-model")
-    guard = 0
-    while flow.stage == "forge_field":
+    while flow._forge_i < len(flow_mod.FORGE_ROLE_ORDER) - 1:
         flow.submit_input("")
-        guard += 1
-        assert guard < 30
+    router_screen = flow.screen()
+    assert "Router model" in router_screen.input_label
+    flow.submit_input("forge-router")
     assert flow.stage == "advanced"
     assert flow.state.forge_role_models.get("coding") == "forge-model"
+    assert flow.state.forge_role_models.get("router") == "forge-router"
+
+
+def test_forge_router_override_can_be_cleared_to_inherit():
+    cfg = _cfg()
+    cfg.extra_fields = {"forge_role_models": {"router": "old-forge-router"}}
+    flow = ConfigFlow(cfg=cfg)
+
+    flow.choose("advanced")
+    flow.choose("forge")
+    while flow._forge_i < len(flow_mod.FORGE_ROLE_ORDER) - 1:
+        flow.submit_input("")
+
+    assert "clear" in flow.screen().input_label
+    assert flow.screen().input_default == "old-forge-router"
+    flow.submit_input("clear")
+
+    assert flow.stage == "advanced"
+    assert flow.state.forge_role_models.get("router") == ""
+
+
+def test_forge_cancel_does_not_resurrect_router_change_after_profile_switch() -> None:
+    cfg = _cfg_with_profiles(active="openai")
+    cfg.extra_fields["forge_role_models"] = {"router": "original-router"}
+    flow = ConfigFlow(cfg=cfg)
+
+    flow.choose("advanced")
+    flow.choose("forge")
+    flow.state.set_forge_role_model("router", "cancelled-router")
+    flow.back()
+    flow.state.set_active_profile_name("anthropic")
+    flow.state.set_active_profile_name("openai")
+
+    assert flow.state.forge_role_models["router"] == "original-router"
 
 
 # --------------------------------------------------------------------------- api key
@@ -303,9 +812,115 @@ def test_provider_add_preset_with_base_url():
     flow.choose("openai")  # has a base_url → no URL prompt
     assert flow.stage == "provider_preset_name"
     flow.submit_input("")  # default name = preset key
-    assert flow.stage == "provider"
+    assert flow.stage == "api_key"  # now chains into the guided API key → model steps
     assert "openai" in flow.state.profiles
     assert flow.state.active_profile == "openai"
+
+
+def test_provider_add_preset_cannot_overwrite_subscription_profile():
+    flow = ConfigFlow(cfg=_cfg_with_subscription_profile())
+    flow.choose("profile")
+    flow.choose("add_preset")
+    flow.choose("openai-responses")
+    flow.submit_input("chatgpt-codex")
+
+    assert flow.stage == "provider_preset_name"
+    assert flow.status_tone == "err"
+    assert "cannot be overwritten through generic profile settings" in flow.status
+    preserved = ProfileSpec.from_dict(
+        "chatgpt-codex",
+        flow.state.profiles["chatgpt-codex"],
+    )
+    assert preserved.auth_provider == "openai-codex"
+    assert preserved.default_model == "gpt-5.4"
+
+    flow.submit_input("openai-key")
+    assert flow.stage == "api_key"
+    assert "openai-key" in flow.state.profiles
+
+
+def test_provider_add_preset_surfaces_hosted_providers_with_advanced_branch():
+    # The TUI /config "Add from preset" picker surfaces every hosted provider
+    # (DeepSeek, OpenRouter, …) directly; only local, compatibility, custom, and
+    # legacy presets stay behind the "Advanced" branch. Asserts displayed rows.
+    flow = ConfigFlow(cfg=AppConfig(model="x"))
+    flow.choose("profile")
+    flow.choose("add_preset")
+    assert flow.stage == "provider_add_preset"
+
+    values = [r.value for r in flow.screen().rows]
+    assert "deepseek" in values  # hosted providers now on the primary picker…
+    assert "ollama" not in values  # …local endpoints stay behind the advanced branch
+    assert flow_mod._ADVANCED_PROVIDER_PRESETS_VALUE in values
+
+    flow.choose(flow_mod._ADVANCED_PROVIDER_PRESETS_VALUE)
+    assert flow.stage == "provider_add_preset_advanced"
+    advanced_values = [r.value for r in flow.screen().rows]
+    assert "deepseek" not in advanced_values  # promoted to the primary picker
+    assert "ollama" in advanced_values
+
+    flow.choose("ollama")
+    assert flow.stage == "provider_preset_name"
+    assert flow._pending_preset is not None
+    assert flow._pending_preset.key == "ollama"
+
+
+def test_provider_add_preset_advanced_back_returns_to_primary():
+    flow = ConfigFlow(cfg=AppConfig(model="x"))
+    flow.choose("profile")
+    flow.choose("add_preset")
+    flow.choose(flow_mod._ADVANCED_PROVIDER_PRESETS_VALUE)
+    assert flow.stage == "provider_add_preset_advanced"
+    flow.back()
+    assert flow.stage == "provider_add_preset"
+
+
+def test_add_preset_chains_into_api_key_then_model():
+    # After adding a provider preset, the flow guides the user straight through
+    # API key → default-model pick, landing fully configured — not just
+    # "Profile added" back at the menu.
+    flow = ConfigFlow(cfg=AppConfig(model="x"))
+    flow.choose("profile")
+    flow.choose("add_preset")
+    flow.choose("deepseek")  # hosted providers are on the primary picker now
+    flow.submit_input("")  # accept default profile name (deepseek has a base_url)
+
+    assert flow.stage == "api_key"
+    assert "deepseek" in flow.state.profiles
+    assert flow.state.active_profile == "deepseek"
+
+    flow.submit_input("sk-deepseek-test")
+    # Chained to the model picker, now scoped to DeepSeek's models.
+    assert flow.stage == "model"
+    model_values = [r.value for r in flow.screen().rows]
+    assert "deepseek-v4-pro" in model_values
+
+    flow.choose("deepseek-v4-pro")
+    # Done: back on the provider screen, fully configured, chain cleared.
+    assert flow.stage == "provider"
+    assert flow.state.fields.get("model") == "deepseek-v4-pro"
+    assert flow._preset_setup_chain is False
+
+
+def test_add_preset_chain_allows_skipping_api_key():
+    flow = ConfigFlow(cfg=AppConfig(model="x"))
+    flow.choose("profile")
+    flow.choose("add_preset")
+    flow.choose("deepseek")  # hosted providers are on the primary picker now
+    flow.submit_input("")
+    assert flow.stage == "api_key"
+    flow.submit_input("")  # skip the key — still guided onward to the model pick
+    assert flow.stage == "model"
+
+
+def test_api_key_menu_action_still_returns_to_menu():
+    # Guard: outside the add-provider chain, the API-key step still returns to menu.
+    flow = ConfigFlow(cfg=_cfg_with_profiles(active="openai"))
+    flow.choose("api_key")
+    assert flow.stage == "api_key"
+    flow.submit_input("sk-standalone")
+    assert flow.stage == "menu"
+    assert flow._preset_setup_chain is False
 
 
 def test_provider_add_custom():
@@ -321,6 +936,25 @@ def test_provider_add_custom():
     assert flow.stage == "provider"
     assert "local" in flow.state.profiles
     assert flow.state.profiles["local"]["base_url"] == "http://localhost:1234/v1"
+
+
+def test_provider_add_custom_cannot_overwrite_subscription_profile():
+    flow = ConfigFlow(cfg=_cfg_with_subscription_profile())
+    flow.choose("profile")
+    flow.choose("add_custom")
+    flow.submit_input("chatgpt-codex")
+    flow.submit_input("http://localhost:1234/v1")
+    flow.submit_input("")
+
+    assert flow.stage == "provider_custom_name"
+    assert flow.status_tone == "err"
+    assert "cannot be overwritten through generic profile settings" in flow.status
+    preserved = ProfileSpec.from_dict(
+        "chatgpt-codex",
+        flow.state.profiles["chatgpt-codex"],
+    )
+    assert preserved.auth_provider == "openai-codex"
+    assert preserved.base_url == "https://chatgpt.com/backend-api/codex"
 
 
 def test_provider_add_custom_rejects_empty_url():
@@ -433,6 +1067,20 @@ def test_cancel_when_clean_exits_directly():
     flow = ConfigFlow(cfg=_cfg())
     flow.request_cancel()
     assert flow.stage == "done" and flow.success is False
+
+
+def test_tui_save_keeps_staged_api_key_bound_to_original_profile(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+    flow = ConfigFlow(cfg=_cfg_with_profiles(active="openai"))
+    flow.state.set_field("new_api_key", "openai-only-secret")
+    flow.state.set_active_profile_name("anthropic")
+
+    flow._goto("saving")
+    flow.run_busy()
+
+    stored = load_persisted_profile_keys()
+    assert stored["openai"] == "openai-only-secret"
+    assert "anthropic" not in stored
 
 
 def test_cancel_no_resumes_to_current_subflow_stage():
@@ -620,3 +1268,21 @@ def test_headless_config_opens_overlay_not_routed_to_runner():
     assert opened["n"] == 1
     assert ("user", "/config") not in transcript
     assert all(text.strip().lower() != "/config" for text, _w in calls)
+
+
+def test_headless_config_can_open_on_start():
+    opened = {"n": 0}
+
+    def _factory():
+        opened["n"] += 1
+        return ConfigFlow(cfg=_cfg())
+
+    result, transcript = _run_headless(
+        "q/exit\r",
+        config_flow_factory=_factory,
+        open_config_on_start=True,
+    )
+
+    assert opened["n"] == 1
+    assert result == "/exit"
+    assert transcript == []

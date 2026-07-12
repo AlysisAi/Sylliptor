@@ -14,8 +14,12 @@ from ...updates import (
     detect_installer_plan,
     maybe_refresh_update_cache_in_background,
     passive_update_notice,
+    read_update_prompt_state,
+    record_update_prompt_shown,
+    record_update_skipped,
     resolve_update_check_enabled,
     run_installer_plan,
+    should_prompt_for_update,
     status_from_cache,
 )
 from . import _patchable
@@ -23,6 +27,7 @@ from ._shared import _console
 
 update_app = typer.Typer(add_completion=False, help="Check for and apply Sylliptor updates.")
 _BACKGROUND_UPDATE_SUBCOMMANDS = {"chat", "run", "forge"}
+_update_prompt_completed = False
 
 
 def _cached_update_notice() -> str | None:
@@ -42,6 +47,149 @@ def _start_background_update_check() -> None:
         )
     except Exception:  # noqa: BLE001 - update checks must never block normal CLI startup
         return
+
+
+def _classic_update_prompt(console: Any, status: UpdateStatus, plan: InstallerPlan) -> str:
+    console.print(
+        f"[yellow]Sylliptor {status.latest_version} is available.[/yellow] "
+        f"You have {status.current_version}."
+    )
+    if status.url:
+        console.print(f"[dim]Release:[/dim] {status.url}")
+    if plan.supported and plan.display_command:
+        console.print(f"[dim]Update command:[/dim] {plan.display_command}")
+    elif plan.reason:
+        console.print(f"[dim]{plan.reason}[/dim]")
+    try:
+        answer = (
+            typer.prompt("Update now? [y=update / n=later / s=skip this version]", default="n")
+            .strip()
+            .lower()
+        )
+    except (EOFError, KeyboardInterrupt, typer.Abort):
+        # typer.prompt surfaces Ctrl-C/Ctrl-D as typer.Abort.
+        return "later"
+    if answer in {"y", "yes", "u", "update"}:
+        return "update"
+    if answer in {"s", "skip"}:
+        return "skip"
+    return "later"
+
+
+def _tui_popup_enabled() -> bool:
+    try:
+        from ..tui.config import is_tui_enabled
+
+        return bool(is_tui_enabled())
+    except Exception:  # noqa: BLE001 - TUI probing must not break the prompt
+        return False
+
+
+def _pause_before_alt_screen(console: Any) -> None:
+    """Keep launch-time guidance readable before the chat TUI covers it."""
+    if not _tui_popup_enabled():
+        return
+    try:
+        typer.prompt("Press Enter to continue", default="", show_default=False)
+    except (EOFError, KeyboardInterrupt, typer.Abort):
+        pass
+
+
+def _prompt_update_choice(console: Any, status: UpdateStatus, plan: InstallerPlan) -> str:
+    if _tui_popup_enabled():
+        try:
+            from ..tui.update_prompt import select_update_action
+
+            choice, interactive_available = select_update_action(
+                current_version=status.current_version,
+                latest_version=str(status.latest_version),
+                command=plan.display_command if plan.supported else None,
+                unsupported_reason=None if plan.supported else (plan.reason or None),
+            )
+            if interactive_available:
+                return choice or "later"
+        except Exception:  # noqa: BLE001 - fall back to the classic inline prompt
+            pass
+    return _classic_update_prompt(console, status, plan)
+
+
+def _apply_startup_update(console: Any, plan: InstallerPlan) -> str:
+    """Run the detected upgrade command; exits the process on success."""
+    _print_installer_plan(console, plan)
+    if not plan.supported:
+        console.print(
+            "[yellow]Automatic update is not available for this install.[/yellow] "
+            "Update manually using the installer that created this environment."
+        )
+        _pause_before_alt_screen(console)
+        return "manual"
+    try:
+        exit_code = _patchable("run_installer_plan", run_installer_plan)(plan)
+    except Exception as exc:  # noqa: BLE001 - a failed upgrade must not block launch
+        console.print(f"[red]Update failed:[/red] {exc} Continuing with the current version.")
+        _pause_before_alt_screen(console)
+        return "update-failed"
+    if exit_code != 0:
+        console.print(
+            f"[red]Update command failed with exit code {exit_code}.[/red] "
+            "Continuing with the current version."
+        )
+        _pause_before_alt_screen(console)
+        return "update-failed"
+    console.print("[green]Update installed.[/green] Restart Sylliptor to use the new version.")
+    raise typer.Exit(code=0)
+
+
+def maybe_prompt_update_at_startup(*, console: Any | None = None) -> str | None:
+    """Offer a newer release at launch, before the setup/workspace screens.
+
+    Runs at most once per process and decides from the cached check only, so
+    it never blocks startup on the network. Returns the action taken
+    ("update-failed" / "manual" / "skip" / "later"), or None when no prompt was
+    shown; a successful update exits the process via ``typer.Exit`` so the
+    user restarts into the new version.
+    """
+    global _update_prompt_completed
+    if _update_prompt_completed:
+        return None
+    _update_prompt_completed = True
+
+    try:
+        from .startup import _is_interactive_terminal
+
+        if not _is_interactive_terminal():
+            return None
+        cfg = _patchable("load_config", load_config)()
+        status = _patchable("status_from_cache", status_from_cache)(
+            current_version=__version__,
+            cfg=cfg,
+        )
+        state = read_update_prompt_state()
+        if not should_prompt_for_update(status=status, state=state, cfg=cfg):
+            return None
+        latest = status.latest_version
+        if not latest:
+            return None
+        plan = _patchable("detect_installer_plan", detect_installer_plan)()
+        if plan.method == "editable":
+            # Dev checkouts update via git; don't nag at every launch.
+            return None
+        record_update_prompt_shown(latest)
+        out = console if console is not None else _console()
+        choice = _prompt_update_choice(out, status, plan)
+    except Exception:  # noqa: BLE001 - the update prompt must never break startup
+        return None
+
+    if choice == "skip":
+        try:
+            record_update_skipped(latest)
+        except Exception:  # noqa: BLE001 - persisting the skip is best-effort
+            pass
+        out.print(f"[dim]Skipping version {latest}. Run `sylliptor update` any time.[/dim]")
+        return "skip"
+    if choice != "update":
+        return "later"
+    return _apply_startup_update(out, plan)
 
 
 def _print_update_status(console: Any, status: UpdateStatus) -> None:

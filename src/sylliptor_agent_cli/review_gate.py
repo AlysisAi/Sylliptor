@@ -10,8 +10,8 @@ from typing import Any
 from .config import (
     AppConfig,
     ConfigError,
-    get_api_key,
     resolve_llm_timeout_s,
+    resolve_model_access_api_key,
     resolve_prompt_cache_key,
     resolve_prompt_cache_retention,
     resolve_role_temperature,
@@ -549,11 +549,9 @@ def review_task(
     )
 
     try:
-        api_key = api_key_override.strip() if api_key_override is not None else get_api_key()
+        api_key = resolve_model_access_api_key(cfg, override=api_key_override)
     except ConfigError as e:
         raise ReviewError(str(e)) from e
-    if not api_key:
-        raise ReviewError("API key is empty.")
     model_name = resolve_model_for_role(
         cfg=cfg,
         role=ROLE_REVIEW,

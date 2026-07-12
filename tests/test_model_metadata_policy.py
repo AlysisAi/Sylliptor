@@ -51,8 +51,14 @@ def test_evaluate_active_model_metadata_policy_warn_dedupes_same_model_roles() -
     assert result.policy == "warn"
     assert len(result.diagnostics) == 2
     assert len(result.warning_messages) == 1
-    assert "unknown-model-xyz" in result.warning_messages[0]
-    assert "coding, router" in result.warning_messages[0]
+    warning = result.warning_messages[0]
+    assert "Unknown model unknown-model-xyz" in warning
+    assert "default context limits" in warning
+    assert "/config set unknown-model-xyz <context> <max_output>" in warning
+    assert "SYLLIPTOR_CONTEXT_WINDOW" in warning
+    assert "coding, router" not in warning
+    assert "fallback capacity metadata" not in warning
+    assert "Registry detail" not in warning
     assert all(diagnostic.fallback_capacity_active for diagnostic in result.diagnostics)
 
 

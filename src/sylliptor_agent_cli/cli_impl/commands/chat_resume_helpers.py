@@ -190,7 +190,13 @@ def _generate_session_summary_with_model(
         return None
     api_key = str(getattr(getattr(session, "client", None), "api_key", "") or "").strip()
     if not api_key:
-        return None
+        try:
+            from ...profiles import get_active_profile
+
+            if not get_active_profile(cfg).auth_provider:
+                return None
+        except Exception:
+            return None
 
     prompt_messages = _session_summary_prompt_messages(transcript_messages=transcript_messages)
     if not prompt_messages:
@@ -362,6 +368,37 @@ def _format_clock_time(dt: datetime) -> str:
     return value.lstrip("0") or value
 
 
+def _resume_dt_from_info(info: SessionInfo) -> datetime | None:
+    """Local-naive datetime for a session's "when", from the log's own ts.
+
+    Prefers the log-recorded ``last_event_ts`` (UTC ISO) — which reflects when
+    the user actually messaged and is immune to file copy/extract resetting
+    mtime — converted to local wall time so it is directly comparable to
+    ``datetime.now()``. Falls back to filesystem mtime when the log carries no
+    parseable timestamp (empty/corrupt logs, or SessionInfo built without one).
+    """
+    raw_ts = getattr(info, "last_event_ts", None)
+    if isinstance(raw_ts, str) and raw_ts.strip():
+        text = raw_ts.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is not None:
+                try:
+                    return parsed.astimezone().replace(tzinfo=None)
+                except (OSError, OverflowError, ValueError):
+                    return parsed.replace(tzinfo=None)
+            return parsed
+    try:
+        return datetime.fromtimestamp(float(info.mtime))
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def _truncate_preview(text: str, max_chars: int = 64) -> str:
     clean = re.sub(r"\s+", " ", text).strip()
     if len(clean) <= max_chars:
@@ -383,9 +420,8 @@ def _load_resume_preview_text(info: SessionInfo) -> str:
     if first_user_preview:
         return first_user_preview
 
-    try:
-        dt = datetime.fromtimestamp(float(info.mtime))
-    except Exception:  # noqa: BLE001
+    dt = _resume_dt_from_info(info)
+    if dt is None:
         return "Untitled conversation"
     return f"Conversation at {_format_clock_time(dt)}"
 
@@ -436,11 +472,7 @@ def _chat_resume_display_rows(*, sessions: list[SessionInfo]) -> list[_ResumeSes
     rows: list[_ResumeSessionRow] = []
     now = datetime.now()
     for idx, info in enumerate(sessions, start=1):
-        dt: datetime | None
-        try:
-            dt = datetime.fromtimestamp(float(info.mtime))
-        except Exception:  # noqa: BLE001
-            dt = None
+        dt: datetime | None = _resume_dt_from_info(info)
         rows.append(
             _ResumeSessionRow(
                 session_id=info.session_id,
@@ -786,7 +818,26 @@ def _load_chat_resume_messages(path: Path) -> list[dict[str, Any]]:
         if not isinstance(payload, dict):
             continue
 
-        if event_type == "user_message":
+        if event_type == "conversation_summary_updated":
+            compacted_messages = payload.get("active_conversation_messages")
+            if isinstance(compacted_messages, list):
+                restored = [
+                    copy.deepcopy(message)
+                    for message in compacted_messages
+                    if isinstance(message, dict)
+                    and str(message.get("role") or "").strip()
+                    in {"system", "user", "assistant", "tool"}
+                ]
+                if restored:
+                    # The compaction event is an authoritative snapshot of the
+                    # model-visible conversation suffix. Replace the raw event
+                    # replay accumulated so far, then continue applying newer
+                    # events. Fresh session bootstrap messages are added by
+                    # create_session and therefore are intentionally excluded.
+                    out = restored
+                    pending_tool_calls = []
+                    pending_tool_index = 0
+        elif event_type == "user_message":
             _append_message("user", _user_message_display_content(payload))
         elif event_type in {"assistant_message", "final", "route_decision"}:
             if event_type == "assistant_message" and _append_internal_message(
@@ -1243,6 +1294,39 @@ def _load_chat_resume_session_start(path: Path) -> dict[str, Any]:
     return latest_payload
 
 
+def _load_chat_resume_runtime_settings(path: Path) -> dict[str, Any]:
+    """Restore mutable chat settings from the ordered session event stream."""
+
+    stream: bool | None = None
+    trace_level = "compact"
+    for event in read_session_events(path):
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if event_type == "session_start":
+            raw_stream = payload.get("stream")
+            if isinstance(raw_stream, bool):
+                stream = raw_stream
+            raw_trace = str(payload.get("trace_level") or "").strip().lower()
+            if raw_trace in {"off", "compact", "full"}:
+                trace_level = raw_trace
+            continue
+        if event_type != "session_setting_changed":
+            continue
+        setting = str(payload.get("setting") or "").strip().lower()
+        value = payload.get("value")
+        if setting == "stream" and isinstance(value, bool):
+            stream = value
+        elif setting == "trace_level":
+            normalized = str(value or "").strip().lower()
+            if normalized in {"off", "compact", "full"}:
+                trace_level = normalized
+    return {"stream": stream, "trace_level": trace_level}
+
+
 def _load_chat_resume_active_workdir_relpath(path: Path) -> str | None:
     latest_relpath: str | None = None
     for event in read_session_events(path):
@@ -1267,13 +1351,41 @@ def _collect_chat_resume_candidates(
     *,
     sessions_dir: Path,
     current_session_id: str,
+    workspace_root: str | Path | None = None,
+    git_root: str | Path | None = None,
     max_candidates: int = _CHAT_RESUME_MAX_CANDIDATES,
 ) -> list[SessionInfo]:
-    candidates = [
-        info
-        for info in _patchable("list_sessions", list_sessions)(sessions_dir)
-        if info.session_id and info.session_id != current_session_id
-    ]
+    """Collect resumable sessions, newest first, excluding the current one.
+
+    Sessions stamped with a different owner than the local account (see
+    :func:`session_belongs_to_owner`) are ALWAYS excluded — one user's
+    conversations must never surface in another user's ``/resume``, no matter
+    how the log files arrived. Legacy logs with no recorded owner stay visible.
+
+    When ``workspace_root`` is provided (the live session's workspace), the list
+    is additionally scoped to that workspace so each project only surfaces its
+    own chats — this is what every end-user ``/resume`` picker passes.
+    ``workspace_root`` accepts the raw store value (str/Path) and is
+    canonicalized here; leaving it ``None`` (admin/CLI/test callers) preserves
+    the workspace-unscoped listing. Filtering happens BEFORE the
+    ``max_candidates`` slice so in-scope sessions are never truncated away by
+    out-of-scope ones. Excluded sessions remain reachable by an explicit
+    ``/resume <id>`` on the machine that holds them.
+    """
+    scope_requested = bool(str(workspace_root or "").strip())
+    current_ws = canonical_workspace_path(workspace_root) if scope_requested else None
+    current_git = canonical_workspace_path(git_root) if scope_requested else None
+    current_owner = _patchable("local_session_owner", local_session_owner)()
+
+    candidates: list[SessionInfo] = []
+    for info in _patchable("list_sessions", list_sessions)(sessions_dir):
+        if not info.session_id or info.session_id == current_session_id:
+            continue
+        if not session_belongs_to_owner(info, current_owner):
+            continue
+        if scope_requested and not session_belongs_to_workspace(info, current_ws, current_git):
+            continue
+        candidates.append(info)
     if max_candidates > 0:
         return candidates[:max_candidates]
     return candidates

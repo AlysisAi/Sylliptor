@@ -96,6 +96,7 @@ from .swarm_backend import (
     select_swarm_backend,
 )
 from .swarm_scheduler import (
+    SUCCESSFUL_TERMINAL_STATUSES,
     canonical_task_status,
     compute_schedule,
     is_expected_red_regression_precursor,
@@ -112,6 +113,7 @@ from .swarm_worker import (
     resolve_worker_verify_contract,
     run_task_worker,
 )
+from .verification_command_analysis import is_benign_non_execution_reason
 from .verify_gate import ResolvedVerifyCommands, resolve_verify_command_selection
 from .workspace_binding import WorkspaceBinding
 
@@ -203,6 +205,10 @@ def _worker_result_nonexecuting_verification_reason(result: TaskWorkerResult) ->
         if item.get("real_execution") is not False:
             continue
         reason = str(item.get("non_execution_reason") or "").strip()
+        if str(item.get("status") or "").strip().lower() == "skipped" and (
+            is_benign_non_execution_reason(reason)
+        ):
+            continue
         command = str(item.get("command") or item.get("effective_command") or "").strip()
         if reason and command:
             return f"{reason} ({command})"
@@ -218,7 +224,7 @@ def _merge_outcome_success_trace_message(outcome: MergeOutcome) -> str:
     if outcome.action == "applied":
         return f"Applied successfully ({outcome.merge_commit_hash or 'no merge hash'})."
     if outcome.action == "noop":
-        return "Accepted verified no-op outcome; no merge/apply was required."
+        return "Accepted already-satisfied no-op outcome; no merge/apply was required."
     return f"Merged successfully ({outcome.merge_commit_hash or 'no merge hash'})."
 
 
@@ -723,9 +729,13 @@ _FAILURE_LIKE_STATUSES = frozenset(
         "changes_requested",
         "merge_conflict",
         "blocked_integration",
+        "interrupted",
+        "cancelled",
     }
 )
-_NON_EXECUTABLE_SUCCESS_STATUSES = frozenset({"done", "superseded", "invalidated"})
+_NON_EXECUTABLE_SUCCESS_STATUSES = frozenset(
+    {*SUCCESSFUL_TERMINAL_STATUSES, "superseded", "invalidated"}
+)
 
 
 def _task_status_counts(plan: dict[str, Any]) -> dict[str, int]:
@@ -942,7 +952,7 @@ def _write_swarm_summary(
                     )
                 elif item.action == "noop":
                     merged_line = (
-                        f"- `{item.task_id}` completed as an already-satisfied verified no-op "
+                        f"- `{item.task_id}` completed as an already-satisfied no-op "
                         f"(`{item.branch}`); no merge required"
                     )
                 else:
@@ -1114,6 +1124,8 @@ def _mark_remaining_tasks_blocked_by_integration(
         "changes_requested",
         "merge_conflict",
         "blocked_integration",
+        "interrupted",
+        "cancelled",
     }
     changed = False
     for task in plan.get("tasks") or []:
@@ -1726,7 +1738,7 @@ def _accept_noop_task(
     task_obj = find_task(plan, task_id)
     if task_obj is not None:
         task_obj.pop("merge_commit_hash", None)
-    _mark_status(paths, plan, task_id, "done")
+    _mark_status(paths, plan, task_id, "already_satisfied")
     cleanup_errors = backend.cleanup_task_workspace(
         root=paths.root,
         prepared_workspace=prepared_workspace,
@@ -2810,7 +2822,9 @@ def run_swarm(
                     str(task.get("id") or ""): resolve_worker_verify_contract(
                         cfg=cfg,
                         verify_mode=verify_mode,
-                        verify_commands=(_get_verify_commands() if verify_mode != "off" else None),
+                        verify_commands=(
+                            (_get_verify_commands() or None) if verify_mode != "off" else None
+                        ),
                         verify_command_selection=(
                             _get_verify_command_selection() if verify_mode != "off" else None
                         ),
@@ -2866,7 +2880,7 @@ def run_swarm(
                             success_message = "Worker finished successfully."
                             if result.noop_success:
                                 success_message = (
-                                    "Worker finished successfully with a verified no-op outcome."
+                                    "Worker finished successfully; task was already satisfied."
                                 )
                             _trace(
                                 "worker.lifecycle",
@@ -2988,8 +3002,7 @@ def run_swarm(
                                     acceptance_state="accepted",
                                     result=result,
                                     summary=(
-                                        "Worker result was accepted as an already-satisfied no-op "
-                                        "after authoritative verification passed."
+                                        "Worker result was accepted as an already-satisfied no-op."
                                     ),
                                 )
                                 or batch_task_attempt_resolutions

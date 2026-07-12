@@ -210,7 +210,9 @@ def test_interactive_bootstrap_payload_stays_bounded(tmp_path: Path) -> None:
     try:
         messages_json = json.dumps(session.messages, ensure_ascii=True)
         tools_json = json.dumps(session.tool_list, ensure_ascii=True)
-        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 5600
+        # Bound rebased after immutable-test and execution-evidence guidance grew
+        # the interactive prompt; keep ~5% headroom over the measured size.
+        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 6700
     finally:
         session.close()
 
@@ -281,7 +283,9 @@ def test_one_shot_bootstrap_payload_stays_bounded(tmp_path: Path) -> None:
     try:
         messages_json = json.dumps(session.messages, ensure_ascii=True)
         tools_json = json.dumps(session.tool_list, ensure_ascii=True)
-        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 6400
+        # Bound rebased after repo-map/test-discovery schemas and execution-evidence
+        # guidance grew the one-shot prompt; keep ~5% headroom over the measured size.
+        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 7600
     finally:
         session.close()
 
@@ -306,6 +310,33 @@ def test_create_session_wires_optional_prompt_cache_knobs(tmp_path: Path) -> Non
     try:
         assert session.client.prompt_cache_key == "repo-main"
         assert session.client.prompt_cache_retention == "24h"
+    finally:
+        session.close()
+
+
+def test_create_session_auto_prompt_cache_key_is_workspace_scoped(tmp_path: Path) -> None:
+    _fake_git_repo(tmp_path)
+    cfg = AppConfig(
+        model="gpt-test",
+        web_search_mode="off",
+        prompt_cache_mode="auto",
+    )
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=1,
+        no_log=True,
+        api_key_override="override-key",
+    )
+    try:
+        assert session.client.prompt_cache_key is not None
+        assert session.client.prompt_cache_key.startswith("sylliptor:openai:")
+        assert str(tmp_path) not in session.client.prompt_cache_key
+        router_client = getattr(session, "router_client", None)
+        if router_client is not None:
+            assert router_client.prompt_cache_key != session.client.prompt_cache_key
     finally:
         session.close()
 

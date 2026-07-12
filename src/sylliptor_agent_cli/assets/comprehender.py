@@ -22,6 +22,7 @@ from ..config import (
     get_api_key,
     resolve_llm_enable_thinking,
     resolve_llm_timeout_s,
+    resolve_model_access_api_key,
     resolve_profile_api_key,
     resolve_prompt_cache_key,
     resolve_prompt_cache_retention,
@@ -458,7 +459,9 @@ class AssetComprehender:
 
     def _api_key_for_profile(self, profile: ProfileSpec | None) -> str:
         if profile is None:
-            return get_api_key()
+            return resolve_model_access_api_key(self.cfg, legacy_resolver=get_api_key)
+        if profile.auth_provider:
+            return ""
         resolved = resolve_profile_api_key(self.cfg, profile.name)
         if not resolved.key:
             raise ConfigError(f"Missing API key for profile {profile.name}.")

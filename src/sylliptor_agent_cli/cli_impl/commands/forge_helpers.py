@@ -676,6 +676,7 @@ def _run_forge_planner_turn_controller(
     trace_callback: Callable[[str, bool], None] | None = None,
     stream: bool = False,
     on_text_delta: Callable[[str], None] | None = None,
+    on_usage_events: Callable[[list[dict[str, Any]]], None] | None = None,
     error_fallback: Callable[[], None] | None = None,
 ) -> _ForgePlannerTurnControllerResult:
     planner_state.transcript.append({"role": "user", "content": user_text})
@@ -733,6 +734,12 @@ def _run_forge_planner_turn_controller(
         pending_questions=planner_state.pending_questions,
         run_paths=paths,
     )
+    usage_events = list(getattr(planner_result, "usage_events", []) or [])
+    if usage_events and on_usage_events is not None:
+        try:
+            on_usage_events(usage_events)
+        except Exception:
+            pass
     planner_router_event = getattr(planner_result, "planner_router_event", None)
     if isinstance(planner_router_event, dict):
         append_planner_router_event(paths, planner_router_event)
@@ -959,6 +966,16 @@ def _capture_forge_requirement_from_planner_fallback(
         )
         return False
 
+    if _set_forge_project_goal_if_empty(
+        plan=plan,
+        paths=paths,
+        console=console,
+        goal=user_text,
+        transcript_message="Captured project goal (planner produced no structured update).",
+        display_message="Captured project goal because the planner produced no structured update.",
+    ):
+        return True
+
     add_requirement(
         plan,
         user_text,
@@ -975,6 +992,27 @@ def _capture_forge_requirement_from_planner_fallback(
         console=console,
         message="Captured requirement note because the planner produced no structured update.",
     )
+    return True
+
+
+def _set_forge_project_goal_if_empty(
+    *,
+    plan: dict[str, Any],
+    paths: RunPaths,
+    console: Console,
+    goal: str,
+    transcript_message: str = "Updated project goal.",
+    display_message: str = "Project goal set.",
+) -> bool:
+    normalized_goal = str(goal or "").strip()
+    if not normalized_goal or str(plan.get("project_goal") or "").strip():
+        return False
+    plan["project_goal"] = normalized_goal
+    if not str(plan.get("summary") or "").strip():
+        plan["summary"] = normalized_goal
+    save_plan(paths, plan)
+    append_transcript_note(paths, role="system", message=transcript_message)
+    _print_forge_meta(console=console, message=display_message)
     return True
 
 
@@ -1037,6 +1075,7 @@ def _enter_forge_mode(
     forge_state: _ForgeChatState,
     model: str | None = None,
     mode: str | None = None,
+    planner_assistant_default: bool | None = None,
 ) -> bool:
     forge_binding: WorkspaceBinding | None = None
     try:
@@ -1080,6 +1119,8 @@ def _enter_forge_mode(
     plan = entry_selection.plan
     forge_state.paths = paths
     forge_state.plan = plan
+    entry_goal = str(getattr(forge_state, "entry_goal", "") or "").strip()
+    forge_state.entry_goal = ""
     try:
         workspace_scan = refresh_workspace_context_artifacts(paths)
     except ForgeError as e:
@@ -1089,10 +1130,22 @@ def _enter_forge_mode(
         refresh_current_run_pointer_if_tracking_same_run(paths)
 
     forge_state.ui_mode = "forge"
-    forge_state.assistant_enabled = _patchable(
-        "_prompt_forge_entry_plan_assistant",
-        _prompt_forge_entry_plan_assistant,
-    )(console=console)
+    if planner_assistant_default is None:
+        forge_state.assistant_enabled = _patchable(
+            "_prompt_forge_entry_plan_assistant",
+            _prompt_forge_entry_plan_assistant,
+        )(console=console)
+    else:
+        forge_state.assistant_enabled = bool(planner_assistant_default)
+    if entry_goal:
+        _set_forge_project_goal_if_empty(
+            plan=plan,
+            paths=paths,
+            console=console,
+            goal=entry_goal,
+            transcript_message="Set project goal from /forge shortcut.",
+            display_message="Project goal set from /forge.",
+        )
     forge_state.planner_session = _ForgePlannerSessionState(
         workspace_context=_augment_workspace_context_with_mcp_execution_context(
             workspace_context={
@@ -1116,6 +1169,7 @@ def _enter_forge_mode(
     )
     if (
         not forge_state.assistant_enabled
+        and planner_assistant_default is None
         and _is_non_interactive_terminal()
         and env_get("SYLLIPTOR_FORGE_PLAN_ASSISTANT") is None
     ):

@@ -1,39 +1,92 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from ..error_text import sanitize_error_text_for_output
+from ..provider_auth import ProviderAuthAdapter
 from ..provider_telemetry import ProviderCallTelemetryRecorder
+from ..request_estimation import estimate_provider_payload_tokens
 from ..web_search_adapters import AUTO_WEB_SEARCH_ADAPTER, OPENAI_RESPONSES_ADAPTER
-from .metadata import OPENAI_RESPONSES_PROVIDER_METADATA_KEY, PROVIDER_METADATA_KEY
+from .cache_policy import merge_cache_policy_metadata
+from .metadata import (
+    OPENAI_RESPONSES_PROVIDER_METADATA_KEY,
+    PROVIDER_METADATA_KEY,
+    ProviderRouteIdentity,
+    build_provider_route_identity,
+    canonicalize_extra_headers,
+    credential_scope_fingerprint,
+    gate_messages_for_provider_route,
+    merge_canonical_headers,
+    stamp_response_for_route,
+)
 from .provider_limits import (
     DEFAULT_PROVIDER_CONCURRENCY_CAPS,
     ProviderRetrySettings,
     best_effort_provider_key,
+    mark_provider_call_non_retryable,
     run_provider_limited_call,
 )
+from .request_plan import LLMRequestPlan, RequestCachePlan
+from .request_shape import build_request_shape_report
 from .streaming import SSEFrame, iter_sse_frames, parse_sse_json_frame
-from .types import LLMError, LLMResponse, LLMUsage, ToolCall
+from .types import (
+    InputTokenCount,
+    LLMError,
+    LLMResponse,
+    LLMUsage,
+    ReasoningOutput,
+    ReasoningOutputKind,
+    ToolCall,
+    UsageConfidence,
+    UsageContract,
+)
 
 
 class ResponsesError(RuntimeError):
-    pass
+    def __init__(self, message: object = "") -> None:
+        super().__init__(sanitize_error_text_for_output(message))
 
 
 _DEFAULT_ACCEPT_ENCODING = "identity"
+_PROVIDER_RETRY_WALL_CLOCK_CAP_SECONDS = 60.0
 _OPENAI_RESPONSES_METADATA_KEY = OPENAI_RESPONSES_PROVIDER_METADATA_KEY
 _WEB_SEARCH_MODES_ALLOWING_OPENAI_BUILTIN = frozenset({"auto", "native"})
 _RESPONSES_TOOL_CHOICE_STRINGS = frozenset({"auto", "none", "required"})
-_RESPONSES_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+_RESPONSES_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+)
 _RESPONSES_JSON_SCHEMA_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SYLLIPTOR_WEB_SEARCH_FUNCTION_NAME = "web_search"
 _RESPONSES_HOSTED_WEB_SEARCH_TYPES = frozenset({"web_search", "web_search_preview"})
+
+
+@dataclass(frozen=True)
+class _ResponsesContinuation:
+    previous_response_id: str
+    suffix_messages: list[dict[str, Any]]
+    anchor_index: int
+
+
+def _stable_request_signature(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _non_negative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
 
 # Some models (notably the GPT-5 reasoning family) reject a non-default
 # ``temperature`` on the Responses API with a 400/422 ("temperature is not
@@ -53,6 +106,26 @@ _TEMPERATURE_UNSUPPORTED_TOKENS = (
 )
 _RESPONSES_OMIT_TEMPERATURE_MODELS: set[str] = set()
 
+_REASONING_SUMMARY_UNSUPPORTED_STATUS_MARKERS = ("error 400", "error 422")
+_REASONING_SUMMARY_UNSUPPORTED_TOKENS = (
+    "invalid",
+    "unsupported",
+    "not support",
+    "not allowed",
+    "not permitted",
+    "unknown",
+    "unknown parameter",
+    "unknown field",
+    "unrecognized",
+    "unexpected",
+    "invalid parameter",
+    "extra",
+    "extra inputs",
+    "forbidden",
+    "cannot be set",
+    "must be omitted",
+)
+
 
 def _responses_temperature_omit_key(base_url: str, model: str) -> str:
     return f"{str(base_url).strip().rstrip('/')}\n{str(model).strip()}"
@@ -67,10 +140,52 @@ def _responses_temperature_unsupported(err: Exception) -> bool:
     return any(token in text for token in _TEMPERATURE_UNSUPPORTED_TOKENS)
 
 
+def _responses_reasoning_summary_unsupported(err: Exception) -> bool:
+    """Return whether a 400/422 clearly rejects ``reasoning.summary``.
+
+    Keep this deliberately narrower than the generic unsupported-parameter
+    fallback: an unrelated response summary error must not disable reasoning
+    summaries for the rest of the client session.
+    """
+
+    text = str(err).casefold()
+    if not any(marker in text for marker in _REASONING_SUMMARY_UNSUPPORTED_STATUS_MARKERS):
+        return False
+    if "summary" not in text:
+        return False
+    if not any(
+        context in text
+        for context in (
+            "reasoning",
+            "parameter",
+            "field",
+            "request argument",
+            "extra inputs",
+        )
+    ):
+        return False
+    return any(token in text for token in _REASONING_SUMMARY_UNSUPPORTED_TOKENS)
+
+
+def _without_responses_reasoning_summary(payload: dict[str, Any]) -> bool:
+    """Remove only ``reasoning.summary`` from an already-adapted payload."""
+
+    raw_reasoning = payload.get("reasoning")
+    if not isinstance(raw_reasoning, dict) or "summary" not in raw_reasoning:
+        return False
+    reasoning = copy.deepcopy(raw_reasoning)
+    reasoning.pop("summary", None)
+    if reasoning:
+        payload["reasoning"] = reasoning
+    else:
+        payload.pop("reasoning", None)
+    return True
+
+
 def _headers_with_default_accept_encoding(headers: dict[str, str]) -> dict[str, str]:
     request_headers = dict(headers)
     if not any(key.lower() == "accept-encoding" for key in request_headers):
-        request_headers["Accept-Encoding"] = _DEFAULT_ACCEPT_ENCODING
+        request_headers["accept-encoding"] = _DEFAULT_ACCEPT_ENCODING
     return request_headers
 
 
@@ -245,6 +360,83 @@ def _metadata_output_items(message: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(item, dict):
             copied.append(copy.deepcopy(item))
     return copied
+
+
+def _metadata_responses_payload(message: dict[str, Any]) -> dict[str, Any] | None:
+    metadata = message.get(PROVIDER_METADATA_KEY)
+    if not isinstance(metadata, dict):
+        return None
+    responses_metadata = metadata.get(_OPENAI_RESPONSES_METADATA_KEY)
+    if not isinstance(responses_metadata, dict):
+        return None
+    return responses_metadata
+
+
+def _response_with_request_plan_metadata(
+    response: LLMResponse,
+    request_plan_metadata: dict[str, Any],
+) -> LLMResponse:
+    provider_metadata = copy.deepcopy(response.provider_metadata) or {}
+    responses_metadata = provider_metadata.setdefault(_OPENAI_RESPONSES_METADATA_KEY, {})
+    if isinstance(responses_metadata, dict):
+        responses_metadata["request_plan"] = copy.deepcopy(request_plan_metadata)
+    return LLMResponse(
+        content=response.content,
+        tool_calls=response.tool_calls,
+        raw=response.raw,
+        response_model=response.response_model,
+        usage=response.usage,
+        provider_metadata=provider_metadata,
+        reasoning=response.reasoning,
+    )
+
+
+def _responses_continuation_from_messages(
+    messages: list[dict[str, Any]],
+) -> _ResponsesContinuation | None:
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "").strip() != "assistant":
+            continue
+        responses_metadata = _metadata_responses_payload(message)
+        if not responses_metadata:
+            continue
+        previous_response_id = str(responses_metadata.get("response_id") or "").strip()
+        request_plan_metadata = responses_metadata.get("request_plan")
+        if not previous_response_id or not isinstance(request_plan_metadata, dict):
+            continue
+        request_message_count = _non_negative_int(
+            request_plan_metadata.get("request_message_count")
+        )
+        request_messages_signature = str(
+            request_plan_metadata.get("request_messages_signature") or ""
+        ).strip()
+        if request_message_count != index or not request_messages_signature:
+            continue
+        prefix_messages = messages[:index]
+        if _stable_request_signature(prefix_messages) != request_messages_signature:
+            continue
+        suffix_messages = messages[index + 1 :]
+        if not suffix_messages:
+            continue
+        return _ResponsesContinuation(
+            previous_response_id=previous_response_id,
+            suffix_messages=copy.deepcopy(suffix_messages),
+            anchor_index=index,
+        )
+    return None
+
+
+def _responses_previous_response_rejected(err: Exception) -> bool:
+    text = str(err).casefold()
+    if "previous_response_id" in text:
+        return True
+    return "previous response" in text and any(
+        marker in text
+        for marker in ("not found", "invalid", "expired", "unknown", "does not exist")
+    )
 
 
 def _responses_input_from_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -694,15 +886,22 @@ def _responses_reasoning(
     *,
     enable_thinking: bool | None,
     reasoning_effort: str | None,
+    request_summary: bool = False,
 ) -> dict[str, Any] | None:
+    reasoning: dict[str, Any] = {}
     effort = str(reasoning_effort or "").strip().lower()
     if effort:
         if effort not in _RESPONSES_REASONING_EFFORTS:
             raise LLMError(f"OpenAI Responses reasoning_effort is not supported: {effort}")
-        return {"effort": effort}
-    if enable_thinking is False:
-        return {"effort": "none"}
-    return None
+        reasoning["effort"] = effort
+    elif enable_thinking is False:
+        reasoning["effort"] = "none"
+    if request_summary:
+        # Summary visibility is independent from reasoning effort. In
+        # particular, an automatic/default effort must remain omitted while
+        # still asking the provider for the best supported summary.
+        reasoning["summary"] = "auto"
+    return reasoning or None
 
 
 def _parse_usage(raw: Any) -> LLMUsage | None:
@@ -728,18 +927,34 @@ def _parse_usage(raw: Any) -> LLMUsage | None:
     prompt_details = raw.get("prompt_tokens_details")
     if cached_tokens is None and isinstance(prompt_details, dict):
         cached_tokens = prompt_details.get("cached_tokens")
+    output_details = raw.get("output_tokens_details")
+    if not isinstance(output_details, dict):
+        output_details = raw.get("completion_tokens_details")
+    reasoning_tokens = None
+    if isinstance(output_details, dict):
+        reasoning_tokens = output_details.get("reasoning_tokens")
 
+    prompt_tokens = _as_non_negative_int(input_tokens)
+    cached_prompt_tokens = _as_non_negative_int(cached_tokens)
+    input_tokens_uncached = None
+    if prompt_tokens is not None and cached_prompt_tokens is not None:
+        input_tokens_uncached = max(0, prompt_tokens - cached_prompt_tokens)
     usage = LLMUsage(
-        prompt_tokens=_as_non_negative_int(input_tokens),
+        prompt_tokens=prompt_tokens,
         completion_tokens=_as_non_negative_int(output_tokens),
         total_tokens=_as_non_negative_int(total_tokens),
-        cached_prompt_tokens=_as_non_negative_int(cached_tokens),
+        cached_prompt_tokens=cached_prompt_tokens,
+        input_tokens_uncached=input_tokens_uncached,
+        cache_read_input_tokens=cached_prompt_tokens,
+        reasoning_tokens=_as_non_negative_int(reasoning_tokens),
+        raw_provider_usage=copy.deepcopy(raw),
     )
     if (
         usage.prompt_tokens is None
         and usage.completion_tokens is None
         and usage.total_tokens is None
         and usage.cached_prompt_tokens is None
+        and usage.reasoning_tokens is None
     ):
         return None
     return usage
@@ -786,6 +1001,48 @@ def _responses_provider_metadata(data: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(stream_metadata, dict):
         metadata["stream_metadata"] = copy.deepcopy(stream_metadata)
     return {_OPENAI_RESPONSES_METADATA_KEY: metadata} if metadata else None
+
+
+def _responses_reasoning_outputs(data: dict[str, Any]) -> tuple[ReasoningOutput, ...]:
+    """Extract provider-generated summaries, never opaque/raw reasoning state."""
+
+    output = data.get("output")
+    if not isinstance(output, list):
+        return ()
+    seen: set[str] = set()
+    summaries: list[ReasoningOutput] = []
+    for item in output:
+        if not isinstance(item, dict) or str(item.get("type") or "") != "reasoning":
+            continue
+        parts = item.get("summary")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if str(part.get("type") or "") not in {"summary_text", "text"}:
+                continue
+            summary = part.get("text")
+            if not isinstance(summary, str) or not summary.strip() or summary in seen:
+                continue
+            seen.add(summary)
+            summaries.append(
+                ReasoningOutput(
+                    text=summary,
+                    kind=ReasoningOutputKind.SUMMARY,
+                    provider="openai",
+                )
+            )
+    return tuple(summaries)
+
+
+def _has_responses_reasoning_output(data: dict[str, Any]) -> bool:
+    """Return whether the provider produced a reasoning item of any visibility class."""
+
+    output = data.get("output")
+    return isinstance(output, list) and any(
+        isinstance(item, dict) and str(item.get("type") or "") == "reasoning" for item in output
+    )
 
 
 def _extract_refusal(data: dict[str, Any]) -> str:
@@ -883,14 +1140,23 @@ def _stream_error_message(data: dict[str, Any]) -> str:
 
 
 class _OpenAIResponsesStreamAccumulator:
-    def __init__(self, *, on_text_delta: Callable[[str], None] | None) -> None:
+    def __init__(
+        self,
+        *,
+        on_text_delta: Callable[[str], None] | None,
+        on_reasoning_delta: Callable[[str], None] | None,
+    ) -> None:
         self.on_text_delta = on_text_delta
+        self.on_reasoning_delta = on_reasoning_delta
         self.response: dict[str, Any] = {"object": "response", "output": []}
         self.output_items: dict[int, dict[str, Any]] = {}
         self.text_parts: dict[tuple[int, int], dict[str, Any]] = {}
+        self.reasoning_summary_parts: dict[tuple[int, int], dict[str, Any]] = {}
+        self.reasoning_delta_keys: set[tuple[int, int] | None] = set()
         self.argument_chunks: dict[int, list[str]] = {}
         self.unknown_events: list[dict[str, Any]] = []
         self.event_count = 0
+        self.text_delta_seen = False
         self.seen_final = False
         self.final_response: dict[str, Any] | None = None
 
@@ -926,6 +1192,25 @@ class _OpenAIResponsesStreamAccumulator:
         if event_type == "response.output_text.annotation.added":
             self._handle_output_text_annotation(data)
             return
+        if event_type in {
+            "response.reasoning_summary_text.delta",
+            # Compatibility event emitted by older/private Responses surfaces.
+            "response.reasoning_summary.delta",
+        }:
+            self._handle_reasoning_summary_delta(data)
+            return
+        if event_type in {
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary.done",
+        }:
+            self._handle_reasoning_summary_done(data)
+            return
+        if event_type in {
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_part.done",
+        }:
+            self._handle_reasoning_summary_part(data, done=event_type.endswith(".done"))
+            return
         if event_type == "response.function_call_arguments.delta":
             self._handle_function_arguments_delta(data)
             return
@@ -941,8 +1226,6 @@ class _OpenAIResponsesStreamAccumulator:
     def finish(self) -> dict[str, Any]:
         if self.event_count <= 0:
             raise LLMError("OpenAI Responses stream returned no events")
-        if not self.seen_final:
-            raise LLMError("OpenAI Responses stream ended before response.completed")
         data = copy.deepcopy(self.final_response or self.response)
         output = data.get("output")
         if not isinstance(output, list) or not output:
@@ -950,11 +1233,18 @@ class _OpenAIResponsesStreamAccumulator:
             data["output"] = output
         elif self.output_items:
             data["output"] = self._merge_ordered_items(output)
+        reasoning_only_partial = bool(output) and all(
+            isinstance(item, dict) and str(item.get("type") or "") == "reasoning" for item in output
+        )
+        if not self.seen_final and not reasoning_only_partial:
+            raise LLMError("OpenAI Responses stream ended before response.completed")
         if "output_text" not in data:
             text = _extract_answer_text(data)
             if text:
                 data["output_text"] = text
         stream_metadata: dict[str, Any] = {"events": self.event_count}
+        if not self.seen_final:
+            stream_metadata["ended_before_response_completed"] = True
         if self.unknown_events:
             stream_metadata["unknown_events"] = copy.deepcopy(self.unknown_events)
         data["stream_metadata"] = stream_metadata
@@ -1064,6 +1354,7 @@ class _OpenAIResponsesStreamAccumulator:
         part = self._ensure_text_part(output_index, content_index, item_id)
         existing = part.get("text")
         part["text"] = (existing if isinstance(existing, str) else "") + delta
+        self.text_delta_seen = True
         if self.on_text_delta is not None:
             self.on_text_delta(delta)
 
@@ -1092,6 +1383,120 @@ class _OpenAIResponsesStreamAccumulator:
         annotations = part.setdefault("annotations", [])
         if isinstance(annotations, list):
             annotations.append(copy.deepcopy(annotation))
+
+    @staticmethod
+    def _reasoning_indices(data: dict[str, Any]) -> tuple[int, int] | None:
+        output_index = data.get("output_index")
+        summary_index = data.get("summary_index")
+        if not isinstance(output_index, int) or output_index < 0:
+            return None
+        if not isinstance(summary_index, int) or summary_index < 0:
+            summary_index = 0
+        return output_index, summary_index
+
+    def _ensure_reasoning_summary_part(
+        self,
+        *,
+        output_index: int,
+        summary_index: int,
+        item_id: str,
+    ) -> dict[str, Any] | None:
+        key = (output_index, summary_index)
+        existing_part = self.reasoning_summary_parts.get(key)
+        if existing_part is not None:
+            return existing_part
+
+        item = self.output_items.get(output_index)
+        if item is None:
+            item = {"type": "reasoning", "summary": []}
+            if item_id:
+                item["id"] = item_id
+            self.output_items[output_index] = item
+        elif str(item.get("type") or "") not in {"", "reasoning"}:
+            # Malformed/colliding provider events must not overwrite another
+            # output item merely to reconstruct optional reasoning metadata.
+            return None
+        else:
+            item.setdefault("type", "reasoning")
+            if item_id and not item.get("id"):
+                item["id"] = item_id
+
+        summary = item.get("summary")
+        if not isinstance(summary, list):
+            summary = []
+            item["summary"] = summary
+        while len(summary) <= summary_index:
+            summary.append({"type": "summary_text", "text": ""})
+        part = summary[summary_index]
+        if not isinstance(part, dict):
+            part = {"type": "summary_text", "text": ""}
+            summary[summary_index] = part
+        else:
+            part.setdefault("type", "summary_text")
+            part.setdefault("text", "")
+        self.reasoning_summary_parts[key] = part
+        return part
+
+    def _reasoning_part_for_event(self, data: dict[str, Any]) -> dict[str, Any] | None:
+        indices = self._reasoning_indices(data)
+        if indices is None:
+            return None
+        output_index, summary_index = indices
+        return self._ensure_reasoning_summary_part(
+            output_index=output_index,
+            summary_index=summary_index,
+            item_id=str(data.get("item_id") or "").strip(),
+        )
+
+    def _handle_reasoning_summary_delta(self, data: dict[str, Any]) -> None:
+        delta = data.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return
+        key = self._reasoning_indices(data)
+        part = self._reasoning_part_for_event(data)
+        if part is not None:
+            existing = part.get("text")
+            part["text"] = (existing if isinstance(existing, str) else "") + delta
+        self.reasoning_delta_keys.add(key)
+        if self.on_reasoning_delta is not None:
+            self.on_reasoning_delta(delta)
+
+    def _handle_reasoning_summary_done(self, data: dict[str, Any]) -> None:
+        text = data.get("text")
+        if not isinstance(text, str):
+            return
+        key = self._reasoning_indices(data)
+        part = self._reasoning_part_for_event(data)
+        if part is not None:
+            part["type"] = "summary_text"
+            part["text"] = text
+        # Some compatible providers send only the completed summary event. It is
+        # still genuine provider output, so surface it once, but never inject it
+        # after visible answer text has already started or duplicate prior deltas.
+        if (
+            text
+            and self.on_reasoning_delta is not None
+            and key not in self.reasoning_delta_keys
+            and None not in self.reasoning_delta_keys
+            and not self.text_delta_seen
+        ):
+            self.reasoning_delta_keys.add(key)
+            self.on_reasoning_delta(text)
+
+    def _handle_reasoning_summary_part(self, data: dict[str, Any], *, done: bool) -> None:
+        raw_part = data.get("part")
+        if not isinstance(raw_part, dict):
+            return
+        part = self._reasoning_part_for_event(data)
+        if part is None:
+            return
+        part.update(copy.deepcopy(raw_part))
+        part["type"] = "summary_text"
+        text = raw_part.get("text")
+        if done and isinstance(text, str):
+            completed = dict(data)
+            completed["text"] = text
+            self._handle_reasoning_summary_done(completed)
 
     def _handle_function_arguments_delta(self, data: dict[str, Any]) -> None:
         output_index = _event_output_index(
@@ -1183,7 +1588,13 @@ class _OpenAIResponsesStreamAccumulator:
 
 
 class OpenAIResponsesClient:
+    usage_contract = UsageContract(
+        response_usage_confidence=UsageConfidence.AUTHORITATIVE,
+        input_token_count_strategy="openai_responses",
+    )
+    supports_tool_calling = True
     supports_forced_tool_choice = True
+    usage_counts_authoritative = usage_contract.response_usage_authoritative
 
     def __init__(
         self,
@@ -1206,6 +1617,11 @@ class OpenAIResponsesClient:
         provider_retry_settings: ProviderRetrySettings | None = None,
         provider_sleep_fn: Callable[[float], None] | None = None,
         provider_random_fn: Callable[[], float] | None = None,
+        prompt_cache_policy_metadata: Mapping[str, Any] | None = None,
+        provider_auth: ProviderAuthAdapter | None = None,
+        session_id: str | None = None,
+        usage_contract: UsageContract | None = None,
+        route_identity: ProviderRouteIdentity | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -1217,12 +1633,17 @@ class OpenAIResponsesClient:
         self.enable_thinking = enable_thinking
         self.reasoning_effort = str(reasoning_effort or "").strip().lower() or None
         self._transport = transport
-        self.extra_headers = {
-            str(key): str(value)
-            for key, value in (extra_headers or {}).items()
-            if str(key).strip() and str(value).strip()
-        }
+        self.extra_headers = canonicalize_extra_headers(extra_headers)
         self.provider_key = str(provider_key or "").strip() or None
+        self.route_identity = route_identity or build_provider_route_identity(
+            protocol="openai_responses",
+            base_url=self.base_url,
+            provider_key=self.provider_key,
+            model=self.model,
+            credential_scope=credential_scope_fingerprint(self.api_key),
+            routing_headers=self.extra_headers,
+            session_scope=credential_scope_fingerprint(session_id),
+        )
         self.web_search_mode = str(web_search_mode or "off").strip().lower()
         self.web_search_adapter = (
             str(web_search_adapter or AUTO_WEB_SEARCH_ADAPTER).strip().lower()
@@ -1236,14 +1657,62 @@ class OpenAIResponsesClient:
         self.provider_retry_settings = provider_retry_settings or ProviderRetrySettings()
         self._provider_sleep_fn = provider_sleep_fn
         self._provider_random_fn = provider_random_fn
+        self.prompt_cache_policy_metadata = (
+            copy.deepcopy(dict(prompt_cache_policy_metadata))
+            if isinstance(prompt_cache_policy_metadata, Mapping)
+            else None
+        )
+        self.provider_auth = provider_auth
+        self.session_id = str(session_id or "").strip() or None
+        self.usage_contract = usage_contract or type(self).usage_contract
+        self.usage_counts_authoritative = self.usage_contract.response_usage_authoritative
+        self._input_token_count_available: bool | None = None
+        self._reasoning_summary_support_by_model: dict[str, bool] = {}
+        self._provider_retry_wall_clock_cap_seconds = _PROVIDER_RETRY_WALL_CLOCK_CAP_SECONDS
 
-    def _headers(self) -> dict[str, str]:
+    def _reasoning_summary_support_key(self) -> str:
+        return _responses_temperature_omit_key(self.base_url, self.model)
+
+    def _should_request_reasoning_summary(self) -> bool:
+        capability = getattr(self, "reasoning_trace_capability", None)
+        if self.enable_thinking is False:
+            return False
+        if not bool(getattr(capability, "requestable", False)):
+            return False
+        if not bool(getattr(capability, "has_safe_summary", False)):
+            return False
+        return (
+            self._reasoning_summary_support_by_model.get(self._reasoning_summary_support_key())
+            is not False
+        )
+
+    def _headers(self, url: str, *, force_refresh: bool = False) -> dict[str, str]:
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "User-Agent": "sylliptor-agent-cli/0.1.0",
         }
-        headers.update(self.extra_headers)
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        headers = merge_canonical_headers(headers, self.extra_headers)
+        if self.provider_auth is not None:
+            for key in tuple(headers):
+                if key.casefold() in {
+                    "authorization",
+                    "chatgpt-account-id",
+                    "originator",
+                    "session-id",
+                    "x-session-affinity",
+                    "x-session-id",
+                }:
+                    headers.pop(key, None)
+            headers = merge_canonical_headers(
+                headers,
+                self.provider_auth.authorization_headers(
+                    url,
+                    force_refresh=force_refresh,
+                    session_id=self.session_id,
+                ),
+            )
         return _headers_with_default_accept_encoding(headers)
 
     @staticmethod
@@ -1254,15 +1723,27 @@ class OpenAIResponsesClient:
             body = response.text
             if len(body) > 1000:
                 body = body[:1000] + "...(truncated)"
-            return ResponsesError(f"Responses error {response.status_code}: {body}")
+            return ResponsesError(
+                sanitize_error_text_for_output(f"Responses error {response.status_code}: {body}")
+            )
         if isinstance(data, dict):
             error_message = _extract_error_message(data)
             if error_message:
                 lower = error_message.lower()
                 if "unsupported" in lower or "not support" in lower:
-                    return ResponsesError(f"Responses web_search unsupported: {error_message}")
-                return ResponsesError(f"Responses error {response.status_code}: {error_message}")
-        return ResponsesError(f"Responses error {response.status_code}: {data!r}")
+                    return ResponsesError(
+                        sanitize_error_text_for_output(
+                            f"Responses web_search unsupported: {error_message}"
+                        )
+                    )
+                return ResponsesError(
+                    sanitize_error_text_for_output(
+                        f"Responses error {response.status_code}: {error_message}"
+                    )
+                )
+        return ResponsesError(
+            sanitize_error_text_for_output(f"Responses error {response.status_code}: {data!r}")
+        )
 
     @staticmethod
     def _llm_error_from_response(response: httpx.Response) -> LLMError:
@@ -1272,11 +1753,108 @@ class OpenAIResponsesClient:
             body = response.text
             if len(body) > 1000:
                 body = body[:1000] + "...(truncated)"
-            return LLMError(f"LLM error {response.status_code}: {body}")
+            return LLMError(
+                sanitize_error_text_for_output(f"LLM error {response.status_code}: {body}")
+            )
         error_message = _extract_error_message(data)
         if error_message:
-            return LLMError(f"LLM error {response.status_code}: {error_message}")
-        return LLMError(f"LLM error {response.status_code}: {data!r}")
+            return LLMError(
+                sanitize_error_text_for_output(f"LLM error {response.status_code}: {error_message}")
+            )
+        return LLMError(
+            sanitize_error_text_for_output(f"LLM error {response.status_code}: {data!r}")
+        )
+
+    def count_input_tokens(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
+    ) -> InputTokenCount | None:
+        if self._input_token_count_available is False:
+            return None
+        messages = gate_messages_for_provider_route(messages, self.route_identity)
+        tool_mapping = _responses_tools(
+            tools,
+            mode=self.web_search_mode,
+            adapter=self.web_search_adapter,
+        )
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "input": _responses_input_from_messages(messages),
+        }
+        if tool_mapping.tools:
+            payload["tools"] = tool_mapping.tools
+            payload["tool_choice"] = (
+                "auto"
+                if tool_choice is None
+                else _tool_choice_for_mapped_tools(
+                    tool_choice,
+                    removed_sylliptor_web_search=tool_mapping.removed_sylliptor_web_search,
+                )
+            )
+        if self.provider_auth is not None:
+            adapted = self.provider_auth.adapt_responses_payload(payload)
+            payload = {
+                key: adapted[key]
+                for key in ("model", "input", "instructions", "tools", "tool_choice")
+                if key in adapted
+            }
+        url = f"{self.base_url}/responses/input_tokens"
+
+        def _send_request() -> InputTokenCount | None:
+            auth_refresh_used = False
+            while True:
+                try:
+                    with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
+                        response = client.post(
+                            url,
+                            headers=self._headers(url, force_refresh=auth_refresh_used),
+                            json=payload,
+                        )
+                except httpx.HTTPError as exc:
+                    raise LLMError(
+                        "OpenAI input token count request failed: "
+                        f"{sanitize_error_text_for_output(exc)}"
+                    ) from exc
+                if (
+                    response.status_code == 401
+                    and self.provider_auth is not None
+                    and not auth_refresh_used
+                ):
+                    auth_refresh_used = True
+                    continue
+                if response.status_code in {404, 405, 501}:
+                    self._input_token_count_available = False
+                    return None
+                if response.status_code >= 400:
+                    raise self._llm_error_from_response(response)
+                try:
+                    data = response.json()
+                except Exception as exc:  # noqa: BLE001
+                    raise LLMError("OpenAI input token count returned non-JSON response") from exc
+                count = _non_negative_int(
+                    data.get("input_tokens") if isinstance(data, dict) else None
+                )
+                if count is None:
+                    raise LLMError("OpenAI input token count response omitted input_tokens")
+                self._input_token_count_available = True
+                return InputTokenCount(
+                    input_tokens=count,
+                    raw_provider_usage=copy.deepcopy(data),
+                )
+
+        return run_provider_limited_call(
+            call=_send_request,
+            provider_key=self.provider_key,
+            provider_concurrency_caps=self.provider_concurrency_caps,
+            retry_settings=self.provider_retry_settings,
+            operation="responses_count_input_tokens",
+            sleep_fn=self._provider_sleep_fn,
+            random_fn=self._provider_random_fn,
+            retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
+        )
 
     def chat(
         self,
@@ -1290,8 +1868,50 @@ class OpenAIResponsesClient:
         on_reasoning_delta: Callable[[str], None] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        request_plan: LLMRequestPlan | None = None,
     ) -> LLMResponse:
-        _ = on_reasoning_delta
+        default_cache = RequestCachePlan(
+            strategy=(
+                "openai_prompt_cache"
+                if self.prompt_cache_key or self.prompt_cache_retention
+                else "none"
+            ),
+            mode=(
+                "automatic" if self.prompt_cache_key or self.prompt_cache_retention else "manual"
+            ),
+            prompt_cache_key=self.prompt_cache_key,
+            prompt_cache_retention=self.prompt_cache_retention,
+        )
+        plan = request_plan or LLMRequestPlan.from_chat_args(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            stream=stream,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            cache=default_cache,
+        )
+        if (
+            request_plan is not None
+            and plan.cache.mode != "off"
+            and plan.cache.strategy == "none"
+            and not plan.cache.prompt_cache_key
+            and not plan.cache.prompt_cache_retention
+            and (self.prompt_cache_key or self.prompt_cache_retention)
+        ):
+            plan = plan.with_cache(default_cache)
+        messages = gate_messages_for_provider_route(plan.message_list(), self.route_identity)
+        tools = plan.tool_list()
+        tool_choice = plan.tool_choice
+        response_format = plan.response_format
+        public_stream = plan.stream
+        stream = public_stream or bool(
+            self.provider_auth is not None
+            and getattr(self.provider_auth, "requires_streaming", False)
+        )
+        temperature = plan.temperature
+        max_tokens = plan.max_tokens
         tool_mapping = _responses_tools(
             tools,
             mode=self.web_search_mode,
@@ -1299,46 +1919,152 @@ class OpenAIResponsesClient:
         )
         mapped_tools = tool_mapping.tools
         temp_omit_key = _responses_temperature_omit_key(self.base_url, self.model)
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "input": _responses_input_from_messages(messages),
-        }
-        if temp_omit_key not in _RESPONSES_OMIT_TEMPERATURE_MODELS:
-            payload["temperature"] = self.temperature if temperature is None else float(temperature)
-        if self.prompt_cache_key:
-            payload["prompt_cache_key"] = self.prompt_cache_key
-        if self.prompt_cache_retention:
-            payload["prompt_cache_retention"] = self.prompt_cache_retention
+        reasoning_summary_support_key = self._reasoning_summary_support_key()
         reasoning = _responses_reasoning(
             enable_thinking=self.enable_thinking,
             reasoning_effort=self.reasoning_effort,
+            request_summary=self._should_request_reasoning_summary(),
         )
-        if reasoning is not None:
-            payload["reasoning"] = reasoning
-        if mapped_tools:
-            payload["tools"] = mapped_tools
-            payload["tool_choice"] = (
-                "auto"
-                if tool_choice is None
-                else _tool_choice_for_mapped_tools(
+        text_config = _responses_text_config(response_format)
+        full_input = _responses_input_from_messages(messages)
+        continuation = _responses_continuation_from_messages(messages)
+        previous_response_id: str | None = None
+        sent_input = full_input
+        input_mode = "full"
+        continuation_anchor_index: int | None = None
+        supports_previous_response_id = self.provider_auth is None or bool(
+            getattr(self.provider_auth, "supports_previous_response_id", True)
+        )
+        if continuation is not None and supports_previous_response_id:
+            # With previous_response_id the API appends the sent input items to the
+            # stored thread; system/developer messages from turn 1 are already
+            # retained server-side, so resending them duplicates the instructions
+            # on every chained turn. Send only the new suffix.
+            continuation_input = _responses_input_from_messages(continuation.suffix_messages)
+            if continuation_input:
+                previous_response_id = continuation.previous_response_id
+                sent_input = continuation_input
+                input_mode = "previous_response_id"
+                continuation_anchor_index = continuation.anchor_index
+
+        cache_policy = merge_cache_policy_metadata(
+            self.prompt_cache_policy_metadata,
+            plan.cache.openai_prompt_cache_policy_metadata(),
+        )
+
+        def _build_payload(
+            input_items: list[dict[str, Any]],
+            *,
+            prior_response_id: str | None,
+        ) -> dict[str, Any]:
+            payload: dict[str, Any] = {
+                "model": self.model,
+                "input": input_items,
+            }
+            if prior_response_id:
+                payload["previous_response_id"] = prior_response_id
+            if temp_omit_key not in _RESPONSES_OMIT_TEMPERATURE_MODELS:
+                payload["temperature"] = (
+                    self.temperature if temperature is None else float(temperature)
+                )
+            if plan.cache.prompt_cache_key:
+                payload["prompt_cache_key"] = plan.cache.prompt_cache_key
+            if plan.cache.prompt_cache_retention:
+                payload["prompt_cache_retention"] = plan.cache.prompt_cache_retention
+            if reasoning is not None:
+                payload["reasoning"] = copy.deepcopy(reasoning)
+            if mapped_tools:
+                payload["tools"] = mapped_tools
+                payload["tool_choice"] = (
+                    "auto"
+                    if tool_choice is None
+                    else _tool_choice_for_mapped_tools(
+                        tool_choice,
+                        removed_sylliptor_web_search=tool_mapping.removed_sylliptor_web_search,
+                    )
+                )
+                if tool_mapping.added_builtin_web_search:
+                    payload["include"] = ["web_search_call.action.sources"]
+            elif tool_choice is not None:
+                payload["tool_choice"] = _tool_choice_for_mapped_tools(
                     tool_choice,
                     removed_sylliptor_web_search=tool_mapping.removed_sylliptor_web_search,
                 )
+            if text_config is not None:
+                payload["text"] = text_config
+            if max_tokens is not None:
+                payload["max_output_tokens"] = int(max_tokens)
+            if stream:
+                payload["stream"] = True
+            if self.provider_auth is not None:
+                payload = self.provider_auth.adapt_responses_payload(payload)
+            if self._reasoning_summary_support_by_model.get(reasoning_summary_support_key) is False:
+                _without_responses_reasoning_summary(payload)
+            return payload
+
+        def _prompt_estimation_payload(payload: dict[str, Any]) -> dict[str, Any]:
+            estimation_payload: dict[str, Any] = {
+                "input": payload.get("input", []),
+            }
+            for key in ("tools", "text", "include"):
+                if key in payload:
+                    estimation_payload[key] = payload[key]
+            return estimation_payload
+
+        payload = _build_payload(sent_input, prior_response_id=previous_response_id)
+        full_estimate_payload = _build_payload(full_input, prior_response_id=None)
+        full_input_estimate_tokens = estimate_provider_payload_tokens(
+            _prompt_estimation_payload(full_estimate_payload)
+        )
+
+        def _request_plan_metadata(current_payload: dict[str, Any]) -> dict[str, Any]:
+            extra: dict[str, Any] = {
+                "full_input_item_count": len(full_input),
+                "sent_input_item_count": len(sent_input),
+                "previous_response_id_used": previous_response_id is not None,
+                # Continuation never resends stable instructions; kept at 0 so the
+                # telemetry schema stays stable for downstream consumers.
+                "resent_stable_instruction_count": 0,
+            }
+            if continuation_anchor_index is not None:
+                extra["continuation_anchor_index"] = continuation_anchor_index
+            metadata = plan.request_plan_metadata(
+                input_mode=input_mode,
+                continuation_strategy=(
+                    "previous_response_id" if previous_response_id else "full_replay"
+                ),
+                provider_payload=_prompt_estimation_payload(full_estimate_payload),
+                sent_provider_payload=_prompt_estimation_payload(current_payload),
+                cache_policy_metadata=cache_policy,
+                extra=extra,
             )
-            if tool_mapping.added_builtin_web_search:
-                payload["include"] = ["web_search_call.action.sources"]
-        elif tool_choice is not None:
-            payload["tool_choice"] = _tool_choice_for_mapped_tools(
-                tool_choice,
-                removed_sylliptor_web_search=tool_mapping.removed_sylliptor_web_search,
+            metadata["request_messages_signature"] = _stable_request_signature(messages)
+            return metadata
+
+        request_plan_metadata = _request_plan_metadata(payload)
+
+        def _token_reconciliation_metadata(
+            current_payload: dict[str, Any],
+        ) -> dict[str, Any]:
+            sent_input_estimate_tokens = estimate_provider_payload_tokens(
+                _prompt_estimation_payload(current_payload)
             )
-        text_config = _responses_text_config(response_format)
-        if text_config is not None:
-            payload["text"] = text_config
-        if max_tokens is not None:
-            payload["max_output_tokens"] = int(max_tokens)
-        if stream:
-            payload["stream"] = True
+            return {
+                "input_estimate_tokens": full_input_estimate_tokens,
+                "sent_input_estimate_tokens": sent_input_estimate_tokens,
+                "estimator": "cl100k_base",
+                "estimate_basis": "provider_prompt_payload",
+                "input_mode": str(request_plan_metadata.get("input_mode") or input_mode),
+            }
+
+        def _request_shape_metadata(current_payload: dict[str, Any]) -> dict[str, Any]:
+            return build_request_shape_report(
+                messages=messages,
+                tools=tools,
+                cache_policy=cache_policy,
+                provider_payload=_prompt_estimation_payload(current_payload),
+                input_mode=str(request_plan_metadata.get("input_mode") or input_mode),
+            )
 
         provider_key = self.provider_key or best_effort_provider_key(
             base_url=self.base_url,
@@ -1354,12 +2080,94 @@ class OpenAIResponsesClient:
             web_search_mode=self.web_search_mode,
             web_search_adapter=self.web_search_adapter,
             native_web_search=tool_mapping.added_builtin_web_search,
+            cache_policy=cache_policy,
+            request_plan=request_plan_metadata,
+            request_shape=_request_shape_metadata(payload),
+            token_reconciliation=_token_reconciliation_metadata(payload),
             operation="responses_chat",
         )
         telemetry_on_text_delta = telemetry.wrap_text_delta(on_text_delta)
+        telemetry_on_reasoning_delta = telemetry.wrap_reasoning_delta(on_reasoning_delta)
+        public_output_emitted = False
+
+        def _tracked_text_delta(delta: str) -> None:
+            nonlocal public_output_emitted
+            if delta:
+                public_output_emitted = True
+            if telemetry_on_text_delta is not None:
+                telemetry_on_text_delta(delta)
+
+        def _tracked_reasoning_delta(delta: str) -> None:
+            nonlocal public_output_emitted
+            if delta:
+                public_output_emitted = True
+            if telemetry_on_reasoning_delta is not None:
+                telemetry_on_reasoning_delta(delta)
+
+        def _finalize_response(response: LLMResponse) -> LLMResponse:
+            raw_reasoning = payload.get("reasoning")
+            if isinstance(raw_reasoning, dict) and raw_reasoning.get("summary") == "auto":
+                self._reasoning_summary_support_by_model[reasoning_summary_support_key] = True
+            if not public_stream:
+                if on_reasoning_delta is not None and telemetry_on_reasoning_delta is not None:
+                    for summary in response.reasoning:
+                        if summary.kind == ReasoningOutputKind.SUMMARY:
+                            telemetry_on_reasoning_delta(summary.text)
+                if (
+                    on_text_delta is not None
+                    and telemetry_on_text_delta is not None
+                    and response.content
+                ):
+                    telemetry_on_text_delta(response.content)
+            telemetry.set_request_plan(request_plan_metadata)
+            telemetry.set_request_shape(_request_shape_metadata(payload))
+            telemetry.set_token_reconciliation(_token_reconciliation_metadata(payload))
+            return _response_with_request_plan_metadata(
+                response,
+                request_plan_metadata,
+            )
 
         def _send_request() -> LLMResponse:
+            nonlocal input_mode, payload, previous_response_id, reasoning
+            nonlocal request_plan_metadata, sent_input
             url = f"{self.base_url}/responses"
+            previous_response_fallback_used = False
+            reasoning_summary_fallback_used = False
+            auth_refresh_used = False
+
+            def _refresh_request_metadata() -> None:
+                nonlocal request_plan_metadata
+                request_plan_metadata = _request_plan_metadata(payload)
+                telemetry.set_request_plan(request_plan_metadata)
+                telemetry.set_request_shape(_request_shape_metadata(payload))
+                telemetry.set_token_reconciliation(_token_reconciliation_metadata(payload))
+
+            def _retry_without_reasoning_summary(err: Exception) -> bool:
+                nonlocal payload, reasoning, reasoning_summary_fallback_used
+                if reasoning_summary_fallback_used:
+                    return False
+                if not _responses_reasoning_summary_unsupported(err):
+                    return False
+                if (
+                    not isinstance(payload.get("reasoning"), dict)
+                    or "summary" not in payload["reasoning"]
+                ):
+                    return False
+                reasoning_summary_fallback_used = True
+                if (
+                    self._reasoning_summary_support_by_model.get(reasoning_summary_support_key)
+                    is not True
+                ):
+                    self._reasoning_summary_support_by_model[reasoning_summary_support_key] = False
+                if isinstance(reasoning, dict):
+                    reasoning = copy.deepcopy(reasoning)
+                    reasoning.pop("summary", None)
+                    reasoning = reasoning or None
+                payload = _build_payload(sent_input, prior_response_id=previous_response_id)
+                _without_responses_reasoning_summary(payload)
+                _refresh_request_metadata()
+                return True
+
             while True:
                 try:
                     with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
@@ -1367,12 +2175,38 @@ class OpenAIResponsesClient:
                             with client.stream(
                                 "POST",
                                 url,
-                                headers=self._headers(),
+                                headers=self._headers(url, force_refresh=auth_refresh_used),
                                 json=payload,
                             ) as response:
                                 if response.status_code >= 400:
                                     response.read()
+                                    if (
+                                        response.status_code == 401
+                                        and self.provider_auth is not None
+                                        and not auth_refresh_used
+                                    ):
+                                        auth_refresh_used = True
+                                        continue
                                     err = self._llm_error_from_response(response)
+                                    if (
+                                        previous_response_id
+                                        and not previous_response_fallback_used
+                                        and _responses_previous_response_rejected(err)
+                                    ):
+                                        previous_response_fallback_used = True
+                                        previous_response_id = None
+                                        sent_input = full_input
+                                        input_mode = (
+                                            "full_retry_after_previous_response_id_rejected"
+                                        )
+                                        payload = _build_payload(
+                                            sent_input,
+                                            prior_response_id=None,
+                                        )
+                                        _refresh_request_metadata()
+                                        continue
+                                    if _retry_without_reasoning_summary(err):
+                                        continue
                                     if (
                                         "temperature" in payload
                                         and _responses_temperature_unsupported(err)
@@ -1381,19 +2215,68 @@ class OpenAIResponsesClient:
                                         _RESPONSES_OMIT_TEMPERATURE_MODELS.add(temp_omit_key)
                                         continue
                                     raise err
-                                return self._parse_stream_response(
-                                    response,
-                                    on_text_delta=telemetry_on_text_delta,
+                                return _finalize_response(
+                                    self._parse_stream_response(
+                                        response,
+                                        on_text_delta=(
+                                            _tracked_text_delta
+                                            if public_stream and on_text_delta is not None
+                                            else None
+                                        ),
+                                        on_reasoning_delta=(
+                                            _tracked_reasoning_delta
+                                            if public_stream and on_reasoning_delta is not None
+                                            else None
+                                        ),
+                                    )
                                 )
-                        response = client.post(url, headers=self._headers(), json=payload)
+                        response = client.post(
+                            url,
+                            headers=self._headers(url, force_refresh=auth_refresh_used),
+                            json=payload,
+                        )
                 except httpx.DecodingError as e:
-                    raise LLMError(f"OpenAI Responses decompression failed: {e}") from e
+                    err = LLMError(
+                        "OpenAI Responses decompression failed: "
+                        f"{sanitize_error_text_for_output(e)}"
+                    )
+                    if stream and public_output_emitted:
+                        mark_provider_call_non_retryable(err)
+                    raise err from e
                 except Exception as e:  # noqa: BLE001
                     if isinstance(e, LLMError):
+                        if stream and public_output_emitted:
+                            mark_provider_call_non_retryable(e)
                         raise
-                    raise LLMError(f"OpenAI Responses request failed: {e}") from e
+                    err = LLMError(
+                        f"OpenAI Responses request failed: {sanitize_error_text_for_output(e)}"
+                    )
+                    if stream and public_output_emitted:
+                        mark_provider_call_non_retryable(err)
+                    raise err from e
                 if response.status_code >= 400:
+                    if (
+                        response.status_code == 401
+                        and self.provider_auth is not None
+                        and not auth_refresh_used
+                    ):
+                        auth_refresh_used = True
+                        continue
                     err = self._llm_error_from_response(response)
+                    if (
+                        previous_response_id
+                        and not previous_response_fallback_used
+                        and _responses_previous_response_rejected(err)
+                    ):
+                        previous_response_fallback_used = True
+                        previous_response_id = None
+                        sent_input = full_input
+                        input_mode = "full_retry_after_previous_response_id_rejected"
+                        payload = _build_payload(sent_input, prior_response_id=None)
+                        _refresh_request_metadata()
+                        continue
+                    if _retry_without_reasoning_summary(err):
+                        continue
                     # The model rejected ``temperature``: drop it (and remember
                     # that for this model) and retry once. Bounded — the second
                     # attempt has no ``temperature`` so it can't loop here.
@@ -1402,20 +2285,28 @@ class OpenAIResponsesClient:
                         _RESPONSES_OMIT_TEMPERATURE_MODELS.add(temp_omit_key)
                         continue
                     raise err
-                return self._parse_chat_response(response)
+                return _finalize_response(self._parse_chat_response(response))
 
-        return telemetry.run(
-            lambda: run_provider_limited_call(
-                call=_send_request,
-                provider_key=provider_key,
-                provider_concurrency_caps=self.provider_concurrency_caps,
-                retry_settings=self.provider_retry_settings,
-                operation="responses_chat",
-                sleep_fn=self._provider_sleep_fn,
-                random_fn=self._provider_random_fn,
-                on_retry=telemetry.on_retry,
-                retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
-            )
+        return stamp_response_for_route(
+            telemetry.run(
+                lambda: run_provider_limited_call(
+                    call=_send_request,
+                    provider_key=provider_key,
+                    provider_concurrency_caps=self.provider_concurrency_caps,
+                    retry_settings=self.provider_retry_settings,
+                    operation="responses_chat",
+                    sleep_fn=self._provider_sleep_fn,
+                    random_fn=self._provider_random_fn,
+                    on_retry=telemetry.on_retry,
+                    retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
+                    retry_wall_clock_cap_seconds=getattr(
+                        self,
+                        "_provider_retry_wall_clock_cap_seconds",
+                        _PROVIDER_RETRY_WALL_CLOCK_CAP_SECONDS,
+                    ),
+                )
+            ),
+            self.route_identity,
         )
 
     @staticmethod
@@ -1423,8 +2314,12 @@ class OpenAIResponsesClient:
         response: httpx.Response,
         *,
         on_text_delta: Callable[[str], None] | None,
+        on_reasoning_delta: Callable[[str], None] | None,
     ) -> LLMResponse:
-        accumulator = _OpenAIResponsesStreamAccumulator(on_text_delta=on_text_delta)
+        accumulator = _OpenAIResponsesStreamAccumulator(
+            on_text_delta=on_text_delta,
+            on_reasoning_delta=on_reasoning_delta,
+        )
         for frame in iter_sse_frames(response.iter_lines()):
             raw_event = parse_sse_json_frame(frame, stream_name="OpenAI Responses stream")
             if not isinstance(raw_event, dict):
@@ -1444,13 +2339,15 @@ class OpenAIResponsesClient:
 
         content = _extract_answer_text(data)
         tool_calls = _parse_response_tool_calls(data)
+        reasoning = _responses_reasoning_outputs(data)
         if not content and not tool_calls:
             refusal = _extract_refusal(data)
             if refusal:
                 raise LLMError(f"OpenAI Responses refusal: {refusal}")
-            status = str(data.get("status") or "").strip()
-            suffix = f" (status={status})" if status else ""
-            raise LLMError(f"OpenAI Responses returned no assistant text or tool calls{suffix}")
+            if not _has_responses_reasoning_output(data):
+                status = str(data.get("status") or "").strip()
+                suffix = f" (status={status})" if status else ""
+                raise LLMError(f"OpenAI Responses returned no assistant text or tool calls{suffix}")
 
         response_model = data.get("model") if isinstance(data.get("model"), str) else None
         return LLMResponse(
@@ -1460,6 +2357,7 @@ class OpenAIResponsesClient:
             response_model=response_model,
             usage=_parse_usage(data.get("usage")),
             provider_metadata=_responses_provider_metadata(data),
+            reasoning=reasoning,
         )
 
     def web_search(
@@ -1472,7 +2370,6 @@ class OpenAIResponsesClient:
         tool_choice: str | dict[str, Any] | None = "required",
     ) -> WebSearchResponse:
         url = f"{self.base_url}/responses"
-        headers = self._headers()
 
         tool_spec: dict[str, Any] = {"type": "web_search"}
         if allowed_domains:
@@ -1489,6 +2386,8 @@ class OpenAIResponsesClient:
             payload["tool_choice"] = tool_choice
         if include_source_details:
             payload["include"] = ["web_search_call.action.sources"]
+        if self.provider_auth is not None:
+            payload = self.provider_auth.adapt_responses_payload(payload)
 
         provider_key = self.provider_key or best_effort_provider_key(
             base_url=self.base_url,
@@ -1496,13 +2395,31 @@ class OpenAIResponsesClient:
         )
 
         def _send_request() -> httpx.Response:
+            auth_refresh_used = False
             try:
-                with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
-                    response = client.post(url, headers=headers, json=payload)
+                while True:
+                    with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
+                        response = client.post(
+                            url,
+                            headers=self._headers(url, force_refresh=auth_refresh_used),
+                            json=payload,
+                        )
+                    if (
+                        response.status_code == 401
+                        and self.provider_auth is not None
+                        and not auth_refresh_used
+                    ):
+                        auth_refresh_used = True
+                        continue
+                    break
             except httpx.DecodingError as e:
-                raise ResponsesError(f"Responses response decompression failed: {e}") from e
+                raise ResponsesError(
+                    f"Responses response decompression failed: {sanitize_error_text_for_output(e)}"
+                ) from e
             except Exception as e:  # noqa: BLE001
-                raise ResponsesError(f"Responses request failed: {e}") from e
+                raise ResponsesError(
+                    f"Responses request failed: {sanitize_error_text_for_output(e)}"
+                ) from e
             if response.status_code >= 400:
                 raise self._error_from_response(response)
             return response

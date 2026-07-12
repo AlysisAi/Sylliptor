@@ -5,6 +5,10 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .branding import env_get
+from .chatgpt_codex_static_provider import (
+    CHATGPT_CODEX_SUBSCRIPTION_CATALOG_SOURCE,
+    resolve_chatgpt_codex_static_model,
+)
 from .config import AppConfig
 from .litellm_static_provider import (
     BUNDLED_MODEL_CATALOG_SOURCE,
@@ -19,28 +23,57 @@ from .model_metadata_utils import (
 )
 
 _INT_FIELDS = ("context_window_tokens", "max_output_tokens")
-_FLOAT_FIELDS = ("input_cost_per_token", "output_cost_per_token")
-_BOOL_FIELDS = ("supports_vision",)
+_FLOAT_FIELDS = (
+    "input_cost_per_token",
+    "output_cost_per_token",
+    "cache_read_input_cost_per_token",
+    "cache_creation_input_cost_per_token",
+    "cache_creation_5m_input_cost_per_token",
+    "cache_creation_1h_input_cost_per_token",
+    "reasoning_output_cost_per_token",
+)
+_BOOL_FIELDS = ("supports_vision", "supports_reasoning")
 _TRACKED_FIELDS = (
     "context_window_tokens",
     "max_output_tokens",
     "supports_vision",
+    "supports_reasoning",
     "input_cost_per_token",
     "output_cost_per_token",
+    "cache_read_input_cost_per_token",
+    "cache_creation_input_cost_per_token",
+    "cache_creation_5m_input_cost_per_token",
+    "cache_creation_1h_input_cost_per_token",
+    "reasoning_output_cost_per_token",
 )
+DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS = 128_000
+DEFAULT_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS = 8_192
+
 _FALLBACKS: dict[str, Any] = {
-    "context_window_tokens": 8192,
-    "max_output_tokens": 2048,
+    "context_window_tokens": DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+    "max_output_tokens": DEFAULT_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS,
     "supports_vision": False,
+    "supports_reasoning": None,
     "input_cost_per_token": None,
     "output_cost_per_token": None,
+    "cache_read_input_cost_per_token": None,
+    "cache_creation_input_cost_per_token": None,
+    "cache_creation_5m_input_cost_per_token": None,
+    "cache_creation_1h_input_cost_per_token": None,
+    "reasoning_output_cost_per_token": None,
 }
 _ENV_FIELD_MAP: dict[str, str] = {
     "context_window_tokens": "SYLLIPTOR_CONTEXT_WINDOW",
     "max_output_tokens": "SYLLIPTOR_MAX_OUTPUT_TOKENS",
     "supports_vision": "SYLLIPTOR_SUPPORTS_VISION",
+    "supports_reasoning": "SYLLIPTOR_SUPPORTS_REASONING",
     "input_cost_per_token": "SYLLIPTOR_INPUT_COST_PER_TOKEN",
     "output_cost_per_token": "SYLLIPTOR_OUTPUT_COST_PER_TOKEN",
+    "cache_read_input_cost_per_token": "SYLLIPTOR_CACHE_READ_INPUT_COST_PER_TOKEN",
+    "cache_creation_input_cost_per_token": "SYLLIPTOR_CACHE_CREATION_INPUT_COST_PER_TOKEN",
+    "cache_creation_5m_input_cost_per_token": ("SYLLIPTOR_CACHE_CREATION_5M_INPUT_COST_PER_TOKEN"),
+    "cache_creation_1h_input_cost_per_token": ("SYLLIPTOR_CACHE_CREATION_1H_INPUT_COST_PER_TOKEN"),
+    "reasoning_output_cost_per_token": "SYLLIPTOR_REASONING_OUTPUT_COST_PER_TOKEN",
 }
 _DEPRECATED_MODEL_CAPABILITIES_WARNING = (
     "Config key `model_capabilities` is deprecated and ignored; use `model_metadata_overrides`."
@@ -80,7 +113,7 @@ _BUILT_IN_MODEL_METADATA: dict[str, dict[str, Any]] = {
     # Hosted Xiaomi MiMo trial models. The proxy serves these ids when allowlisted,
     # and falls back server-side to its canonical MiMo model otherwise.
     "mimo-v2.5-pro": {
-        "context_window_tokens": 1_048_576,
+        "context_window_tokens": 1_000_000,
         "max_output_tokens": 131_072,
         "supports_vision": False,
         "input_cost_per_token": 0.000001,
@@ -94,7 +127,7 @@ _BUILT_IN_MODEL_METADATA: dict[str, dict[str, Any]] = {
         "output_cost_per_token": 0.0000003,
     },
     "mimo-v2.5": {
-        "context_window_tokens": 1_048_576,
+        "context_window_tokens": 1_000_000,
         "max_output_tokens": 131_072,
         "supports_vision": True,
         "input_cost_per_token": 0.0000004,
@@ -103,8 +136,8 @@ _BUILT_IN_MODEL_METADATA: dict[str, dict[str, Any]] = {
     # Legacy friendly id kept for sessions that logged in before model choice.
     # Hosted Xiaomi MiMo trial: the CLI sends the friendly id "mimo" (the proxy
     # pins it to the real upstream id server-side). Without an entry here the id
-    # resolves nowhere and falls back to 8192/2048 — emitting a metadata warning
-    # on every run and silently collapsing the usable context window ~32x.
+    # resolves nowhere and falls back to generic unknown-model metadata, emitting
+    # a metadata note on every run and silently shrinking the usable context.
     # Values mirror the bundled `openrouter/xiaomi/mimo-v2-flash` catalog entry
     # (262144 input / 16384 output); costs use the mimo-v2.5-pro list price.
     "mimo": {
@@ -124,11 +157,18 @@ class ModelMeta:
     max_output_tokens: int
     input_cost_per_token: float | None = None
     output_cost_per_token: float | None = None
+    cache_read_input_cost_per_token: float | None = None
+    cache_creation_input_cost_per_token: float | None = None
+    cache_creation_5m_input_cost_per_token: float | None = None
+    cache_creation_1h_input_cost_per_token: float | None = None
+    reasoning_output_cost_per_token: float | None = None
     raw_metadata: dict[str, Any] = field(default_factory=dict)
     source: str = "fallback"
     supports_vision: bool = False
+    supports_reasoning: bool | None = None
     field_sources: dict[str, str] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    provider_key: str | None = None
 
 
 @dataclass
@@ -249,6 +289,25 @@ class ModelRegistry:
         self.last_warnings: list[str] = []
         self.last_source: str | None = None
 
+    def _provider_route_identity(self) -> tuple[str | None, str]:
+        """Resolve explicit preset route identity without trusting model aliases."""
+
+        try:
+            from .profile_presets import find_preset_for_profile
+            from .profiles import get_active_profile
+
+            profile = get_active_profile(self._cfg)
+            preset = find_preset_for_profile(profile)
+        except Exception:  # noqa: BLE001 - metadata fallback must remain offline-safe
+            return None, str(self._cfg.base_url or "").strip()
+        provider_key = str(preset.provider_key or "").strip() if preset is not None else ""
+        base_url = str(profile.base_url or self._cfg.base_url or "").strip()
+        return provider_key or None, base_url
+
+    def _provider_hint(self) -> str | None:
+        provider_key, _base_url = self._provider_route_identity()
+        return provider_key
+
     def _resolve_env_layer(self) -> _LayerData:
         layer = _LayerData(name="env")
         for field_name, env_name in _ENV_FIELD_MAP.items():
@@ -355,10 +414,22 @@ class ModelRegistry:
 
     def _resolve_bundled_model_catalog_layer(self, requested_model: str) -> _LayerData:
         layer = _LayerData(name=BUNDLED_MODEL_CATALOG_SOURCE)
-        static_meta = resolve_litellm_static_metadata(
-            requested_model,
-            base_url=self._cfg.base_url,
-        )
+        provider_hint, route_base_url = self._provider_route_identity()
+        try:
+            static_meta = resolve_litellm_static_metadata(
+                requested_model,
+                base_url=route_base_url,
+                provider_hint=provider_hint,
+            )
+        except TypeError as exc:
+            # Preserve compatibility with lightweight test/plugin resolvers that
+            # implement the older ``(model, *, base_url)`` extension surface.
+            if "provider_hint" not in str(exc):
+                raise
+            static_meta = resolve_litellm_static_metadata(
+                requested_model,
+                base_url=route_base_url,
+            )
         layer.error = static_meta.error
         layer.raw_metadata = static_meta.raw_metadata
         layer.model_name = static_meta.model_key
@@ -367,14 +438,166 @@ class ModelRegistry:
             "context_window_tokens": static_meta.context_window_tokens,
             "max_output_tokens": static_meta.max_output_tokens,
             "supports_vision": static_meta.supports_vision,
+            "supports_reasoning": parse_bool(static_meta.raw_metadata.get("supports_reasoning")),
             "input_cost_per_token": static_meta.input_cost_per_token,
             "output_cost_per_token": static_meta.output_cost_per_token,
+            "cache_read_input_cost_per_token": static_meta.cache_read_input_cost_per_token,
+            "cache_creation_input_cost_per_token": (
+                static_meta.cache_creation_input_cost_per_token
+            ),
+            "cache_creation_5m_input_cost_per_token": (
+                static_meta.cache_creation_5m_input_cost_per_token
+            ),
+            "cache_creation_1h_input_cost_per_token": (
+                static_meta.cache_creation_1h_input_cost_per_token
+            ),
+            "reasoning_output_cost_per_token": static_meta.reasoning_output_cost_per_token,
         }
         for field_name, value in values.items():
             if value is None:
                 continue
             layer.values[field_name] = value
             layer.field_sources[field_name] = BUNDLED_MODEL_CATALOG_SOURCE
+        return layer
+
+    def _resolve_provider_auth_layer(self, requested_model: str) -> _LayerData:
+        """Project the active account's live model catalog into context metadata."""
+
+        layer = _LayerData(name="provider_auth")
+        try:
+            from .profiles import get_active_profile
+
+            profile = get_active_profile(self._cfg)
+        except Exception:  # noqa: BLE001 - malformed profiles fall through to static metadata
+            return layer
+        provider_id = str(profile.auth_provider or "").strip()
+        if not provider_id:
+            return layer
+        try:
+            from .provider_auth import create_provider_auth
+
+            models = create_provider_auth(provider_id).list_models(refresh=False)
+        except Exception as exc:  # noqa: BLE001 - offline startup must remain possible
+            layer.warnings.append(f"Subscription model metadata unavailable: {exc}")
+            models = ()
+
+        requested_variants = {
+            value.casefold() for value in model_name_variants(requested_model) if value
+        }
+        selected = next(
+            (
+                model
+                for model in models
+                if requested_variants.intersection(
+                    value.casefold() for value in model_name_variants(model.id) if value
+                )
+            ),
+            None,
+        )
+        if selected is None and provider_id != "openai-codex":
+            return layer
+
+        source = f"provider_auth:{provider_id}"
+        static_subscription_model = (
+            resolve_chatgpt_codex_static_model(requested_model)
+            if provider_id == "openai-codex"
+            else None
+        )
+        if selected is not None:
+            layer.model_name = selected.id
+        elif static_subscription_model is not None:
+            layer.model_name = static_subscription_model.id
+            source = f"provider_auth:{provider_id}:{CHATGPT_CODEX_SUBSCRIPTION_CATALOG_SOURCE}"
+            layer.warnings.append(
+                "Using the bundled ChatGPT subscription capacity snapshot because live "
+                "metadata for the selected model is unavailable."
+            )
+        else:
+            layer.model_name = requested_model
+            source = f"provider_auth:{provider_id}:conservative-default"
+            layer.warnings.append(
+                "Using conservative ChatGPT subscription capacity because the selected "
+                "model is absent from both live and bundled subscription metadata."
+            )
+
+        context_window_tokens = (
+            selected.context_window_tokens if selected is not None else None
+        ) or (
+            static_subscription_model.context_window_tokens
+            if static_subscription_model is not None
+            else None
+        )
+        max_output_tokens = (selected.max_output_tokens if selected is not None else None) or (
+            static_subscription_model.max_output_tokens
+            if static_subscription_model is not None
+            else None
+        )
+        input_modalities = (
+            selected.input_modalities
+            if selected is not None
+            else (
+                static_subscription_model.input_modalities
+                if static_subscription_model is not None
+                else ("text",)
+            )
+        )
+        layer.raw_metadata = {
+            "provider_auth": provider_id,
+            "subscription_backed": True,
+            "input_modalities": list(input_modalities),
+        }
+        selected_reasoning_efforts = (
+            selected.reasoning_efforts
+            if selected is not None
+            else (
+                static_subscription_model.reasoning_efforts
+                if static_subscription_model is not None
+                else ()
+            )
+        )
+        selected_default_effort = (
+            selected.default_reasoning_effort
+            if selected is not None
+            else (
+                static_subscription_model.default_reasoning_effort
+                if static_subscription_model is not None
+                else None
+            )
+        )
+        if selected is not None or static_subscription_model is not None:
+            supports_reasoning = bool(selected_reasoning_efforts or selected_default_effort)
+            layer.values["supports_reasoning"] = supports_reasoning
+            layer.field_sources["supports_reasoning"] = source
+            layer.raw_metadata["supports_reasoning"] = supports_reasoning
+        if context_window_tokens is not None:
+            layer.values["context_window_tokens"] = context_window_tokens
+            layer.field_sources["context_window_tokens"] = source
+            layer.raw_metadata["context_window_tokens"] = context_window_tokens
+            # The Codex catalog currently omits a response-output ceiling. Keep
+            # Sylliptor's existing local reserve without adding a wire-level cap.
+            layer.values["max_output_tokens"] = (
+                max_output_tokens or DEFAULT_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS
+            )
+            layer.field_sources["max_output_tokens"] = (
+                source if max_output_tokens is not None else f"{source}:local-default"
+            )
+            layer.raw_metadata["max_output_tokens"] = layer.values["max_output_tokens"]
+        if max_output_tokens is not None and "max_output_tokens" not in layer.values:
+            layer.values["max_output_tokens"] = max_output_tokens
+            layer.field_sources["max_output_tokens"] = source
+            layer.raw_metadata["max_output_tokens"] = max_output_tokens
+        if provider_id == "openai-codex" and "context_window_tokens" not in layer.values:
+            layer.values["context_window_tokens"] = DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS
+            layer.field_sources["context_window_tokens"] = source
+            layer.values["max_output_tokens"] = DEFAULT_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS
+            layer.field_sources["max_output_tokens"] = f"{source}:local-default"
+            layer.raw_metadata["context_window_tokens"] = layer.values["context_window_tokens"]
+            layer.raw_metadata["max_output_tokens"] = layer.values["max_output_tokens"]
+        layer.values["supports_vision"] = "image" in input_modalities
+        layer.field_sources["supports_vision"] = source
+        for field_name in _FLOAT_FIELDS:
+            layer.values[field_name] = 0.0
+            layer.field_sources[field_name] = f"{source}:included"
         return layer
 
     def _resolve_builtin_layer(self, requested_model: str) -> _LayerData:
@@ -409,7 +632,7 @@ class ModelRegistry:
             return value, layer.field_sources.get(field_name, layer.name)
         return _FALLBACKS[field_name], "fallback"
 
-    def get(self, model_name: str) -> ModelMeta:
+    def get(self, model_name: str, *, include_provider_auth: bool = True) -> ModelMeta:
         requested = model_name.strip() or self._cfg.model.strip() or "unknown-model"
         warnings: list[str] = []
         if "model_capabilities" in self._cfg.extra_fields:
@@ -417,10 +640,22 @@ class ModelRegistry:
 
         env_layer = self._resolve_env_layer()
         user_layer = self._resolve_user_layer(requested)
+        provider_auth_layer = (
+            self._resolve_provider_auth_layer(requested)
+            if include_provider_auth
+            else _LayerData(name="provider_auth")
+        )
         bundled_catalog_layer = self._resolve_bundled_model_catalog_layer(requested)
         built_in_layer = self._resolve_builtin_layer(requested)
         learned_layer = self._resolve_learned_layer(requested)
-        layers = [env_layer, user_layer, bundled_catalog_layer, built_in_layer, learned_layer]
+        layers = [
+            env_layer,
+            user_layer,
+            provider_auth_layer,
+            bundled_catalog_layer,
+            built_in_layer,
+            learned_layer,
+        ]
 
         for layer in layers:
             warnings.extend(layer.warnings)
@@ -447,6 +682,11 @@ class ModelRegistry:
         )
         if supports_vision is None:
             supports_vision = _FALLBACKS["supports_vision"]
+        supports_reasoning = (
+            parse_bool(resolved_fields["supports_reasoning"])
+            if resolved_fields["supports_reasoning"] is not None
+            else None
+        )
         input_cost_per_token = (
             parse_non_negative_float(resolved_fields["input_cost_per_token"])
             if resolved_fields["input_cost_per_token"] is not None
@@ -455,6 +695,31 @@ class ModelRegistry:
         output_cost_per_token = (
             parse_non_negative_float(resolved_fields["output_cost_per_token"])
             if resolved_fields["output_cost_per_token"] is not None
+            else None
+        )
+        cache_read_input_cost_per_token = (
+            parse_non_negative_float(resolved_fields["cache_read_input_cost_per_token"])
+            if resolved_fields["cache_read_input_cost_per_token"] is not None
+            else None
+        )
+        cache_creation_input_cost_per_token = (
+            parse_non_negative_float(resolved_fields["cache_creation_input_cost_per_token"])
+            if resolved_fields["cache_creation_input_cost_per_token"] is not None
+            else None
+        )
+        cache_creation_5m_input_cost_per_token = (
+            parse_non_negative_float(resolved_fields["cache_creation_5m_input_cost_per_token"])
+            if resolved_fields["cache_creation_5m_input_cost_per_token"] is not None
+            else None
+        )
+        cache_creation_1h_input_cost_per_token = (
+            parse_non_negative_float(resolved_fields["cache_creation_1h_input_cost_per_token"])
+            if resolved_fields["cache_creation_1h_input_cost_per_token"] is not None
+            else None
+        )
+        reasoning_output_cost_per_token = (
+            parse_non_negative_float(resolved_fields["reasoning_output_cost_per_token"])
+            if resolved_fields["reasoning_output_cost_per_token"] is not None
             else None
         )
 
@@ -490,17 +755,26 @@ class ModelRegistry:
         self.last_warnings = list(final_warnings)
         self.last_source = overall_source
 
+        raw_metadata = dict(bundled_catalog_layer.raw_metadata)
+        raw_metadata.update(provider_auth_layer.raw_metadata)
         return ModelMeta(
             model_name=resolved_model_name,
             context_window_tokens=context_window_tokens,
             max_output_tokens=max_output_tokens,
             input_cost_per_token=input_cost_per_token,
             output_cost_per_token=output_cost_per_token,
-            raw_metadata=bundled_catalog_layer.raw_metadata,
+            cache_read_input_cost_per_token=cache_read_input_cost_per_token,
+            cache_creation_input_cost_per_token=cache_creation_input_cost_per_token,
+            cache_creation_5m_input_cost_per_token=cache_creation_5m_input_cost_per_token,
+            cache_creation_1h_input_cost_per_token=cache_creation_1h_input_cost_per_token,
+            reasoning_output_cost_per_token=reasoning_output_cost_per_token,
+            raw_metadata=raw_metadata,
             source=overall_source,
             supports_vision=bool(supports_vision),
+            supports_reasoning=supports_reasoning,
             field_sources=field_sources,
             warnings=final_warnings,
+            provider_key=self._provider_hint(),
         )
 
 
@@ -512,7 +786,18 @@ def resolve_model_provider_key(
     profile_name: str | None = None,
 ) -> str | None:
     requested_model = str(model_name or "").strip()
-    url_provider = _provider_key_from_base_url(base_url or getattr(cfg, "base_url", None))
+    resolved_base_url = base_url or getattr(cfg, "base_url", None)
+    try:
+        from .profile_presets import find_preset_for_base_url
+
+        preset = find_preset_for_base_url(str(resolved_base_url or ""))
+    except Exception:  # noqa: BLE001 - provider inference remains best effort
+        preset = None
+    preset_provider = str(preset.provider_key or "").strip() if preset is not None else ""
+    if preset_provider:
+        return preset_provider
+
+    url_provider = _provider_key_from_base_url(resolved_base_url)
     if url_provider == "openrouter":
         return url_provider
 

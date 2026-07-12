@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -43,7 +44,10 @@ from sylliptor_agent_cli.review_gate import ReviewOutcome
 from sylliptor_agent_cli.run_lock import write_run_mutation_lock_metadata
 from sylliptor_agent_cli.runtime_kind import RuntimeKind
 from sylliptor_agent_cli.swarm_backend import PreparedTaskWorkspace
-from sylliptor_agent_cli.swarm_orchestrator import run_swarm
+from sylliptor_agent_cli.swarm_orchestrator import (
+    _worker_result_nonexecuting_verification_reason,
+    run_swarm,
+)
 from sylliptor_agent_cli.swarm_trace import SwarmWorkerTraceSurface, build_swarm_trace_event
 from sylliptor_agent_cli.swarm_worker import TaskWorkerResult, run_task_worker
 from sylliptor_agent_cli.verify_gate import VerifyCommandResult, VerifyRunResult
@@ -191,6 +195,34 @@ def _ok_worker_result(
         result_kind=result_kind,
         noop_reason=noop_reason,
     )
+
+
+def test_swarm_nonexecuting_verification_reason_uses_shared_benign_predicate(
+    tmp_path: Path,
+) -> None:
+    result = _ok_worker_result(
+        run_dir=tmp_path,
+        task_id="T01",
+        branch="feat/t01",
+        verify_summary="verification skipped: nothing to verify (1/1)",
+        verify_payload={
+            "commands": ["go test ./..."],
+            "all_passed": True,
+            "command_results": [
+                {
+                    "command": "go test ./...",
+                    "effective_command": "go test ./...",
+                    "exit_code": 0,
+                    "status": "skipped",
+                    "ok": True,
+                    "real_execution": False,
+                    "non_execution_reason": "go_test_no_test_files",
+                }
+            ],
+        },
+    )
+
+    assert _worker_result_nonexecuting_verification_reason(result) is None
 
 
 def _persist_worker_capture_artifact(
@@ -692,6 +724,7 @@ def _integration_result(
                 output=summary,
                 stdout="" if not passed else "ok\n",
                 stderr="" if passed else "failed\n",
+                real_execution=True,
             )
         ],
         artifact_path=verify_path,
@@ -2756,7 +2789,7 @@ def test_swarm_accepts_verified_noop_without_review_or_merge(
     assert calls["delete"] == 1
 
     final_plan = load_plan(paths)
-    assert final_plan["tasks"][0]["status"] == "done"
+    assert final_plan["tasks"][0]["status"] == "already_satisfied"
     assert "merge_commit_hash" not in final_plan["tasks"][0]
 
     worker_result = _load_json(paths.execution_dir / "worker_results" / f"{task['id']}.json")
@@ -2772,8 +2805,191 @@ def test_swarm_accepts_verified_noop_without_review_or_merge(
     assert merge_result["backend_name"] == "git_worktree"
 
     summary = (paths.execution_dir / "swarm_summary.md").read_text(encoding="utf-8")
-    assert "already-satisfied verified no-op" in summary
+    assert "already-satisfied no-op" in summary
     assert "no merge required" in summary
+
+
+def test_swarm_suppresses_scope_irrelevant_generic_preset_for_static_noop_worker(
+    tmp_path: Path,
+) -> None:
+    # A generic preset like ``pytest -q`` is only trusted once a real test surface is
+    # confirmed. For a task scoped to static files (index.html/style.css) in a repo
+    # with no discoverable Python test surface, the worker receives no verify command
+    # and the run records the first-class, non-failing
+    # ``task_refinement.no_authoritative_commands`` selection instead of forcing an
+    # empty pytest run. The worker's resolved contract (cfg.verify_commands) reflects
+    # that suppression.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo_with_head(repo)
+    paths = create_plan_run(repo)
+    plan = load_plan(paths)
+    task = add_task(
+        plan,
+        title="Create static site files",
+        estimated_files=["index.html", "style.css"],
+        branch="feat/t01-static",
+    )
+    task["write_scope"] = ["index.html", "style.css"]
+    save_plan(paths, plan)
+    captured: dict[str, object] = {}
+
+    def worker_runner(**kwargs):  # type: ignore[no-untyped-def]
+        captured["verify_commands"] = list(kwargs["verify_commands"])
+        captured["cfg_verify_commands"] = list(kwargs["cfg"].verify_commands)
+        selection = kwargs["verify_command_selection"]
+        captured["verify_command_selection_source"] = (
+            selection.source if selection is not None else None
+        )
+        t = kwargs["task"]
+        return _ok_worker_result(
+            run_dir=paths.run_dir,
+            task_id=str(t["id"]),
+            branch=str(t["branch"]),
+            commit_hash=None,
+            changed_files=[],
+            result_kind="success_noop",
+            noop_reason="already_satisfied",
+            verify_payload={
+                "commands": list(kwargs["verify_commands"]),
+                "all_passed": True,
+                "command_results": [],
+            },
+            verify_command_source=str(captured["verify_command_selection_source"] or ""),
+        )
+
+    code = run_swarm(
+        paths=paths,
+        plan=plan,
+        cfg=AppConfig(model="test-model", verify_commands=["pytest -q"]),
+        mode="auto",
+        yes=False,
+        max_steps=10,
+        api_key_override="k",
+        no_log=True,
+        parallel=1,
+        base_branch=None,
+        max_tasks=None,
+        max_attempts=None,
+        dry_run=False,
+        keep_worktrees=False,
+        retry_failed=False,
+        retry_changes_requested=False,
+        only=None,
+        retry_merge_conflicts=False,
+        console=_null_console(),
+        scope_mode="warn",
+        verify_mode="warn",
+        integration_mode="off",
+        review=False,
+        worker_runner=worker_runner,
+        merge_runner=lambda *_a, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("accepted no-op should not merge")
+        ),
+        ensure_worktree_fn=lambda **_kwargs: None,
+        remove_worktree_fn=lambda **_kwargs: None,
+        delete_branch_fn=lambda *_a, **_kwargs: None,
+        branch_exists_fn=lambda *_a, **_kwargs: True,
+        current_branch_fn=lambda _root: "main",
+    )
+
+    assert code == 0
+    assert captured["verify_commands"] == []
+    assert captured["cfg_verify_commands"] == []
+    assert (
+        captured["verify_command_selection_source"] == "task_refinement.no_authoritative_commands"
+    )
+    final_plan = load_plan(paths)
+    assert final_plan["tasks"][0]["status"] == "already_satisfied"
+
+
+def test_swarm_passes_authoritative_config_verify_commands_to_worker(
+    tmp_path: Path,
+) -> None:
+    # An authoritative, bespoke verify command (``config.verify_commands``) is never
+    # refined away by task/repo heuristics: it reaches the worker verbatim even for a
+    # scope-irrelevant static task. This guards the plumbing that hands configured
+    # verify commands through to the worker.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo_with_head(repo)
+    paths = create_plan_run(repo)
+    plan = load_plan(paths)
+    task = add_task(
+        plan,
+        title="Create static site files",
+        estimated_files=["index.html", "style.css"],
+        branch="feat/t01-static",
+    )
+    task["write_scope"] = ["index.html", "style.css"]
+    save_plan(paths, plan)
+    captured: dict[str, object] = {}
+
+    def worker_runner(**kwargs):  # type: ignore[no-untyped-def]
+        captured["verify_commands"] = list(kwargs["verify_commands"])
+        captured["cfg_verify_commands"] = list(kwargs["cfg"].verify_commands)
+        selection = kwargs["verify_command_selection"]
+        captured["verify_command_selection_source"] = (
+            selection.source if selection is not None else None
+        )
+        t = kwargs["task"]
+        return _ok_worker_result(
+            run_dir=paths.run_dir,
+            task_id=str(t["id"]),
+            branch=str(t["branch"]),
+            commit_hash=None,
+            changed_files=[],
+            result_kind="success_noop",
+            noop_reason="already_satisfied",
+            verify_payload={
+                "commands": list(kwargs["verify_commands"]),
+                "all_passed": True,
+                "command_results": [],
+            },
+            verify_command_source=str(captured["verify_command_selection_source"] or ""),
+        )
+
+    code = run_swarm(
+        paths=paths,
+        plan=plan,
+        cfg=AppConfig(model="test-model", verify_commands=["make verify"]),
+        mode="auto",
+        yes=False,
+        max_steps=10,
+        api_key_override="k",
+        no_log=True,
+        parallel=1,
+        base_branch=None,
+        max_tasks=None,
+        max_attempts=None,
+        dry_run=False,
+        keep_worktrees=False,
+        retry_failed=False,
+        retry_changes_requested=False,
+        only=None,
+        retry_merge_conflicts=False,
+        console=_null_console(),
+        scope_mode="warn",
+        verify_mode="warn",
+        integration_mode="off",
+        review=False,
+        worker_runner=worker_runner,
+        merge_runner=lambda *_a, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("accepted no-op should not merge")
+        ),
+        ensure_worktree_fn=lambda **_kwargs: None,
+        remove_worktree_fn=lambda **_kwargs: None,
+        delete_branch_fn=lambda *_a, **_kwargs: None,
+        branch_exists_fn=lambda *_a, **_kwargs: True,
+        current_branch_fn=lambda _root: "main",
+    )
+
+    assert code == 0
+    assert captured["verify_commands"] == ["make verify"]
+    assert captured["cfg_verify_commands"] == ["make verify"]
+    assert captured["verify_command_selection_source"] == "config.verify_commands"
+    final_plan = load_plan(paths)
+    assert final_plan["tasks"][0]["status"] == "already_satisfied"
 
 
 def test_swarm_rejects_salvaged_agent_exception_worker_result(
@@ -5342,7 +5558,7 @@ def test_swarm_verify_strict_failure_marks_verify_failed_and_skips_merge(tmp_pat
     assert statuses[task["id"]] == "verify_failed"
 
 
-def test_swarm_warn_mode_merges_successful_worker_when_verification_did_not_execute_tests(
+def test_swarm_warn_mode_treats_pytest_no_tests_collected_as_clean_verification(
     tmp_path: Path,
 ) -> None:
     repo = tmp_path / "repo"
@@ -5355,21 +5571,24 @@ def test_swarm_warn_mode_merges_successful_worker_when_verification_did_not_exec
     merges: list[str] = []
 
     def fake_worker_runner(**kwargs):  # type: ignore[no-untyped-def]
+        assert kwargs["verify_commands"] == ["pytest -q"]
         t = kwargs["task"]
         return _ok_worker_result(
             run_dir=paths.run_dir,
             task_id=str(t["id"]),
             branch=str(t["branch"]),
             changed_files=["src/a.py"],
-            verify_summary="verification failed (0/1); failed: pytest -q",
+            verify_summary="verification skipped: nothing to verify (1/1)",
             verify_payload={
                 "commands": ["pytest -q"],
-                "all_passed": False,
+                "all_passed": True,
                 "command_results": [
                     {
                         "command": "pytest -q",
                         "effective_command": "pytest -q",
                         "exit_code": 5,
+                        "status": "skipped",
+                        "ok": True,
                         "real_execution": False,
                         "non_execution_reason": "pytest_no_tests_collected",
                     }
@@ -5420,10 +5639,10 @@ def test_swarm_warn_mode_merges_successful_worker_when_verification_did_not_exec
     statuses = {entry["id"]: entry["status"] for entry in final_plan["tasks"]}
     assert statuses[task["id"]] == "done"
     summary = (paths.execution_dir / "swarm_summary.md").read_text(encoding="utf-8")
-    assert "verification did not execute tests: pytest_no_tests_collected" in summary
-    assert "- Run Status: `completed_with_verification_warnings`" in summary
-    assert "- Clean: `no`" in summary
-    assert "- Verification Status: `failed_tolerated_by_warn_policy`" in summary
+    assert "verification did not execute tests: pytest_no_tests_collected" not in summary
+    assert "- Run Status: `clean`" in summary
+    assert "- Clean: `yes`" in summary
+    assert "- Verification Status: `not_run`" in summary
 
 
 def test_swarm_blocks_merge_that_would_overwrite_untracked_workspace_file(
@@ -6848,7 +7067,7 @@ def test_swarm_accepts_green_pre_merge_candidate_via_real_integration_gate_git_b
             verify_summary="verification disabled (--verify off)",
         )
 
-    integration_command = f"{sys.executable} -m pytest -q -s test_calc.py"
+    integration_command = f"{shlex.quote(sys.executable)} -m pytest -q -s test_calc.py"
     code = run_swarm(
         paths=paths,
         plan=plan,
@@ -6942,7 +7161,7 @@ def test_swarm_accepts_green_pre_merge_candidate_via_real_integration_gate_snaps
             verify_summary="verification disabled (--verify off)",
         )
 
-    integration_command = f"{sys.executable} -m pytest -q -s test_calc.py"
+    integration_command = f"{shlex.quote(sys.executable)} -m pytest -q -s test_calc.py"
     code = run_swarm(
         paths=paths,
         plan=plan,

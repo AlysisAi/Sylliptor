@@ -72,9 +72,10 @@ Sylliptor talks to model providers through configured API profiles. The default
 transport is chat completions, with provider-specific request normalization
 where needed.
 
-Model choice, base URL, API key source, timeout, reasoning options, and role
-overrides are resolved before a session starts. Provider credentials are never
-embedded in project files by Sylliptor.
+Model choice, base URL, credential source, timeout, reasoning options, and role
+overrides are resolved before a session starts. API-key and supported
+subscription profiles use the same agent, tool, policy, and TUI layers.
+Provider credentials are never embedded in project files by Sylliptor.
 
 ### Built-In Tools
 
@@ -192,6 +193,7 @@ and the rules that apply to them.
 ## Where To Go Next
 
 - [Quickstart](quickstart.md): install and run the first session.
+- [Providers and models](providers.md): configure model access.
 - [Reference](reference.md): detailed runtime behavior and configuration.
 - [Security model](security_model.md): trust boundaries and sandboxing.
 - [Shell sandbox](shell_sandbox.md): Docker and Bubblewrap setup.

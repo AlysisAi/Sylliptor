@@ -2,25 +2,61 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from ..error_text import sanitize_error_text_for_output
 from ..provider_telemetry import ProviderCallTelemetryRecorder
+from ..request_estimation import estimate_provider_payload_tokens
 from ..web_search_adapters import ANTHROPIC_MESSAGES_ADAPTER, AUTO_WEB_SEARCH_ADAPTER
-from .metadata import ANTHROPIC_MESSAGES_PROVIDER_METADATA_KEY, PROVIDER_METADATA_KEY
+from .cache_capabilities import CACHE_CONTROL_FIELD
+from .cache_control_blocks import (
+    count_cache_control_blocks,
+    count_explicit_cache_control_blocks,
+    explicit_cache_control_payloads,
+    strip_cache_control_blocks,
+)
+from .cache_policy import merge_cache_policy_metadata
+from .metadata import (
+    ANTHROPIC_MESSAGES_PROVIDER_METADATA_KEY,
+    PROVIDER_METADATA_KEY,
+    ProviderRouteIdentity,
+    build_provider_route_identity,
+    canonicalize_extra_headers,
+    credential_scope_fingerprint,
+    gate_messages_for_provider_route,
+    merge_canonical_headers,
+    stamp_response_for_route,
+)
 from .provider_limits import (
     DEFAULT_PROVIDER_CONCURRENCY_CAPS,
     ProviderRetrySettings,
     best_effort_provider_key,
+    mark_provider_call_non_retryable,
     run_provider_limited_call,
 )
+from .request_plan import LLMRequestPlan, RequestCachePlan
+from .request_shape import build_request_shape_report
 from .streaming import SSEFrame, iter_sse_frames, parse_sse_json_frame
-from .types import LLMError, LLMResponse, LLMUsage, ToolCall
+from .temperature_compat import documented_temperature_omit_reason
+from .types import (
+    InputTokenCount,
+    LLMError,
+    LLMResponse,
+    LLMUsage,
+    ReasoningOutput,
+    ReasoningOutputKind,
+    ToolCall,
+    UsageConfidence,
+    UsageContract,
+)
 
 _DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
+ANTHROPIC_MESSAGES_ROUTE_REVISION = _DEFAULT_ANTHROPIC_VERSION
 _DEFAULT_ACCEPT_ENCODING = "identity"
 _ANTHROPIC_METADATA_KEY = ANTHROPIC_MESSAGES_PROVIDER_METADATA_KEY
 _SYLLIPTOR_WEB_SEARCH_FUNCTION_NAME = "web_search"
@@ -32,13 +68,267 @@ _ANTHROPIC_WEB_SEARCH_TOOL_TYPES = frozenset(
     }
 )
 _WEB_SEARCH_MODES_ALLOWING_ANTHROPIC_BUILTIN = frozenset({"auto", "native"})
+_ANTHROPIC_CACHE_CONTROL_TTLS = frozenset({"5m", "1h"})
+_ANTHROPIC_MAX_CACHE_CONTROL_BREAKPOINTS = 4
+_ANTHROPIC_MIN_MANUAL_THINKING_BUDGET = 1024
+_ANTHROPIC_MANUAL_THINKING_BUDGETS = {
+    "minimal": 1024,
+    "low": 1024,
+    "medium": 4096,
+    "high": 8192,
+    "xhigh": 16384,
+    "max": 32768,
+}
+_ANTHROPIC_API_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_CLAUDE_MODEL_VERSION_RE = re.compile(
+    r"(?:^|[/.:_-])claude[-_.](?P<family>opus|sonnet|haiku|fable|mythos)"
+    r"[-_.](?P<major>\d+)(?:[-_.](?P<minor>\d+))?"
+)
+
+
+@dataclass(frozen=True)
+class _ClaudeModelVersion:
+    family: str
+    major: int
+    minor: int | None
+
+
+@dataclass(frozen=True)
+class _AnthropicThinkingPlan:
+    config: dict[str, Any] | None
+    output_effort: str | None
+    active: bool
+
+
+def _claude_model_version(model: str) -> _ClaudeModelVersion | None:
+    normalized = str(model or "").strip().casefold()
+    match = _CLAUDE_MODEL_VERSION_RE.search(normalized)
+    if match is None:
+        return None
+    minor_text = match.group("minor")
+    minor = int(minor_text) if minor_text is not None else None
+    # Dated snapshots such as claude-opus-4-20250514 are Claude 4.0, not
+    # version 4.20-million. Keep the same distinction as temperature_compat.
+    if minor is not None and minor >= 100:
+        minor = None
+    return _ClaudeModelVersion(
+        family=match.group("family"),
+        major=int(match.group("major")),
+        minor=minor,
+    )
+
+
+def _uses_adaptive_thinking(model: str) -> bool:
+    normalized = str(model or "").strip().casefold()
+    if "claude-mythos-preview" in normalized:
+        return True
+    version = _claude_model_version(model)
+    if version is None:
+        return False
+    if version.family in {"fable", "mythos"}:
+        return version.major >= 5
+    if version.family not in {"opus", "sonnet"}:
+        return False
+    return version.major >= 5 or (
+        version.major == 4 and version.minor is not None and version.minor >= 6
+    )
+
+
+def _supports_disabled_thinking(model: str) -> bool:
+    normalized = str(model or "").strip().casefold()
+    if "claude-mythos-preview" in normalized:
+        return False
+    version = _claude_model_version(model)
+    if version is None:
+        return True
+    return not (version.family in {"fable", "mythos"} and version.major >= 5)
+
+
+def _thinking_enabled_by_default(model: str) -> bool:
+    """Models whose documented default already includes adaptive thinking."""
+
+    normalized = str(model or "").strip().casefold()
+    if "claude-mythos-preview" in normalized:
+        return True
+    version = _claude_model_version(model)
+    if version is None or version.major < 5:
+        return False
+    return version.family in {"fable", "mythos", "sonnet"}
+
+
+def _supports_output_effort(model: str) -> bool:
+    normalized = str(model or "").strip().casefold()
+    if "claude-mythos-preview" in normalized:
+        return True
+    version = _claude_model_version(model)
+    if version is None:
+        return False
+    if version.family in {"fable", "mythos"}:
+        return version.major >= 5
+    if version.family == "opus":
+        return version.major >= 5 or (
+            version.major == 4 and version.minor is not None and version.minor >= 5
+        )
+    if version.family == "sonnet":
+        return version.major >= 5 or (
+            version.major == 4 and version.minor is not None and version.minor >= 6
+        )
+    return False
+
+
+def _supports_xhigh_effort(model: str) -> bool:
+    version = _claude_model_version(model)
+    if version is None:
+        return False
+    if version.family in {"fable", "mythos"}:
+        return version.major >= 5
+    if version.family == "opus":
+        return version.major >= 5 or (
+            version.major == 4 and version.minor is not None and version.minor >= 7
+        )
+    return version.family == "sonnet" and version.major >= 5
+
+
+def _supports_max_effort(model: str) -> bool:
+    normalized = str(model or "").strip().casefold()
+    return "claude-mythos-preview" in normalized or _uses_adaptive_thinking(model)
+
+
+def _manual_thinking_budget(*, effort: str | None, max_tokens: int) -> int:
+    if max_tokens <= _ANTHROPIC_MIN_MANUAL_THINKING_BUDGET:
+        raise LLMError("Anthropic manual thinking requires max_tokens greater than 1024")
+    requested = _ANTHROPIC_MANUAL_THINKING_BUDGETS.get(effort or "high", 8192)
+    # Preserve useful answer headroom where possible while satisfying the API's
+    # strict budget_tokens < max_tokens constraint for smaller output limits.
+    reserve = 1024 if max_tokens >= 2048 else 1
+    return max(
+        _ANTHROPIC_MIN_MANUAL_THINKING_BUDGET,
+        min(requested, max_tokens - reserve),
+    )
+
+
+def _anthropic_thinking_plan(
+    *,
+    model: str,
+    enable_thinking: bool | None,
+    reasoning_effort: str | None,
+    max_tokens: int,
+    request_summary: bool,
+) -> _AnthropicThinkingPlan:
+    effort = str(reasoning_effort or "").strip().casefold() or None
+    if effort == "ultra":
+        raise LLMError(
+            "Anthropic Messages does not support reasoning_effort='ultra'; use xhigh or max"
+        )
+    if effort not in {None, "none", *_ANTHROPIC_MANUAL_THINKING_BUDGETS}:
+        raise LLMError(f"Anthropic Messages reasoning_effort is not supported: {effort}")
+
+    if enable_thinking is False or effort == "none":
+        if not _supports_disabled_thinking(model):
+            raise LLMError(f"Anthropic model {model!r} does not support disabling thinking")
+        return _AnthropicThinkingPlan(
+            config={"type": "disabled"},
+            output_effort=None,
+            active=False,
+        )
+
+    explicitly_active = enable_thinking is True or effort is not None
+    if not explicitly_active:
+        # Auto/default is intentionally provider-owned. Trace visibility must
+        # never switch model reasoning on by itself. For models that already
+        # think by default, requesting ``display=summarized`` changes visibility
+        # only; the provider still owns effort and whether a simple turn thinks.
+        default_active = _thinking_enabled_by_default(model)
+        return _AnthropicThinkingPlan(
+            config=(
+                {"type": "adaptive", "display": "summarized"}
+                if default_active and request_summary
+                else None
+            ),
+            output_effort=None,
+            active=default_active,
+        )
+
+    version = _claude_model_version(model)
+    if version is None and "claude-mythos-preview" not in str(model).casefold():
+        raise LLMError(
+            f"Anthropic Messages cannot safely select a thinking mode for model {model!r}"
+        )
+    if version is not None and version.major < 4:
+        raise LLMError(f"Anthropic model {model!r} does not support extended thinking")
+
+    display = "summarized" if request_summary else "omitted"
+    if _uses_adaptive_thinking(model):
+        config: dict[str, Any] = {"type": "adaptive", "display": display}
+    else:
+        config = {
+            "type": "enabled",
+            "budget_tokens": _manual_thinking_budget(
+                effort=effort,
+                max_tokens=max_tokens,
+            ),
+            "display": display,
+        }
+
+    output_effort: str | None = None
+    if effort is not None and _supports_output_effort(model):
+        if effort not in _ANTHROPIC_API_EFFORTS:
+            raise LLMError(f"Anthropic Messages reasoning_effort is not supported: {effort}")
+        if effort == "xhigh" and not _supports_xhigh_effort(model):
+            raise LLMError(f"Anthropic model {model!r} does not support xhigh effort")
+        if effort == "max" and not _supports_max_effort(model):
+            raise LLMError(f"Anthropic model {model!r} does not support max effort")
+        output_effort = effort
+    return _AnthropicThinkingPlan(
+        config=config,
+        output_effort=output_effort,
+        active=True,
+    )
 
 
 def _headers_with_default_accept_encoding(headers: dict[str, str]) -> dict[str, str]:
     request_headers = dict(headers)
     if not any(key.lower() == "accept-encoding" for key in request_headers):
-        request_headers["Accept-Encoding"] = _DEFAULT_ACCEPT_ENCODING
+        request_headers["accept-encoding"] = _DEFAULT_ACCEPT_ENCODING
     return request_headers
+
+
+def _non_negative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _normalize_prompt_cache_control_ttl(value: str | None) -> str:
+    normalized = str(value or "").strip().lower() or "5m"
+    return normalized if normalized in _ANTHROPIC_CACHE_CONTROL_TTLS else "5m"
+
+
+def _response_with_cache_policy_metadata(
+    response: LLMResponse,
+    cache_policy: dict[str, Any] | None,
+    request_plan_metadata: dict[str, Any] | None = None,
+) -> LLMResponse:
+    if not cache_policy and not request_plan_metadata:
+        return response
+    provider_metadata = copy.deepcopy(response.provider_metadata) or {}
+    anthropic_metadata = provider_metadata.setdefault(_ANTHROPIC_METADATA_KEY, {})
+    if isinstance(anthropic_metadata, dict):
+        if cache_policy:
+            anthropic_metadata["cache_policy"] = copy.deepcopy(cache_policy)
+        if request_plan_metadata:
+            anthropic_metadata["request_plan"] = copy.deepcopy(request_plan_metadata)
+    return LLMResponse(
+        content=response.content,
+        tool_calls=response.tool_calls,
+        raw=response.raw,
+        response_model=response.response_model,
+        usage=response.usage,
+        provider_metadata=provider_metadata,
+        reasoning=response.reasoning,
+    )
 
 
 def _content_to_text(raw: Any) -> str:
@@ -98,7 +388,11 @@ def _anthropic_blocks_from_content(raw: Any, *, role: str) -> list[dict[str, Any
         block_type = str(item.get("type") or "").strip()
         text = item.get("text") or item.get("content")
         if block_type in {"text", "input_text", "output_text"} and isinstance(text, str):
-            blocks.append({"type": "text", "text": text})
+            block = {"type": "text", "text": text}
+            cache_control = item.get(CACHE_CONTROL_FIELD)
+            if isinstance(cache_control, dict):
+                block[CACHE_CONTROL_FIELD] = copy.deepcopy(cache_control)
+            blocks.append(block)
             continue
         if role == "user" and block_type == "image_url":
             image_url = item.get("image_url")
@@ -342,17 +636,35 @@ def _is_tool_result_user_message(message: dict[str, Any]) -> bool:
 
 def _anthropic_messages_from_messages(
     messages: list[dict[str, Any]],
-) -> tuple[str | None, list[dict[str, Any]]]:
+) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
     system_parts: list[str] = []
+    system_blocks: list[dict[str, Any]] = []
     anthropic_messages: list[dict[str, Any]] = []
+
+    def _flush_system_parts() -> None:
+        if not system_parts:
+            return
+        text = "\n\n".join(system_parts).strip()
+        system_parts.clear()
+        if text:
+            system_blocks.append({"type": "text", "text": text})
+
     for message in messages:
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "").strip()
         if role in {"system", "developer"}:
-            text = _content_to_text(message.get("content")).strip()
+            content = message.get("content")
+            if isinstance(content, list) and count_cache_control_blocks(content) > 0:
+                _flush_system_parts()
+                system_blocks.extend(_anthropic_blocks_from_content(content, role="system"))
+                continue
+            text = _content_to_text(content).strip()
             if text:
-                system_parts.append(text)
+                if system_blocks:
+                    system_blocks.append({"type": "text", "text": text})
+                else:
+                    system_parts.append(text)
             continue
         if role == "user":
             blocks = _anthropic_blocks_from_content(message.get("content"), role="user")
@@ -393,8 +705,238 @@ def _anthropic_messages_from_messages(
                 )
             continue
         raise LLMError(f"Anthropic Messages cannot send message role {role!r}")
-    system = "\n\n".join(system_parts).strip() or None
+    if system_blocks:
+        _flush_system_parts()
+        system: str | list[dict[str, Any]] | None = system_blocks
+    else:
+        system = "\n\n".join(system_parts).strip() or None
     return system, anthropic_messages
+
+
+def _anthropic_system_with_cache_control(
+    system: str | list[dict[str, Any]] | None,
+    *,
+    cache_control: Mapping[str, Any] | None,
+) -> tuple[str | list[dict[str, Any]] | None, bool]:
+    if not system or not isinstance(cache_control, Mapping):
+        return system, False
+    if count_cache_control_blocks(system) > 0:
+        return system, True
+    cache_control_payload = copy.deepcopy(dict(cache_control))
+    if isinstance(system, str):
+        text = system.strip()
+        if not text:
+            return system, False
+        return (
+            [
+                {
+                    "type": "text",
+                    "text": system,
+                    CACHE_CONTROL_FIELD: cache_control_payload,
+                }
+            ],
+            True,
+        )
+    copied: list[dict[str, Any]] = [copy.deepcopy(block) for block in system]
+    for index in range(len(copied) - 1, -1, -1):
+        block = copied[index]
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "text").strip().lower()
+        text = block.get("text")
+        if block_type != "text" or not isinstance(text, str) or not text.strip():
+            continue
+        block[CACHE_CONTROL_FIELD] = cache_control_payload
+        return copied, True
+    return system, False
+
+
+def _cache_control_ttl(cache_control: Mapping[str, Any] | None) -> str:
+    if not isinstance(cache_control, Mapping):
+        return "5m"
+    return _normalize_prompt_cache_control_ttl(str(cache_control.get("ttl") or "5m"))
+
+
+def _append_policy_list_value(
+    cache_policy: dict[str, Any] | None,
+    key: str,
+    value: str,
+) -> None:
+    if cache_policy is None:
+        return
+    normalized = str(value or "").strip()
+    if not normalized:
+        return
+    existing = cache_policy.get(key)
+    values = [str(item).strip() for item in existing] if isinstance(existing, list) else []
+    if normalized not in values:
+        values.append(normalized)
+    cache_policy[key] = values
+
+
+def _apply_anthropic_cache_control_plan(
+    *,
+    payload: dict[str, Any],
+    cache_control: Mapping[str, Any] | None,
+    cache_policy: dict[str, Any] | None,
+) -> None:
+    if not isinstance(cache_control, Mapping):
+        return
+
+    explicit_payloads = explicit_cache_control_payloads(payload)
+    explicit_block_count = count_explicit_cache_control_blocks(payload)
+    requested_ttl = _cache_control_ttl(cache_control)
+    ttl_conflict = (
+        bool(explicit_payloads) and _cache_control_ttl(explicit_payloads[-1]) != requested_ttl
+    )
+    top_level_allowed = (
+        not ttl_conflict and explicit_block_count < _ANTHROPIC_MAX_CACHE_CONTROL_BREAKPOINTS
+    )
+    explicit_slot_limit = _ANTHROPIC_MAX_CACHE_CONTROL_BREAKPOINTS - (1 if top_level_allowed else 0)
+
+    system = payload.get("system")
+    if system and not ttl_conflict:
+        system_has_cache_control = count_cache_control_blocks(system) > 0
+        if not system_has_cache_control and explicit_block_count < explicit_slot_limit:
+            updated_system, added_system_cache_control = _anthropic_system_with_cache_control(
+                system,
+                cache_control=cache_control,
+            )
+            if added_system_cache_control:
+                payload["system"] = updated_system
+                explicit_block_count = count_explicit_cache_control_blocks(payload)
+        elif system_has_cache_control:
+            explicit_block_count = count_explicit_cache_control_blocks(payload)
+
+    if top_level_allowed:
+        payload[CACHE_CONTROL_FIELD] = copy.deepcopy(dict(cache_control))
+    else:
+        _append_policy_list_value(
+            cache_policy,
+            "warnings",
+            (
+                "anthropic_top_level_cache_control_skipped_ttl_conflict"
+                if ttl_conflict
+                else "anthropic_top_level_cache_control_skipped_breakpoint_limit"
+            ),
+        )
+
+    explicit_block_count = count_explicit_cache_control_blocks(payload)
+    if cache_policy is not None:
+        cache_policy["used"] = bool(top_level_allowed or explicit_block_count > 0)
+        cache_policy["top_level_cache_control_used"] = bool(top_level_allowed)
+        cache_policy["explicit_block_used"] = explicit_block_count > 0
+        cache_policy["explicit_block_count"] = explicit_block_count
+        if not top_level_allowed and explicit_block_count <= 0:
+            cache_policy["fallback"] = "cache_control_not_applied"
+            _append_policy_list_value(cache_policy, "disabled_fields", CACHE_CONTROL_FIELD)
+
+
+def _payload_has_cache_control(payload: Mapping[str, Any]) -> bool:
+    return count_cache_control_blocks(payload) > 0
+
+
+def _cache_control_rejection_reason(response: httpx.Response) -> str | None:
+    if response.status_code != 400:
+        return None
+    try:
+        body = response.text
+    except Exception:
+        body = ""
+    lowered = body.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "cache_control",
+            "cache control",
+            "prompt cache",
+            "cache breakpoint",
+            "ephemeral",
+            "ttl",
+        )
+    ):
+        return "anthropic_cache_control_rejected"
+    return None
+
+
+def _temperature_rejection_reason(response: httpx.Response) -> str | None:
+    if response.status_code not in {400, 422}:
+        return None
+    try:
+        body = response.text
+    except Exception:
+        body = ""
+    if "temperature" in body.casefold():
+        return "provider_rejected_temperature"
+    return None
+
+
+def _thinking_display_rejection_reason(response: httpx.Response) -> str | None:
+    """Return a fallback reason only for explicit summary-display incompatibility."""
+
+    if response.status_code not in {400, 422}:
+        return None
+    try:
+        body = response.text
+    except Exception:
+        body = ""
+    lowered = body.casefold()
+    if not any(marker in lowered for marker in ("display", "summarized")):
+        return None
+    if not any(
+        marker in lowered
+        for marker in (
+            "unsupported",
+            "not supported",
+            "does not support",
+            "unknown",
+            "unrecognized",
+            "invalid",
+            "not allowed",
+            "not permitted",
+            "unexpected",
+            "extra input",
+            "extra field",
+        )
+    ):
+        return None
+    return "provider_rejected_thinking_display"
+
+
+def _payload_requests_summarized_thinking(payload: Mapping[str, Any]) -> bool:
+    thinking = payload.get("thinking")
+    return isinstance(thinking, Mapping) and thinking.get("display") == "summarized"
+
+
+def _without_thinking_display(payload: Mapping[str, Any]) -> dict[str, Any]:
+    downgraded = copy.deepcopy(dict(payload))
+    thinking = downgraded.get("thinking")
+    if isinstance(thinking, dict):
+        thinking.pop("display", None)
+    return downgraded
+
+
+def _downgrade_anthropic_cache_control_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    downgraded = copy.deepcopy(dict(payload))
+    strip_cache_control_blocks(downgraded)
+    return downgraded
+
+
+def _mark_anthropic_cache_control_downgrade(
+    cache_policy: dict[str, Any] | None,
+    *,
+    reason: str,
+) -> None:
+    if cache_policy is None:
+        return
+    cache_policy["status"] = "fallback"
+    cache_policy["used"] = False
+    cache_policy["fallback"] = reason
+    cache_policy["top_level_cache_control_used"] = False
+    cache_policy["explicit_block_used"] = False
+    cache_policy["explicit_block_count"] = 0
+    _append_policy_list_value(cache_policy, "disabled_fields", CACHE_CONTROL_FIELD)
+    _append_policy_list_value(cache_policy, "warnings", reason)
 
 
 def _parse_usage(raw: Any) -> LLMUsage | None:
@@ -412,15 +954,50 @@ def _parse_usage(raw: Any) -> LLMUsage | None:
 
     input_tokens = _as_non_negative_int(raw.get("input_tokens"))
     output_tokens = _as_non_negative_int(raw.get("output_tokens"))
+    cache_read_input_tokens = _as_non_negative_int(raw.get("cache_read_input_tokens"))
+    cache_creation = raw.get("cache_creation")
+    cache_creation_5m_input_tokens: int | None = None
+    cache_creation_1h_input_tokens: int | None = None
+    if isinstance(cache_creation, dict):
+        cache_creation_5m_input_tokens = _as_non_negative_int(
+            cache_creation.get("ephemeral_5m_input_tokens")
+        )
+        cache_creation_1h_input_tokens = _as_non_negative_int(
+            cache_creation.get("ephemeral_1h_input_tokens")
+        )
+    cache_creation_input_tokens = _as_non_negative_int(raw.get("cache_creation_input_tokens"))
+    if cache_creation_input_tokens is None:
+        creation_parts = [
+            value
+            for value in (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens)
+            if value is not None
+        ]
+        if creation_parts:
+            cache_creation_input_tokens = sum(creation_parts)
+
+    has_cache_accounting = any(
+        value is not None for value in (cache_read_input_tokens, cache_creation_input_tokens)
+    )
+    prompt_tokens = input_tokens
+    if has_cache_accounting:
+        prompt_tokens = sum(
+            value or 0
+            for value in (input_tokens, cache_read_input_tokens, cache_creation_input_tokens)
+        )
     total_tokens = None
-    if input_tokens is not None and output_tokens is not None:
-        total_tokens = input_tokens + output_tokens
-    cached_tokens = _as_non_negative_int(raw.get("cache_read_input_tokens"))
+    if prompt_tokens is not None and output_tokens is not None:
+        total_tokens = prompt_tokens + output_tokens
     return LLMUsage(
-        prompt_tokens=input_tokens,
+        prompt_tokens=prompt_tokens,
         completion_tokens=output_tokens,
         total_tokens=total_tokens,
-        cached_prompt_tokens=cached_tokens,
+        cached_prompt_tokens=cache_read_input_tokens,
+        input_tokens_uncached=input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_creation_5m_input_tokens=cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens=cache_creation_1h_input_tokens,
+        raw_provider_usage=copy.deepcopy(raw),
     )
 
 
@@ -446,6 +1023,19 @@ def _text_from_content_blocks(content: list[Any]) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "".join(parts)
+
+
+def _thinking_summaries_from_content_blocks(content: list[Any]) -> list[str]:
+    summaries: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or str(block.get("type") or "") != "thinking":
+            continue
+        thinking = block.get("thinking")
+        if isinstance(thinking, str) and thinking:
+            # This field is only requested with display="summarized". Never
+            # surface signatures, redacted_thinking blocks, or opaque state.
+            summaries.append(thinking)
+    return summaries
 
 
 def _parse_tool_calls(content: list[Any]) -> list[ToolCall]:
@@ -606,8 +1196,16 @@ def _event_index(data: dict[str, Any], *, event_type: str) -> int:
 
 
 class _AnthropicStreamAccumulator:
-    def __init__(self, *, on_text_delta: Callable[[str], None] | None) -> None:
+    def __init__(
+        self,
+        *,
+        on_text_delta: Callable[[str], None] | None,
+        on_reasoning_delta: Callable[[str], None] | None,
+        reasoning_is_summary: bool,
+    ) -> None:
         self.on_text_delta = on_text_delta
+        self.on_reasoning_delta = on_reasoning_delta
+        self.reasoning_is_summary = reasoning_is_summary
         self.message: dict[str, Any] = {
             "type": "message",
             "role": "assistant",
@@ -710,6 +1308,8 @@ class _AnthropicStreamAccumulator:
             if isinstance(thinking, str) and thinking:
                 existing = block.get("thinking")
                 block["thinking"] = (existing if isinstance(existing, str) else "") + thinking
+                if self.reasoning_is_summary and self.on_reasoning_delta is not None:
+                    self.on_reasoning_delta(thinking)
             return
 
         if delta_type == "signature_delta":
@@ -817,6 +1417,12 @@ class _AnthropicStreamAccumulator:
 
 
 class AnthropicMessagesClient:
+    usage_contract = UsageContract(
+        response_usage_confidence=UsageConfidence.AUTHORITATIVE,
+        input_token_count_strategy="anthropic_messages",
+    )
+    usage_counts_authoritative = usage_contract.response_usage_authoritative
+    supports_tool_calling = True
     supports_forced_tool_choice = True
 
     def __init__(
@@ -836,11 +1442,16 @@ class AnthropicMessagesClient:
         provider_key: str | None = None,
         web_search_mode: str = "off",
         web_search_adapter: str = AUTO_WEB_SEARCH_ADAPTER,
+        prompt_cache_control_enabled: bool = False,
+        prompt_cache_control_ttl: str = "5m",
+        prompt_cache_policy_metadata: Mapping[str, Any] | None = None,
         provider_concurrency_caps: dict[str, int] | None = None,
         provider_retry_settings: ProviderRetrySettings | None = None,
         provider_sleep_fn: Callable[[float], None] | None = None,
         provider_random_fn: Callable[[], float] | None = None,
         default_max_tokens: int = 4096,
+        usage_contract: UsageContract | None = None,
+        route_identity: ProviderRouteIdentity | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -852,16 +1463,30 @@ class AnthropicMessagesClient:
         self.enable_thinking = enable_thinking
         self.reasoning_effort = str(reasoning_effort or "").strip().lower() or None
         self._transport = transport
-        self.extra_headers = {
-            str(key): str(value)
-            for key, value in (extra_headers or {}).items()
-            if str(key).strip() and str(value).strip()
-        }
+        self.extra_headers = canonicalize_extra_headers(extra_headers)
         self.provider_key = str(provider_key or "").strip() or None
+        self.route_identity = route_identity or build_provider_route_identity(
+            protocol="anthropic_messages",
+            base_url=self.base_url,
+            provider_key=self.provider_key,
+            model=self.model,
+            credential_scope=credential_scope_fingerprint(self.api_key),
+            routing_headers=self.extra_headers,
+            protocol_revision=ANTHROPIC_MESSAGES_ROUTE_REVISION,
+        )
         self.web_search_mode = str(web_search_mode or "off").strip().lower()
         self.web_search_adapter = (
             str(web_search_adapter or AUTO_WEB_SEARCH_ADAPTER).strip().lower()
             or AUTO_WEB_SEARCH_ADAPTER
+        )
+        self.prompt_cache_control_enabled = bool(prompt_cache_control_enabled)
+        self.prompt_cache_control_ttl = _normalize_prompt_cache_control_ttl(
+            prompt_cache_control_ttl
+        )
+        self.prompt_cache_policy_metadata = (
+            copy.deepcopy(dict(prompt_cache_policy_metadata))
+            if isinstance(prompt_cache_policy_metadata, Mapping)
+            else None
         )
         self.provider_concurrency_caps = dict(
             DEFAULT_PROVIDER_CONCURRENCY_CAPS
@@ -872,15 +1497,22 @@ class AnthropicMessagesClient:
         self._provider_sleep_fn = provider_sleep_fn
         self._provider_random_fn = provider_random_fn
         self.default_max_tokens = int(default_max_tokens)
+        self.usage_contract = usage_contract or type(self).usage_contract
+        self.usage_counts_authoritative = self.usage_contract.response_usage_authoritative
+        self._input_token_count_available: bool | None = None
+        self._temperature_omit_after_rejection = False
+        self._thinking_display_supported: bool | None = None
 
     def _headers(self) -> dict[str, str]:
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": _DEFAULT_ANTHROPIC_VERSION,
-            "Content-Type": "application/json",
-            "User-Agent": "sylliptor-agent-cli/0.1.0",
-        }
-        headers.update(self.extra_headers)
+        headers = merge_canonical_headers(
+            {
+                "x-api-key": self.api_key,
+                "anthropic-version": _DEFAULT_ANTHROPIC_VERSION,
+                "Content-Type": "application/json",
+                "User-Agent": "sylliptor-agent-cli/0.1.0",
+            },
+            self.extra_headers,
+        )
         return _headers_with_default_accept_encoding(headers)
 
     @staticmethod
@@ -891,11 +1523,114 @@ class AnthropicMessagesClient:
             body = response.text
             if len(body) > 1000:
                 body = body[:1000] + "...(truncated)"
-            return LLMError(f"LLM error {response.status_code}: {body}")
+            return LLMError(
+                sanitize_error_text_for_output(f"LLM error {response.status_code}: {body}")
+            )
         error_message = _extract_error_message(data)
         if error_message:
-            return LLMError(f"LLM error {response.status_code}: {error_message}")
-        return LLMError(f"LLM error {response.status_code}: {data!r}")
+            return LLMError(
+                sanitize_error_text_for_output(f"LLM error {response.status_code}: {error_message}")
+            )
+        return LLMError(
+            sanitize_error_text_for_output(f"LLM error {response.status_code}: {data!r}")
+        )
+
+    def count_input_tokens(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
+    ) -> InputTokenCount | None:
+        if self._input_token_count_available is False:
+            return None
+        messages = gate_messages_for_provider_route(messages, self.route_identity)
+        system, anthropic_messages = _anthropic_messages_from_messages(messages)
+        tool_mapping = _anthropic_tools(
+            tools,
+            mode=self.web_search_mode,
+            adapter=self.web_search_adapter,
+        )
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": anthropic_messages,
+        }
+        thinking_plan = _anthropic_thinking_plan(
+            model=self.model,
+            enable_thinking=self.enable_thinking,
+            reasoning_effort=self.reasoning_effort,
+            max_tokens=self.default_max_tokens,
+            request_summary=False,
+        )
+        if thinking_plan.config is not None:
+            payload["thinking"] = copy.deepcopy(thinking_plan.config)
+            if self._thinking_display_supported is False:
+                payload = _without_thinking_display(payload)
+        if system:
+            payload["system"] = system
+        if tool_mapping.tools:
+            payload["tools"] = tool_mapping.tools
+            mapped_tool_choice = _anthropic_tool_choice(
+                tool_choice,
+                removed_sylliptor_web_search=tool_mapping.removed_sylliptor_web_search,
+                added_builtin_web_search=tool_mapping.added_builtin_web_search,
+            )
+            if mapped_tool_choice is not None:
+                if not (thinking_plan.active and mapped_tool_choice.get("type") in {"any", "tool"}):
+                    payload["tool_choice"] = mapped_tool_choice
+        count_cache_plan = RequestCachePlan(
+            strategy=("anthropic_cache_control" if self.prompt_cache_control_enabled else "none"),
+            mode="automatic" if self.prompt_cache_control_enabled else "manual",
+            anthropic_cache_control_enabled=self.prompt_cache_control_enabled,
+            anthropic_cache_control_ttl=self.prompt_cache_control_ttl,
+        )
+        _apply_anthropic_cache_control_plan(
+            payload=payload,
+            cache_control=count_cache_plan.anthropic_cache_control_payload(),
+            cache_policy=merge_cache_policy_metadata(
+                self.prompt_cache_policy_metadata,
+                count_cache_plan.anthropic_cache_policy_metadata(),
+            ),
+        )
+        url = f"{self.base_url}/messages/count_tokens"
+
+        def _send_request() -> InputTokenCount | None:
+            try:
+                with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
+                    response = client.post(url, headers=self._headers(), json=payload)
+            except httpx.HTTPError as exc:
+                raise LLMError(
+                    "Anthropic input token count request failed: "
+                    f"{sanitize_error_text_for_output(exc)}"
+                ) from exc
+            if response.status_code in {404, 405, 501}:
+                self._input_token_count_available = False
+                return None
+            if response.status_code >= 400:
+                raise self._llm_error_from_response(response)
+            try:
+                data = response.json()
+            except Exception as exc:  # noqa: BLE001
+                raise LLMError("Anthropic input token count returned non-JSON response") from exc
+            count = _non_negative_int(data.get("input_tokens") if isinstance(data, dict) else None)
+            if count is None:
+                raise LLMError("Anthropic input token count response omitted input_tokens")
+            self._input_token_count_available = True
+            return InputTokenCount(
+                input_tokens=count,
+                raw_provider_usage=copy.deepcopy(data),
+            )
+
+        return run_provider_limited_call(
+            call=_send_request,
+            provider_key=self.provider_key,
+            provider_concurrency_caps=self.provider_concurrency_caps,
+            retry_settings=self.provider_retry_settings,
+            operation="anthropic_messages_count_input_tokens",
+            sleep_fn=self._provider_sleep_fn,
+            random_fn=self._provider_random_fn,
+            retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
+        )
 
     def chat(
         self,
@@ -909,14 +1644,41 @@ class AnthropicMessagesClient:
         on_reasoning_delta: Callable[[str], None] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        request_plan: LLMRequestPlan | None = None,
     ) -> LLMResponse:
-        _ = on_reasoning_delta
+        default_cache = RequestCachePlan(
+            strategy="anthropic_cache_control" if self.prompt_cache_control_enabled else "none",
+            mode="automatic" if self.prompt_cache_control_enabled else "manual",
+            anthropic_cache_control_enabled=self.prompt_cache_control_enabled,
+            anthropic_cache_control_ttl=self.prompt_cache_control_ttl,
+        )
+        plan = request_plan or LLMRequestPlan.from_chat_args(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            stream=stream,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            cache=default_cache,
+        )
+        if (
+            request_plan is not None
+            and plan.cache.mode != "off"
+            and plan.cache.strategy == "none"
+            and not plan.cache.anthropic_cache_control_enabled
+            and self.prompt_cache_control_enabled
+        ):
+            plan = plan.with_cache(default_cache)
+        messages = gate_messages_for_provider_route(plan.message_list(), self.route_identity)
+        tools = plan.tool_list()
+        tool_choice = plan.tool_choice
+        response_format = plan.response_format
+        stream = plan.stream
+        temperature = plan.temperature
+        max_tokens = plan.max_tokens
         if response_format is not None:
             raise LLMError("Anthropic Messages does not support response_format")
-        if self.reasoning_effort:
-            raise LLMError("Anthropic Messages does not support reasoning_effort")
-        if self.enable_thinking:
-            raise LLMError("Anthropic Messages does not support enable_thinking yet")
 
         system, anthropic_messages = _anthropic_messages_from_messages(messages)
         tool_mapping = _anthropic_tools(
@@ -924,16 +1686,46 @@ class AnthropicMessagesClient:
             mode=self.web_search_mode,
             adapter=self.web_search_adapter,
         )
+        effective_max_tokens = (
+            int(max_tokens) if max_tokens is not None else self.default_max_tokens
+        )
+        thinking_plan = _anthropic_thinking_plan(
+            model=self.model,
+            enable_thinking=self.enable_thinking,
+            reasoning_effort=self.reasoning_effort,
+            max_tokens=effective_max_tokens,
+            request_summary=(
+                on_reasoning_delta is not None and self._thinking_display_supported is not False
+            ),
+        )
+        temperature_omit_reason = documented_temperature_omit_reason(self.model)
+        if thinking_plan.active:
+            temperature_omit_reason = "anthropic_extended_thinking_temperature_unsupported"
+        if self._temperature_omit_after_rejection and temperature_omit_reason is None:
+            temperature_omit_reason = "provider_rejected_parameter"
         payload: dict[str, Any] = {
             "model": self.model,
-            "max_tokens": int(max_tokens) if max_tokens is not None else self.default_max_tokens,
+            "max_tokens": effective_max_tokens,
             "messages": anthropic_messages,
-            "temperature": self.temperature if temperature is None else float(temperature),
         }
+        if thinking_plan.config is not None:
+            payload["thinking"] = copy.deepcopy(thinking_plan.config)
+            if self._thinking_display_supported is False:
+                payload = _without_thinking_display(payload)
+        if thinking_plan.output_effort is not None:
+            payload["output_config"] = {"effort": thinking_plan.output_effort}
+        if temperature_omit_reason is None:
+            payload["temperature"] = self.temperature if temperature is None else float(temperature)
+        cache_control = plan.cache.anthropic_cache_control_payload()
+        cache_policy = merge_cache_policy_metadata(
+            self.prompt_cache_policy_metadata,
+            plan.cache.anthropic_cache_policy_metadata(),
+        )
         if stream:
             payload["stream"] = True
         if system:
             payload["system"] = system
+        forced_tool_choice_omitted = False
         if tool_mapping.tools:
             payload["tools"] = tool_mapping.tools
             mapped_tool_choice = _anthropic_tool_choice(
@@ -942,9 +1734,94 @@ class AnthropicMessagesClient:
                 added_builtin_web_search=tool_mapping.added_builtin_web_search,
             )
             if mapped_tool_choice is not None:
-                payload["tool_choice"] = mapped_tool_choice
+                if thinking_plan.active and mapped_tool_choice.get("type") in {"any", "tool"}:
+                    # Anthropic rejects forced tool use while extended thinking
+                    # is active. Leaving the choice unset preserves automatic
+                    # tool selection without failing the entire turn.
+                    forced_tool_choice_omitted = True
+                else:
+                    payload["tool_choice"] = mapped_tool_choice
         elif tool_choice is not None:
             raise LLMError("Anthropic Messages tool_choice requires at least one available tool")
+
+        _apply_anthropic_cache_control_plan(
+            payload=payload,
+            cache_control=cache_control,
+            cache_policy=cache_policy,
+        )
+
+        def _prompt_estimation_payload(current_payload: Mapping[str, Any]) -> dict[str, Any]:
+            estimation_payload = {
+                "messages": current_payload.get("messages", []),
+            }
+            for key in ("system", "tools", "cache_control"):
+                if key in current_payload:
+                    estimation_payload[key] = current_payload[key]
+            return estimation_payload
+
+        def _request_shape_metadata(
+            current_payload: Mapping[str, Any],
+            *,
+            input_mode: str = "full",
+        ) -> dict[str, Any]:
+            return build_request_shape_report(
+                messages=messages,
+                tools=tools,
+                cache_policy=cache_policy,
+                provider_payload=_prompt_estimation_payload(current_payload),
+                input_mode=input_mode,
+            )
+
+        def _token_reconciliation_metadata(
+            current_payload: Mapping[str, Any],
+            *,
+            input_mode: str = "full",
+        ) -> dict[str, Any]:
+            input_estimate_tokens = estimate_provider_payload_tokens(
+                _prompt_estimation_payload(current_payload)
+            )
+            return {
+                "input_estimate_tokens": input_estimate_tokens,
+                "sent_input_estimate_tokens": input_estimate_tokens,
+                "estimator": "cl100k_base",
+                "estimate_basis": "provider_prompt_payload",
+                "input_mode": input_mode,
+            }
+
+        request_shape = _request_shape_metadata(payload)
+        token_reconciliation = _token_reconciliation_metadata(payload)
+        request_plan_extra: dict[str, Any] = {}
+        if temperature_omit_reason is not None:
+            request_plan_extra.update(
+                {
+                    "temperature_omitted": True,
+                    "temperature_omit_reason": temperature_omit_reason,
+                }
+            )
+        payload_thinking = payload.get("thinking")
+        if isinstance(payload_thinking, Mapping):
+            request_plan_extra.update(
+                {
+                    "thinking_mode": payload_thinking.get("type"),
+                    "thinking_display": payload_thinking.get("display"),
+                    "reasoning_summary_requested": _payload_requests_summarized_thinking(payload),
+                }
+            )
+        if forced_tool_choice_omitted:
+            request_plan_extra.update(
+                {
+                    "tool_choice_omitted": True,
+                    "tool_choice_omit_reason": "anthropic_extended_thinking_forced_tool_unsupported",
+                }
+            )
+        request_plan_metadata = plan.request_plan_metadata(
+            input_mode="full",
+            continuation_strategy="full_replay",
+            provider_payload=_prompt_estimation_payload(payload),
+            sent_provider_payload=_prompt_estimation_payload(payload),
+            cache_policy_metadata=cache_policy,
+            extra=request_plan_extra or None,
+        )
 
         provider_key = self.provider_key or best_effort_provider_key(
             base_url=self.base_url,
@@ -960,50 +1837,357 @@ class AnthropicMessagesClient:
             web_search_mode=self.web_search_mode,
             web_search_adapter=self.web_search_adapter,
             native_web_search=tool_mapping.added_builtin_web_search,
+            cache_policy=cache_policy,
+            request_plan=request_plan_metadata,
+            request_shape=request_shape,
+            token_reconciliation=token_reconciliation,
             operation="anthropic_messages_chat",
         )
         telemetry_on_text_delta = telemetry.wrap_text_delta(on_text_delta)
+        telemetry_on_reasoning_delta = telemetry.wrap_reasoning_delta(on_reasoning_delta)
+        public_output_emitted = False
+
+        def _tracked_text_delta(delta: str) -> None:
+            nonlocal public_output_emitted
+            if delta:
+                public_output_emitted = True
+            if telemetry_on_text_delta is not None:
+                telemetry_on_text_delta(delta)
+
+        def _tracked_reasoning_delta(delta: str) -> None:
+            nonlocal public_output_emitted
+            if delta:
+                public_output_emitted = True
+            if telemetry_on_reasoning_delta is not None:
+                telemetry_on_reasoning_delta(delta)
+
+        def _activate_reasoning_summary_fallback(
+            current_payload: Mapping[str, Any],
+            *,
+            reason: str,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            downgraded_payload = _without_thinking_display(current_payload)
+            fallback_plan = plan.request_plan_metadata(
+                input_mode="reasoning_summary_fallback",
+                continuation_strategy="full_replay",
+                provider_payload=_prompt_estimation_payload(downgraded_payload),
+                sent_provider_payload=_prompt_estimation_payload(downgraded_payload),
+                cache_policy_metadata=cache_policy,
+                extra={
+                    "fallback_used": True,
+                    "thinking_display_omitted": True,
+                    "reasoning_summary_requested": False,
+                    "reasoning_summary_fallback_reason": reason,
+                },
+            )
+            telemetry.set_request_plan(fallback_plan)
+            telemetry.set_request_shape(
+                _request_shape_metadata(
+                    downgraded_payload,
+                    input_mode="reasoning_summary_fallback",
+                )
+            )
+            telemetry.set_token_reconciliation(
+                _token_reconciliation_metadata(
+                    downgraded_payload,
+                    input_mode="reasoning_summary_fallback",
+                )
+            )
+            return downgraded_payload, fallback_plan
 
         def _send_request() -> LLMResponse:
             url = f"{self.base_url}/messages"
             try:
                 with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
-                    if stream:
-                        with client.stream(
-                            "POST",
+                    request_payload = payload
+                    active_request_plan_metadata = request_plan_metadata
+                    if self._thinking_display_supported is False and (
+                        _payload_requests_summarized_thinking(request_payload)
+                    ):
+                        request_payload, active_request_plan_metadata = (
+                            _activate_reasoning_summary_fallback(
+                                request_payload,
+                                reason="cached_provider_rejection",
+                            )
+                        )
+                    cache_control_retry_used = False
+                    temperature_retry_used = False
+                    thinking_display_retry_used = False
+                    while True:
+                        if stream:
+                            with client.stream(
+                                "POST",
+                                url,
+                                headers=self._headers(),
+                                json=request_payload,
+                            ) as response:
+                                if response.status_code >= 400:
+                                    response.read()
+                                    thinking_display_rejection = (
+                                        _thinking_display_rejection_reason(response)
+                                        if not thinking_display_retry_used
+                                        and _payload_requests_summarized_thinking(request_payload)
+                                        else None
+                                    )
+                                    if thinking_display_rejection is not None:
+                                        thinking_display_retry_used = True
+                                        self._thinking_display_supported = False
+                                        request_payload, active_request_plan_metadata = (
+                                            _activate_reasoning_summary_fallback(
+                                                request_payload,
+                                                reason=thinking_display_rejection,
+                                            )
+                                        )
+                                        continue
+                                    temperature_rejection = (
+                                        _temperature_rejection_reason(response)
+                                        if not temperature_retry_used
+                                        and "temperature" in request_payload
+                                        else None
+                                    )
+                                    if temperature_rejection is not None:
+                                        temperature_retry_used = True
+                                        self._temperature_omit_after_rejection = True
+                                        request_payload = copy.deepcopy(dict(request_payload))
+                                        request_payload.pop("temperature", None)
+                                        active_request_plan_metadata = plan.request_plan_metadata(
+                                            input_mode="temperature_fallback",
+                                            continuation_strategy="full_replay",
+                                            provider_payload=_prompt_estimation_payload(
+                                                request_payload
+                                            ),
+                                            sent_provider_payload=_prompt_estimation_payload(
+                                                request_payload
+                                            ),
+                                            cache_policy_metadata=cache_policy,
+                                            extra={
+                                                "fallback_used": True,
+                                                "temperature_omitted": True,
+                                                "temperature_omit_reason": (temperature_rejection),
+                                            },
+                                        )
+                                        telemetry.set_request_plan(active_request_plan_metadata)
+                                        telemetry.set_request_shape(
+                                            _request_shape_metadata(
+                                                request_payload,
+                                                input_mode="temperature_fallback",
+                                            )
+                                        )
+                                        telemetry.set_token_reconciliation(
+                                            _token_reconciliation_metadata(
+                                                request_payload,
+                                                input_mode="temperature_fallback",
+                                            )
+                                        )
+                                        continue
+                                    downgrade_reason = (
+                                        _cache_control_rejection_reason(response)
+                                        if not cache_control_retry_used
+                                        and _payload_has_cache_control(request_payload)
+                                        else None
+                                    )
+                                    if downgrade_reason is not None:
+                                        cache_control_retry_used = True
+                                        request_payload = (
+                                            _downgrade_anthropic_cache_control_payload(
+                                                request_payload
+                                            )
+                                        )
+                                        _mark_anthropic_cache_control_downgrade(
+                                            cache_policy,
+                                            reason=downgrade_reason,
+                                        )
+                                        telemetry.set_cache_policy(cache_policy)
+                                        active_request_plan_metadata = plan.request_plan_metadata(
+                                            input_mode="cache_control_fallback",
+                                            continuation_strategy="full_replay",
+                                            provider_payload=_prompt_estimation_payload(
+                                                request_payload
+                                            ),
+                                            sent_provider_payload=_prompt_estimation_payload(
+                                                request_payload
+                                            ),
+                                            cache_policy_metadata=cache_policy,
+                                            extra={"fallback_used": True},
+                                        )
+                                        telemetry.set_request_plan(active_request_plan_metadata)
+                                        telemetry.set_request_shape(
+                                            _request_shape_metadata(
+                                                request_payload,
+                                                input_mode="cache_control_fallback",
+                                            )
+                                        )
+                                        telemetry.set_token_reconciliation(
+                                            _token_reconciliation_metadata(
+                                                request_payload,
+                                                input_mode="cache_control_fallback",
+                                            )
+                                        )
+                                        continue
+                                    raise self._llm_error_from_response(response)
+                                return _response_with_cache_policy_metadata(
+                                    self._parse_stream_response(
+                                        response,
+                                        on_text_delta=(
+                                            _tracked_text_delta
+                                            if telemetry_on_text_delta is not None
+                                            else None
+                                        ),
+                                        on_reasoning_delta=(
+                                            _tracked_reasoning_delta
+                                            if telemetry_on_reasoning_delta is not None
+                                            else None
+                                        ),
+                                        reasoning_is_summary=(
+                                            _payload_requests_summarized_thinking(request_payload)
+                                        ),
+                                    ),
+                                    cache_policy,
+                                    active_request_plan_metadata,
+                                )
+                        response = client.post(
                             url,
                             headers=self._headers(),
-                            json=payload,
-                        ) as response:
-                            if response.status_code >= 400:
-                                raise self._llm_error_from_response(response)
-                            return self._parse_stream_response(
-                                response,
-                                on_text_delta=telemetry_on_text_delta,
+                            json=request_payload,
+                        )
+                        if response.status_code < 400:
+                            break
+                        thinking_display_rejection = (
+                            _thinking_display_rejection_reason(response)
+                            if not thinking_display_retry_used
+                            and _payload_requests_summarized_thinking(request_payload)
+                            else None
+                        )
+                        if thinking_display_rejection is not None:
+                            thinking_display_retry_used = True
+                            self._thinking_display_supported = False
+                            request_payload, active_request_plan_metadata = (
+                                _activate_reasoning_summary_fallback(
+                                    request_payload,
+                                    reason=thinking_display_rejection,
+                                )
                             )
-                    response = client.post(url, headers=self._headers(), json=payload)
+                            continue
+                        temperature_rejection = (
+                            _temperature_rejection_reason(response)
+                            if not temperature_retry_used and "temperature" in request_payload
+                            else None
+                        )
+                        if temperature_rejection is not None:
+                            temperature_retry_used = True
+                            self._temperature_omit_after_rejection = True
+                            request_payload = copy.deepcopy(dict(request_payload))
+                            request_payload.pop("temperature", None)
+                            active_request_plan_metadata = plan.request_plan_metadata(
+                                input_mode="temperature_fallback",
+                                continuation_strategy="full_replay",
+                                provider_payload=_prompt_estimation_payload(request_payload),
+                                sent_provider_payload=_prompt_estimation_payload(request_payload),
+                                cache_policy_metadata=cache_policy,
+                                extra={
+                                    "fallback_used": True,
+                                    "temperature_omitted": True,
+                                    "temperature_omit_reason": temperature_rejection,
+                                },
+                            )
+                            telemetry.set_request_plan(active_request_plan_metadata)
+                            telemetry.set_request_shape(
+                                _request_shape_metadata(
+                                    request_payload,
+                                    input_mode="temperature_fallback",
+                                )
+                            )
+                            telemetry.set_token_reconciliation(
+                                _token_reconciliation_metadata(
+                                    request_payload,
+                                    input_mode="temperature_fallback",
+                                )
+                            )
+                            continue
+                        downgrade_reason = (
+                            _cache_control_rejection_reason(response)
+                            if not cache_control_retry_used
+                            and _payload_has_cache_control(request_payload)
+                            else None
+                        )
+                        if downgrade_reason is not None:
+                            cache_control_retry_used = True
+                            request_payload = _downgrade_anthropic_cache_control_payload(
+                                request_payload
+                            )
+                            _mark_anthropic_cache_control_downgrade(
+                                cache_policy,
+                                reason=downgrade_reason,
+                            )
+                            telemetry.set_cache_policy(cache_policy)
+                            active_request_plan_metadata = plan.request_plan_metadata(
+                                input_mode="cache_control_fallback",
+                                continuation_strategy="full_replay",
+                                provider_payload=_prompt_estimation_payload(request_payload),
+                                sent_provider_payload=_prompt_estimation_payload(request_payload),
+                                cache_policy_metadata=cache_policy,
+                                extra={"fallback_used": True},
+                            )
+                            telemetry.set_request_plan(active_request_plan_metadata)
+                            telemetry.set_request_shape(
+                                _request_shape_metadata(
+                                    request_payload,
+                                    input_mode="cache_control_fallback",
+                                )
+                            )
+                            telemetry.set_token_reconciliation(
+                                _token_reconciliation_metadata(
+                                    request_payload,
+                                    input_mode="cache_control_fallback",
+                                )
+                            )
+                            continue
+                        break
             except httpx.DecodingError as e:
-                raise LLMError(f"Anthropic Messages decompression failed: {e}") from e
+                err = LLMError(
+                    f"Anthropic Messages decompression failed: {sanitize_error_text_for_output(e)}"
+                )
+                if stream and public_output_emitted:
+                    mark_provider_call_non_retryable(err)
+                raise err from e
             except Exception as e:  # noqa: BLE001
                 if isinstance(e, LLMError):
+                    if stream and public_output_emitted:
+                        mark_provider_call_non_retryable(e)
                     raise
-                raise LLMError(f"Anthropic Messages request failed: {e}") from e
+                err = LLMError(
+                    f"Anthropic Messages request failed: {sanitize_error_text_for_output(e)}"
+                )
+                if stream and public_output_emitted:
+                    mark_provider_call_non_retryable(err)
+                raise err from e
             if response.status_code >= 400:
                 raise self._llm_error_from_response(response)
-            return self._parse_chat_response(response)
-
-        return telemetry.run(
-            lambda: run_provider_limited_call(
-                call=_send_request,
-                provider_key=provider_key,
-                provider_concurrency_caps=self.provider_concurrency_caps,
-                retry_settings=self.provider_retry_settings,
-                operation="anthropic_messages_chat",
-                sleep_fn=self._provider_sleep_fn,
-                random_fn=self._provider_random_fn,
-                on_retry=telemetry.on_retry,
-                retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
+            return _response_with_cache_policy_metadata(
+                self._parse_chat_response(
+                    response,
+                    on_reasoning_delta=telemetry_on_reasoning_delta,
+                    reasoning_is_summary=_payload_requests_summarized_thinking(request_payload),
+                ),
+                cache_policy,
+                active_request_plan_metadata,
             )
+
+        return stamp_response_for_route(
+            telemetry.run(
+                lambda: run_provider_limited_call(
+                    call=_send_request,
+                    provider_key=provider_key,
+                    provider_concurrency_caps=self.provider_concurrency_caps,
+                    retry_settings=self.provider_retry_settings,
+                    operation="anthropic_messages_chat",
+                    sleep_fn=self._provider_sleep_fn,
+                    random_fn=self._provider_random_fn,
+                    on_retry=telemetry.on_retry,
+                    retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
+                )
+            ),
+            self.route_identity,
         )
 
     @staticmethod
@@ -1011,18 +2195,34 @@ class AnthropicMessagesClient:
         response: httpx.Response,
         *,
         on_text_delta: Callable[[str], None] | None,
+        on_reasoning_delta: Callable[[str], None] | None,
+        reasoning_is_summary: bool,
     ) -> LLMResponse:
-        accumulator = _AnthropicStreamAccumulator(on_text_delta=on_text_delta)
+        accumulator = _AnthropicStreamAccumulator(
+            on_text_delta=on_text_delta,
+            on_reasoning_delta=on_reasoning_delta,
+            reasoning_is_summary=reasoning_is_summary,
+        )
         for frame in iter_sse_frames(response.iter_lines()):
             raw_event = parse_sse_json_frame(frame, stream_name="Anthropic Messages stream")
             if not isinstance(raw_event, dict):
                 raise LLMError("Anthropic Messages stream emitted non-object JSON event")
             accumulator.handle(frame, raw_event)
         data = accumulator.finish()
-        return AnthropicMessagesClient._parse_chat_response(response=_response_from_json(data))
+        # Streamed thinking was already emitted chunk-by-chunk. Parsing the
+        # accumulated message must not emit the same summary a second time.
+        return AnthropicMessagesClient._parse_chat_response(
+            response=_response_from_json(data),
+            reasoning_is_summary=reasoning_is_summary,
+        )
 
     @staticmethod
-    def _parse_chat_response(response: httpx.Response) -> LLMResponse:
+    def _parse_chat_response(
+        response: httpx.Response,
+        *,
+        reasoning_is_summary: bool,
+        on_reasoning_delta: Callable[[str], None] | None = None,
+    ) -> LLMResponse:
         try:
             data = response.json()
         except Exception as e:  # noqa: BLE001
@@ -1049,7 +2249,20 @@ class AnthropicMessagesClient:
             suffix = f" (stop_reason={stop_reason})" if stop_reason else ""
             raise LLMError(f"Anthropic Messages returned no assistant text or tool calls{suffix}")
 
+        summaries = _thinking_summaries_from_content_blocks(content) if reasoning_is_summary else []
+        if on_reasoning_delta is not None:
+            for summary in summaries:
+                on_reasoning_delta(summary)
+
         response_model = data.get("model") if isinstance(data.get("model"), str) else None
+        reasoning = tuple(
+            ReasoningOutput(
+                text=summary,
+                kind=ReasoningOutputKind.SUMMARY,
+                provider="anthropic",
+            )
+            for summary in summaries
+        )
         return LLMResponse(
             content=text,
             tool_calls=tool_calls,
@@ -1057,4 +2270,5 @@ class AnthropicMessagesClient:
             response_model=response_model,
             usage=_parse_usage(data.get("usage")),
             provider_metadata=_anthropic_provider_metadata(data),
+            reasoning=reasoning,
         )

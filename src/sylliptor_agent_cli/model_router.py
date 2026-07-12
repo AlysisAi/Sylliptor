@@ -68,6 +68,29 @@ def _forge_role_models_from_cfg(cfg: AppConfig) -> dict[str, str]:
     return out
 
 
+def _allowed_model_for_active_profile(cfg: AppConfig, candidate: str) -> str:
+    """Keep auth-profile role overrides inside the connected account catalog."""
+
+    normalized = str(candidate or "").strip()
+    if not normalized:
+        return ""
+    try:
+        from .profiles import get_active_profile
+
+        profile = get_active_profile(cfg)
+    except ConfigError:
+        return normalized
+    if not profile.auth_provider or normalized == profile.default_model:
+        return normalized
+    try:
+        from .provider_auth import create_provider_auth
+
+        models = create_provider_auth(profile.auth_provider).list_models(refresh=False)
+    except Exception:
+        return ""
+    return normalized if any(item.id == normalized for item in models) else ""
+
+
 def resolve_model_for_role(
     *,
     cfg: AppConfig,
@@ -81,23 +104,26 @@ def resolve_model_for_role(
         raise ConfigError(f"Unknown model role: {role}")
 
     env_key = ROLE_ENV_VARS[role_key]
-    env_value = str(env_get(env_key) or "").strip()
+    env_value = _allowed_model_for_active_profile(cfg, str(env_get(env_key) or ""))
     if env_value:
         return env_value
 
     plan_models = _role_models_from_plan(plan)
-    plan_model = (plan_models.get(role_key) or "").strip()
+    plan_model = _allowed_model_for_active_profile(cfg, plan_models.get(role_key) or "")
     if plan_model:
         return plan_model
 
     if prefer_context == PREFER_CONTEXT_FORGE:
         forge_cfg_models = _forge_role_models_from_cfg(cfg)
-        forge_cfg_model = (forge_cfg_models.get(role_key) or "").strip()
+        forge_cfg_model = _allowed_model_for_active_profile(
+            cfg,
+            forge_cfg_models.get(role_key) or "",
+        )
         if forge_cfg_model:
             return forge_cfg_model
 
     cfg_models = _role_models_from_cfg(cfg)
-    cfg_model = (cfg_models.get(role_key) or "").strip()
+    cfg_model = _allowed_model_for_active_profile(cfg, cfg_models.get(role_key) or "")
     if cfg_model:
         return cfg_model
 

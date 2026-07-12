@@ -272,7 +272,7 @@ class ConfigOverlay:
         elif mode == "confirm":
             right_text = "Y / N · Esc back"
         elif mode == "busy":
-            right_text = "Saving…"
+            right_text = "Working…"
         else:
             right_text = "Ctrl+C cancel"
         right = [("class:setup.footer.dim", right_text)]
@@ -396,9 +396,17 @@ class ConfigOverlay:
         flow = self.flow
         if flow is not None:
             try:
-                flow.perform_save()
+                perform_busy = getattr(flow, "perform_busy", None)
+                if callable(perform_busy):
+                    perform_busy()
+                else:
+                    flow.perform_save()
             except BaseException as exc:  # noqa: BLE001 - record, never hang the UI
-                flow.set_save_failure(f"{type(exc).__name__}: {exc}")
+                set_busy_failure = getattr(flow, "set_busy_failure", None)
+                if callable(set_busy_failure):
+                    set_busy_failure(f"{type(exc).__name__}: {exc}")
+                else:
+                    flow.set_save_failure(f"{type(exc).__name__}: {exc}")
         self._invalidate()
         try:
             loop = getattr(get_app(), "loop", None)
@@ -412,7 +420,11 @@ class ConfigOverlay:
     def _finalize_save(self) -> None:
         flow = self.flow
         if flow is not None:
-            flow.apply_save_outcome()
+            apply_busy_outcome = getattr(flow, "apply_busy_outcome", None)
+            if callable(apply_busy_outcome):
+                apply_busy_outcome()
+            else:
+                flow.apply_save_outcome()
         self._busy["running"] = False
         self._pump()
 

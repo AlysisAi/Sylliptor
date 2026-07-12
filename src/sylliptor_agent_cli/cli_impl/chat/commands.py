@@ -11,6 +11,7 @@ from typing import Any
 import typer
 from rich.text import Text
 
+from ...llm.base import effective_tools_for_client
 from ...plan_validation import PlannerFailedError, raise_for_execution_ready_plan
 from ...surface.styles import (
     STYLE_CHROME,
@@ -19,9 +20,15 @@ from ...surface.styles import (
     STYLE_WARN,
 )
 from ...swarm_orchestrator import acquire_swarm_mutation_guard
+from ...usage_tracker import UsageRecord, aggregate_usage_from_session_logs
 from .state import _ChatExecutionRequest, _ChatPlanModeState, _ForgeChatState
 
 _PROTECTED_COMMAND_GLOBAL_NAMES: set[str] = set()
+_PATCHABLE_COMMAND_GLOBAL_NAMES: set[str] = {
+    "_apply_config_menu_changes_to_session",
+    "_is_non_interactive_terminal",
+    "load_config",
+}
 _LOGGER = logging.getLogger("sylliptor_agent_cli.cli_impl.chat.commands")
 _TERMINALS_DISPLAY_LINE_LIMIT = 200
 _TERMINALS_USAGE_LINES = (
@@ -31,6 +38,95 @@ _TERMINALS_USAGE_LINES = (
     "       /terminals kill <process_id>",
     "       /terminals help",
 )
+
+
+def _merge_usage_payloads_into_session(
+    *, session: Any, payloads: list[dict[str, Any]] | tuple[dict[str, Any], ...]
+) -> int:
+    summary = getattr(session, "usage_summary", None)
+    add_event_payload = getattr(summary, "add_event_payload", None)
+    store = getattr(session, "store", None)
+    append = getattr(store, "append", None)
+    merged = 0
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("event_type") or "") != "llm_usage":
+            continue
+        if callable(add_event_payload):
+            try:
+                add_event_payload(payload)
+            except Exception:
+                continue
+        if callable(append):
+            try:
+                append("llm_usage", dict(payload))
+            except Exception:
+                pass
+        merged += 1
+    return merged
+
+
+def _merge_usage_records_into_session(
+    *, session: Any, records: list[UsageRecord] | tuple[UsageRecord, ...]
+) -> int:
+    summary = getattr(session, "usage_summary", None)
+    add_record = getattr(summary, "add_record", None)
+    store = getattr(session, "store", None)
+    append = getattr(store, "append", None)
+    merged = 0
+    for record in records:
+        if not isinstance(record, UsageRecord):
+            continue
+        if callable(add_record):
+            try:
+                add_record(record)
+            except Exception:
+                continue
+        if callable(append):
+            try:
+                append("llm_usage", record.to_payload())
+            except Exception:
+                pass
+        merged += 1
+    return merged
+
+
+def _merge_forge_execution_usage_into_session(*, session: Any, paths: Any) -> int:
+    logs_dir = getattr(paths, "execution_logs_dir", None)
+    if logs_dir is None:
+        return 0
+    try:
+        imported = set(getattr(session, "_sylliptor_imported_forge_usage_logs", set()) or set())
+        log_paths = sorted(Path(logs_dir).glob("*.jsonl"))
+    except Exception:
+        return 0
+    selected: list[Path] = []
+    selected_keys: list[str] = []
+    for path in log_paths:
+        try:
+            key = os.fspath(path.resolve())
+        except Exception:
+            key = os.fspath(path)
+        if key in imported:
+            continue
+        selected.append(path)
+        selected_keys.append(key)
+    if not selected:
+        return 0
+    try:
+        summary = aggregate_usage_from_session_logs(selected)
+        records = summary.records()
+    except Exception:
+        return 0
+    merged = _merge_usage_records_into_session(session=session, records=records)
+    if merged:
+        imported.update(selected_keys)
+        try:
+            session._sylliptor_imported_forge_usage_logs = imported
+        except Exception:
+            pass
+    return merged
 
 
 def _print_sylliptor_trial_models(console: Console, session: Any, *, current: str) -> None:
@@ -80,9 +176,13 @@ def _sync_command_globals(source_globals: dict[str, Any]) -> None:
             if callable(local_value):
                 _PROTECTED_COMMAND_GLOBAL_NAMES.add(local_name)
     for name, value in source_globals.items():
-        if name.startswith("__") or name in _PROTECTED_COMMAND_GLOBAL_NAMES:
+        if name.startswith("__"):
+            continue
+        if name in _PROTECTED_COMMAND_GLOBAL_NAMES and name not in _PATCHABLE_COMMAND_GLOBAL_NAMES:
             continue
         module_globals[name] = value
+        if name == "_resume_chat_session":
+            _PROTECTED_COMMAND_GLOBAL_NAMES.add(name)
 
 
 def _handle_chat_command(
@@ -95,6 +195,7 @@ def _handle_chat_command(
     forge_state: _ForgeChatState,
     plan_mode_state: _ChatPlanModeState,
     plan_mode_escape_supported: bool = False,
+    plan_mode_action_prompt: Any | None = None,
 ) -> str | _ChatExecutionRequest:
     trimmed = input_text.strip()
     if not trimmed:
@@ -131,6 +232,7 @@ def _handle_chat_command(
             console.print("Forge is already active.")
             return "handled"
         forge_state.entry_request_mode = parsed_forge_enter.entry_mode
+        forge_state.entry_goal = parsed_forge_enter.initial_goal
         try:
             forge_root = _resolve_forge_entry_root(session=session, fallback_root=root)
         except Exception as e:  # noqa: BLE001
@@ -154,6 +256,13 @@ def _handle_chat_command(
             enter_kwargs["model"] = str(forge_model) if forge_model else None
         if accepts_extra or "mode" in enter_params:
             enter_kwargs["mode"] = str(forge_mode) if forge_mode else None
+        if accepts_extra or "planner_assistant_default" in enter_params:
+            if parsed_forge_enter.planner_assistant_default is not None:
+                enter_kwargs["planner_assistant_default"] = (
+                    parsed_forge_enter.planner_assistant_default
+                )
+            elif bool(getattr(session, "_sylliptor_tui_interactive", False)):
+                enter_kwargs["planner_assistant_default"] = True
         _enter_forge_mode(**enter_kwargs)
         return "handled"
     if cmd == "/":
@@ -205,13 +314,18 @@ def _handle_chat_command(
         candidates = _collect_chat_resume_candidates(
             sessions_dir=sessions_dir,
             current_session_id=current_session_id,
+            workspace_root=getattr(store, "workspace_root", None),
+            git_root=getattr(store, "git_root", None),
         )
-        if not candidates:
+        target_session_id: str | None = None
+        raw_arg = arg.strip()
+        # Only the bare-picker form needs candidates; an explicit
+        # "/resume <id>" must still reach the direct-id escape hatch below even
+        # when owner/workspace scoping filtered the list down to nothing.
+        if not candidates and not raw_arg:
             console.print("No previous sessions available to resume.")
             return "handled"
 
-        target_session_id: str | None = None
-        raw_arg = arg.strip()
         if not raw_arg:
             target_session_id, picker_available = _select_chat_resume_interactive(
                 current_session_id=current_session_id,
@@ -576,6 +690,7 @@ def _handle_chat_command(
         messages = messages_obj if isinstance(messages_obj, list) else []
         tool_list_obj = getattr(session, "tool_list", None)
         tool_list = tool_list_obj if isinstance(tool_list_obj, list) else None
+        tool_list = effective_tools_for_client(getattr(session, "client", None), tool_list)
         tokens_before = _estimate_request_tokens(messages, tool_list)
         state = getattr(compactor, "state", None)
         chunks_before = int(getattr(state, "history_chunk_index", 0) or 0)
@@ -584,14 +699,28 @@ def _handle_chat_command(
         if not callable(compact_fn):
             console.print("Compaction unavailable for this session (missing compact_now).")
             return "handled"
+        refresh_calibration = getattr(session, "refresh_compactor_calibration_filters", None)
+        if callable(refresh_calibration):
+            refresh_calibration()
         new_messages, changed = compact_fn(
             messages=messages,
             tool_list=tool_list,
             main_model=str(getattr(getattr(session, "client", None), "model", "") or ""),
+            cache_policy=getattr(
+                getattr(session, "client", None),
+                "prompt_cache_policy_metadata",
+                None,
+            ),
             focus=focus,
         )
         if isinstance(new_messages, list):
             session.messages = new_messages
+        if changed:
+            invalidate_request_context = getattr(session, "invalidate_request_context", None)
+            if callable(invalidate_request_context):
+                invalidate_request_context(reason="manual_compaction")
+            elif hasattr(session, "request_context_measurement"):
+                session.request_context_measurement = None
         tokens_after = _estimate_request_tokens(getattr(session, "messages", []), tool_list)
         chunks_after = int(
             getattr(getattr(compactor, "state", None), "history_chunk_index", 0) or 0
@@ -709,14 +838,33 @@ def _handle_chat_command(
                 console.print(_chat_config_panel(session=session))
                 return "handled"
             from ..config_menu import run_config_menu
+            from .loop import _ConfigReloadRequiresRestart
 
             result = run_config_menu()
             if not result.saved:
                 console.print("Closed without saving.")
                 return "handled"
             change_count = len(result.changes) + (1 if result.api_key_changed else 0)
+            previous_cfg = getattr(session, "cfg", None)
             try:
-                _apply_config_menu_changes_to_session(session=session, cfg=load_config())
+                from ...profiles import connection_fingerprint
+
+                reloaded = load_config()
+                if previous_cfg is None or connection_fingerprint(
+                    reloaded
+                ) != connection_fingerprint(previous_cfg):
+                    console.print(
+                        "[yellow]Model access changed. This session is closing so the old and "
+                        "new connection states are never mixed. Start `sylliptor chat` again.[/yellow]"
+                    )
+                    return "exit"
+                _apply_config_menu_changes_to_session(session=session, cfg=reloaded)
+            except _ConfigReloadRequiresRestart as e:
+                console.print(
+                    f"[yellow]Config saved. {e} This session is closing; start "
+                    "`sylliptor chat` again.[/yellow]"
+                )
+                return "exit"
             except Exception as e:  # noqa: BLE001
                 console.print(f"[red]Config saved, but session reload failed:[/red] {e}")
                 return "handled"
@@ -740,8 +888,19 @@ def _handle_chat_command(
 
                 try:
                     cfg_to_save = config_mod.load_config()
+                    from ...profiles import connection_fingerprint
+
+                    config_mod.ensure_subscription_menu_managed_key(cfg_to_save, config_key)
+                    previous_fingerprint = connection_fingerprint(cfg_to_save)
                     config_mod.set_config_value(cfg_to_save, config_key, parts_config[2])
                     config_mod.save_config(cfg_to_save)
+                    if connection_fingerprint(cfg_to_save) != previous_fingerprint:
+                        console.print(
+                            "[yellow]Model access changed. This session is closing so the old "
+                            "and new connection states are never mixed. Start `sylliptor chat` "
+                            "again.[/yellow]"
+                        )
+                        return "exit"
                     _apply_config_menu_changes_to_session(session=session, cfg=cfg_to_save)
                 except Exception as e:  # noqa: BLE001
                     console.print(f"[red]Config update failed:[/red] {e}")
@@ -946,6 +1105,7 @@ def _handle_chat_command(
                 session=session,
                 console=console,
                 user_message=plan_task,
+                action_prompt=plan_mode_action_prompt,
             )
             if approved_instruction is None:
                 return "handled"
@@ -1064,6 +1224,24 @@ def _handle_chat_command(
             clear_draft=True,
         )
         return "handled"
+    if cmd in {"/stream"}:
+        stream_arg = arg.strip().lower()
+        if not stream_arg or stream_arg == "status":
+            enabled = bool(getattr(session, "stream", True))
+            console.print(
+                f"Streaming is {'on' if enabled else 'off'}. "
+                "Use /stream on|off or bare /stream in the TUI."
+            )
+            return "handled"
+        stream_value = _parse_bool_text(stream_arg)
+        if stream_value is None:
+            console.print(
+                "[red]Invalid stream value.[/red] Try: /stream on, /stream off, or /stream status."
+            )
+            return "handled"
+        _set_chat_stream_enabled(session=session, enabled=stream_value)
+        console.print(f"Streaming set for this session: {'on' if stream_value else 'off'}")
+        return "handled"
     if cmd in {"/trace"}:
         trace_arg = arg.strip()
         if not trace_arg:
@@ -1135,53 +1313,129 @@ def _handle_chat_command(
         console.print("Cleared queued images.")
         return "handled"
     if cmd in {"/model"}:
+        subscription_profile = False
+        try:
+            from ...profiles import get_active_profile
+
+            cfg = getattr(session, "cfg", None)
+            profile = get_active_profile(cfg) if cfg is not None else None
+            subscription_profile = bool(profile is not None and profile.auth_provider)
+        except Exception:
+            subscription_profile = False
         if not arg:
             model = getattr(getattr(session, "client", None), "model", "")
             console.print(f"Current model: {model}")
-            _print_sylliptor_trial_models(console, session, current=str(model))
+            if subscription_profile:
+                console.print(
+                    "[dim]Open /config → Default Model to choose from your live "
+                    "subscription models and supported reasoning efforts.[/dim]"
+                )
+            else:
+                _print_sylliptor_trial_models(console, session, current=str(model))
             return "handled"
-        if hasattr(session, "client"):
-            session.client.model = arg
-        if hasattr(session, "cfg"):
-            session.cfg.model = arg
+        if subscription_profile:
+            console.print(
+                "[yellow]Subscription model changes are managed in /config so the model and "
+                "reasoning effort stay compatible and persist together.[/yellow]"
+            )
+            return "handled"
+        previous_cfg = getattr(session, "cfg", None)
+        copy_cfg = getattr(previous_cfg, "model_copy", None)
+        if previous_cfg is None or not callable(copy_cfg):
+            client = getattr(session, "client", None)
+            legacy_store = getattr(session, "store", None)
+            legacy_session_id = str(getattr(legacy_store, "session_id", "") or "").strip()
+            if (
+                previous_cfg is None
+                and legacy_session_id
+                and client is not None
+                and hasattr(client, "model")
+            ):
+                client.model = arg
+                _refresh_chat_hud_context_cache(session)
+                console.print(f"Model set for this session: {arg}")
+                return "handled"
+            console.print(
+                "[yellow]Model was not changed because this session cannot safely refresh "
+                "its provider route. Restart chat with the desired model.[/yellow]"
+            )
+            return "handled"
+        client = getattr(session, "client", None)
+        previous_client_model = getattr(client, "model", None)
+        previous_route_identity = getattr(client, "route_identity", None)
+        candidate_cfg = copy_cfg(update={"model": arg}, deep=True)
+        try:
+            from . import loop as _model_loop
+
+            _model_loop._apply_config_menu_changes_to_session(
+                session=session,
+                cfg=candidate_cfg,
+            )
+        except Exception as exc:  # noqa: BLE001 - restore the verified route atomically
+            session.cfg = previous_cfg
+            if client is not None:
+                client.model = previous_client_model
+                if previous_route_identity is not None or hasattr(client, "route_identity"):
+                    client.route_identity = previous_route_identity
+            console.print(
+                f"[yellow]Model was not changed because provider capabilities could not be "
+                f"refreshed: {exc}[/yellow]"
+            )
+            return "handled"
         _refresh_chat_hud_context_cache(session)
         console.print(f"Model set for this session: {arg}")
         return "handled"
     if cmd in {"/login"}:
-        from ...account_login import SylliptorLoginError
-        from ...account_login import login as _sylliptor_login
+        from ..commands.auth import login_connection_interactively, login_connection_rows
 
-        cfg = getattr(session, "cfg", None)
-        if cfg is None:
-            console.print("[red]No active config; run `sylliptor login` from the shell.[/red]")
+        selected = str(arg or "").strip()
+        if not selected:
+            from ..config_menu import _run_config_picker
+
+            rows = login_connection_rows()
+            selected = str(
+                _run_config_picker(
+                    console=console,
+                    title="Log in",
+                    subtitle="Choose how Sylliptor should connect.",
+                    rows=rows,
+                    current_value=rows[0][0],
+                )
+                or ""
+            ).strip()
+        if not selected:
             return "handled"
+        previous_cfg = getattr(session, "cfg", None)
         try:
-            result = _sylliptor_login(
-                cfg, output_write=lambda message: console.print(message, highlight=False)
-            )
-        except SylliptorLoginError as exc:
-            console.print(f"[red]{exc}[/red]")
+            login_connection_interactively(selected, console=console)
+        except typer.Exit:
             return "handled"
-        who = f" as [bold]{result.email}[/bold]" if result.email else ""
-        console.print(f"[green]Logged in{who}.[/green] Your free MiMo trial is ready.")
         try:
             from ... import config as _login_config
+            from ...profiles import connection_fingerprint
             from . import loop as _login_loop
 
+            reloaded_cfg = _login_config.load_config()
+            if previous_cfg is None or connection_fingerprint(
+                previous_cfg
+            ) != connection_fingerprint(reloaded_cfg):
+                console.print(
+                    "[yellow]Connection saved. This session is closing so the provider "
+                    "transport, authentication, and trace capability can be rebuilt safely. "
+                    "Start `sylliptor chat` again.[/yellow]"
+                )
+                return "exit"
             _login_loop._apply_config_menu_changes_to_session(
                 session=session,
-                cfg=_login_config.load_config(),
+                cfg=reloaded_cfg,
             )
+            console.print("[green]The selected connection is active for this session.[/green]")
+        except Exception as exc:  # noqa: BLE001 - never keep a possibly stale transport alive
             console.print(
-                f"Profile [bold]{result.profile_name}[/bold] (model "
-                f"[bold]{result.model}[/bold]) is now active for this session."
+                f"[yellow]Connection saved, but live reload failed: {exc}. This session is "
+                "closing; start `sylliptor chat` again.[/yellow]"
             )
-            console.print("[dim]Tip: switch model anytime with /model.[/dim]")
-        except Exception:  # noqa: BLE001 - fall back to restart guidance
-            console.print(
-                f"Profile [bold]{result.profile_name}[/bold] is set. "
-                "Restart chat to use it for this session."
-            )
+            return "exit"
         return "handled"
     if cmd in {"/logout"}:
         from ...account_login import logout as _sylliptor_logout
@@ -1594,6 +1848,7 @@ def _handle_forge_chat_command(
             enrich_attempted = False
             enrich_applied = False
             enrich_summary = "enrichment not needed"
+            show_enrichment_details = _chat_trace_level(session) == "full"
             if _forge_should_try_enrichment(validation_warnings):
                 if not _forge_enrich_plan_enabled():
                     enrich_summary = "enrichment skipped: disabled"
@@ -1628,6 +1883,10 @@ def _handle_forge_chat_command(
                             ),
                             run_paths=paths,
                         )
+                        _merge_usage_payloads_into_session(
+                            session=session,
+                            payloads=list(getattr(planner_result, "usage_events", []) or []),
+                        )
                         request_retry_count = int(
                             getattr(planner_result, "request_retry_count", 0) or 0
                         )
@@ -1637,16 +1896,18 @@ def _handle_forge_chat_command(
                                 f"Planner request recovered after {request_retry_count} transient "
                                 f"{retry_word}."
                             )
-                            _print_forge_warning_messages(
-                                console=console,
-                                label="Plan enrichment",
-                                warnings=[retry_notice],
-                            )
-                            append_transcript_note(
-                                paths,
-                                role="system",
-                                message=f"Plan enrichment warning: {retry_notice}",
-                            )
+                            if show_enrichment_details:
+                                _print_forge_warning_messages(
+                                    console=console,
+                                    label="Plan enrichment",
+                                    warnings=[retry_notice],
+                                )
+                            if show_enrichment_details:
+                                append_transcript_note(
+                                    paths,
+                                    role="system",
+                                    message=f"Plan enrichment warning: {retry_notice}",
+                                )
                         if planner_result.error:
                             retry_word = "retry" if request_retry_count == 1 else "retries"
                             enrichment_error_summary = (
@@ -1688,17 +1949,19 @@ def _handle_forge_chat_command(
                                 plan_update=planner_result.plan_update,
                             )
                             if sanitized_enrichment.warnings:
-                                _print_forge_warning_messages(
-                                    console=console,
-                                    label="Plan enrichment",
-                                    warnings=list(sanitized_enrichment.warnings),
-                                )
-                                for warning in sanitized_enrichment.warnings:
-                                    append_transcript_note(
-                                        paths,
-                                        role="system",
-                                        message=f"Plan enrichment warning: {warning}",
+                                if show_enrichment_details:
+                                    _print_forge_warning_messages(
+                                        console=console,
+                                        label="Plan enrichment",
+                                        warnings=list(sanitized_enrichment.warnings),
                                     )
+                                if show_enrichment_details:
+                                    for warning in sanitized_enrichment.warnings:
+                                        append_transcript_note(
+                                            paths,
+                                            role="system",
+                                            message=f"Plan enrichment warning: {warning}",
+                                        )
                             if sanitized_enrichment.plan_update is None:
                                 enrich_summary = "enrichment produced no applicable changes"
                             else:
@@ -1717,17 +1980,19 @@ def _handle_forge_chat_command(
                                     )
                                 )
                                 if apply_result.warnings:
-                                    _print_forge_warning_messages(
-                                        console=console,
-                                        label="Plan enrichment",
-                                        warnings=list(apply_result.warnings),
-                                    )
-                                    for warning in apply_result.warnings:
-                                        append_transcript_note(
-                                            paths,
-                                            role="system",
-                                            message=f"Plan enrichment warning: {warning}",
+                                    if show_enrichment_details:
+                                        _print_forge_warning_messages(
+                                            console=console,
+                                            label="Plan enrichment",
+                                            warnings=list(apply_result.warnings),
                                         )
+                                    if show_enrichment_details:
+                                        for warning in apply_result.warnings:
+                                            append_transcript_note(
+                                                paths,
+                                                role="system",
+                                                message=f"Plan enrichment warning: {warning}",
+                                            )
                                 if apply_result.changed:
                                     enrich_applied = True
                                     reconciliation_result, workspace_context = (
@@ -1759,6 +2024,8 @@ def _handle_forge_chat_command(
                         enrich_summary = "enrichment skipped: missing planner api key/config"
 
             append_planner_summary(paths, enrich_summary)
+            if enrich_applied:
+                _print_forge_meta(console=console, message="Refined plan.")
 
             if validation_warnings:
                 _print_forge_warning_messages(
@@ -1772,9 +2039,15 @@ def _handle_forge_chat_command(
                         role="system",
                         message=f"Plan validation warning: {warning}",
                     )
-            elif enrich_attempted and enrich_applied and not validation_warnings:
-                _print_forge_meta(
-                    console=console,
+            elif (
+                enrich_attempted
+                and enrich_applied
+                and not validation_warnings
+                and show_enrichment_details
+            ):
+                append_transcript_note(
+                    paths,
+                    role="system",
                     message="Plan enrichment cleared the remaining validation warnings.",
                 )
 
@@ -1866,6 +2139,7 @@ def _handle_forge_chat_command(
                 )
                 return "handled"
 
+            _merge_forge_execution_usage_into_session(session=session, paths=paths)
             summary_path = paths.execution_dir / "swarm_summary.md"
             summary_json_path = paths.execution_dir / "swarm_summary.json"
             run_status = ""
@@ -2127,6 +2401,10 @@ def _handle_forge_chat_command(
             ),
             stream=stream_planner,
             on_text_delta=on_text_delta,
+            on_usage_events=lambda payloads: _merge_usage_payloads_into_session(
+                session=session,
+                payloads=payloads,
+            ),
             error_fallback=lambda: _capture_forge_requirement_from_planner_fallback(
                 plan=plan,
                 paths=paths,
@@ -2137,8 +2415,23 @@ def _handle_forge_chat_command(
         )
         return "handled"
 
-    add_requirement(plan, trimmed)
-    save_plan(paths, plan)
-    append_transcript_note(paths, role="system", message="Captured requirement note.")
-    _print_forge_meta(console=console, message="Captured requirement note.")
+    goal_was_set = _set_forge_project_goal_if_empty(
+        plan=plan,
+        paths=paths,
+        console=console,
+        goal=trimmed,
+    )
+    if goal_was_set:
+        add_requirement(plan, trimmed)
+        save_plan(paths, plan)
+        append_transcript_note(
+            paths,
+            role="system",
+            message="Captured project goal as planning input.",
+        )
+    else:
+        add_requirement(plan, trimmed)
+        save_plan(paths, plan)
+        append_transcript_note(paths, role="system", message="Captured requirement note.")
+        _print_forge_meta(console=console, message="Captured requirement note.")
     return "handled"

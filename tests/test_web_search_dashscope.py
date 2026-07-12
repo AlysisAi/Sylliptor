@@ -10,6 +10,8 @@ from sylliptor_agent_cli.tools.web_search_dashscope import (
     DashScopeChatSearchError,
     _sources_from_urls,
     dashscope_chat_search,
+    dashscope_model_supports_web_search,
+    dashscope_model_uses_responses_search,
 )
 
 
@@ -97,6 +99,79 @@ def test_dashscope_chat_search_posts_enable_search_and_returns_sources() -> None
             "end_index": None,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["qwen3.7-plus", "qwen3.7-max", "qwen3.6-plus", "qwen3.6-flash"],
+)
+def test_current_qwen_models_use_responses_web_search(model: str) -> None:
+    assert dashscope_model_supports_web_search(model) is True
+    assert dashscope_model_uses_responses_search(model) is True
+
+
+def test_dashscope_responses_search_supports_qwen37_sources_and_queries() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert (
+            str(request.url) == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/responses"
+        )
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["model"] == "qwen3.7-plus"
+        assert body["tools"] == [{"type": "web_search"}]
+        assert body["stream"] is False
+        assert "docs.example.com" in body["input"]
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_qwen37_1",
+                "model": "qwen3.7-plus",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "action": {
+                            "query": "Qwen web search docs",
+                            "sources": [
+                                {
+                                    "title": "Qwen Docs",
+                                    "url": "https://docs.example.com/qwen",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Use the current Qwen documentation.",
+                                "annotations": [
+                                    {
+                                        "type": "url_citation",
+                                        "url": "https://docs.example.com/qwen",
+                                        "title": "Qwen Docs",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+
+    result = dashscope_chat_search(
+        query="current Qwen web search",
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        api_key="dashscope-key",
+        model="qwen3.7-plus",
+        include_domains=["docs.example.com"],
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+    )
+
+    assert result["backend"] == "dashscope_responses"
+    assert result["answer"] == "Use the current Qwen documentation."
+    assert result["queries"] == ["Qwen web search docs"]
+    assert result["sources"] == [{"url": "https://docs.example.com/qwen", "title": "Qwen Docs"}]
 
 
 def test_dashscope_sources_from_urls_preserves_parenthesized_path() -> None:

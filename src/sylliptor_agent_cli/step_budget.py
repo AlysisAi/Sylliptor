@@ -3,11 +3,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-DEFAULT_CHAT_MAX_STEPS = 50
-DEFAULT_TASK_MAX_STEPS = 100
-DEFAULT_SUBAGENT_MAX_STEPS = 16
+# These remain the default limits for the opt-in ``limited`` policy and for
+# backwards-compatible configuration files.  The default ``autonomous`` policy
+# does not consume them.
+DEFAULT_CHAT_MAX_STEPS = 80
+DEFAULT_TASK_MAX_STEPS = 160
+DEFAULT_SUBAGENT_MAX_STEPS = 28
 
-VALID_STEP_BUDGET_POLICIES = {"fixed", "adaptive"}
+AUTONOMOUS_STEP_BUDGET_POLICY = "autonomous"
+LIMITED_STEP_BUDGET_POLICY = "limited"
+
+# ``adaptive`` and ``fixed`` are legacy spellings.  Keeping them loadable avoids
+# breaking existing installations while giving them the new, explicit contract:
+# adaptive -> autonomous, fixed -> limited.
+_STEP_BUDGET_POLICY_ALIASES = {
+    "adaptive": AUTONOMOUS_STEP_BUDGET_POLICY,
+    "fixed": LIMITED_STEP_BUDGET_POLICY,
+}
+VALID_STEP_BUDGET_POLICIES = {
+    AUTONOMOUS_STEP_BUDGET_POLICY,
+    LIMITED_STEP_BUDGET_POLICY,
+    *_STEP_BUDGET_POLICY_ALIASES,
+}
 
 
 def _positive_int(value: Any, *, default: int) -> int:
@@ -18,25 +35,16 @@ def _positive_int(value: Any, *, default: int) -> int:
     return max(1, parsed)
 
 
-def _non_negative_int(value: Any) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return 0
-    return max(0, parsed)
-
-
-def _clamp(value: int, *, minimum: int, maximum: int) -> int:
-    if maximum < minimum:
-        minimum = maximum
-    return max(minimum, min(maximum, value))
-
-
 def normalize_step_budget_policy(raw_value: Any) -> str:
     normalized = str(raw_value or "").strip().lower()
-    if normalized in VALID_STEP_BUDGET_POLICIES:
+    normalized = _STEP_BUDGET_POLICY_ALIASES.get(normalized, normalized)
+    if normalized in {AUTONOMOUS_STEP_BUDGET_POLICY, LIMITED_STEP_BUDGET_POLICY}:
         return normalized
-    return "adaptive"
+    return AUTONOMOUS_STEP_BUDGET_POLICY
+
+
+def step_budget_is_autonomous(raw_value: Any) -> bool:
+    return normalize_step_budget_policy(raw_value) == AUTONOMOUS_STEP_BUDGET_POLICY
 
 
 def resolve_subagent_step_profile(subagent_name: Any) -> str | None:
@@ -52,7 +60,7 @@ def resolve_subagent_step_profile(subagent_name: Any) -> str | None:
 class StepBudgetRequest:
     kind: str
     policy: str
-    hard_cap: int
+    hard_cap: int | None
     fixed_override: int | None = None
     mode: str | None = None
     route: str | None = None
@@ -77,13 +85,17 @@ class StepBudgetRequest:
 class StepBudgetResolution:
     kind: str
     policy: str
-    hard_cap: int
-    resolved_max_steps: int
+    hard_cap: int | None
+    resolved_max_steps: int | None
     override_applied: bool
     reason: str
     signals_used: dict[str, Any]
-    base_steps: int
+    base_steps: int | None
     profile: str | None = None
+
+    @property
+    def unlimited(self) -> bool:
+        return self.resolved_max_steps is None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -91,6 +103,7 @@ class StepBudgetResolution:
             "policy": self.policy,
             "hard_cap": self.hard_cap,
             "resolved_max_steps": self.resolved_max_steps,
+            "unlimited": self.unlimited,
             "override_applied": self.override_applied,
             "reason": self.reason,
             "signals_used": dict(self.signals_used),
@@ -105,15 +118,18 @@ class StepBudgetRuntime:
     last_resolution: StepBudgetResolution | None = None
 
 
-def _resolve_hard_cap(request: StepBudgetRequest) -> int:
-    default_cap = {
+def _default_cap(kind: str) -> int:
+    return {
         "chat_turn": DEFAULT_CHAT_MAX_STEPS,
         "managed_task": DEFAULT_TASK_MAX_STEPS,
         "conflict_resolution": DEFAULT_TASK_MAX_STEPS,
         "subagent": DEFAULT_SUBAGENT_MAX_STEPS,
-    }.get(str(request.kind), DEFAULT_CHAT_MAX_STEPS)
-    hard_cap = _positive_int(request.hard_cap, default=default_cap)
-    if request.kind == "subagent" and request.parent_turn_budget is not None:
+    }.get(kind, DEFAULT_CHAT_MAX_STEPS)
+
+
+def _resolve_limited_cap(request: StepBudgetRequest, *, kind: str) -> int:
+    hard_cap = _positive_int(request.hard_cap, default=_default_cap(kind))
+    if kind == "subagent" and request.parent_turn_budget is not None:
         hard_cap = min(
             hard_cap,
             _positive_int(request.parent_turn_budget, default=hard_cap),
@@ -121,225 +137,94 @@ def _resolve_hard_cap(request: StepBudgetRequest) -> int:
     return max(1, hard_cap)
 
 
-def _fixed_resolution(
-    request: StepBudgetRequest,
-    *,
-    hard_cap: int,
-    policy: str,
-    reason: str,
-    fixed_value: int,
-    profile: str | None,
-    signals_used: dict[str, Any] | None = None,
-) -> StepBudgetResolution:
-    resolved = _clamp(
-        _positive_int(fixed_value, default=hard_cap),
-        minimum=1,
-        maximum=hard_cap,
-    )
-    return StepBudgetResolution(
-        kind=request.kind,
-        policy=policy,
-        hard_cap=hard_cap,
-        resolved_max_steps=resolved,
-        override_applied=(reason == "fixed_override"),
-        reason=reason,
-        signals_used=signals_used or {},
-        base_steps=resolved,
-        profile=profile,
-    )
+def _request_signals(request: StepBudgetRequest) -> dict[str, Any]:
+    """Retain useful task-shape telemetry without using it to terminate work."""
+
+    return {
+        "mode": request.mode,
+        "route": request.route,
+        "one_shot_execution": bool(request.one_shot_execution),
+        "one_shot_turn_intent": request.one_shot_turn_intent,
+        "verification_enabled": bool(request.verification_enabled),
+        "subagents_enabled": bool(request.subagents_enabled),
+        "subagent_name": request.subagent_name,
+        "parent_turn_budget": request.parent_turn_budget,
+        "attempt_count": request.attempt_count,
+        "image_count": request.image_count,
+        "explicit_path_count": request.explicit_path_count,
+        "acceptance_criteria_count": request.acceptance_criteria_count,
+        "estimated_files_count": request.estimated_files_count,
+        "write_scope_count": request.write_scope_count,
+        "dependency_count": request.dependency_count,
+        "asset_count": request.asset_count,
+        "conflict_file_count": request.conflict_file_count,
+    }
 
 
 def resolve_step_budget(request: StepBudgetRequest) -> StepBudgetResolution:
+    """Resolve an optional safety ceiling for one autonomous agent loop.
+
+    Autonomous execution is intentionally unbounded.  A finite ceiling exists
+    only when the caller supplies an explicit override or selects the opt-in
+    limited policy.  Completion, cancellation, blockers, fatal errors, and an
+    optional wall-clock deadline remain independent termination conditions.
+    """
+
+    kind = str(request.kind or "").strip().lower() or "chat_turn"
     policy = normalize_step_budget_policy(request.policy)
-    hard_cap = _resolve_hard_cap(request)
-    profile = (
-        resolve_subagent_step_profile(request.subagent_name) if request.kind == "subagent" else None
-    )
+    profile = resolve_subagent_step_profile(request.subagent_name) if kind == "subagent" else None
+
     if request.fixed_override is not None:
-        return _fixed_resolution(
-            request,
-            hard_cap=hard_cap,
+        explicit_limit = _positive_int(
+            request.fixed_override,
+            default=_default_cap(kind),
+        )
+        return StepBudgetResolution(
+            kind=kind,
             policy=policy,
-            reason="fixed_override",
-            fixed_value=request.fixed_override,
-            profile=profile,
+            hard_cap=explicit_limit,
+            resolved_max_steps=explicit_limit,
+            override_applied=True,
+            reason="explicit_limit",
             signals_used={
+                **_request_signals(request),
+                "policy": policy,
+                "explicit_limit": explicit_limit,
+            },
+            base_steps=explicit_limit,
+            profile=profile,
+        )
+
+    if policy == LIMITED_STEP_BUDGET_POLICY:
+        hard_cap = _resolve_limited_cap(request, kind=kind)
+        return StepBudgetResolution(
+            kind=kind,
+            policy=policy,
+            hard_cap=hard_cap,
+            resolved_max_steps=hard_cap,
+            override_applied=False,
+            reason="limited_policy",
+            signals_used={
+                **_request_signals(request),
                 "policy": policy,
                 "hard_cap": hard_cap,
-                "fixed_override": _positive_int(request.fixed_override, default=hard_cap),
             },
-        )
-    if policy == "fixed":
-        return _fixed_resolution(
-            request,
-            hard_cap=hard_cap,
-            policy=policy,
-            reason="fixed_policy",
-            fixed_value=hard_cap,
-            profile=profile,
-            signals_used={"policy": policy, "hard_cap": hard_cap},
-        )
-
-    kind = str(request.kind or "").strip().lower()
-    if kind == "chat_turn":
-        base_steps = 10
-        route = str(request.route or "").strip().lower()
-        intent = str(request.one_shot_turn_intent or "").strip().lower()
-        repo_route = route == "repo"
-        execute_like_repo_turn = repo_route and (
-            bool(request.one_shot_execution) or intent == "execute"
-        )
-        resolved = base_steps
-        execution_reserve_steps = 0
-        if repo_route:
-            if request.one_shot_execution:
-                resolved += 4
-            if intent == "execute":
-                resolved += 8
-            elif intent == "explain":
-                resolved += 2
-            if execute_like_repo_turn:
-                execution_reserve_steps = 8
-                resolved += execution_reserve_steps
-            if str(request.mode or "").strip().lower() in {"auto", "fullaccess"}:
-                resolved += 4
-            if request.verification_enabled and execute_like_repo_turn:
-                resolved += 4
-            if request.subagents_enabled:
-                resolved += 2
-            resolved += min(_non_negative_int(request.explicit_path_count), 6)
-            resolved += min(_non_negative_int(request.image_count), 3)
-        resolved = _clamp(resolved, minimum=6, maximum=hard_cap)
-        return StepBudgetResolution(
-            kind=kind,
-            policy=policy,
-            hard_cap=hard_cap,
-            resolved_max_steps=resolved,
-            override_applied=False,
-            reason="adaptive_chat_turn" if repo_route else "adaptive_chat_turn_non_repo",
-            signals_used={
-                "route": route,
-                "mode": request.mode,
-                "one_shot_execution": bool(request.one_shot_execution),
-                "one_shot_turn_intent": intent or None,
-                "execution_reserve_steps": execution_reserve_steps,
-                "verification_enabled": bool(request.verification_enabled),
-                "subagents_enabled": bool(request.subagents_enabled),
-                "explicit_path_count": _non_negative_int(request.explicit_path_count),
-                "image_count": _non_negative_int(request.image_count),
-            },
-            base_steps=base_steps,
-        )
-
-    if kind == "managed_task":
-        base_steps = 24
-        verification_repair_reserve_steps = 14 if request.verification_enabled else 0
-        file_scope_count = max(
-            _non_negative_int(request.estimated_files_count),
-            _non_negative_int(request.write_scope_count),
-        )
-        attempt_extra = max(_non_negative_int(request.attempt_count) - 1, 0)
-        resolved = base_steps
-        resolved += 2 * min(_non_negative_int(request.acceptance_criteria_count), 8)
-        resolved += 2 * min(file_scope_count, 8)
-        resolved += min(_non_negative_int(request.dependency_count), 4)
-        resolved += min(
-            _non_negative_int(request.asset_count) + _non_negative_int(request.image_count),
-            6,
-        )
-        resolved += verification_repair_reserve_steps
-        resolved += 6 * min(attempt_extra, 3)
-        resolved = _clamp(resolved, minimum=20, maximum=hard_cap)
-        return StepBudgetResolution(
-            kind=kind,
-            policy=policy,
-            hard_cap=hard_cap,
-            resolved_max_steps=resolved,
-            override_applied=False,
-            reason="adaptive_managed_task",
-            signals_used={
-                "mode": request.mode,
-                "verification_enabled": bool(request.verification_enabled),
-                "verification_repair_reserve_steps": verification_repair_reserve_steps,
-                "attempt_count": _non_negative_int(request.attempt_count),
-                "acceptance_criteria_count": _non_negative_int(request.acceptance_criteria_count),
-                "estimated_files_count": _non_negative_int(request.estimated_files_count),
-                "write_scope_count": _non_negative_int(request.write_scope_count),
-                "dependency_count": _non_negative_int(request.dependency_count),
-                "asset_count": _non_negative_int(request.asset_count),
-                "image_count": _non_negative_int(request.image_count),
-            },
-            base_steps=base_steps,
-        )
-
-    if kind == "conflict_resolution":
-        base_steps = 18
-        attempt_extra = max(_non_negative_int(request.attempt_count) - 1, 0)
-        resolved = base_steps
-        resolved += 3 * min(_non_negative_int(request.conflict_file_count), 8)
-        if request.verification_enabled:
-            resolved += 4
-        resolved += 4 * min(attempt_extra, 3)
-        resolved = _clamp(resolved, minimum=12, maximum=hard_cap)
-        return StepBudgetResolution(
-            kind=kind,
-            policy=policy,
-            hard_cap=hard_cap,
-            resolved_max_steps=resolved,
-            override_applied=False,
-            reason="adaptive_conflict_resolution",
-            signals_used={
-                "mode": request.mode,
-                "verification_enabled": bool(request.verification_enabled),
-                "attempt_count": _non_negative_int(request.attempt_count),
-                "conflict_file_count": _non_negative_int(request.conflict_file_count),
-            },
-            base_steps=base_steps,
-        )
-
-    if kind == "subagent":
-        base_steps = 8
-        resolved = base_steps
-        if profile == "explorer":
-            resolved += 4
-        elif profile == "reviewer":
-            resolved += 2
-        elif profile == "test-strategist":
-            resolved += 3
-        resolved += min(_non_negative_int(request.explicit_path_count), 4)
-        if str(request.mode or "").strip().lower() != "readonly":
-            resolved += 2
-        resolved = _clamp(resolved, minimum=4, maximum=hard_cap)
-        return StepBudgetResolution(
-            kind=kind,
-            policy=policy,
-            hard_cap=hard_cap,
-            resolved_max_steps=resolved,
-            override_applied=False,
-            reason="adaptive_subagent",
-            signals_used={
-                "mode": request.mode,
-                "subagent_name": request.subagent_name,
-                "parent_turn_budget": (
-                    _positive_int(request.parent_turn_budget, default=hard_cap)
-                    if request.parent_turn_budget is not None
-                    else None
-                ),
-                "explicit_path_count": _non_negative_int(request.explicit_path_count),
-            },
-            base_steps=base_steps,
+            base_steps=hard_cap,
             profile=profile,
         )
 
-    base_steps = hard_cap
     return StepBudgetResolution(
-        kind=kind or "chat_turn",
-        policy=policy,
-        hard_cap=hard_cap,
-        resolved_max_steps=hard_cap,
+        kind=kind,
+        policy=AUTONOMOUS_STEP_BUDGET_POLICY,
+        hard_cap=None,
+        resolved_max_steps=None,
         override_applied=False,
-        reason="unknown_kind_fallback",
-        signals_used={"requested_kind": request.kind},
-        base_steps=base_steps,
+        reason="autonomous_unbounded",
+        signals_used={
+            **_request_signals(request),
+            "policy": AUTONOMOUS_STEP_BUDGET_POLICY,
+            "configured_legacy_cap": request.hard_cap,
+        },
+        base_steps=None,
         profile=profile,
     )

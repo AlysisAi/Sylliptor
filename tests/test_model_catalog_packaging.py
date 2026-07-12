@@ -42,6 +42,24 @@ def test_bundled_model_catalog_resource_is_readable() -> None:
     assert "ref" not in meta["upstream"]
 
 
+def test_chatgpt_subscription_catalog_resource_is_readable_and_not_entitlement() -> None:
+    catalog_text = (
+        resources.files("sylliptor_agent_cli.model_catalog")
+        .joinpath("chatgpt_codex_subscription_snapshot.json")
+        .read_text(encoding="utf-8")
+    )
+
+    catalog = json.loads(catalog_text)
+
+    assert catalog["schema_version"] == 1
+    assert catalog["source"] == "bundled_chatgpt_codex_subscription_snapshot"
+    assert catalog["refresh_policy"] == "manual_reviewed_only"
+    assert catalog["usage"] == "capacity_and_capability_fallback_only_not_entitlement"
+    assert catalog["client_version"]
+    assert len(catalog["input_sha256"]) == 64
+    assert catalog["models"]
+
+
 def test_bundled_model_catalog_provenance_helper_reads_packaged_meta() -> None:
     provenance = get_bundled_model_catalog_provenance()
     assert provenance.error is None

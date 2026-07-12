@@ -10,8 +10,11 @@ from sylliptor_agent_cli.agent.acceptance_contract import (
     classify_evidence_origin,
 )
 from sylliptor_agent_cli.agent_loop import (
+    TurnExecutionState,
     VerificationEvidenceCategory,
+    _fresh_executed_evidence_for_claim,
     _shell_command_is_verification_attempt,
+    _successful_verification_claim_kind,
     classify_verification_evidence,
 )
 
@@ -32,22 +35,37 @@ def test_authoritative_matching_command_is_authoritative_evidence() -> None:
     assert evidence.reason == "matched_authoritative_contract"
 
 
-def test_trusted_pipeline_matching_command_is_contract_evidence() -> None:
-    command = "printf 'a\\nb\\n' | tail -n 1"
+def test_authoritative_vacuous_contract_command_is_not_evidence() -> None:
+    evidence = classify_verification_evidence(
+        "true",
+        known_verification_commands=["true"],
+        authoritative=True,
+        exit_code=0,
+        output="",
+    )
+
+    assert evidence.category == VerificationEvidenceCategory.AUTHORITATIVE
+    assert evidence.allowed_to_satisfy_contract is False
+    assert evidence.covered_verification_commands == ("true",)
+    assert evidence.reason == "vacuous_verifier"
+
+
+def test_trusted_pipeline_matching_command_is_not_contract_evidence() -> None:
+    command = "tool args | tail -n 1"
 
     evidence = classify_verification_evidence(
         command,
         known_verification_commands=[command],
         authoritative=False,
         exit_code=0,
-        output="b\n",
+        output="ok\n",
         real_execution=True,
     )
 
-    assert evidence.category == VerificationEvidenceCategory.REPO_NATIVE
-    assert evidence.allowed_to_satisfy_contract is True
-    assert evidence.covered_verification_commands == (command,)
-    assert evidence.reason == "matched_contract"
+    assert evidence.category == VerificationEvidenceCategory.NOT_VERIFICATION
+    assert evidence.allowed_to_satisfy_contract is False
+    assert evidence.covered_verification_commands == ()
+    assert evidence.reason == "unsafe_pipeline"
 
 
 def test_trusted_command_that_mutates_source_is_supplemental_until_clean_rerun() -> None:
@@ -74,6 +92,40 @@ def test_trusted_command_that_mutates_source_is_supplemental_until_clean_rerun()
     assert mutating.reason == "mutated_material_paths"
     assert clean.allowed_to_satisfy_contract is True
     assert clean.covered_verification_commands == (command,)
+
+
+def test_curl_fail_probe_can_satisfy_explicit_contract() -> None:
+    command = "curl -fsS http://127.0.0.1:3000/health"
+
+    evidence = classify_verification_evidence(
+        command,
+        known_verification_commands=[command],
+        authoritative=True,
+        exit_code=0,
+        output="ok\n",
+        real_execution=True,
+    )
+
+    assert evidence.category == VerificationEvidenceCategory.AUTHORITATIVE
+    assert evidence.allowed_to_satisfy_contract is True
+    assert evidence.reason == "matched_authoritative_contract"
+
+
+def test_plain_curl_probe_is_inconclusive_contract_evidence() -> None:
+    command = "curl -s http://127.0.0.1:3000/health"
+
+    evidence = classify_verification_evidence(
+        command,
+        known_verification_commands=[command],
+        authoritative=True,
+        exit_code=0,
+        output="HTTP 500\n",
+        real_execution=None,
+    )
+
+    assert evidence.category == VerificationEvidenceCategory.AUTHORITATIVE
+    assert evidence.allowed_to_satisfy_contract is False
+    assert evidence.reason == "http_probe_requires_curl_fail"
 
 
 def test_authoritative_contract_rejects_unrelated_task_specific_check(tmp_path: Path) -> None:
@@ -270,6 +322,10 @@ def test_boolean_shell_helper_preserves_contract_matching_behavior() -> None:
         "python check.py",
         known_verification_commands=["pytest -q"],
     )
+    assert not _shell_command_is_verification_attempt(
+        "true",
+        known_verification_commands=["true"],
+    )
     assert _shell_command_is_verification_attempt(
         "python check.py",
         known_verification_commands=None,
@@ -290,3 +346,80 @@ def test_acceptance_provenance_identifies_preexisting_checker(tmp_path: Path) ->
     )
 
     assert origin == EvidenceOrigin.PREEXISTING_TASK_CHECKER
+
+
+def test_successful_test_claim_accepts_fresh_observed_execution_evidence() -> None:
+    state = TurnExecutionState(execution_requested=True)
+    state.note_verification_relevant_edit()
+    evidence = classify_verification_evidence(
+        "pytest tests/test_app.py -q",
+        exit_code=0,
+        output="1 passed\n",
+        real_execution=True,
+    )
+    state.record_verification_evidence(
+        evidence,
+        accepted=evidence.allowed_to_satisfy_contract,
+        observed_exit_code=0,
+        observed_output=True,
+    )
+
+    assert _successful_verification_claim_kind("All tests passed.") == "tests"
+    assert _fresh_executed_evidence_for_claim(state, claim_kind="tests")
+
+
+def test_successful_test_claim_rejects_stale_or_unobserved_execution_evidence() -> None:
+    state = TurnExecutionState(execution_requested=True)
+    evidence = classify_verification_evidence(
+        "pytest tests/test_app.py -q",
+        exit_code=0,
+        output="1 passed\n",
+        real_execution=True,
+    )
+    state.record_verification_evidence(
+        evidence,
+        accepted=True,
+        observed_exit_code=0,
+        observed_output=True,
+    )
+    state.note_verification_relevant_edit()
+
+    assert _fresh_executed_evidence_for_claim(state, claim_kind="tests") == []
+
+    state.record_verification_evidence(
+        evidence,
+        accepted=True,
+        observed_exit_code=0,
+        observed_output=False,
+    )
+    assert _fresh_executed_evidence_for_claim(state, claim_kind="tests") == []
+
+
+def test_claim_detector_ignores_truthful_non_execution_reports() -> None:
+    assert _successful_verification_claim_kind("I verified the behavior.") == "verification"
+    assert _successful_verification_claim_kind("I did not run tests.") is None
+    assert (
+        _successful_verification_claim_kind("Tests could not run; verification impossible.") is None
+    )
+    assert _successful_verification_claim_kind("The change was not verified.") is None
+    assert _successful_verification_claim_kind("No tests passed because collection failed.") is None
+
+
+def test_test_claim_accepts_repo_specific_test_runner_execution() -> None:
+    state = TurnExecutionState(execution_requested=True)
+    evidence = classify_verification_evidence(
+        "python tests/runtests.py migrations.test_loader",
+        exit_code=0,
+        output="Ran 4 tests\nOK\n",
+        real_execution=True,
+    )
+    state.record_verification_evidence(
+        evidence,
+        accepted=False,
+        observed_exit_code=0,
+        observed_output=True,
+    )
+
+    claim = "Tests: python tests/runtests.py migrations.test_loader (passed)."
+    assert _successful_verification_claim_kind(claim) == "tests"
+    assert _fresh_executed_evidence_for_claim(state, claim_kind="tests")

@@ -671,8 +671,9 @@ class SessionWebResearchTracker:
         These are the exact canonical forms ``resolve_fetch_url`` matches against,
         so the model can copy one verbatim into ``web_fetch``. web_search source
         URLs come first (the common "fetch a result" case), then user-provided
-        URLs; order within each group is the order they were observed. Bounded so
-        a long session does not bloat an error payload.
+        URLs; order within each group is the order they were observed (so "the
+        first one" maps to the first source). Bounded so a long session does not
+        bloat an error payload.
         """
         ordered: list[str] = []
         seen: set[str] = set()

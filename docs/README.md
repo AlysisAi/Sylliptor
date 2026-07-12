@@ -7,6 +7,7 @@ Start with the [root README](../README.md) for installation and first use. Use t
 ## Start Here
 
 - [Quickstart](quickstart.md): configure a provider, bind a workspace, and run the first task.
+- [Providers and models](providers.md): connect API-key or subscription-backed models.
 - [Credentials](credentials.md): understand API-key precedence and persisted credential storage.
 - [Reference](reference.md): review commands, modes, configuration, updates, sessions, and troubleshooting.
 

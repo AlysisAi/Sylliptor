@@ -24,7 +24,7 @@ from ...hooks import (
     user_hooks_config_path,
 )
 from ...runtime_kind import RuntimeKind, normalize_runtime_kind
-from ...session_store import list_sessions, resolve_sessions_dir
+from ...session_store import filter_sessions_to_local_owner, list_sessions, resolve_sessions_dir
 from ...surface.styles import STYLE_CONTENT
 from . import _patchable
 from ._shared import _console, _resolve_tool_workspace_root, _Table
@@ -290,9 +290,17 @@ def hooks_trace(
     sessions_dir = resolve_sessions_dir(cfg)
     resolved_session_id = session_id
     if not resolved_session_id:
-        infos = _patchable("list_sessions", list_sessions)(sessions_dir)
+        all_infos = _patchable("list_sessions", list_sessions)(sessions_dir)
+        infos = filter_sessions_to_local_owner(all_infos)
         if not infos:
-            console.print(f"No retained sessions found in {sessions_dir}")
+            if all_infos:
+                console.print(f"No sessions owned by this account in {sessions_dir}")
+                console.print(
+                    f"{len(all_infos)} session(s) recorded by a different account; "
+                    "pass an explicit session id."
+                )
+            else:
+                console.print(f"No retained sessions found in {sessions_dir}")
             return
         resolved_session_id = infos[0].session_id
     artifact_path = hook_audit_artifact_path(
@@ -691,9 +699,17 @@ def hooks_watch(
     sessions_dir = resolve_sessions_dir(cfg)
     resolved_session_id = session_id
     if not resolved_session_id:
-        infos = _patchable("list_sessions", list_sessions)(sessions_dir)
+        all_infos = _patchable("list_sessions", list_sessions)(sessions_dir)
+        infos = filter_sessions_to_local_owner(all_infos)
         if not infos:
-            console.print(f"No retained sessions found in {sessions_dir}")
+            if all_infos:
+                console.print(f"No sessions owned by this account in {sessions_dir}")
+                console.print(
+                    f"{len(all_infos)} session(s) recorded by a different account; "
+                    "pass an explicit session id."
+                )
+            else:
+                console.print(f"No retained sessions found in {sessions_dir}")
             return
         resolved_session_id = infos[0].session_id
     artifact_path = hook_audit_artifact_path(

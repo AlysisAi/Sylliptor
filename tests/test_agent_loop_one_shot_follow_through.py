@@ -14,6 +14,10 @@ from sylliptor_agent_cli.agent.acceptance_contract import (
     build_acceptance_contract,
     finalize_acceptance_contract,
 )
+from sylliptor_agent_cli.agent.turn.exploration import (
+    _is_action_progress_tool,
+    _is_exploration_only_tool,
+)
 from sylliptor_agent_cli.agent_loop import (
     ToolDef,
     TurnExecutionState,
@@ -24,6 +28,7 @@ from sylliptor_agent_cli.agent_loop import (
     _classify_one_shot_repo_turn_intent,
     _completion_gate_nudge_message,
     _completion_gate_problems,
+    _fresh_executed_evidence_for_claim,
     _matching_effective_verification_commands,
     _normalize_marker_text,
     _record_tool_effect,
@@ -37,6 +42,9 @@ from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse, ToolCall
 from sylliptor_agent_cli.session_store import read_session_events
 from sylliptor_agent_cli.surface.noop_surface import NoopSurface
+from sylliptor_agent_cli.tools.availability import WEB_UNAVAILABLE_OBSERVATION
+from sylliptor_agent_cli.tools.web import WebFetchError
+from sylliptor_agent_cli.tools.web_search import WebSearchError
 from sylliptor_agent_cli.verify_gate import VerifyCommandResult, VerifyRunResult
 
 
@@ -98,6 +106,56 @@ class _ScriptedClient:
         return response
 
 
+def test_shell_run_semantic_progress_classifier_distinguishes_dumps_from_progress() -> None:
+    for command in (
+        "cat src/app.py",
+        "grep -R TODO src",
+        "ls -la",
+        "head -40 README.md",
+        "sed -n '1,80p' src/app.py",
+        "python -c \"print('debug')\"",
+    ):
+        assert not _is_action_progress_tool(
+            "shell_run",
+            arguments={"cmd": command},
+            result={"exit_code": 0, "stdout": "debug\n", "stderr": ""},
+        )
+        assert _is_exploration_only_tool(
+            "shell_run",
+            arguments={"cmd": command},
+            result={"exit_code": 0, "stdout": "debug\n", "stderr": ""},
+        )
+
+    assert _is_action_progress_tool(
+        "shell_run",
+        arguments={"cmd": "python -m pytest tests/test_app.py -q"},
+        result={"exit_code": 0, "stdout": "1 passed\n", "stderr": ""},
+    )
+    assert _is_action_progress_tool(
+        "shell_run",
+        arguments={"cmd": "cat > out.txt <<'EOF'\ndone\nEOF"},
+        result={"exit_code": 0, "stdout": "", "stderr": ""},
+        touched_paths={"out.txt"},
+    )
+    assert _is_action_progress_tool(
+        "shell_run",
+        arguments={"cmd": "python scripts/probe_target.py src/app.py"},
+        result={"exit_code": 0, "stdout": "ok\n", "stderr": ""},
+        focused=True,
+    )
+    assert not _is_action_progress_tool(
+        "shell_run",
+        arguments={"cmd": "python scripts/probe_target.py src/app.py"},
+        result={"exit_code": 0, "stdout": "ok\n", "stderr": ""},
+        focused=False,
+    )
+    assert _is_action_progress_tool("shell_background")
+    assert _is_action_progress_tool("shell_service_start")
+    assert _is_action_progress_tool("workspace_preview_start")
+    assert _is_action_progress_tool("shell_service_status", result={"ready": True})
+    assert _is_exploration_only_tool("shell_service_status", result={"ready": False})
+
+
 class _ForcedToolChoiceScriptedClient(_ScriptedClient):
     supports_forced_tool_choice = True
 
@@ -133,7 +191,12 @@ _VERIFY_GO_MIXED_OK_COMMAND = "go test ./mixed/..."
 def _fake_verify_command_result(command: str) -> VerifyCommandResult:
     normalized = " ".join(str(command).split())
     if normalized == _VERIFY_OK_COMMAND:
-        return VerifyCommandResult(command=command, exit_code=0, output="ok\n")
+        return VerifyCommandResult(
+            command=command,
+            exit_code=0,
+            output="ok\n",
+            real_execution=True,
+        )
     if normalized == _VERIFY_FAIL_COMMAND:
         return VerifyCommandResult(
             command=command,
@@ -229,22 +292,21 @@ def test_no_material_completion_gate_nudge_is_action_first() -> None:
         ["no_material_edits", "verification_not_attempted"],
     )
 
-    assert "implementation or deliverable-creation action" in message
-    for tool_name in ("fs_edit", "fs_write", "git_apply_patch", "fs_move", "fs_copy"):
-        assert tool_name in message
-    assert "shell_run only when it actually performs implementation" in message
-    assert "Verification alone cannot satisfy" in message
-    assert "run verification after material work exists" in message
-    assert "Prefer verify_run with no arguments" not in message
-    assert "Run the session's configured verification now" not in message
+    assert message.startswith("Finalization check - one pass before you finish:")
+    assert "No file changes are recorded yet" in message
+    assert "Expected verification has not been completed" in message
+    assert "this checklist is advisory" in message
 
 
 def test_verification_not_attempted_completion_gate_nudge_stays_verification_specific() -> None:
-    message = _completion_gate_nudge_message(["verification_not_attempted"])
+    message = _completion_gate_nudge_message(
+        ["verification_not_attempted"],
+        missing_verification_commands=["pytest -q"],
+    )
 
-    assert "Run the session's configured verification now" in message
-    assert "Prefer verify_run with no arguments" in message
-    assert "implementation or deliverable-creation action" not in message
+    assert "Expected verification not yet run: pytest -q" in message
+    assert "Run them, or state why they don't apply" in message
+    assert "No file changes are recorded yet" not in message
 
 
 def test_verification_failed_completion_gate_nudge_instructs_fix_then_rerun() -> None:
@@ -253,10 +315,9 @@ def test_verification_failed_completion_gate_nudge_instructs_fix_then_rerun() ->
         verification_failure_snippet="pytest failed\nNameError: search_notes is not defined",
     )
 
-    assert "Inspect the observed failure" in message
-    assert "edit or fix the implementation" in message
-    assert "rerun verification" in message
-    assert "First reported error:" in message
+    assert "Your last verification failed: NameError: search_notes is not defined" in message
+    assert "Fix and re-run" in message
+    assert "Re-read the task statement once" in message
 
 
 def _latest_completion_gate_payload(
@@ -264,28 +325,54 @@ def _latest_completion_gate_payload(
     session_id: str,
 ) -> dict[str, Any]:
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
-    incomplete_events = [
+    return _latest_completion_gate_acceptance_payload(events)
+
+
+def _latest_completion_gate_acceptance_payload(events: list[dict[str, Any]]) -> dict[str, Any]:
+    accepted_events = [
         event
         for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
+        if event.get("type") == "completion_gate_accepted_with_open_problems"
     ]
-    assert incomplete_events
-    return dict(incomplete_events[-1].get("payload") or {})
+    assert accepted_events
+    return dict(accepted_events[-1].get("payload") or {})
+
+
+def _assert_no_completion_gate_terminal_events(events: list[dict[str, Any]]) -> None:
+    assert not any(
+        event.get("type")
+        in {
+            "one_shot_completion_gate_incomplete_after_retries",
+            "one_shot_no_material_edits_incomplete_after_retries",
+            "completion_gate_terminal_failure",
+        }
+        for event in events
+    )
 
 
 def _assert_forced_final_summary_emitted(events: list[dict[str, Any]]) -> str:
     assert any(event.get("type") == "forced_final_summary_requested" for event in events)
-    assert any(
-        event.get("type") in {"forced_final_summary_completed", "forced_final_summary_fallback"}
+    summary_events = [
+        event
         for event in events
-    )
+        if event.get("type") in {"forced_final_summary_completed", "forced_final_summary_fallback"}
+    ]
+    assert summary_events
     assistant_events = [event for event in events if event.get("type") == "assistant_message"]
     final_events = [event for event in events if event.get("type") == "final"]
     assert assistant_events
     assert final_events
     content = str((assistant_events[-1].get("payload") or {}).get("content") or "")
     assert content
-    assert str((final_events[-1].get("payload") or {}).get("content") or "") == content
+    final_payload = dict(final_events[-1].get("payload") or {})
+    summary_payload = dict(summary_events[-1].get("payload") or {})
+    assert str(final_payload.get("content") or "") == content
+    assert final_payload["controller_interventions_total"] >= 1
+    assert (
+        final_payload["controller_interventions_total"]
+        == summary_payload["controller_interventions_total"]
+    )
+    assert "controller_interventions" in final_payload
     return content
 
 
@@ -423,6 +510,105 @@ def test_verify_run_coverage_uses_original_command_when_effective_command_expand
     assert state.covered_verification_commands == {configured}
 
 
+def test_claim_evidence_accepts_clean_cd_wrapper_but_rejects_masking_pipeline(
+    tmp_path: Path,
+) -> None:
+    clean_command = "cd /testbed && python tests/runtests.py servers 2>&1"
+    state = TurnExecutionState(execution_requested=True)
+    state.note_verification_relevant_edit()
+    _record_tool_effect(
+        root=tmp_path,
+        state=state,
+        tool_name="shell_run",
+        arguments={"cmd": clean_command},
+        status="ok",
+        result={
+            "cmd": clean_command,
+            "effective_cmd": clean_command,
+            "exit_code": 0,
+            "stdout": "Ran 32 tests\nOK\n",
+            "stderr": "",
+        },
+        known_verification_commands=[],
+    )
+
+    assert _fresh_executed_evidence_for_claim(state, claim_kind="tests")
+
+    masked_command = f"{clean_command} | tail -10"
+    masked_state = TurnExecutionState(execution_requested=True)
+    _record_tool_effect(
+        root=tmp_path,
+        state=masked_state,
+        tool_name="shell_run",
+        arguments={"cmd": masked_command},
+        status="ok",
+        result={
+            "cmd": masked_command,
+            "effective_cmd": masked_command,
+            "exit_code": 0,
+            "stdout": "OK\n",
+            "stderr": "",
+        },
+        known_verification_commands=[],
+    )
+    assert _fresh_executed_evidence_for_claim(masked_state, claim_kind="tests") == []
+
+
+def test_completion_gate_accepts_configured_pytest_no_tests_skip(
+    tmp_path: Path,
+) -> None:
+    state = TurnExecutionState(
+        execution_requested=True,
+        expected_verification_commands={"pytest -q"},
+        material_edit_count=1,
+        touched_repo_paths={"ok.txt"},
+    )
+
+    _record_tool_effect(
+        root=tmp_path,
+        state=state,
+        tool_name="verify_run",
+        arguments={},
+        status="ok",
+        result={
+            "commands": ["pytest -q"],
+            "all_passed": True,
+            "failed_commands": [],
+            "summary": "verification skipped: nothing to verify (1/1)",
+            "command_results": [
+                {
+                    "command": "pytest -q",
+                    "effective_command": "pytest -q",
+                    "exit_code": 5,
+                    "status": "skipped",
+                    "ok": True,
+                    "real_execution": False,
+                    "non_execution_reason": "pytest_no_tests_collected",
+                    "output_preview": "collected 0 items\n",
+                }
+            ],
+        },
+        known_verification_commands=["pytest -q"],
+        verification_authoritative=True,
+    )
+
+    assert state.verification_attempt_count == 1
+    assert state.last_verification_passed is True
+    assert state.covered_verification_commands == {"pytest -q"}
+    assert state.failed_verification_commands() == set()
+    assert state.last_verification_failure_snippet == ""
+    assert state.accepted_verification_evidence
+
+    problems = _completion_gate_problems(
+        state=state,
+        final_text="Created ok.txt and verification had nothing to collect.",
+        blocked=False,
+        verification_expected=True,
+        require_material_edit_evidence=True,
+    )
+    assert problems == []
+
+
 def test_shell_service_start_counts_as_material_work_and_durable_acceptance(
     tmp_path: Path,
 ) -> None:
@@ -541,6 +727,22 @@ def _init_git_repo_with_commit(repo: Path) -> None:
     )
 
 
+def _commit_repo_file(repo: Path, rel_path: str, content: str) -> None:
+    _write_repo_text(repo, rel_path, content)
+    subprocess.run(
+        ["git", "-C", os.fspath(repo), "add", rel_path],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", os.fspath(repo), "commit", "-m", f"add {rel_path}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _shell_run_with_repo_mutations(
     *,
     mutations: dict[str, tuple[str, str]],
@@ -569,6 +771,7 @@ def _shell_run_with_repo_mutations(
                     cmd,
                     "" if exit_code == 0 else "command failed\n",
                 ),
+                "touched_repo_paths": [rel_path],
             }
         if cmd == "pytest -q":
             _write_repo_text(root, ".pytest_cache/v/cache/nodeids", "cache\n")
@@ -981,6 +1184,73 @@ def test_one_shot_continues_after_non_final_progress_message(tmp_path: Path) -> 
     assert "one_shot_completion_gate_incomplete_after_retries" not in event_types
 
 
+def test_one_shot_plan_only_then_final_records_single_continuation_intervention(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(model="test-model", routing_mode="code_only")
+    sessions_dir = tmp_path / "sessions"
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=10,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        session_log_dir_override=sessions_dir,
+        session_id_override="one-shot-plan-then-final-interventions",
+    )
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="I will inspect the repo, make the edit, and then verify it.",
+                tool_calls=[],
+                raw={},
+            ),
+            LLMResponse(
+                content="I have enough information to finish this turn.",
+                tool_calls=[],
+                raw={},
+            ),
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Implement search command and update tests.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    events = list(
+        read_session_events(sessions_dir / "one-shot-plan-then-final-interventions.jsonl")
+    )
+    interventions = [
+        dict(event.get("payload") or {})
+        for event in events
+        if event.get("type") == "controller_intervention"
+    ]
+    headline_interventions = [
+        payload for payload in interventions if payload.get("headline_counted") is True
+    ]
+    assert [payload["detail"] for payload in headline_interventions] == [
+        "non_final_progress_continuation_nudge",
+    ]
+    assert [payload["class"] for payload in headline_interventions] == [
+        "continuation",
+    ]
+    finalized = [
+        dict(event.get("payload") or {})
+        for event in events
+        if event.get("type") == "turn_intent_finalized"
+    ]
+    assert finalized
+    assert finalized[-1]["controller_interventions_total"] == 1
+    assert finalized[-1]["controller_interventions"]["by_class"] == {
+        "continuation": 1,
+    }
+
+
 def test_one_shot_continues_after_greek_non_final_progress_message(tmp_path: Path) -> None:
     cfg = AppConfig(
         model="test-model",
@@ -1106,14 +1376,15 @@ def test_one_shot_greek_blocker_text_is_not_treated_as_non_final_progress(tmp_pa
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-greek-blocker.jsonl"))
     event_types = [event.get("type") for event in events]
     assert "one_shot_non_final_progress_detected" not in event_types
     assert "continuation_nudge" not in event_types
     assert "completion_gate_nudge" in event_types
-    assert "nudge_stall_detected" in event_types
-    assert "one_shot_completion_gate_incomplete_after_retries" in event_types
+    assert "nudge_stall_detected" not in event_types
+    assert "one_shot_completion_gate_incomplete_after_retries" not in event_types
+    assert "completion_gate_accepted_with_open_problems" in event_types
 
 
 def test_one_shot_greek_completion_text_is_not_treated_as_non_final_progress(
@@ -1156,12 +1427,14 @@ def test_one_shot_greek_completion_text_is_not_treated_as_non_final_progress(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-greek-completion-no-evidence.jsonl"))
     event_types = [event.get("type") for event in events]
     assert "one_shot_non_final_progress_detected" not in event_types
     assert "continuation_nudge" not in event_types
-    assert "one_shot_completion_gate_incomplete_after_retries" in event_types
+    assert "completion_gate_nudge" in event_types
+    assert "one_shot_completion_gate_incomplete_after_retries" not in event_types
+    assert "completion_gate_accepted_with_open_problems" in event_types
 
 
 def test_one_shot_final_completion_response_finishes_normally(tmp_path: Path) -> None:
@@ -1172,7 +1445,7 @@ def test_one_shot_final_completion_response_finishes_normally(tmp_path: Path) ->
         root=tmp_path,
         mode="auto",
         yes=True,
-        max_steps=6,
+        max_steps=10,
         no_log=False,
         api_key_override="override-key",
         one_shot_execution=True,
@@ -1224,6 +1497,21 @@ def test_one_shot_final_completion_response_finishes_normally(tmp_path: Path) ->
     assert "one_shot_non_final_progress_detected" not in event_types
     assert "continuation_nudge" not in event_types
     assert "one_shot_completion_gate_incomplete_after_retries" not in event_types
+    headline_interventions = [
+        dict(event.get("payload") or {})
+        for event in events
+        if event.get("type") == "controller_intervention"
+        and (event.get("payload") or {}).get("headline_counted") is True
+    ]
+    assert [payload["detail"] for payload in headline_interventions] == []
+    finalized = [
+        dict(event.get("payload") or {})
+        for event in events
+        if event.get("type") == "turn_intent_finalized"
+    ]
+    assert finalized
+    assert finalized[-1]["controller_interventions_total"] == 0
+    assert finalized[-1]["controller_interventions"]["by_class"] == {}
 
 
 def test_one_shot_empty_after_read_recovers_to_edit_verify_and_success(tmp_path: Path) -> None:
@@ -1637,6 +1925,11 @@ def test_one_shot_credential_clarification_can_finalize(tmp_path: Path) -> None:
                 tool_calls=[],
                 raw={},
             ),
+            LLMResponse(
+                content="I cannot proceed without the API token, so this is blocked.",
+                tool_calls=[],
+                raw={},
+            ),
         ]
     )  # type: ignore[assignment]
 
@@ -1651,7 +1944,8 @@ def test_one_shot_credential_clarification_can_finalize(tmp_path: Path) -> None:
     event_types = [event.get("type") for event in events]
 
     assert exit_code == 0
-    assert "completion_gate_blocker_accepted" in event_types
+    assert "completion_gate_nudge" in event_types
+    assert "completion_gate_accepted_with_open_problems" not in event_types
 
 
 def test_one_shot_plan_only_request_does_not_auto_continue(tmp_path: Path) -> None:
@@ -1801,7 +2095,7 @@ def test_one_shot_non_execution_repo_question_is_exempt_from_execution_safeguard
         ("Make a worthwhile improvement in Flask.", "one-shot-repeat-progress-flask"),
     ],
 )
-def test_one_shot_non_final_progress_stopped_repeated_progress_emits_forced_final_summary(
+def test_one_shot_non_final_progress_accepts_second_final_after_single_nudge(
     tmp_path: Path,
     instruction: str,
     session_id: str,
@@ -1858,40 +2152,23 @@ def test_one_shot_non_final_progress_stopped_repeated_progress_emits_forced_fina
     finally:
         session.close()
 
-    assert exit_code == 1
-    assert client.calls == 4
+    assert exit_code == 0
+    assert client.calls == 2
 
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
     assert any(event.get("type") == "continuation_nudge" for event in events)
-    incomplete_events = [
+    assert any(
+        event.get("type") == "completion_gate_accepted_with_open_problems" for event in events
+    )
+    assert not [
         event for event in events if event.get("type") == "one_shot_incomplete_after_retries"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    assert payload.get("reason") == "stagnant_progress"
-    expected_error = (
-        "One-shot run stopped: model returned repeated/non-final progress text "
-        "without continuing implementation."
-    )
-    assert surface.errors
-    assert surface.errors[-1] == expected_error
-    requested = [event for event in events if event.get("type") == "forced_final_summary_requested"]
-    assert requested
-    assert dict(requested[-1].get("payload") or {}).get("reason") == (
-        "non_final_progress_retry_exhausted"
-    )
-    summary = _assert_forced_final_summary_emitted(events)
-    assert surface.final_messages[-1] == summary
-    _assert_last_forced_summary_request(
-        client,
-        latest_assistant_text=repeated_progress_text,
-        termination_cause=(
-            "non-final progress stagnated without implementation or verification progress"
-        ),
-    )
+    assert not [event for event in events if event.get("type") == "forced_final_summary_requested"]
+    assert surface.errors == []
+    assert surface.final_messages[-1] == repeated_progress_text
 
 
-def test_forced_final_summary_falls_back_when_model_returns_tool_markup(
+def test_non_final_progress_second_response_is_accepted_even_if_tool_markup(
     tmp_path: Path,
 ) -> None:
     cfg = AppConfig(model="test-model", routing_mode="code_only")
@@ -1921,8 +2198,6 @@ def test_forced_final_summary_falls_back_when_model_returns_tool_markup(
     client = _ScriptedClient(
         [
             LLMResponse(content=progress_text, tool_calls=[], raw={}),
-            LLMResponse(content=progress_text, tool_calls=[], raw={}),
-            LLMResponse(content=progress_text, tool_calls=[], raw={}),
             LLMResponse(content=raw_tool_markup, tool_calls=[], raw={}),
         ]
     )
@@ -1933,22 +2208,14 @@ def test_forced_final_summary_falls_back_when_model_returns_tool_markup(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-forced-summary-tool-markup.jsonl"))
-    fallback_events = [
-        event for event in events if event.get("type") == "forced_final_summary_fallback"
-    ]
-    assert fallback_events
-    assert dict(fallback_events[-1].get("payload") or {}).get("fallback_reason") == (
-        "tool_call_markup_response"
-    )
-    summary = _assert_forced_final_summary_emitted(events)
-    assert "DSML" not in summary
-    assert "tool_calls" not in summary
-    assert surface.final_messages[-1] == summary
+    assert any(event.get("type") == "continuation_nudge" for event in events)
+    assert not [event for event in events if event.get("type") == "forced_final_summary_fallback"]
+    assert surface.final_messages[-1] == raw_tool_markup
 
 
-def test_one_shot_non_final_progress_stopped_at_continuation_cap_emits_forced_final_summary(
+def test_one_shot_non_final_progress_accepts_after_single_nudge_without_forced_summary(
     tmp_path: Path,
 ) -> None:
     cfg = AppConfig(model="test-model", routing_mode="code_only")
@@ -1991,37 +2258,21 @@ def test_one_shot_non_final_progress_stopped_at_continuation_cap_emits_forced_fi
     finally:
         session.close()
 
-    assert exit_code == 1
-    assert client.calls == 4
+    assert exit_code == 0
+    assert client.calls == 2
     events = list(
         read_session_events(sessions_dir / "one-shot-continuation-cap-forced-summary.jsonl")
     )
-    incomplete_events = [
+    assert any(event.get("type") == "continuation_nudge" for event in events)
+    assert any(
+        event.get("type") == "completion_gate_accepted_with_open_problems" for event in events
+    )
+    assert not [
         event for event in events if event.get("type") == "one_shot_incomplete_after_retries"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    assert payload.get("reason") == "stagnant_progress"
-    expected_error = (
-        "One-shot run stopped: model returned repeated/non-final progress text "
-        "without continuing implementation."
-    )
-    assert surface.errors
-    assert surface.errors[-1] == expected_error
-    requested = [event for event in events if event.get("type") == "forced_final_summary_requested"]
-    assert requested
-    assert dict(requested[-1].get("payload") or {}).get("reason") == (
-        "non_final_progress_retry_exhausted"
-    )
-    summary = _assert_forced_final_summary_emitted(events)
-    assert surface.final_messages[-1] == summary
-    _assert_last_forced_summary_request(
-        client,
-        latest_assistant_text=latest_progress_text,
-        termination_cause=(
-            "non-final progress stagnated without implementation or verification progress"
-        ),
-    )
+    assert not [event for event in events if event.get("type") == "forced_final_summary_requested"]
+    assert surface.errors == []
+    assert surface.final_messages[-1] == latest_progress_text
 
 
 def test_one_shot_completion_gate_rejects_empty_final_response(tmp_path: Path) -> None:
@@ -2061,19 +2312,24 @@ def test_one_shot_completion_gate_rejects_empty_final_response(tmp_path: Path) -
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-empty-final.jsonl"))
     assert any(event.get("type") == "empty_model_response_recovery" for event in events)
     assert any(event.get("type") == "completion_gate_nudge" for event in events)
-    incomplete_events = [
+    accepted_events = [
+        event
+        for event in events
+        if event.get("type") == "completion_gate_accepted_with_open_problems"
+    ]
+    assert accepted_events
+    payload = dict(accepted_events[-1].get("payload") or {})
+    problems = set(payload.get("problems") or [])
+    assert "empty_final_response" in problems
+    assert not [
         event
         for event in events
         if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "empty_final_response" in problems
 
 
 def test_one_shot_empty_response_recovers_with_action_and_verification(tmp_path: Path) -> None:
@@ -2207,7 +2463,13 @@ def test_two_incomplete_final_claims_can_still_recover(tmp_path: Path) -> None:
     failed_events = [
         event for event in events if event.get("type") == "one_shot_completion_gate_failed"
     ]
-    assert len(failed_events) == 2
+    assert len(failed_events) == 1
+    accepted_events = [
+        event
+        for event in events
+        if event.get("type") == "completion_gate_accepted_with_open_problems"
+    ]
+    assert accepted_events
     assert not any(
         event.get("type") == "one_shot_completion_gate_incomplete_after_retries" for event in events
     )
@@ -2310,8 +2572,9 @@ def test_safety_critical_one_shot_clarification_can_finalize(tmp_path: Path) -> 
 
     assert exit_code == 0
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
-    assert any(event.get("type") == "completion_gate_blocker_accepted" for event in events)
-    assert not any(event.get("type") == "one_shot_completion_gate_failed" for event in events)
+    assert any(event.get("type") == "completion_gate_nudge" for event in events)
+    assert any(event.get("type") == "one_shot_completion_gate_failed" for event in events)
+    assert not any(event.get("type") == "completion_gate_blocker_accepted" for event in events)
     final_events = [event for event in events if event.get("type") == "final"]
     assert final_events
     assert (final_events[-1].get("payload") or {}).get("content") == final_text
@@ -2360,23 +2623,24 @@ def test_interactive_completion_gate_rejects_claim_only_without_evidence(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
     event_types = [event.get("type") for event in events]
     assert "interactive_completion_gate_failed" in event_types
-    assert "interactive_completion_gate_incomplete_after_retries" in event_types
+    assert "interactive_completion_gate_incomplete_after_retries" not in event_types
+    assert "completion_gate_accepted_with_open_problems" in event_types
     assert "one_shot_completion_gate_failed" not in event_types
-    incomplete_events = [
+    accepted_events = [
         event
         for event in events
-        if event.get("type") == "interactive_completion_gate_incomplete_after_retries"
+        if event.get("type") == "completion_gate_accepted_with_open_problems"
     ]
-    payload = dict(incomplete_events[-1].get("payload") or {})
+    payload = dict(accepted_events[-1].get("payload") or {})
     assert payload.get("runtime_kind") == "interactive_chat"
-    assert set(payload.get("problems") or []) >= {"no_material_edits", "verification_not_attempted"}
+    assert set(payload.get("problems") or []) >= {"no_material_edits"}
     nudge_events = [event for event in events if event.get("type") == "completion_gate_nudge"]
     assert nudge_events
-    assert "interactive execution turn" in str(
+    assert "Finalization check - one pass before you finish:" in str(
         dict(nudge_events[-1].get("payload") or {}).get("message") or ""
     )
 
@@ -2470,19 +2734,23 @@ def test_one_shot_completion_gate_rejects_claim_only_without_evidence(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
-    incomplete_events = [
+    accepted_events = [
+        event
+        for event in events
+        if event.get("type") == "completion_gate_accepted_with_open_problems"
+    ]
+    assert accepted_events
+    payload = dict(accepted_events[-1].get("payload") or {})
+    problems = set(payload.get("problems") or [])
+    assert "no_material_edits" in problems
+    assert payload.get("stage") == "no_material_edits"
+    assert not [
         event
         for event in events
         if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "no_material_edits" in problems
-    assert "verification_not_attempted" in problems
-    assert payload.get("stage") == "no_material_edits"
 
 
 def test_one_shot_no_material_edits_repo_activity_uses_distinct_stage_and_strong_nudge(
@@ -2550,7 +2818,7 @@ def test_one_shot_no_material_edits_repo_activity_uses_distinct_stage_and_strong
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
     assert any(event.get("type") == "one_shot_no_material_edits_detected" for event in events)
     assert not any(event.get("type") == "implementation_bootstrap_nudge" for event in events)
@@ -2560,16 +2828,17 @@ def test_one_shot_no_material_edits_repo_activity_uses_distinct_stage_and_strong
     assert nudge_events
     nudge_payload = dict(nudge_events[-1].get("payload") or {})
     message = str(nudge_payload.get("message") or "")
-    assert "Do not finalize or summarize yet." in message
-    assert "Your next step must be an implementation or deliverable-creation action" in message
-    assert "Verification alone cannot satisfy" in message
-    assert "Prefer verify_run with no arguments" not in message
-    assert "Likely repo-root-relative targets: src/mini_notes/logic.py." in message
+    assert "Finalization check - one pass before you finish:" in message
+    assert "No file changes are recorded yet" in message
+    assert "this checklist is advisory" in message
     assert nudge_payload.get("repo_tool_activity_observed") is True
-    assert nudge_payload.get("nudge_reason") == "requirements_missing"
-    assert nudge_payload.get("completion_gate_nudge_reason") == "requirements_missing"
+    assert nudge_payload.get("nudge_reason") == "advisory_checklist_needed"
+    assert nudge_payload.get("completion_gate_nudge_reason") == "advisory_checklist_needed"
     payload = _latest_completion_gate_payload(sessions_dir, session_id)
     assert payload.get("stage") == "no_material_edits"
+    assert any(
+        event.get("type") == "completion_gate_accepted_with_open_problems" for event in events
+    )
 
 
 def test_one_shot_no_material_edits_bootstrap_nudge_includes_recent_path_anchors(
@@ -2655,7 +2924,7 @@ def test_one_shot_no_material_edits_bootstrap_nudge_includes_recent_path_anchors
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
     nudge_events = [
         event for event in events if event.get("type") == "no_material_edits_bootstrap_nudge"
@@ -2666,8 +2935,11 @@ def test_one_shot_no_material_edits_bootstrap_nudge_includes_recent_path_anchors
     assert "src/mini_notes/logic.py" in anchor_paths
     assert "tests/test_cli.py" in anchor_paths
     message = str(payload.get("message") or "")
-    assert "src/mini_notes/logic.py" in message
-    assert "tests/test_cli.py" in message
+    assert "Finalization check - one pass before you finish:" in message
+    assert "No file changes are recorded yet" in message
+    assert any(
+        event.get("type") == "completion_gate_accepted_with_open_problems" for event in events
+    )
 
 
 def test_one_shot_no_material_edits_bootstrap_recovers_after_real_action(tmp_path: Path) -> None:
@@ -2750,6 +3022,588 @@ def test_one_shot_no_material_edits_bootstrap_recovers_after_real_action(tmp_pat
     )
 
 
+def test_one_shot_empty_git_diff_finalization_is_blocked_until_a_change_exists(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo_with_commit(repo)
+    _commit_repo_file(repo, "src/app.py", "VALUE = 'old'\n")
+    sessions_dir = tmp_path / "sessions"
+    session_id = "one-shot-empty-diff-blocked"
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="code_only"),
+        root=repo,
+        mode="auto",
+        yes=True,
+        max_steps=6,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        verification_enabled=False,
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-read",
+                        name="fs_read",
+                        arguments={"path": "src/app.py"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content="The correct fix would be to change src/app.py.",
+                tool_calls=[],
+                raw={},
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-write",
+                        name="fs_write",
+                        arguments={"path": "src/app.py", "content": "VALUE = 'fixed'\n"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="Updated src/app.py.", tool_calls=[], raw={}),
+            LLMResponse(content="Updated src/app.py.", tool_calls=[], raw={}),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Fix the bug in src/app.py.")
+    finally:
+        session.close()
+
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    blocked = [event for event in events if event.get("type") == "empty_diff_finalization_blocked"]
+    assert exit_code == 0
+    assert blocked
+    assert not any(event.get("type") == "empty_diff_forced" for event in events)
+    corrective = str((blocked[-1].get("payload") or {}).get("message") or "")
+    assert "no human user exists" in corrective
+    assert "no fix has been applied" in corrective
+    assert "Continue working from the repository" in corrective
+    assert "make a concrete code change and verify it" in corrective
+    assert (
+        "src/app.py"
+        in subprocess.run(
+            ["git", "-C", os.fspath(repo), "diff", "--name-only"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+    )
+
+
+def test_one_shot_empty_git_diff_is_forced_only_when_step_budget_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo_with_commit(repo)
+    _commit_repo_file(repo, "src/app.py", "VALUE = 'old'\n")
+    sessions_dir = tmp_path / "sessions"
+    session_id = "one-shot-empty-diff-forced"
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="code_only"),
+        root=repo,
+        mode="auto",
+        yes=True,
+        max_steps=3,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        verification_enabled=False,
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    final_text = "The correct fix would be to change src/app.py."
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-read",
+                        name="fs_read",
+                        arguments={"path": "src/app.py"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content=final_text, tool_calls=[], raw={}),
+            LLMResponse(content=final_text, tool_calls=[], raw={}),
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Fix the bug in src/app.py.")
+    finally:
+        session.close()
+
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    forced = [event for event in events if event.get("type") == "empty_diff_forced"]
+    assert exit_code == 0
+    assert any(event.get("type") == "empty_diff_finalization_blocked" for event in events)
+    assert len(forced) == 1
+    assert (forced[0].get("payload") or {}).get("reason") == "step_budget_exhausted"
+    assert not subprocess.run(
+        ["git", "-C", os.fspath(repo), "diff", "--quiet", "HEAD", "--"],
+        check=False,
+    ).returncode
+
+
+def test_one_shot_empty_git_diff_logs_forced_after_last_step_tool_call(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo_with_commit(repo)
+    _commit_repo_file(repo, "src/app.py", "VALUE = 'old'\n")
+    sessions_dir = tmp_path / "sessions"
+    session_id = "benchmark-empty-diff-tool-exhaustion"
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="code_only"),
+        root=repo,
+        mode="auto",
+        yes=True,
+        max_steps=1,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        verification_enabled=False,
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-read",
+                        name="fs_read",
+                        arguments={"path": "src/app.py"},
+                    )
+                ],
+                raw={},
+            )
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Fix the bug in src/app.py.")
+    finally:
+        session.close()
+
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    forced = [event for event in events if event.get("type") == "empty_diff_forced"]
+    assert exit_code == 1
+    assert len(forced) == 1
+    payload = dict(forced[0].get("payload") or {})
+    assert payload["reason"] == "step_budget_exhausted"
+    assert payload["termination_path"] == "step_loop_exhausted"
+    assert payload["steps_remaining"] == 0
+
+
+def test_one_shot_success_claim_is_blocked_until_fresh_test_execution(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo_with_commit(repo)
+    _commit_repo_file(repo, "src/app.py", "VALUE = 'old'\n")
+    sessions_dir = tmp_path / "sessions"
+    session_id = "one-shot-execution-evidence-blocked"
+    session = create_session(
+        cfg=AppConfig(
+            model="test-model",
+            routing_mode="code_only",
+            verify_commands=[_VERIFY_OK_COMMAND],
+        ),
+        root=repo,
+        mode="auto",
+        yes=True,
+        max_steps=7,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    final_text = "Implemented the source fix. All tests passed."
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-write",
+                        name="fs_write",
+                        arguments={"path": "src/app.py", "content": "VALUE = 'fixed'\n"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content=final_text, tool_calls=[], raw={}),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-verify",
+                        name="verify_run",
+                        arguments={"commands": [_VERIFY_OK_COMMAND]},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content=final_text, tool_calls=[], raw={}),
+            LLMResponse(content=final_text, tool_calls=[], raw={}),
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Fix the bug in src/app.py and run the tests.")
+    finally:
+        session.close()
+
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    blocked = [
+        event for event in events if event.get("type") == "execution_evidence_finalization_blocked"
+    ]
+    assert exit_code == 0
+    assert len(blocked) == 1
+    assert (blocked[0].get("payload") or {}).get("claim_kind") == "tests"
+    assert not any(event.get("type") == "execution_evidence_violation_forced" for event in events)
+
+
+def test_one_shot_existing_test_edit_correctives_are_capped_and_logged(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo_with_commit(repo)
+    _commit_repo_file(repo, "tests/test_app.py", "def test_app():\n    assert True\n")
+    sessions_dir = tmp_path / "sessions"
+    session_id = "one-shot-existing-test-edit-cap"
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="code_only"),
+        root=repo,
+        mode="auto",
+        yes=True,
+        max_steps=9,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        verification_enabled=False,
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    final_response = LLMResponse(
+        content="Implemented the requested behavior.",
+        tool_calls=[],
+        raw={},
+    )
+    test_edit_responses = [
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id=f"tc-test-write-{index}",
+                    name="fs_write",
+                    arguments={
+                        "path": "tests/test_app.py",
+                        "content": "def test_app():\n    assert False\n",
+                    },
+                )
+            ],
+            raw={},
+        )
+        for index in range(1, 4)
+    ]
+    session.client = _ScriptedClient(
+        [
+            test_edit_responses[0],
+            final_response,
+            final_response,
+            test_edit_responses[1],
+            final_response,
+            test_edit_responses[2],
+            final_response,
+            final_response,
+            final_response,
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Fix the implementation without changing existing tests.")
+    finally:
+        session.close()
+
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    blocked = [
+        event for event in events if event.get("type") == "existing_test_edits_finalization_blocked"
+    ]
+    forced = [
+        event for event in events if event.get("type") == "existing_test_edits_violation_forced"
+    ]
+    assert exit_code == 0
+    assert len(blocked) == 3
+    assert [(event.get("payload") or {}).get("hard_block") for event in blocked] == [
+        False,
+        True,
+        True,
+    ]
+    assert "Hard block" in str((blocked[1].get("payload") or {}).get("message") or "")
+    assert "tests/test_app.py" in str((blocked[1].get("payload") or {}).get("message") or "")
+    assert (blocked[1].get("payload") or {}).get("restored_test_paths") == ["tests/test_app.py"]
+    assert len(forced) == 1
+    assert (forced[0].get("payload") or {}).get("reason") == "corrective_cap_exhausted"
+    assert (forced[0].get("payload") or {}).get("violation_flag") == "existing_test_edits"
+    assert (forced[0].get("payload") or {}).get("restored_test_paths") == ["tests/test_app.py"]
+    assert (repo / "tests" / "test_app.py").read_text(encoding="utf-8") == (
+        "def test_app():\n    assert True\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "error_type", "arguments"),
+    [
+        ("web_search", WebSearchError, {"query": "external docs"}),
+        ("web_fetch", WebFetchError, {"url": "https://example.com/missing"}),
+    ],
+)
+def test_repo_web_tool_failures_are_nonfatal_and_not_retried(
+    tmp_path: Path,
+    tool_name: str,
+    error_type: type[Exception],
+    arguments: dict[str, Any],
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo_with_commit(repo)
+    _commit_repo_file(repo, "src/app.py", "VALUE = 'old'\n")
+    sessions_dir = tmp_path / "sessions"
+    session_id = f"one-shot-{tool_name}-nonfatal"
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="code_only"),
+        root=repo,
+        mode="auto",
+        yes=True,
+        max_steps=6,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        verification_enabled=False,
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    calls = 0
+
+    def _failing_web_tool(_args: dict[str, Any]) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        raise error_type("gateway returned 404")
+
+    session.tools[tool_name] = ToolDef(
+        name=tool_name,
+        description="Test web tool.",
+        parameters={"type": "object", "properties": {}},
+        run=_failing_web_tool,
+    )
+    session.tool_list = [tool.as_openai_tool() for tool in session.tools.values()]
+    client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="tc-web-1", name=tool_name, arguments=arguments)],
+                raw={},
+            ),
+            LLMResponse(
+                content=(
+                    "The web lookup failed. You should work around the bug by overriding the "
+                    "method yourself."
+                ),
+                tool_calls=[],
+                raw={},
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="tc-web-2", name=tool_name, arguments=arguments)],
+                raw={},
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-write",
+                        name="fs_write",
+                        arguments={"path": "src/app.py", "content": "VALUE = 'fixed'\n"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="Updated src/app.py.", tool_calls=[], raw={}),
+            LLMResponse(content="Updated src/app.py.", tool_calls=[], raw={}),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Fix the bug in src/app.py using repository evidence.")
+    finally:
+        session.close()
+
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    blocked = [event for event in events if event.get("type") == "empty_diff_finalization_blocked"]
+    tool_results = [
+        dict(event.get("payload") or {}).get("result")
+        for event in events
+        if event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == tool_name
+    ]
+    second_request_tool_names = {
+        str((tool.get("function") or {}).get("name") or "")
+        for tool in (client.call_records[1].get("tools") or [])
+    }
+    assert exit_code == 0
+    assert calls == 1
+    assert blocked
+    corrective = str((blocked[-1].get("payload") or {}).get("message") or "")
+    assert "no human user exists" in corrective
+    assert "Continue working from the repository" in corrective
+    assert len(tool_results) == 2
+    assert all(isinstance(result, dict) and "error" not in result for result in tool_results)
+    assert all(result.get("reason") == WEB_UNAVAILABLE_OBSERVATION for result in tool_results)
+    assert tool_name not in second_request_tool_names
+    assert sum(event.get("type") == "web_tool_unavailable" for event in events) == 1
+    assert not any(
+        event.get("type") == "warning"
+        and (event.get("payload") or {}).get("warning") == "repeated_tool_failure_guard"
+        for event in events
+    )
+
+
+def test_repo_web_tool_recoverable_errors_return_error_and_keep_tool_available(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo_with_commit(repo)
+    _commit_repo_file(repo, "src/app.py", "VALUE = 'old'\n")
+    sessions_dir = tmp_path / "sessions"
+    session_id = "one-shot-web-search-recoverable"
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="code_only"),
+        root=repo,
+        mode="auto",
+        yes=True,
+        max_steps=6,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        verification_enabled=False,
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    calls = 0
+
+    def _web_search_tool(args: dict[str, Any]) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise WebSearchError(
+                "max_sources must be an integer between 1 and 20.",
+                recoverable=True,
+            )
+        return {
+            "query": str(args.get("query") or ""),
+            "answer": "Corrected retry succeeded.",
+            "sources": [{"url": "https://docs.example.com/fix", "title": "Fix"}],
+        }
+
+    session.tools["web_search"] = ToolDef(
+        name="web_search",
+        description="Test web search tool.",
+        parameters={"type": "object", "properties": {}},
+        run=_web_search_tool,
+    )
+    session.tool_list = [tool.as_openai_tool() for tool in session.tools.values()]
+    client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-web-1",
+                        name="web_search",
+                        arguments={"query": "external docs", "max_sources": 50},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-web-2",
+                        name="web_search",
+                        arguments={"query": "external docs", "max_sources": 5},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-write",
+                        name="fs_write",
+                        arguments={"path": "src/app.py", "content": "VALUE = 'fixed'\n"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="Updated src/app.py.", tool_calls=[], raw={}),
+            LLMResponse(content="Updated src/app.py.", tool_calls=[], raw={}),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Fix the bug in src/app.py using repository evidence.")
+    finally:
+        session.close()
+
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    tool_results = [
+        dict(event.get("payload") or {}).get("result")
+        for event in events
+        if event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == "web_search"
+    ]
+    second_request_tool_names = {
+        str((tool.get("function") or {}).get("name") or "")
+        for tool in (client.call_records[1].get("tools") or [])
+    }
+    assert exit_code == 0
+    assert calls == 2
+    assert len(tool_results) == 2
+    first_result = tool_results[0]
+    assert isinstance(first_result, dict)
+    assert first_result.get("error") == "max_sources must be an integer between 1 and 20."
+    assert first_result.get("recoverable") is True
+    second_result = tool_results[1]
+    assert isinstance(second_result, dict)
+    assert "error" not in second_result
+    assert second_result.get("answer") == "Corrected retry succeeded."
+    assert "web_search" in second_request_tool_names
+    assert sum(event.get("type") == "web_tool_unavailable" for event in events) == 0
+
+
 def test_one_shot_read_only_between_rejected_finals_does_not_reset_gate(
     tmp_path: Path,
 ) -> None:
@@ -2815,19 +3669,14 @@ def test_one_shot_read_only_between_rejected_finals_does_not_reset_gate(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
+    payload = _latest_completion_gate_acceptance_payload(events)
     assert payload.get("stage") == "no_material_edits"
-    assert payload.get("completion_gate_decision") == "TERMINATE_STAGNANT"
-    assert payload.get("completion_gate_stagnant_attempt_count") == 3
-    assert payload.get("completion_gate_meaningful_progress_since_previous_rejection") is False
+    assert "no_material_edits" in set(payload.get("problems") or [])
+    assert not any(
+        event.get("type") == "one_shot_completion_gate_incomplete_after_retries" for event in events
+    )
 
 
 def test_one_shot_no_material_to_verification_stage_transition_starts_new_episode(
@@ -2903,18 +3752,14 @@ def test_one_shot_no_material_to_verification_stage_transition_starts_new_episod
         event for event in events if event.get("type") == "one_shot_completion_gate_failed"
     ]
     stages = [str((event.get("payload") or {}).get("stage") or "") for event in gate_failed_events]
-    assert stages == ["no_material_edits", "verification_not_attempted"]
-    verification_payload = dict(gate_failed_events[-1].get("payload") or {})
-    assert (
-        verification_payload.get("completion_gate_meaningful_progress_since_previous_rejection")
-        is True
-    )
+    assert stages == ["no_material_edits"]
+    _assert_no_completion_gate_terminal_events(events)
     assert not any(
         event.get("type") == "one_shot_completion_gate_incomplete_after_retries" for event in events
     )
 
 
-def test_one_shot_completion_gate_terminal_failure_no_material_edits_emits_forced_final_summary(
+def test_one_shot_completion_gate_no_material_edits_accepts_after_checklist(
     tmp_path: Path,
 ) -> None:
     _write_test_files(tmp_path, ["src/mini_notes/logic.py"])
@@ -2999,41 +3844,14 @@ def test_one_shot_completion_gate_terminal_failure_no_material_edits_emits_force
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_no_material_edits_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
+    payload = _latest_completion_gate_acceptance_payload(events)
     assert payload.get("stage") == "no_material_edits"
-    assert payload.get("repo_tool_activity_observed") is True
-    assert "src/mini_notes/logic.py" in list(payload.get("anchor_paths") or [])
-    assert any(
-        event.get("type") == "one_shot_completion_gate_incomplete_after_retries" for event in events
-    )
-    expected_error = (
-        "One-shot run stopped: completion gate requirements were not met (no material edits)."
-    )
-    assert surface.errors
-    assert surface.errors[-1] == expected_error
-    requested = [event for event in events if event.get("type") == "forced_final_summary_requested"]
-    assert requested
-    assert dict(requested[-1].get("payload") or {}).get("reason") == (
-        "completion_gate_terminal_failure"
-    )
-    summary = _assert_forced_final_summary_emitted(events)
-    assert surface.final_messages[-1] == summary
-    _assert_last_forced_summary_request(
-        client,
-        latest_assistant_text=latest_final_text,
-        termination_cause=(
-            "completion-gate stagnation after repeated invalid finalization attempts "
-            "without new implementation or verification progress"
-        ),
-    )
+    assert "no_material_edits" in set(payload.get("problems") or [])
+    assert not surface.errors
+    assert not any(event.get("type") == "forced_final_summary_requested" for event in events)
+    assert surface.final_messages[-1] == latest_final_text
 
 
 def test_one_shot_completion_gate_rejects_failing_verification(tmp_path: Path) -> None:
@@ -3101,18 +3919,251 @@ def test_one_shot_completion_gate_rejects_failing_verification(tmp_path: Path) -
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-verification-failed.jsonl"))
-    assert any(event.get("type") == "completion_gate_nudge" for event in events)
-    incomplete_events = [
-        event
+    _assert_no_completion_gate_terminal_events(events)
+    verify_results = [
+        dict((event.get("payload") or {}).get("result") or {})
         for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
+        if event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == "verify_run"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "verification_failed" in problems
+    assert verify_results
+    assert verify_results[-1].get("all_passed") is False
+
+
+def test_one_shot_completion_gate_forces_verify_when_missing(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(
+        model="test-model",
+        routing_mode="code_only",
+        verify_commands=[_VERIFY_OK_COMMAND],
+    )
+    sessions_dir = tmp_path / "sessions"
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=6,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        session_log_dir_override=sessions_dir,
+        session_id_override="one-shot-forced-missing-verify",
+    )
+    client = _ForcedToolChoiceScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc1",
+                        name="fs_write",
+                        arguments={"path": "src/app.py", "content": "print('ok')\n"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="Implemented and ready.", tool_calls=[], raw={}),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc2",
+                        name="verify_run",
+                        arguments={},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="Implemented and verified.", tool_calls=[], raw={}),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Update the app implementation.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    forced_choices = [record["tool_choice"] for record in client.call_records]
+    assert all(choice is None for choice in forced_choices)
+    events = list(read_session_events(sessions_dir / "one-shot-forced-missing-verify.jsonl"))
+    nudge_events = [event for event in events if event.get("type") == "completion_gate_nudge"]
+    assert nudge_events
+    payload = dict(nudge_events[-1].get("payload") or {})
+    assert payload.get("completion_gate_preferred_tool_names") == []
+    assert payload.get("forced_tool_choice") is None
+    assert "Expected verification not yet run" in str(payload.get("message") or "")
+
+
+def test_one_shot_completion_gate_forces_diff_review_after_fresh_verification(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo_with_commit(repo)
+    cfg = AppConfig(
+        model="test-model",
+        routing_mode="code_only",
+        verify_commands=[_VERIFY_OK_COMMAND],
+    )
+    sessions_dir = tmp_path / "sessions"
+    session = create_session(
+        cfg=cfg,
+        root=repo,
+        mode="auto",
+        yes=True,
+        max_steps=7,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        session_log_dir_override=sessions_dir,
+        session_id_override="one-shot-forced-diff-review",
+    )
+    client = _ForcedToolChoiceScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc1",
+                        name="fs_write",
+                        arguments={"path": "README.md", "content": "repo updated\n"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc2",
+                        name="verify_run",
+                        arguments={},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="Updated README and verification passed.", tool_calls=[], raw={}),
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="tc3", name="git_diff", arguments={})],
+                raw={},
+            ),
+            LLMResponse(
+                content="Updated README, verified, and reviewed the diff.", tool_calls=[], raw={}
+            ),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Update README.md and verify the change.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    forced_choices = [record["tool_choice"] for record in client.call_records]
+    assert all(choice is None for choice in forced_choices)
+    events = list(read_session_events(sessions_dir / "one-shot-forced-diff-review.jsonl"))
+    assert not any(
+        "diff_not_reviewed" in set((event.get("payload") or {}).get("problems") or [])
+        for event in events
+    )
+
+
+def test_one_shot_completion_gate_switches_repeated_verification_failure_to_test_discover(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(
+        model="test-model",
+        routing_mode="code_only",
+        verify_commands=[_VERIFY_FAIL_COMMAND],
+    )
+    sessions_dir = tmp_path / "sessions"
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=7,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        session_log_dir_override=sessions_dir,
+        session_id_override="one-shot-forced-test-discover",
+    )
+    client = _ForcedToolChoiceScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc1",
+                        name="fs_write",
+                        arguments={"path": "src/app.py", "content": "print('bad')\n"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc2",
+                        name="verify_run",
+                        arguments={},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="Implemented and ran verification.", tool_calls=[], raw={}),
+            LLMResponse(content="Implemented and ran verification.", tool_calls=[], raw={}),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc3",
+                        name="test_discover",
+                        arguments={"paths": ["src/app.py"], "include_commands": True},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content=(
+                    "Completed work: implementation was attempted.\n"
+                    "Remaining work: verification is still failing.\n"
+                    "Known issues or risks: completion-gate repair needs another patch."
+                ),
+                tool_calls=[],
+                raw={},
+            ),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Fix the failing app behavior.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    forced_choices = [record["tool_choice"] for record in client.call_records]
+    assert all(choice is None for choice in forced_choices)
+    events = list(read_session_events(sessions_dir / "one-shot-forced-test-discover.jsonl"))
+    nudge_payloads = [
+        dict(event.get("payload") or {})
+        for event in events
+        if event.get("type") == "completion_gate_nudge"
+    ]
+    assert any(payload.get("stage") == "verification_failed" for payload in nudge_payloads)
+    assert all(
+        payload.get("completion_gate_preferred_tool_names") == [] for payload in nudge_payloads
+    )
 
 
 def test_one_shot_repeated_identical_verification_failure_does_not_reset_gate(
@@ -3189,19 +4240,17 @@ def test_one_shot_repeated_identical_verification_failure_does_not_reset_gate(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
-    incomplete_events = [
-        event
+    _assert_no_completion_gate_terminal_events(events)
+    verify_results = [
+        dict((event.get("payload") or {}).get("result") or {})
         for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
+        if event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == "verify_run"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    assert payload.get("stage") == "verification_failed"
-    assert payload.get("completion_gate_decision") == "TERMINATE_STAGNANT"
-    assert payload.get("completion_gate_stagnant_attempt_count") == 3
-    assert payload.get("completion_gate_meaningful_progress_since_previous_rejection") is False
+    assert verify_results
+    assert verify_results[-1].get("all_passed") is False
 
 
 def test_one_shot_blocker_text_does_not_bypass_code_verification_failure(
@@ -3281,7 +4330,7 @@ def test_one_shot_blocker_text_does_not_bypass_code_verification_failure(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-code-failure-not-blocker.jsonl"))
     failed_events = [
         event for event in events if event.get("type") == "one_shot_completion_gate_failed"
@@ -3291,6 +4340,8 @@ def test_one_shot_blocker_text_does_not_bypass_code_verification_failure(
     assert payload.get("blocked_response") is True
     assert payload.get("blocked_response_allows_completion") is False
     assert "verification_failed" in set(payload.get("problems") or [])
+    accepted_payload = _latest_completion_gate_acceptance_payload(events)
+    assert "verification_failed" in set(accepted_payload.get("problems") or [])
 
 
 def test_one_shot_infra_verification_blocker_can_finalize(
@@ -3473,20 +4524,13 @@ def test_one_shot_completion_gate_allows_failed_verification_repair_cycle_to_rec
 
     assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-verify-repair-recover.jsonl"))
-    gate_failed_events = [
-        event for event in events if event.get("type") == "one_shot_completion_gate_failed"
-    ]
-    assert gate_failed_events
-    stages = [str((event.get("payload") or {}).get("stage") or "") for event in gate_failed_events]
-    assert "verification_not_attempted" in stages
-    assert "verification_failed" in stages
-    assert any(event.get("type") == "failed_verification_repair_attempt" for event in events)
+    _assert_no_completion_gate_terminal_events(events)
     assert not any(
         event.get("type") == "one_shot_completion_gate_incomplete_after_retries" for event in events
     )
 
 
-def test_one_shot_completion_gate_terminal_failure_after_failed_verification_repair_emits_forced_final_summary(
+def test_one_shot_completion_gate_failed_verification_accepts_after_checklist(
     tmp_path: Path,
 ) -> None:
     cfg = AppConfig(model="test-model", routing_mode="code_only")
@@ -3505,7 +4549,7 @@ def test_one_shot_completion_gate_terminal_failure_after_failed_verification_rep
         session_id_override="one-shot-verify-repair-terminal",
         surface=surface,
     )
-    latest_final_text = "Implemented and verified successfully."
+    latest_final_text = "Implemented the repair attempt; verification is still failing."
     client = _ScriptedClient(
         [
             LLMResponse(
@@ -3590,40 +4634,20 @@ def test_one_shot_completion_gate_terminal_failure_after_failed_verification_rep
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-verify-repair-terminal.jsonl"))
-    assert any(event.get("type") == "failed_verification_repair_attempt" for event in events)
-    incomplete_events = [
-        event
+    _assert_no_completion_gate_terminal_events(events)
+    verify_results = [
+        dict((event.get("payload") or {}).get("result") or {})
         for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
+        if event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == "verify_run"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    assert payload.get("stage") == "verification_failed"
-    assert payload.get("problem_summary") == "verification failing"
-    assert "NameError" in str(payload.get("verification_failure_snippet") or "")
-    expected_error = (
-        "One-shot run stopped: completion gate requirements were not met "
-        "(verification failing). First reported error: NameError: search_notes is not defined."
-    )
-    assert surface.errors
-    assert surface.errors[-1] == expected_error
-    requested = [event for event in events if event.get("type") == "forced_final_summary_requested"]
-    assert requested
-    assert dict(requested[-1].get("payload") or {}).get("reason") == (
-        "completion_gate_terminal_failure"
-    )
-    summary = _assert_forced_final_summary_emitted(events)
-    assert surface.final_messages[-1] == summary
-    _assert_last_forced_summary_request(
-        client,
-        latest_assistant_text=latest_final_text,
-        termination_cause=(
-            "completion-gate stagnation after repeated invalid finalization attempts "
-            "without new implementation or verification progress"
-        ),
-    )
+    assert verify_results
+    assert verify_results[-1].get("all_passed") is False
+    assert not surface.errors
+    assert not any(event.get("type") == "forced_final_summary_requested" for event in events)
+    assert surface.final_messages[-1] == latest_final_text
 
 
 def test_one_shot_completion_gate_nudge_includes_first_failed_verification_snippet(
@@ -3699,18 +4723,17 @@ def test_one_shot_completion_gate_nudge_includes_first_failed_verification_snipp
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-verify-snippet-nudge.jsonl"))
-    nudge_events = [event for event in events if event.get("type") == "completion_gate_nudge"]
-    assert nudge_events
-    nudge_payload = dict(nudge_events[-1].get("payload") or {})
-    assert nudge_payload.get("stage") == "verification_failed"
-    snippet = str(nudge_payload.get("verification_failure_snippet") or "")
-    message = str(nudge_payload.get("message") or "")
-    assert "ImportError" in snippet
-    assert "search_notes" in snippet
-    assert "First reported error:" in message
-    assert "ImportError" in message
+    _assert_no_completion_gate_terminal_events(events)
+    verify_results = [
+        dict((event.get("payload") or {}).get("result") or {})
+        for event in events
+        if event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == "verify_run"
+    ]
+    assert verify_results
+    assert verify_results[-1].get("all_passed") is False
 
 
 def test_one_shot_final_summary_is_rewritten_to_greek_with_explicit_override(
@@ -3802,6 +4825,12 @@ def test_one_shot_final_summary_is_rewritten_to_greek_with_explicit_override(
     assert rewrite_events
     rewrite_payload = dict(rewrite_events[-1].get("payload") or {})
     assert rewrite_payload.get("status") == "applied"
+    usage_operations = {
+        str((event.get("payload") or {}).get("operation") or "")
+        for event in events
+        if event.get("type") == "llm_usage"
+    }
+    assert "final_summary_language_rewrite" in usage_operations
     final_events = [event for event in events if event.get("type") == "final"]
     assert final_events
     final_content = str((final_events[-1].get("payload") or {}).get("content") or "")
@@ -3829,18 +4858,22 @@ def test_final_summary_rewrite_keeps_original_when_technical_tokens_change() -> 
         ]
     )
 
+    usage_calls: list[dict[str, Any]] = []
     rewritten, payload = _rewrite_final_summary_for_language(
         client=client,
         final_text=original,
         language="Greek",
         script="",
         explicit_language_override=True,
+        record_usage=lambda **kwargs: usage_calls.append(kwargs),
     )
 
     assert rewritten == original
     assert payload is not None
     assert payload.get("status") == "kept_original"
     assert payload.get("reason") == "protected_tokens_missing"
+    assert len(usage_calls) == 1
+    assert usage_calls[0]["operation"] == "final_summary_language_rewrite"
 
 
 def test_one_shot_runtime_messages_remain_english_without_explicit_override(
@@ -3920,6 +4953,7 @@ def test_runtime_message_falls_back_to_english_for_unsupported_language() -> Non
         )
         == "Understanding your request."
     )
+    assert _runtime_message("phase_drafting_response") == "Contacting model provider."
 
     client = _ScriptedClient(
         [
@@ -4010,6 +5044,42 @@ def test_one_shot_docs_only_readme_change_requires_explicit_verification_contrac
         blocked=False,
         touched_repo_paths={"README.md"},
         verification_contract_requires_execution=False,
+        effective_verification_commands=["pytest -q"],
+    )
+    assert not _verification_expected_for_turn(
+        turn_intent="execute",
+        blocked=False,
+        touched_repo_paths={"notes/result.txt"},
+        verification_contract_requires_execution=False,
+        effective_verification_commands=["pytest -q"],
+    )
+    assert _verification_expected_for_turn(
+        turn_intent="execute",
+        blocked=False,
+        touched_repo_paths={"src/app.py"},
+        verification_contract_requires_execution=False,
+        effective_verification_commands=["pytest -q"],
+    )
+    assert not _verification_expected_for_turn(
+        turn_intent="execute",
+        blocked=False,
+        touched_repo_paths={"styles/site.css"},
+        verification_contract_requires_execution=False,
+        effective_verification_commands=["pytest -q"],
+    )
+    assert not _verification_expected_for_turn(
+        turn_intent="execute",
+        blocked=False,
+        touched_repo_paths={"src/app.py"},
+        verification_contract_requires_execution=False,
+        effective_verification_commands=["npm test"],
+    )
+    assert _verification_expected_for_turn(
+        turn_intent="execute",
+        blocked=False,
+        touched_repo_paths={"package.json"},
+        verification_contract_requires_execution=False,
+        effective_verification_commands=["npm test"],
     )
 
 
@@ -4114,17 +5184,11 @@ def test_one_shot_source_code_change_without_verification_still_fails(tmp_path: 
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-code-no-verify.jsonl"))
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "verification_not_attempted" in problems
+    assert not any(
+        event.get("type") == "one_shot_completion_gate_incomplete_after_retries" for event in events
+    )
 
 
 def test_one_shot_mixed_docs_and_code_change_without_verification_still_fails(
@@ -4191,17 +5255,11 @@ def test_one_shot_mixed_docs_and_code_change_without_verification_still_fails(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-mixed-docs-code-no-verify.jsonl"))
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "verification_not_attempted" in problems
+    assert not any(
+        event.get("type") == "one_shot_completion_gate_incomplete_after_retries" for event in events
+    )
 
 
 def test_one_shot_source_code_change_with_passing_verification_succeeds(tmp_path: Path) -> None:
@@ -4677,17 +5735,16 @@ def test_one_shot_shell_run_that_is_not_safe_verification_does_not_count(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / f"one-shot-{session_suffix}-no-verify.jsonl"))
-    incomplete_events = [
-        event
+    shell_results = [
+        dict((event.get("payload") or {}).get("result") or {})
         for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
+        if event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == "shell_run"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "verification_not_attempted" in problems
+    assert shell_results
+    assert shell_results[-1].get("verification_evidence_allowed") is False
 
 
 def test_one_shot_verify_run_rejects_unsafe_compound_command(
@@ -4765,17 +5822,17 @@ def test_one_shot_verify_run_rejects_unsafe_compound_command(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-verify-run-unsafe-command.jsonl"))
-    incomplete_events = [
-        event
+    verify_results = [
+        dict((event.get("payload") or {}).get("result") or {})
         for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
+        if event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == "verify_run"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "verification_failed" in problems
+    assert verify_results
+    assert "disallowed_shell_control_flow" in str(verify_results[-1].get("error") or "")
+    assert verify_results[-1].get("verification_evidence_allowed") is False
 
 
 def test_one_shot_verify_run_incompatible_override_does_not_count(
@@ -4846,19 +5903,24 @@ def test_one_shot_verify_run_incompatible_override_does_not_count(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(
         read_session_events(sessions_dir / "one-shot-verify-run-incompatible-override.jsonl")
     )
-    incomplete_events = [
-        event
+    verify_results = [
+        dict((event.get("payload") or {}).get("result") or {})
         for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
+        if event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == "verify_run"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "verification_failed" in problems
+    assert verify_results
+    assert verify_results[-1].get("verification_evidence_allowed") is False
+    assert not verify_results[-1].get("error")
+    assert verify_results[-1].get("commands") == []
+    assert verify_results[-1].get("ignored_model_verification_commands") == [
+        'python3 -c "print(123)"'
+    ]
+    assert verify_results[-1].get("verification_skip_reason") == "verification_contract_unavailable"
 
 
 def test_one_shot_verify_run_go_no_tests_to_run_does_not_count(
@@ -4929,17 +5991,9 @@ def test_one_shot_verify_run_go_no_tests_to_run_does_not_count(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-verify-run-go-no-tests.jsonl"))
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "verification_failed" in problems
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_verify_run_go_no_test_files_does_not_count(
@@ -5005,17 +6059,9 @@ def test_one_shot_verify_run_go_no_test_files_does_not_count(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-verify-run-go-no-test-files.jsonl"))
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "verification_failed" in problems
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_partial_shell_verification_coverage_does_not_count(
@@ -5084,20 +6130,11 @@ def test_one_shot_partial_shell_verification_coverage_does_not_count(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(
         read_session_events(sessions_dir / "one-shot-partial-shell-verification-coverage.jsonl")
     )
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert problems & {"verification_incomplete", "verification_failed"}
-    assert "ruff check ." in set(payload.get("missing_verification_commands") or [])
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_partial_verify_run_coverage_does_not_count(
@@ -5164,18 +6201,9 @@ def test_one_shot_partial_verify_run_coverage_does_not_count(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-partial-verify-run-coverage.jsonl"))
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert problems & {"verification_incomplete", "verification_failed"}
-    assert "ruff check ." in set(payload.get("missing_verification_commands") or [])
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_two_shell_verification_commands_cover_effective_contract(
@@ -5396,12 +6424,9 @@ def test_one_shot_verify_run_coverage_becomes_stale_after_later_code_edit(
     finally:
         session.close()
 
-    assert exit_code == 1
-    payload = _latest_completion_gate_payload(sessions_dir, session_id)
-    problems = set(payload.get("problems") or [])
-    assert "verification_incomplete" in problems
-    assert payload.get("verification_coverage_stale") is True
-    assert "pytest -q" in set(payload.get("missing_verification_commands") or [])
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_shell_verification_coverage_becomes_stale_after_later_code_edit(
@@ -5478,12 +6503,9 @@ def test_one_shot_shell_verification_coverage_becomes_stale_after_later_code_edi
     finally:
         session.close()
 
-    assert exit_code == 1
-    payload = _latest_completion_gate_payload(sessions_dir, session_id)
-    problems = set(payload.get("problems") or [])
-    assert "verification_incomplete" in problems
-    assert payload.get("verification_coverage_stale") is True
-    assert "pytest -q" in set(payload.get("missing_verification_commands") or [])
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_shell_edit_after_verification_invalidates_freshness(
@@ -5555,12 +6577,23 @@ def test_one_shot_shell_edit_after_verification_invalidates_freshness(
     finally:
         session.close()
 
-    assert exit_code == 1
-    payload = _latest_completion_gate_payload(sessions_dir, session_id)
-    problems = set(payload.get("problems") or [])
-    assert "verification_incomplete" in problems
-    assert payload.get("verification_coverage_stale") is True
-    assert "pytest -q" in set(payload.get("missing_verification_commands") or [])
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    _assert_no_completion_gate_terminal_events(events)
+    invalidations = [
+        event.get("payload", {})
+        for event in events
+        if event.get("type") == "verified_state_invalidated_by_edit"
+    ]
+    assert invalidations
+    invalidation = invalidations[-1]
+    assert invalidation.get("tool") == "shell_run"
+    assert invalidation.get("requested_tool") == "shell_run"
+    assert invalidation.get("tool_call_id") == "tc3"
+    assert str(invalidation.get("verified_generation_id", "")).startswith(
+        "verification-generation-"
+    )
+    assert "re-verify before finalizing" in str(invalidation.get("message", ""))
 
 
 def test_one_shot_shell_only_repo_edit_counts_as_material_edit(
@@ -5738,7 +6771,7 @@ def test_one_shot_task_specific_acceptance_cannot_override_authoritative_contrac
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     payload = _latest_completion_gate_payload(sessions_dir, session_id)
     assert "verification_failed" in set(payload.get("problems") or [])
     assert payload.get("verification_evidence_category") == (
@@ -5937,7 +6970,7 @@ def test_one_shot_shell_verification_cache_artifacts_do_not_count_as_material_ed
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     payload = _latest_completion_gate_payload(sessions_dir, session_id)
     problems = set(payload.get("problems") or [])
     assert "no_material_edits" in problems
@@ -6006,10 +7039,9 @@ def test_one_shot_shell_verification_that_mutates_code_fails_closed(
     finally:
         session.close()
 
-    assert exit_code == 1
-    payload = _latest_completion_gate_payload(sessions_dir, session_id)
-    problems = set(payload.get("problems") or [])
-    assert "verification_failed" in problems
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_verify_run_that_mutates_code_fails_closed(
@@ -6083,12 +7115,9 @@ def test_one_shot_verify_run_that_mutates_code_fails_closed(
     finally:
         session.close()
 
-    assert exit_code == 1
-    payload = _latest_completion_gate_payload(sessions_dir, session_id)
-    problems = set(payload.get("problems") or [])
-    assert "verification_failed" in problems
-    state = dict(payload.get("state") or {})
-    assert "verify_run" in set(state.get("material_edit_tools") or [])
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_failed_shell_edit_after_verification_invalidates_freshness(
@@ -6162,12 +7191,9 @@ def test_one_shot_failed_shell_edit_after_verification_invalidates_freshness(
     finally:
         session.close()
 
-    assert exit_code == 1
-    payload = _latest_completion_gate_payload(sessions_dir, session_id)
-    problems = set(payload.get("problems") or [])
-    assert "verification_incomplete" in problems
-    assert payload.get("verification_coverage_stale") is True
-    assert "pytest -q" in set(payload.get("missing_verification_commands") or [])
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_failed_shell_only_repo_edit_counts_as_material_edit(
@@ -6526,15 +7552,9 @@ def test_one_shot_multicommand_verification_becomes_stale_after_code_edit(
     finally:
         session.close()
 
-    assert exit_code == 1
-    payload = _latest_completion_gate_payload(sessions_dir, session_id)
-    problems = set(payload.get("problems") or [])
-    assert "verification_incomplete" in problems
-    assert payload.get("verification_coverage_stale") is True
-    assert set(payload.get("missing_verification_commands") or []) == {
-        "pytest -q",
-        "ruff check .",
-    }
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_multicommand_shell_code_edit_invalidates_verification(
@@ -6616,15 +7636,9 @@ def test_one_shot_multicommand_shell_code_edit_invalidates_verification(
     finally:
         session.close()
 
-    assert exit_code == 1
-    payload = _latest_completion_gate_payload(sessions_dir, session_id)
-    problems = set(payload.get("problems") or [])
-    assert "verification_incomplete" in problems
-    assert payload.get("verification_coverage_stale") is True
-    assert set(payload.get("missing_verification_commands") or []) == {
-        "pytest -q",
-        "ruff check .",
-    }
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_multicommand_docs_only_edit_keeps_verification_fresh(
@@ -6861,12 +7875,9 @@ def test_one_shot_multicommand_rerunning_only_one_command_after_code_edit_is_inc
     finally:
         session.close()
 
-    assert exit_code == 1
-    payload = _latest_completion_gate_payload(sessions_dir, session_id)
-    problems = set(payload.get("problems") or [])
-    assert "verification_incomplete" in problems
-    assert payload.get("verification_coverage_stale") is False
-    assert set(payload.get("missing_verification_commands") or []) == {"ruff check ."}
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_multicommand_rerunning_all_commands_after_code_edit_passes(
@@ -7038,21 +8049,21 @@ def test_one_shot_verify_run_non_executing_override_does_not_count(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(
         read_session_events(
             sessions_dir / f"one-shot-verify-run-non-executing-{session_suffix}.jsonl"
         )
     )
-    incomplete_events = [
-        event
+    verify_results = [
+        dict((event.get("payload") or {}).get("result") or {})
         for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
+        if event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == "verify_run"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "verification_failed" in problems
+    assert verify_results
+    assert verify_results[-1].get("verification_evidence_allowed") is False
+    assert "non_assertive_verification_mode" in str(verify_results[-1].get("error") or "")
 
 
 @pytest.mark.parametrize(
@@ -7222,17 +8233,9 @@ def test_one_shot_shell_go_no_tests_to_run_does_not_count(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-shell-go-no-tests.jsonl"))
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "verification_failed" in problems
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_verify_run_go_mixed_output_counts(
@@ -7294,6 +8297,17 @@ def test_one_shot_verify_run_go_mixed_output_counts(
         session.close()
 
     assert exit_code == 0
+    events = list(read_session_events(sessions_dir / "one-shot-verify-run-go-mixed-output.jsonl"))
+    tool_results = [
+        event.get("payload", {}).get("result", {})
+        for event in events
+        if event.get("type") == "tool_result"
+    ]
+    verify_results = [result for result in tool_results if result.get("verification_note")]
+    assert verify_results
+    assert verify_results[0].get("verification_note") == (
+        "evidence origin: PREEXISTING_REPO_NATIVE (independent)"
+    )
 
 
 def test_one_shot_shell_go_mixed_output_counts(
@@ -7450,17 +8464,9 @@ def test_one_shot_shell_go_no_test_files_does_not_count(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-shell-go-no-test-files.jsonl"))
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    problems = set(payload.get("problems") or [])
-    assert "verification_failed" in problems
+    _assert_no_completion_gate_terminal_events(events)
 
 
 def test_one_shot_completion_gate_step_budget_exhausted_emits_forced_final_summary(
@@ -7519,24 +8525,17 @@ def test_one_shot_completion_gate_step_budget_exhausted_emits_forced_final_summa
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-completion-gate-step-budget.jsonl"))
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    assert payload.get("reason") == "completion_gate_incomplete_verification_step_budget_exhausted"
-    assert payload.get("completion_gate_decision") == "TERMINATE_BUDGET_EXHAUSTED"
+    assert not any(
+        event.get("type") == "one_shot_completion_gate_incomplete_after_retries" for event in events
+    )
     assert not any(
         event.get("type") == "error"
         and str((event.get("payload") or {}).get("error")) == "max_steps exceeded"
         for event in events
     )
-    summary = _assert_forced_final_summary_emitted(events)
-    assert "Remaining work: verification still needs to run." in summary
+    assert not any(event.get("type") == "forced_final_summary_requested" for event in events)
 
 
 def test_one_shot_session_context_includes_follow_through_guidance(tmp_path: Path) -> None:
@@ -8301,7 +9300,7 @@ def test_one_shot_greek_post_explore_progress_transitions_to_action(tmp_path: Pa
     assert "one_shot_incomplete_after_retries" not in event_types
 
 
-def test_one_shot_post_explore_retry_exhausted_emits_forced_final_summary(
+def test_one_shot_post_explore_stagnation_after_nudge_cap_accepts_final(
     tmp_path: Path,
 ) -> None:
     _write_test_files(tmp_path, ["src/mini_notes/cli.py"])
@@ -8354,6 +9353,11 @@ def test_one_shot_post_explore_retry_exhausted_emits_forced_final_summary(
                 )
                 for idx in range(2, 9)
             ],
+            LLMResponse(
+                content="I inspected the likely edit target and am ready to continue directly.",
+                tool_calls=[],
+                raw={},
+            ),
         ]
     )  # type: ignore[assignment]
 
@@ -8362,34 +9366,24 @@ def test_one_shot_post_explore_retry_exhausted_emits_forced_final_summary(
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-post-explore-fail-cap.jsonl"))
-    assert any(event.get("type") == "one_shot_post_explore_stagnation_detected" for event in events)
-    incomplete_events = [
+    detections = [
         event
         for event in events
-        if event.get("type") == "one_shot_post_explore_incomplete_after_retries"
+        if event.get("type") == "one_shot_post_explore_stagnation_detected"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    assert payload.get("reason") == "repeated_successful_exploration_loop"
+    assert detections
+    assert any(dict(event.get("payload") or {}).get("nudge_sent") is False for event in detections)
+    bootstrap_events = [
+        event for event in events if event.get("type") == "implementation_bootstrap_nudge"
+    ]
+    assert len(bootstrap_events) == 1
     assert not any(
-        event.get("type") == "error"
-        and str((event.get("payload") or {}).get("error")) == "max_steps exceeded"
-        for event in events
+        event.get("type") == "one_shot_post_explore_incomplete_after_retries" for event in events
     )
-    requested = [event for event in events if event.get("type") == "forced_final_summary_requested"]
-    assert requested
-    assert dict(requested[-1].get("payload") or {}).get("reason") == "post_explore_retry_exhausted"
-    expected_error = (
-        "One-shot run stopped: post-explore stagnation persisted after bounded "
-        "implementation-bootstrap nudges. Start implementing or creating the requested "
-        "deliverable now or report a concrete blocker."
-    )
-    assert expected_error in surface.errors
-    assert surface.errors[-1] == expected_error
-    summary = _assert_forced_final_summary_emitted(events)
-    assert surface.final_messages[-1] == summary
+    assert not any(event.get("type") == "forced_final_summary_requested" for event in events)
+    assert surface.errors == []
 
 
 def test_one_shot_post_explore_bootstrap_nudge_includes_recent_path_anchors(
@@ -8753,7 +9747,7 @@ def test_one_shot_plan_only_task_does_not_trigger_exploration_stagnation_nudges(
     assert "exploration_nudge" not in event_types
 
 
-def test_one_shot_exploration_retry_exhausted_emits_forced_final_summary(tmp_path: Path) -> None:
+def test_one_shot_exploration_after_nudge_cap_accepts_final(tmp_path: Path) -> None:
     _write_test_files(tmp_path, ["repeat.txt"])
 
     cfg = AppConfig(model="test-model", routing_mode="code_only")
@@ -8799,6 +9793,11 @@ def test_one_shot_exploration_retry_exhausted_emits_forced_final_summary(tmp_pat
                 tool_calls=[ToolCall(id="tc5", name="fs_read", arguments={"path": "repeat.txt"})],
                 raw={},
             ),
+            LLMResponse(
+                content="I inspected the repeated file and can now proceed.",
+                tool_calls=[],
+                raw={},
+            ),
         ]
     )  # type: ignore[assignment]
 
@@ -8807,30 +9806,22 @@ def test_one_shot_exploration_retry_exhausted_emits_forced_final_summary(tmp_pat
     finally:
         session.close()
 
-    assert exit_code == 1
+    assert exit_code == 0
     events = list(
         read_session_events(sessions_dir / "one-shot-exploration-fail-after-nudges.jsonl")
     )
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_exploration_incomplete_after_retries"
+    detections = [
+        event for event in events if event.get("type") == "one_shot_exploration_stagnation_detected"
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    assert payload.get("reason") == "repeated_successful_exploration_loop"
-    requested = [event for event in events if event.get("type") == "forced_final_summary_requested"]
-    assert requested
-    assert dict(requested[-1].get("payload") or {}).get("reason") == "exploration_retry_exhausted"
-    expected_error = (
-        "One-shot run stopped: exploration stagnation persisted after bounded nudges. "
-        "Start implementing or creating the requested deliverable, delegate once to a suitable "
-        "available subagent if more investigation is genuinely needed, or report a concrete blocker."
+    assert detections
+    assert any(dict(event.get("payload") or {}).get("nudge_sent") is False for event in detections)
+    nudge_events = [event for event in events if event.get("type") == "exploration_nudge"]
+    assert len(nudge_events) == 1
+    assert not any(
+        event.get("type") == "one_shot_exploration_incomplete_after_retries" for event in events
     )
-    assert expected_error in surface.errors
-    assert surface.errors[-1] == expected_error
-    summary = _assert_forced_final_summary_emitted(events)
-    assert surface.final_messages[-1] == summary
+    assert not any(event.get("type") == "forced_final_summary_requested" for event in events)
+    assert surface.errors == []
 
 
 def test_one_shot_failed_varied_read_loop_step_budget_exhausted(tmp_path: Path) -> None:
@@ -8905,20 +9896,10 @@ def test_one_shot_failed_varied_read_loop_step_budget_exhausted(tmp_path: Path) 
     event_types = [event.get("type") for event in events]
     assert "one_shot_exploration_stagnation_detected" in event_types
     assert "exploration_nudge" in event_types
-    incomplete_events = [
-        event
-        for event in events
-        if event.get("type") == "one_shot_exploration_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    assert payload.get("reason") == "exploration_step_budget_exhausted"
-    assert payload.get("exploration_attempt_outcome") == "failed"
-    assert not any(
-        event.get("type") == "error"
-        and str((event.get("payload") or {}).get("error")) == "max_steps exceeded"
-        for event in events
-    )
+    assert "one_shot_exploration_incomplete_after_retries" not in event_types
+    error_events = [event for event in events if event.get("type") == "error"]
+    assert error_events
+    assert "exploration" in dict(error_events[-1].get("payload") or {}).get("stagnation_state", {})
     _assert_forced_final_summary_emitted(events)
 
 
@@ -9049,7 +10030,7 @@ def test_one_shot_failed_exploration_then_action_resets_and_recovers(tmp_path: P
     assert "one_shot_exploration_incomplete_after_retries" not in event_types
 
 
-def test_one_shot_mixed_success_and_failed_exploration_triggers_guard(tmp_path: Path) -> None:
+def test_one_shot_mixed_success_and_failed_exploration_records_signal(tmp_path: Path) -> None:
     _write_test_files(tmp_path, ["existing.txt"])
 
     cfg = AppConfig(model="test-model", routing_mode="code_only")
@@ -9134,6 +10115,9 @@ def test_one_shot_mixed_success_and_failed_exploration_triggers_guard(tmp_path: 
     assert payload.get("exploration_attempt_outcome") == "mixed"
     assert payload.get("step_exploration_attempt_outcome") == "mixed"
     assert any(event.get("type") == "exploration_nudge" for event in events)
+    assert not any(
+        event.get("type") == "one_shot_exploration_incomplete_after_retries" for event in events
+    )
 
 
 def test_one_shot_plan_only_failed_exploration_does_not_trigger_nudges(tmp_path: Path) -> None:
@@ -9195,7 +10179,10 @@ def test_one_shot_plan_only_failed_exploration_does_not_trigger_nudges(tmp_path:
     assert "one_shot_exploration_incomplete_after_retries" not in event_types
 
 
-def test_one_shot_failed_exploration_fails_clearly_after_nudge_cap(tmp_path: Path) -> None:
+def test_one_shot_long_exploration_gets_limited_nudges_and_accepts_final(
+    tmp_path: Path,
+) -> None:
+    _write_test_files(tmp_path, [f"f{i}.txt" for i in range(1, 12)])
     cfg = AppConfig(model="test-model", routing_mode="code_only")
     sessions_dir = tmp_path / "sessions"
     session = create_session(
@@ -9203,12 +10190,12 @@ def test_one_shot_failed_exploration_fails_clearly_after_nudge_cap(tmp_path: Pat
         root=tmp_path,
         mode="auto",
         yes=True,
-        max_steps=10,
+        max_steps=14,
         no_log=False,
         api_key_override="override-key",
         one_shot_execution=True,
         session_log_dir_override=sessions_dir,
-        session_id_override="one-shot-failed-exploration-cap",
+        session_id_override="one-shot-long-exploration-advisory",
     )
     session.client = _ScriptedClient(
         [
@@ -9218,12 +10205,19 @@ def test_one_shot_failed_exploration_fails_clearly_after_nudge_cap(tmp_path: Pat
                     ToolCall(
                         id=f"tc{i}",
                         name="fs_read",
-                        arguments={"path": "missing-repeat.txt"},
+                        arguments={"path": f"f{i}.txt"},
                     )
                 ],
                 raw={},
             )
-            for i in range(1, 13)
+            for i in range(1, 12)
+        ]
+        + [
+            LLMResponse(
+                content="I inspected the requested files and have enough context to answer.",
+                tool_calls=[],
+                raw={},
+            )
         ]
     )  # type: ignore[assignment]
 
@@ -9232,22 +10226,21 @@ def test_one_shot_failed_exploration_fails_clearly_after_nudge_cap(tmp_path: Pat
     finally:
         session.close()
 
-    assert exit_code == 1
-    events = list(read_session_events(sessions_dir / "one-shot-failed-exploration-cap.jsonl"))
-    incomplete_events = [
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / "one-shot-long-exploration-advisory.jsonl"))
+    assert any(event.get("type") == "one_shot_exploration_stagnation_detected" for event in events)
+    stagnation_nudges = [
         event
         for event in events
-        if event.get("type") == "one_shot_exploration_incomplete_after_retries"
+        if event.get("type")
+        in {"exploration_nudge", "implementation_bootstrap_nudge", "edit_strategy_nudge"}
     ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    assert payload.get("reason") == "repeated_failed_exploration_loop"
-    assert payload.get("exploration_attempt_outcome") == "failed"
+    assert len(stagnation_nudges) <= 2
+    assert len([event for event in events if event.get("type") == "exploration_nudge"]) <= 1
     assert not any(
-        event.get("type") == "error"
-        and str((event.get("payload") or {}).get("error")) == "max_steps exceeded"
-        for event in events
+        event.get("type") == "one_shot_exploration_incomplete_after_retries" for event in events
     )
+    assert not any(event.get("type") == "forced_final_summary_requested" for event in events)
 
 
 def test_one_shot_failed_edit_stagnation_emits_strategy_nudge_and_recovers(tmp_path: Path) -> None:
@@ -9379,7 +10372,7 @@ def test_one_shot_failed_edit_stagnation_emits_strategy_nudge_and_recovers(tmp_p
     assert "one_shot_edit_incomplete_after_retries" not in event_types
 
 
-def test_one_shot_edit_retry_exhausted_emits_forced_final_summary(tmp_path: Path) -> None:
+def test_one_shot_edit_stagnation_step_budget_uses_generic_summary(tmp_path: Path) -> None:
     target = tmp_path / "target.txt"
     target.write_text("alpha\nbeta\n", encoding="utf-8")
 
@@ -9432,27 +10425,16 @@ def test_one_shot_edit_retry_exhausted_emits_forced_final_summary(tmp_path: Path
 
     assert exit_code == 1
     events = list(read_session_events(sessions_dir / "one-shot-edit-fail-cap.jsonl"))
-    incomplete_events = [
-        event for event in events if event.get("type") == "one_shot_edit_incomplete_after_retries"
-    ]
-    assert incomplete_events
-    payload = dict(incomplete_events[-1].get("payload") or {})
-    assert payload.get("reason") == "repeated_failed_edit_loop"
     assert not any(
-        event.get("type") == "error"
-        and str((event.get("payload") or {}).get("error")) == "max_steps exceeded"
-        for event in events
+        event.get("type") == "one_shot_edit_incomplete_after_retries" for event in events
     )
+    error_events = [event for event in events if event.get("type") == "error"]
+    assert error_events
+    assert "failed_edit" in dict(error_events[-1].get("payload") or {}).get("stagnation_state", {})
     requested = [event for event in events if event.get("type") == "forced_final_summary_requested"]
     assert requested
-    assert dict(requested[-1].get("payload") or {}).get("reason") == "edit_retry_exhausted"
-    expected_error = (
-        "One-shot run stopped: failed edit/write loop persisted after bounded strategy "
-        "nudges. Switch to exact-match fs_edit ops, or use git_apply_patch/fs_write, "
-        "or report a concrete blocker."
-    )
-    assert expected_error in surface.errors
-    assert surface.errors[-1] == expected_error
+    assert dict(requested[-1].get("payload") or {}).get("reason") == "max_steps_exceeded"
+    assert surface.errors[-1] == "max_steps exceeded"
     summary = _assert_forced_final_summary_emitted(events)
     assert surface.final_messages[-1] == summary
 
@@ -9606,9 +10588,6 @@ def test_one_shot_successful_write_resets_failed_edit_stagnation_counters(tmp_pa
     assert exit_code == 0
     events = list(read_session_events(sessions_dir / "one-shot-edit-reset-counters.jsonl"))
     nudge_events = [event for event in events if event.get("type") == "edit_strategy_nudge"]
-    assert len(nudge_events) == 2
-    assert [int((event.get("payload") or {}).get("attempt") or 0) for event in nudge_events] == [
-        1,
-        1,
-    ]
+    assert len(nudge_events) == 1
+    assert [int((event.get("payload") or {}).get("attempt") or 0) for event in nudge_events] == [1]
     assert all(event.get("type") != "one_shot_edit_incomplete_after_retries" for event in events)

@@ -10,12 +10,11 @@ from ...runtime_artifacts import is_runtime_artifact_path
 from ..prompt_context import _normalize_repo_relative_hint_path
 
 _SHELL_MUTATION_SNAPSHOT_METADATA_PREFIX = "meta"
-_subprocess_run = subprocess.run
 
 
 def _list_git_workspace_snapshot_paths(root: Path) -> set[str] | None:
     try:
-        proc = _subprocess_run(
+        proc = subprocess.run(
             [
                 "git",
                 "-C",

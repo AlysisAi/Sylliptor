@@ -32,6 +32,8 @@ def test_compaction_settings_reads_env(monkeypatch) -> None:
     monkeypatch.setenv("SYLLIPTOR_PIN_SNIPPET_CHARS", "333")
     monkeypatch.setenv("SYLLIPTOR_IMPORTANCE_USE_LLM", "true")
     monkeypatch.setenv("SYLLIPTOR_IMPORTANCE_LLM_MAX_TURNS", "9")
+    monkeypatch.setenv("SYLLIPTOR_CACHE_AWARE_COMPACTION", "false")
+    monkeypatch.setenv("SYLLIPTOR_CACHE_AWARE_MIN_TRIGGER_RATIO", "0.81")
 
     settings = resolve_compaction_settings(cfg)
     assert settings.enabled is False
@@ -54,6 +56,8 @@ def test_compaction_settings_reads_env(monkeypatch) -> None:
     assert settings.pin_snippet_chars == 333
     assert settings.importance_use_llm is True
     assert settings.importance_llm_max_turns == 9
+    assert settings.cache_aware_compaction is False
+    assert settings.cache_aware_min_trigger_ratio == 0.81
 
 
 def test_compaction_settings_cfg_overrides_env(monkeypatch) -> None:
@@ -80,6 +84,8 @@ def test_compaction_settings_cfg_overrides_env(monkeypatch) -> None:
             "pin_snippet_chars": 111,
             "importance_use_llm": False,
             "importance_llm_max_turns": 15,
+            "cache_aware_compaction": False,
+            "cache_aware_min_trigger_ratio": 0.79,
         }
     }
     monkeypatch.setenv("SYLLIPTOR_ENABLE_COMPACTION", "off")
@@ -102,6 +108,8 @@ def test_compaction_settings_cfg_overrides_env(monkeypatch) -> None:
     monkeypatch.setenv("SYLLIPTOR_PIN_SNIPPET_CHARS", "700")
     monkeypatch.setenv("SYLLIPTOR_IMPORTANCE_USE_LLM", "true")
     monkeypatch.setenv("SYLLIPTOR_IMPORTANCE_LLM_MAX_TURNS", "2")
+    monkeypatch.setenv("SYLLIPTOR_CACHE_AWARE_COMPACTION", "true")
+    monkeypatch.setenv("SYLLIPTOR_CACHE_AWARE_MIN_TRIGGER_RATIO", "0.82")
 
     settings = resolve_compaction_settings(cfg)
     assert settings.enabled is True
@@ -124,6 +132,8 @@ def test_compaction_settings_cfg_overrides_env(monkeypatch) -> None:
     assert settings.pin_snippet_chars == 111
     assert settings.importance_use_llm is False
     assert settings.importance_llm_max_turns == 15
+    assert settings.cache_aware_compaction is False
+    assert settings.cache_aware_min_trigger_ratio == 0.79
 
 
 def test_compaction_settings_invalid_values_fall_back_to_defaults(monkeypatch) -> None:
@@ -150,6 +160,8 @@ def test_compaction_settings_invalid_values_fall_back_to_defaults(monkeypatch) -
             "pin_snippet_chars": "bad",
             "importance_use_llm": "???",
             "importance_llm_max_turns": 0,
+            "cache_aware_compaction": "bad",
+            "cache_aware_min_trigger_ratio": 1.0,
         }
     }
     monkeypatch.setenv("SYLLIPTOR_ENABLE_COMPACTION", "invalid")
@@ -172,6 +184,8 @@ def test_compaction_settings_invalid_values_fall_back_to_defaults(monkeypatch) -
     monkeypatch.setenv("SYLLIPTOR_PIN_SNIPPET_CHARS", "-4")
     monkeypatch.setenv("SYLLIPTOR_IMPORTANCE_USE_LLM", "invalid")
     monkeypatch.setenv("SYLLIPTOR_IMPORTANCE_LLM_MAX_TURNS", "-2")
+    monkeypatch.setenv("SYLLIPTOR_CACHE_AWARE_COMPACTION", "invalid")
+    monkeypatch.setenv("SYLLIPTOR_CACHE_AWARE_MIN_TRIGGER_RATIO", "0.99")
 
     settings = resolve_compaction_settings(cfg)
     assert settings == CompactionSettings()

@@ -11,7 +11,14 @@ from typing import TYPE_CHECKING, Any
 import typer
 
 from ... import __version__
-from ...config import AppConfig, ConfigError, config_path, load_config
+from ...config import (
+    AppConfig,
+    ConfigError,
+    config_path,
+    load_config,
+    resolve_model_access_api_key,
+    resolve_web_search_policy,
+)
 from ...provider_diagnostics import build_provider_diagnostics, validate_active_provider_live
 from ...provider_telemetry import (
     diagnostic_bundle_payload,
@@ -20,12 +27,14 @@ from ...provider_telemetry import (
 )
 from ...sandbox_doctor import diagnose_sandbox
 from ...skills import resolve_skills_enabled
+from ...step_budget import normalize_step_budget_policy
 from ...tools.availability import get_tool_availability
 from ...tools.registry import iter_builtin_tool_metadata
 from ...tools.web_search import resolve_web_search_runtime_status
 from ..assets_cli import assets_app as forge_assets_app
 from . import _patchable
 from ._shared import Mode, _console, _Table
+from .auth import auth_app
 from .config import config_app
 from .conventions import conventions_app
 from .extensions import ext_app
@@ -43,6 +52,7 @@ from .update import (
     _BACKGROUND_UPDATE_SUBCOMMANDS,
     _cached_update_status_summary,
     _start_background_update_check,
+    maybe_prompt_update_at_startup,
     update_app,
 )
 
@@ -60,6 +70,7 @@ def _cli_module() -> Any:
 
 
 app = typer.Typer(add_completion=False, help="Local CLI coding agent (multi-provider).")
+app.add_typer(auth_app, name="auth")
 app.add_typer(config_app, name="config")
 app.add_typer(profile_app, name="profile")
 app.add_typer(update_app, name="update")
@@ -108,6 +119,7 @@ def main(
     if cli._is_non_interactive_terminal():
         console.print(cli._home_panel())
         return
+    maybe_prompt_update_at_startup()
     if not cli._home_prompt_enabled():
         if not cli._maybe_run_first_run_setup_wizard():
             return
@@ -152,6 +164,19 @@ def main(
     console.print("[yellow]Unknown action.[/yellow] Run `sylliptor --help`.")
 
 
+def _require_active_subscription_ready(
+    *,
+    model: str | None,
+    base_url: str | None,
+    require_ready: bool = True,
+) -> None:
+    _cli_module()._require_active_subscription_ready(
+        model=model,
+        base_url=base_url,
+        require_ready=require_ready,
+    )
+
+
 @app.command()
 def run(
     ctx: typer.Context = None,
@@ -181,7 +206,11 @@ def run(
         "--stream/--no-stream",
         help="Enable streamed assistant output.",
     ),
-    max_steps: int | None = typer.Option(None, "--max-steps", help="Max steps override."),
+    max_steps: int | None = typer.Option(
+        None,
+        "--max-steps",
+        help="Optional safety limit on agent iterations.",
+    ),
     subagents: bool | None = typer.Option(
         None,
         "--subagents/--no-subagents",
@@ -218,6 +247,14 @@ def run(
         "--yes",
         help="In auto mode, skip confirmations for sensitive commands (hard blocks still apply).",
     ),
+    benchmark: bool = typer.Option(
+        False,
+        "--benchmark",
+        help=(
+            "Use the raw benchmark/autonomy run profile: auto mode, code-only routing, "
+            "longer fixed step budget, and no subagents/skills/custom tools/web by default."
+        ),
+    ),
     deadline_seconds: float | None = typer.Option(
         None,
         "--deadline-seconds",
@@ -237,6 +274,11 @@ def run(
         help="Append minimal crash-safe diagnostic events to this JSONL path.",
     ),
 ) -> None:
+    if not instruction.strip():
+        typer.echo("Missing argument 'INSTRUCTION': instruction is empty.", err=True)
+        raise typer.Exit(1)
+    _require_active_subscription_ready(model=model, base_url=base_url)
+
     from ..chat import run_impl
 
     return run_impl(
@@ -259,6 +301,7 @@ def run(
         api_key_stdin,
         api_key,
         yes,
+        benchmark,
         deadline_seconds,
         require_deadline,
         diagnostic_log,
@@ -297,7 +340,7 @@ def chat(
     max_steps: int | None = typer.Option(
         None,
         "--max-steps",
-        help="Max steps override (per user turn).",
+        help="Optional safety limit on agent iterations for each user turn.",
     ),
     subagents: bool | None = typer.Option(
         None,
@@ -341,6 +384,12 @@ def chat(
         help="Append minimal crash-safe diagnostic events to this JSONL path.",
     ),
 ) -> None:
+    _require_active_subscription_ready(
+        model=model,
+        base_url=base_url,
+        require_ready=False,
+    )
+
     from ..chat import chat_impl
 
     return chat_impl(
@@ -399,9 +448,19 @@ def _doctor_table(cfg: AppConfig) -> Table:
     table.add_row("base_url", cfg.base_url)
     table.add_row("update", _cached_update_status_summary(cfg))
     web_search_status = resolve_web_search_runtime_status(cfg=cfg, api_key=api_key.key)
-    table.add_row("web_search", web_search_status.availability_label)
+    web_search_policy = resolve_web_search_policy(cfg)
+    web_search_label = (
+        "policy-disabled" if web_search_policy == "off" else web_search_status.availability_label
+    )
+    web_search_setup = (
+        "Set `sylliptor config set web_search_policy auto` to expose search to the model."
+        if web_search_policy == "off"
+        else web_search_status.setup_hint
+    )
+    table.add_row("web_search", web_search_label)
+    table.add_row("web_search_policy", web_search_policy)
     table.add_row("web_search_provider", web_search_status.provider or "(none)")
-    table.add_row("web_search_setup", web_search_status.setup_hint)
+    table.add_row("web_search_setup", web_search_setup)
     try:
         sandbox_status = _patchable("diagnose_sandbox", diagnose_sandbox)(
             cfg, include_smoke=False, include_server_image=False
@@ -416,10 +475,14 @@ def _doctor_table(cfg: AppConfig) -> Table:
     table.add_row("temperature", str(cfg.temperature))
     table.add_row("coding_temperature", str(cfg.coding_temperature))
     table.add_row("chat_temperature", str(cfg.chat_temperature))
-    table.add_row("step_budget_policy", str(cfg.step_budget_policy))
-    table.add_row("max_steps", str(cfg.max_steps))
-    table.add_row("task_max_steps", str(cfg.task_max_steps))
-    table.add_row("subagent_max_steps", str(cfg.subagent_max_steps))
+    execution_policy = normalize_step_budget_policy(cfg.step_budget_policy)
+    table.add_row("execution_policy", execution_policy)
+    if execution_policy == "autonomous":
+        table.add_row("step_limit", "unlimited")
+    else:
+        table.add_row("chat_step_limit", str(cfg.max_steps))
+        table.add_row("task_step_limit", str(cfg.task_max_steps))
+        table.add_row("subagent_step_limit", str(cfg.subagent_max_steps))
     table.add_row("custom_tools_enabled", "yes" if cfg.custom_tools_enabled else "no")
     table.add_row("stream", "yes" if cfg.stream else "no")
     return table
@@ -483,13 +546,18 @@ class _ToolAvailabilityRow:
     notes: str
 
 
-def _default_session_api_key() -> str | None:
+def _default_session_api_key(cfg: AppConfig | None = None) -> str | None:
+    if cfg is not None:
+        try:
+            return resolve_model_access_api_key(cfg)
+        except ConfigError:
+            return None
     return _cli_module()._resolved_api_key_value().key
 
 
 def _tool_availability_rows(cfg: AppConfig) -> list[_ToolAvailabilityRow]:
     rows: list[_ToolAvailabilityRow] = []
-    main_api_key = _default_session_api_key()
+    main_api_key = _default_session_api_key(cfg)
 
     for spec in iter_builtin_tool_metadata():
         status = "available"
@@ -502,11 +570,15 @@ def _tool_availability_rows(cfg: AppConfig) -> list[_ToolAvailabilityRow]:
 
         if spec.name == "web_search":
             runtime = resolve_web_search_runtime_status(cfg=cfg, api_key=main_api_key)
-            status = runtime.availability_label
+            policy = resolve_web_search_policy(cfg)
+            status = "policy-disabled" if policy == "off" else runtime.availability_label
+            notes.append(f"policy={policy}")
             notes.append(f"mode={runtime.mode}")
             notes.append(f"provider={runtime.provider or '(none)'}")
-            if runtime.registration_ready:
+            if runtime.registration_ready and policy != "off":
                 notes.append("ready for registration in main agent sessions")
+            elif runtime.registration_ready:
+                notes.append("backend ready but web_search_policy=off prevents registration")
             if runtime.provider == "openai_responses":
                 notes.append(
                     "OpenAI Responses readiness is conservative: explicit web_search_base_url or first-party OpenAI base_url"
@@ -522,14 +594,22 @@ def _tool_availability_rows(cfg: AppConfig) -> list[_ToolAvailabilityRow]:
                 "moonshot_kimi",
                 "zhipu_web_search",
                 "volcengine_web_search",
+                "minimax_coding_plan",
+                "cohere_web_search",
             }:
                 notes.append(f"available via {runtime.provider} provider adapter")
             elif runtime.provider == "dashscope_chat":
-                notes.append("available via DashScope Chat Completions enable_search")
+                notes.append(
+                    "available via DashScope Chat Completions enable_search or Responses web_search"
+                )
             elif runtime.provider == "tavily":
-                notes.append("available via TAVILY_API_KEY")
+                notes.append("available via model-independent Tavily adapter")
+            elif runtime.provider == "ddgs":
+                notes.append("available via keyless DuckDuckGo metasearch (ddgs) adapter")
             notes.extend(runtime.notes)
-            if not runtime.registration_ready:
+            if policy == "off":
+                notes.append("setup: set web_search_policy=auto to expose search to the model")
+            elif not runtime.registration_ready:
                 notes.append(f"setup: {runtime.setup_hint}")
         elif spec.name == "skill_read":
             if not resolve_skills_enabled(cfg):
@@ -603,9 +683,14 @@ def setup(
         # only, then surface any remaining sandbox setup.
         if run_setup_wizard():
             console = _console()
+            configured = _patchable("load_config", load_config)()
+            if configured.execution.backend == "delegated":
+                return
+            _cli_module()._maybe_run_startup_config_menu()
+            configured = _patchable("load_config", load_config)()
             try:
                 result = _patchable("diagnose_sandbox", diagnose_sandbox)(
-                    _patchable("load_config", load_config)(),
+                    configured,
                     include_smoke=False,
                     include_server_image=False,
                 )
@@ -625,6 +710,10 @@ def setup(
     # Enter to start chatting" — in the workspace they just configured (so the
     # broad-workspace guard does not re-ask about it). On cancel, back to shell.
     if tui_result:
+        configured = _patchable("load_config", load_config)()
+        if configured.execution.backend == "delegated":
+            return
+        _cli_module()._maybe_run_startup_config_menu()
         _cli_module()._run_chat_after_setup()
 
 
@@ -676,6 +765,7 @@ def doctor(
             console = _console()
             console.print(_provider_doctor_table(cfg))
             if live:
+                _require_active_subscription_ready(model=None, base_url=None)
                 console.print(
                     "[yellow]Live provider validation sends one minimal text request and may "
                     "incur provider cost or rate-limit usage.[/yellow]"
@@ -720,10 +810,13 @@ def tools() -> None:
         "[dim]Top-level readonly/Plan sessions can use ready web tools; nested readonly subagents keep them hidden.[/dim]"
     )
     console.print(
-        "[dim]Use `web_search_mode=off|auto|native|external` and optional `web_search_adapter`. "
+        "[dim]Use `web_search_policy=off|auto` for model web-search access, "
+        "`web_search_mode=off|auto|native|external` for backend selection, and optional "
+        "`web_search_adapter`. "
         "`auto` can use OpenAI Responses, xAI, Anthropic, Gemini, OpenRouter, DashScope "
         "Chat/Qwen, Kimi, Zhipu/GLM, Doubao, Perplexity, Groq, Mistral, or Tavily when "
-        "`TAVILY_API_KEY` is set. `native` never uses Tavily; `external` uses only external "
+        "`SYLLIPTOR_WEB_SEARCH_API_KEY` or `TAVILY_API_KEY` is set. `native` never uses "
+        "Tavily; `external` uses only external "
         "search adapters. Legacy `on` and `web_search_enabled` values still load as `auto`.[/dim]"
     )
     console.print(
@@ -747,12 +840,22 @@ def login() -> None:
         raise typer.Exit(code=1) from exc
 
     who = f" as [bold]{result.email}[/bold]" if result.email else ""
-    console.print(f"[green]Logged in{who}.[/green] Your free MiMo trial is ready.")
-    console.print(
-        f"Active profile: [bold]{result.profile_name}[/bold] · default model: "
-        f"[bold]{result.model}[/bold]"
-    )
-    console.print("[dim]Switch model anytime with /model in chat, or `sylliptor config`.[/dim]")
+    console.print(f"[green]Logged in{who}.[/green] Your Sylliptor account is connected.")
+    if result.model:
+        console.print(
+            f"Active profile: [bold]{result.profile_name}[/bold] · default model: "
+            f"[bold]{result.model}[/bold]"
+        )
+        console.print("[dim]Switch model anytime with /model in chat, or `sylliptor config`.[/dim]")
+    else:
+        # No model is auto-selected on first login (the free MiMo default was
+        # removed); guide the user to pick one before the "Model is not set" guard.
+        console.print(
+            f"Active profile: [bold]{result.profile_name}[/bold] · no model selected yet."
+        )
+        console.print(
+            "[dim]Pick one with /model in chat, or `sylliptor config set model <MODEL>`.[/dim]"
+        )
     console.print("[dim]Run `sylliptor chat` to start. Use `sylliptor logout` to disconnect.[/dim]")
 
 

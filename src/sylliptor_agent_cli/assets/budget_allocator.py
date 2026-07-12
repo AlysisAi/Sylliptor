@@ -9,8 +9,8 @@ from typing import Any, Literal
 from ..atomic_io import atomic_write_json
 from ..config import (
     AppConfig,
-    get_api_key,
     resolve_llm_enable_thinking,
+    resolve_model_access_api_key,
     resolve_prompt_cache_key,
     resolve_prompt_cache_retention,
     resolve_role_temperature,
@@ -212,7 +212,7 @@ def _call_allocator(
 ) -> LLMResponse:
     client = make_llm_client(
         cfg=cfg,
-        api_key=api_key or get_api_key(),
+        api_key=resolve_model_access_api_key(cfg, override=api_key),
         model=model,
         timeout_s=float(cfg.assets.worker.allocator_timeout_seconds),
         temperature=resolve_role_temperature(cfg, role=role),

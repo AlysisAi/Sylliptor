@@ -8,13 +8,23 @@ import pytest
 from sylliptor_agent_cli.llm.metadata import (
     PROVIDER_METADATA_KEY,
     attach_provider_metadata_to_assistant_message,
+    stamp_provider_metadata_for_route,
     strip_provider_metadata_from_message,
 )
 from sylliptor_agent_cli.llm.openai_responses import (
     OpenAIResponsesClient,
     ResponsesError,
 )
-from sylliptor_agent_cli.llm.types import LLMError
+from sylliptor_agent_cli.llm.protocols import (
+    OPENAI_RESPONSES_PROTOCOL,
+    resolve_reasoning_trace_capability,
+)
+from sylliptor_agent_cli.llm.provider_limits import ProviderRetrySettings
+from sylliptor_agent_cli.llm.types import LLMError, ReasoningOutputKind
+from sylliptor_agent_cli.provider_telemetry import (
+    last_provider_call_summary,
+    reset_provider_telemetry_for_tests,
+)
 
 
 def _client(transport: httpx.BaseTransport) -> OpenAIResponsesClient:
@@ -24,6 +34,17 @@ def _client(transport: httpx.BaseTransport) -> OpenAIResponsesClient:
         model="search-model",
         transport=transport,
     )
+
+
+def _with_openai_reasoning_summary(
+    client: OpenAIResponsesClient,
+) -> OpenAIResponsesClient:
+    client.reasoning_trace_capability = resolve_reasoning_trace_capability(
+        provider_key="openai",
+        protocol=OPENAI_RESPONSES_PROTOCOL,
+        model_supports_reasoning=True,
+    )
+    return client
 
 
 def _sse_event(event_type: str, data: dict[str, object]) -> bytes:
@@ -36,6 +57,319 @@ def _sse_response(events: list[tuple[str, dict[str, object]]]) -> httpx.Response
         headers={"content-type": "text/event-stream"},
         content=b"".join(_sse_event(event, data) for event, data in events),
     )
+
+
+class _TruncatedResponsesSummaryStream(httpx.SyncByteStream):
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        yield _sse_event(
+            "response.reasoning_summary_text.delta",
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "Safe partial summary.",
+            },
+        )
+        raise httpx.RemoteProtocolError("stream closed after partial summary")
+
+
+def test_stream_does_not_retry_after_public_reasoning_summary() -> None:
+    attempts = 0
+    summaries: list[str] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_TruncatedResponsesSummaryStream(),
+        )
+
+    client = OpenAIResponsesClient(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="search-model",
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(max_retries=1),
+        provider_sleep_fn=lambda _seconds: None,
+    )
+
+    with pytest.raises(LLMError):
+        client.chat(
+            messages=[{"role": "user", "content": "hello"}],
+            stream=True,
+            on_reasoning_delta=summaries.append,
+        )
+
+    assert attempts == 1
+    assert summaries == ["Safe partial summary."]
+
+
+def test_count_input_tokens_uses_provider_endpoint_with_full_request_shape() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.openai.com/v1/responses/input_tokens"
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={"object": "response.input_tokens", "input_tokens": 321},
+        )
+
+    result = _client(httpx.MockTransport(handler)).count_input_tokens(
+        messages=[
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Read README.md"},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "fs_read",
+                    "description": "Read a file.",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+    )
+
+    assert result is not None
+    assert result.input_tokens == 321
+    assert result.source.value == "provider_count"
+    assert result.confidence.value == "authoritative"
+    assert captured["model"] == "search-model"
+    assert isinstance(captured.get("input"), list)
+    assert isinstance(captured.get("tools"), list)
+
+
+def test_count_input_tokens_caches_unsupported_endpoint() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    client = _client(httpx.MockTransport(handler))
+    kwargs = {"messages": [{"role": "user", "content": "hello"}]}
+
+    assert client.count_input_tokens(**kwargs) is None
+    assert client.count_input_tokens(**kwargs) is None
+    assert calls == 1
+
+
+def test_count_input_tokens_uses_shared_provider_retry_policy() -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, json={"error": {"message": "rate limited"}})
+        return httpx.Response(200, json={"input_tokens": 77})
+
+    client = OpenAIResponsesClient(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="search-model",
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(
+            max_retries=1,
+            base_delay_seconds=0.01,
+            max_delay_seconds=0.01,
+        ),
+        provider_sleep_fn=sleeps.append,
+        provider_random_fn=lambda: 0.5,
+    )
+
+    result = client.count_input_tokens(messages=[{"role": "user", "content": "hello"}])
+
+    assert result is not None
+    assert result.input_tokens == 77
+    assert calls == 2
+    assert sleeps == [pytest.approx(0.01)]
+
+
+def test_subscription_count_input_tokens_uses_adapter_without_generation_fields() -> None:
+    class SubscriptionAuth:
+        requires_streaming = True
+        supports_previous_response_id = False
+
+        def authorization_headers(
+            self,
+            _url: str,
+            *,
+            force_refresh: bool = False,
+            session_id: str | None = None,
+        ) -> dict[str, str]:
+            _ = force_refresh, session_id
+            return {"Authorization": "Bearer subscription-token"}
+
+        def adapt_responses_payload(self, payload: dict[str, object]) -> dict[str, object]:
+            adapted = dict(payload)
+            adapted["instructions"] = "subscription instructions"
+            adapted["store"] = False
+            adapted["include"] = ["reasoning.encrypted_content"]
+            adapted["text"] = {"verbosity": "low"}
+            return adapted
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer subscription-token"
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["instructions"] == "subscription instructions"
+        assert "store" not in body
+        assert "include" not in body
+        assert "text" not in body
+        return httpx.Response(200, json={"input_tokens": 42})
+
+    client = OpenAIResponsesClient(
+        base_url="https://chatgpt.example/backend-api/codex",
+        api_key="",
+        model="subscription-model",
+        provider_auth=SubscriptionAuth(),  # type: ignore[arg-type]
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = client.count_input_tokens(messages=[{"role": "user", "content": "hello"}])
+
+    assert result is not None
+    assert result.input_tokens == 42
+
+
+def test_provider_can_require_streaming_for_buffered_internal_calls() -> None:
+    class StreamingRequiredAuth:
+        requires_streaming = True
+        supports_previous_response_id = False
+
+        def authorization_headers(
+            self,
+            _url: str,
+            *,
+            force_refresh: bool = False,
+            session_id: str | None = None,
+        ) -> dict[str, str]:
+            return {"Authorization": "Bearer subscription"}
+
+        def adapt_responses_payload(self, payload: dict[str, object]) -> dict[str, object]:
+            return dict(payload)
+
+    text_deltas: list[str] = []
+    reasoning_deltas: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["stream"] is True
+        assert body["reasoning"] == {"summary": "auto"}
+        return _sse_response(
+            [
+                (
+                    "response.reasoning_summary_text.delta",
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "rs_buffered",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "Safe buffered ",
+                    },
+                ),
+                (
+                    "response.reasoning_summary_text.delta",
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "rs_buffered",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "summary.",
+                    },
+                ),
+                (
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_buffered",
+                        "output_index": 1,
+                        "content_index": 0,
+                        "delta": "streamed ",
+                    },
+                ),
+                (
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_buffered",
+                        "output_index": 1,
+                        "content_index": 0,
+                        "delta": "internally",
+                    },
+                ),
+                (
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_required_stream",
+                            "model": "subscription-model",
+                            "status": "completed",
+                            "output_text": "streamed internally",
+                            "output": [
+                                {
+                                    "type": "reasoning",
+                                    "id": "rs_buffered",
+                                    "summary": [
+                                        {
+                                            "type": "summary_text",
+                                            "text": "Safe buffered summary.",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "type": "message",
+                                    "id": "msg_buffered",
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": "streamed internally",
+                                        }
+                                    ],
+                                },
+                            ],
+                            "usage": {
+                                "input_tokens": 2,
+                                "output_tokens": 2,
+                                "total_tokens": 4,
+                            },
+                        },
+                    },
+                ),
+            ]
+        )
+
+    client = _with_openai_reasoning_summary(
+        OpenAIResponsesClient(
+            base_url="https://subscription.example/v1",
+            api_key="",
+            model="subscription-model",
+            provider_auth=StreamingRequiredAuth(),  # type: ignore[arg-type]
+            transport=httpx.MockTransport(handler),
+        )
+    )
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        stream=False,
+        on_text_delta=text_deltas.append,
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+
+    assert response.content == "streamed internally"
+    # The subscription transport uses SSE internally, but buffered mode exposes
+    # one normalized callback per final value rather than live transport chunks.
+    assert reasoning_deltas == ["Safe buffered summary."]
+    assert text_deltas == ["streamed internally"]
 
 
 def test_chat_maps_messages_tools_response_format_and_reasoning() -> None:
@@ -182,6 +516,211 @@ def test_chat_maps_messages_tools_response_format_and_reasoning() -> None:
     assert response.usage.completion_tokens == 3
     assert response.usage.total_tokens == 14
     assert response.usage.cached_prompt_tokens == 5
+    assert response.usage.cache_read_input_tokens == 5
+    assert response.usage.input_tokens_uncached == 6
+
+
+def test_chat_requests_reasoning_summary_without_overriding_explicit_effort() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_reasoning_summary",
+                "model": "gpt-5.5",
+                "output_text": "Done.",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "Checked the constraints."}],
+                    }
+                ],
+            },
+        )
+
+    client = _with_openai_reasoning_summary(
+        OpenAIResponsesClient(
+            base_url="https://api.openai.com/v1",
+            api_key="test-key",
+            model="gpt-5.5",
+            reasoning_effort="high",
+            transport=httpx.MockTransport(handler),
+        )
+    )
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "Think carefully."}],
+    )
+
+    assert response.content == "Done."
+    assert captured["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert [item.kind for item in response.reasoning] == [ReasoningOutputKind.SUMMARY]
+    assert [item.text for item in response.reasoning] == ["Checked the constraints."]
+
+
+def test_chat_rejected_reasoning_summary_is_scoped_to_one_model() -> None:
+    requests: list[dict[str, object]] = []
+    summaries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "Unsupported parameter: 'reasoning.summary'.",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": f"resp_{len(requests)}",
+                "model": "gpt-5.5",
+                "output_text": "Done.",
+                "output": [],
+            },
+        )
+
+    client = _with_openai_reasoning_summary(
+        OpenAIResponsesClient(
+            base_url="https://api.openai.com/v1",
+            api_key="test-key",
+            model="gpt-5.5",
+            reasoning_effort="high",
+            transport=httpx.MockTransport(handler),
+        )
+    )
+
+    first = client.chat(
+        messages=[{"role": "user", "content": "Think carefully."}],
+        on_reasoning_delta=summaries.append,
+    )
+    second = client.chat(
+        messages=[{"role": "user", "content": "Try again."}],
+        on_reasoning_delta=summaries.append,
+    )
+    client.model = "gpt-5.6"
+    third = client.chat(
+        messages=[{"role": "user", "content": "Use the other model."}],
+        on_reasoning_delta=summaries.append,
+    )
+
+    assert first.content == "Done."
+    assert second.content == "Done."
+    assert third.content == "Done."
+    assert requests[0]["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert requests[1]["reasoning"] == {"effort": "high"}
+    assert requests[2]["reasoning"] == {"effort": "high"}
+    assert requests[3]["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert summaries == []
+
+
+def test_chat_streaming_retries_once_without_rejected_reasoning_summary() -> None:
+    requests: list[dict[str, object]] = []
+    summaries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(
+                422,
+                json={
+                    "error": {
+                        "message": "Unknown field reasoning.summary for this model.",
+                    }
+                },
+            )
+        return _sse_response(
+            [
+                (
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_summary_fallback_stream",
+                            "model": "gpt-5.5",
+                            "status": "completed",
+                            "output_text": "Done.",
+                            "output": [],
+                        },
+                    },
+                )
+            ]
+        )
+
+    client = _with_openai_reasoning_summary(
+        OpenAIResponsesClient(
+            base_url="https://api.openai.com/v1",
+            api_key="test-key",
+            model="gpt-5.5",
+            reasoning_effort="medium",
+            transport=httpx.MockTransport(handler),
+        )
+    )
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "Think carefully."}],
+        stream=True,
+        on_reasoning_delta=summaries.append,
+    )
+
+    assert response.content == "Done."
+    assert requests[0]["reasoning"] == {"effort": "medium", "summary": "auto"}
+    assert requests[1]["reasoning"] == {"effort": "medium"}
+    assert summaries == []
+
+
+def test_chat_includes_prompt_cache_fields_and_records_safe_cache_policy() -> None:
+    reset_provider_telemetry_for_tests()
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured.update(body)
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_cache",
+                "model": "gpt-5.5",
+                "output_text": "Done.",
+                "output": [],
+            },
+        )
+
+    client = OpenAIResponsesClient(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="gpt-5.5",
+        prompt_cache_key="repo-main",
+        prompt_cache_retention="24h",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(messages=[{"role": "user", "content": "cache me"}])
+
+    assert response.content == "Done."
+    assert "reasoning" not in captured
+    assert captured["prompt_cache_key"] == "repo-main"
+    assert captured["prompt_cache_retention"] == "24h"
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["cache_policy"] == {
+        "status": "enabled",
+        "strategy": "openai_prompt_cache",
+        "mode": "automatic",
+        "retention": "24h",
+        "enabled": True,
+    }
+    assert summary["token_reconciliation"]["input_estimate_tokens"] > 0
+    assert summary["token_reconciliation"]["sent_input_estimate_tokens"] > 0
+    assert summary["token_reconciliation"]["reported_prompt_tokens"] is None
+    assert "repo-main" not in json.dumps(summary, sort_keys=True)
 
 
 def test_chat_parses_function_calls_and_usage() -> None:
@@ -594,14 +1133,6 @@ def test_chat_streaming_emits_text_deltas_and_preserves_metadata() -> None:
                     },
                 ),
                 (
-                    "response.reasoning_summary.delta",
-                    {
-                        "type": "response.reasoning_summary.delta",
-                        "response_id": "resp_stream",
-                        "delta": "hidden",
-                    },
-                ),
-                (
                     "response.completed",
                     {
                         "type": "response.completed",
@@ -637,10 +1168,260 @@ def test_chat_streaming_emits_text_deltas_and_preserves_metadata() -> None:
     metadata = response.provider_metadata["openai_responses"]
     assert metadata["response_id"] == "resp_stream"
     assert metadata["output_items"] == [message_item]
-    assert metadata["stream_metadata"]["events"] == 7
-    assert metadata["stream_metadata"]["unknown_events"][0]["event"] == (
-        "response.reasoning_summary.delta"
+    assert metadata["stream_metadata"] == {"events": 6}
+
+
+def test_chat_streaming_emits_official_reasoning_summary_events() -> None:
+    captured: dict[str, object] = {}
+    reasoning: list[str] = []
+    text: list[str] = []
+    reasoning_item = {
+        "type": "reasoning",
+        "id": "rs_stream",
+        "status": "completed",
+        "summary": [{"type": "summary_text", "text": "I should check."}],
+    }
+    message_item = {
+        "type": "message",
+        "id": "msg_stream",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "Checked."}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return _sse_response(
+            [
+                (
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "type": "reasoning",
+                            "id": "rs_stream",
+                            "status": "in_progress",
+                            "summary": [],
+                        },
+                    },
+                ),
+                (
+                    "response.reasoning_summary_part.added",
+                    {
+                        "type": "response.reasoning_summary_part.added",
+                        "item_id": "rs_stream",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": ""},
+                    },
+                ),
+                (
+                    "response.reasoning_summary_text.delta",
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "rs_stream",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "I should ",
+                    },
+                ),
+                (
+                    "response.reasoning_summary_text.delta",
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "rs_stream",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "check.",
+                    },
+                ),
+                (
+                    "response.reasoning_summary_text.done",
+                    {
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": "rs_stream",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "text": "I should check.",
+                    },
+                ),
+                (
+                    "response.reasoning_summary_part.done",
+                    {
+                        "type": "response.reasoning_summary_part.done",
+                        "item_id": "rs_stream",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": "I should check."},
+                    },
+                ),
+                (
+                    "response.output_item.done",
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": reasoning_item,
+                    },
+                ),
+                (
+                    "response.output_item.added",
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 1,
+                        "item": {
+                            "type": "message",
+                            "id": "msg_stream",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    },
+                ),
+                (
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_stream",
+                        "output_index": 1,
+                        "content_index": 0,
+                        "delta": "Checked.",
+                    },
+                ),
+                (
+                    "response.output_text.done",
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": "msg_stream",
+                        "output_index": 1,
+                        "content_index": 0,
+                        "text": "Checked.",
+                    },
+                ),
+                (
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_reasoning_stream",
+                            "status": "completed",
+                            "output_text": "Checked.",
+                            "output": [reasoning_item, message_item],
+                        },
+                    },
+                ),
+            ]
+        )
+
+    response = _with_openai_reasoning_summary(_client(httpx.MockTransport(handler))).chat(
+        messages=[{"role": "user", "content": "check"}],
+        stream=True,
+        on_text_delta=text.append,
+        on_reasoning_delta=reasoning.append,
     )
+
+    assert response.content == "Checked."
+    assert captured["reasoning"] == {"summary": "auto"}
+    assert reasoning == ["I should ", "check."]
+    assert text == ["Checked."]
+    assert [item.text for item in response.reasoning] == ["I should check."]
+    assert response.provider_metadata is not None
+    metadata = response.provider_metadata["openai_responses"]
+    assert metadata["output_items"] == [reasoning_item, message_item]
+    assert metadata["stream_metadata"] == {"events": 11}
+
+
+def test_chat_streaming_supports_unindexed_compat_reasoning_delta() -> None:
+    reasoning: list[str] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _sse_response(
+            [
+                (
+                    "response.reasoning_summary.delta",
+                    {
+                        "type": "response.reasoning_summary.delta",
+                        "delta": "Provider summary",
+                    },
+                ),
+                (
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_compat_summary",
+                            "status": "completed",
+                            "output_text": "Done.",
+                            "output": [],
+                        },
+                    },
+                ),
+            ]
+        )
+
+    response = _client(httpx.MockTransport(handler)).chat(
+        messages=[{"role": "user", "content": "check"}],
+        stream=True,
+        on_reasoning_delta=reasoning.append,
+    )
+
+    assert response.content == "Done."
+    assert reasoning == ["Provider summary"]
+    assert response.provider_metadata is not None
+    assert response.provider_metadata["openai_responses"]["stream_metadata"] == {"events": 2}
+
+
+def test_chat_streaming_surfaces_done_only_reasoning_summary_once() -> None:
+    reasoning: list[str] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _sse_response(
+            [
+                (
+                    "response.reasoning_summary_text.done",
+                    {
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": "rs_done_only",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "text": "Completed provider summary.",
+                    },
+                ),
+                (
+                    "response.reasoning_summary_part.done",
+                    {
+                        "type": "response.reasoning_summary_part.done",
+                        "item_id": "rs_done_only",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "part": {
+                            "type": "summary_text",
+                            "text": "Completed provider summary.",
+                        },
+                    },
+                ),
+                (
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_done_only_summary",
+                            "status": "completed",
+                            "output_text": "Done.",
+                            "output": [],
+                        },
+                    },
+                ),
+            ]
+        )
+
+    _client(httpx.MockTransport(handler)).chat(
+        messages=[{"role": "user", "content": "check"}],
+        stream=True,
+        on_reasoning_delta=reasoning.append,
+    )
+
+    assert reasoning == ["Completed provider summary."]
 
 
 def test_chat_streaming_parses_function_call_argument_deltas() -> None:
@@ -935,7 +1716,67 @@ def test_chat_streaming_early_termination_is_clear() -> None:
         )
 
 
+def test_chat_reasoning_only_stream_without_completed_routes_to_recovery() -> None:
+    attempts = 0
+    summaries: list[str] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return _sse_response(
+            [
+                (
+                    "response.reasoning_summary_text.delta",
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "rs_partial",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": "Provider summary.",
+                    },
+                ),
+                (
+                    "response.reasoning_summary_text.done",
+                    {
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": "rs_partial",
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "text": "Provider summary.",
+                    },
+                ),
+            ]
+        )
+
+    client = _with_openai_reasoning_summary(
+        OpenAIResponsesClient(
+            base_url="https://api.openai.com/v1",
+            api_key="test-key",
+            model="gpt-5.5",
+            transport=httpx.MockTransport(handler),
+            provider_retry_settings=ProviderRetrySettings(max_retries=5),
+            provider_sleep_fn=lambda _seconds: None,
+        )
+    )
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        stream=True,
+        on_reasoning_delta=summaries.append,
+    )
+
+    assert attempts == 1
+    assert response.content == ""
+    assert response.tool_calls == []
+    assert [item.text for item in response.reasoning] == ["Provider summary."]
+    assert summaries == ["Provider summary."]
+    assert response.provider_metadata is not None
+    stream_metadata = response.provider_metadata["openai_responses"]["stream_metadata"]
+    assert stream_metadata["ended_before_response_completed"] is True
+
+
 def test_chat_text_only_response_preserves_provider_metadata_for_next_turn() -> None:
+    reset_provider_telemetry_for_tests()
     calls: list[dict[str, object]] = []
     output_items = [
         {
@@ -970,7 +1811,12 @@ def test_chat_text_only_response_preserves_provider_metadata_for_next_turn() -> 
         model="gpt-5.5",
         transport=httpx.MockTransport(handler),
     )
-    first = client.chat(messages=[{"role": "user", "content": "first"}])
+    first_prefix = [
+        {"role": "system", "content": "Always answer with repo-safe constraints."},
+        {"role": "developer", "content": "Prefer concise diffs and keep secrets private."},
+        {"role": "user", "content": "first"},
+    ]
+    first = client.chat(messages=first_prefix)
     assistant_message = attach_provider_metadata_to_assistant_message(
         {"role": "assistant", "content": first.content},
         first,
@@ -981,6 +1827,174 @@ def test_chat_text_only_response_preserves_provider_metadata_for_next_turn() -> 
         "role": "assistant",
         "content": "First answer.",
     }
+    assert first.provider_metadata is not None
+    first_metadata = first.provider_metadata["openai_responses"]
+    assert first_metadata["request_plan"]["input_mode"] == "full"
+
+    second = client.chat(
+        messages=[
+            *first_prefix,
+            assistant_message,
+            {"role": "user", "content": "second"},
+        ],
+    )
+
+    assert second.content == "Second answer."
+    assert calls[1]["previous_response_id"] == "resp_text"
+    assert calls[1]["input"] == [
+        {"role": "user", "content": "second"},
+    ]
+    assert second.provider_metadata is not None
+    second_metadata = second.provider_metadata["openai_responses"]["request_plan"]
+    assert second_metadata["input_mode"] == "previous_response_id"
+    assert second_metadata["previous_response_id_used"] is True
+    assert second_metadata["full_input_item_count"] == 5
+    assert second_metadata["sent_input_item_count"] == 1
+    assert second_metadata["resent_stable_instruction_count"] == 0
+    assert second_metadata["stable_prefix_message_count"] == 4
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["request_plan"]["input_mode"] == "previous_response_id"
+    assert summary["request_plan"]["previous_response_id_used"] is True
+    assert summary["request_plan"]["request_message_count"] == 5
+    assert summary["request_plan"]["full_input_item_count"] == 5
+    assert summary["request_plan"]["sent_input_item_count"] == 1
+    assert summary["request_plan"]["resent_stable_instruction_count"] == 0
+    assert summary["request_plan"]["continuation_anchor_index"] == 3
+    assert summary["request_plan"]["request_messages_signature"]
+    assert summary["token_reconciliation"]["input_mode"] == "previous_response_id"
+    assert (
+        summary["token_reconciliation"]["input_estimate_tokens"]
+        > (summary["token_reconciliation"]["sent_input_estimate_tokens"])
+    )
+
+
+def test_chat_chained_continuations_never_resend_system_or_developer_messages() -> None:
+    calls: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        turn = len(calls)
+        return httpx.Response(
+            200,
+            json={
+                "id": f"resp_{turn}",
+                "model": "gpt-5.5",
+                "output_text": f"Answer {turn}.",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": f"msg_{turn}",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": f"Answer {turn}."}],
+                    }
+                ],
+            },
+        )
+
+    client = OpenAIResponsesClient(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="gpt-5.5",
+        transport=httpx.MockTransport(handler),
+    )
+    first_messages = [
+        {"role": "system", "content": "Always answer with repo-safe constraints."},
+        {"role": "developer", "content": "Prefer concise diffs and keep secrets private."},
+        {"role": "user", "content": "first"},
+    ]
+    first = client.chat(messages=first_messages)
+    first_assistant = attach_provider_metadata_to_assistant_message(
+        {"role": "assistant", "content": first.content},
+        first,
+    )
+    second_messages = [
+        *first_messages,
+        first_assistant,
+        {"role": "user", "content": "second"},
+    ]
+    second = client.chat(messages=second_messages)
+    second_assistant = attach_provider_metadata_to_assistant_message(
+        {"role": "assistant", "content": second.content},
+        second,
+    )
+    third = client.chat(
+        messages=[
+            *second_messages,
+            second_assistant,
+            {"role": "user", "content": "third"},
+        ],
+    )
+
+    assert third.content == "Answer 3."
+    assert len(calls) == 3
+    assert "previous_response_id" not in calls[0]
+    assert calls[1]["previous_response_id"] == "resp_1"
+    assert calls[1]["input"] == [{"role": "user", "content": "second"}]
+    assert calls[2]["previous_response_id"] == "resp_2"
+    assert calls[2]["input"] == [{"role": "user", "content": "third"}]
+    for continuation_body in calls[1:]:
+        roles = {
+            str(item.get("role") or "")
+            for item in continuation_body["input"]
+            if isinstance(item, dict)
+        }
+        assert "system" not in roles
+        assert "developer" not in roles
+    assert third.provider_metadata is not None
+    third_plan = third.provider_metadata["openai_responses"]["request_plan"]
+    assert third_plan["input_mode"] == "previous_response_id"
+    assert third_plan["resent_stable_instruction_count"] == 0
+
+
+def test_chat_retries_full_input_when_previous_response_id_is_rejected() -> None:
+    reset_provider_telemetry_for_tests()
+    calls: list[dict[str, object]] = []
+    output_items = [
+        {
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "First answer."}],
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_text",
+                    "model": "gpt-5.5",
+                    "output_text": "First answer.",
+                    "output": output_items,
+                },
+            )
+        if len(calls) == 2:
+            assert body["previous_response_id"] == "resp_text"
+            return httpx.Response(
+                400,
+                json={"error": {"message": "previous_response_id not found"}},
+            )
+        return httpx.Response(
+            200,
+            json={"id": "resp_retry", "output_text": "Retried.", "output": []},
+        )
+
+    client = OpenAIResponsesClient(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="gpt-5.5",
+        transport=httpx.MockTransport(handler),
+    )
+    first = client.chat(messages=[{"role": "user", "content": "first"}])
+    assistant_message = attach_provider_metadata_to_assistant_message(
+        {"role": "assistant", "content": first.content},
+        first,
+    )
 
     second = client.chat(
         messages=[
@@ -990,9 +2004,80 @@ def test_chat_text_only_response_preserves_provider_metadata_for_next_turn() -> 
         ],
     )
 
-    assert second.content == "Second answer."
-    assert calls[1]["input"] == [
+    assert second.content == "Retried."
+    assert len(calls) == 3
+    assert "previous_response_id" not in calls[2]
+    assert calls[2]["input"] == [
         {"role": "user", "content": "first"},
+        output_items[0],
+        {"role": "user", "content": "second"},
+    ]
+    assert second.provider_metadata is not None
+    request_plan = second.provider_metadata["openai_responses"]["request_plan"]
+    assert request_plan["input_mode"] == "full_retry_after_previous_response_id_rejected"
+    assert request_plan["previous_response_id_used"] is False
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["request_plan"]["input_mode"] == (
+        "full_retry_after_previous_response_id_rejected"
+    )
+    assert summary["request_plan"]["previous_response_id_used"] is False
+    assert summary["request_plan"]["sent_input_item_count"] == 3
+    assert summary["request_plan"]["request_messages_signature"]
+
+
+def test_chat_does_not_use_previous_response_id_when_prefix_changed() -> None:
+    calls: list[dict[str, object]] = []
+    output_items = [
+        {
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "First answer."}],
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_text",
+                    "model": "gpt-5.5",
+                    "output_text": "First answer.",
+                    "output": output_items,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"id": "resp_second", "output_text": "Second.", "output": []},
+        )
+
+    client = OpenAIResponsesClient(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="gpt-5.5",
+        transport=httpx.MockTransport(handler),
+    )
+    first = client.chat(messages=[{"role": "user", "content": "first"}])
+    assistant_message = attach_provider_metadata_to_assistant_message(
+        {"role": "assistant", "content": first.content},
+        first,
+    )
+
+    client.chat(
+        messages=[
+            {"role": "user", "content": "changed prefix"},
+            assistant_message,
+            {"role": "user", "content": "second"},
+        ],
+    )
+
+    assert "previous_response_id" not in calls[1]
+    assert calls[1]["input"] == [
+        {"role": "user", "content": "changed prefix"},
         output_items[0],
         {"role": "user", "content": "second"},
     ]
@@ -1061,12 +2146,8 @@ def test_chat_hosted_web_search_output_round_trips_from_provider_metadata() -> N
         ],
     )
 
-    assert calls[1]["input"] == [
-        {"role": "user", "content": "search"},
-        output_items[0],
-        output_items[1],
-        {"role": "user", "content": "continue"},
-    ]
+    assert calls[1]["previous_response_id"] == "resp_search"
+    assert calls[1]["input"] == [{"role": "user", "content": "continue"}]
 
 
 def test_chat_function_call_and_output_round_trip_uses_exact_call_id() -> None:
@@ -1138,9 +2219,8 @@ def test_chat_function_call_and_output_round_trip_uses_exact_call_id() -> None:
         ],
     )
 
+    assert calls[1]["previous_response_id"] == "resp_call"
     assert calls[1]["input"] == [
-        {"role": "user", "content": "read"},
-        function_call_item,
         {
             "type": "function_call_output",
             "call_id": "call_exact_123",
@@ -1160,6 +2240,65 @@ def test_chat_empty_output_without_refusal_is_explicit() -> None:
         _client(httpx.MockTransport(handler)).chat(
             messages=[{"role": "user", "content": "hello"}],
         )
+
+
+def test_chat_completed_reasoning_only_response_routes_to_agent_recovery() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_reasoning_only",
+                "model": "gpt-5.5",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "status": "completed",
+                        "encrypted_content": "opaque-provider-state",
+                        "summary": [{"type": "summary_text", "text": "Checked the repository."}],
+                    }
+                ],
+            },
+        )
+
+    response = _with_openai_reasoning_summary(_client(httpx.MockTransport(handler))).chat(
+        messages=[{"role": "user", "content": "inspect"}],
+    )
+
+    assert response.content == ""
+    assert response.tool_calls == []
+    assert [item.text for item in response.reasoning] == ["Checked the repository."]
+
+
+def test_responses_chat_retries_are_bounded_by_wall_clock_cap() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.RemoteProtocolError("stream ended early", request=request)
+
+    client = OpenAIResponsesClient(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="gpt-5.5",
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(
+            max_retries=5,
+            base_delay_seconds=10.0,
+            max_delay_seconds=120.0,
+        ),
+        provider_sleep_fn=sleeps.append,
+        provider_random_fn=lambda: 0.5,
+    )
+    client._provider_retry_wall_clock_cap_seconds = 5.0
+
+    with pytest.raises(LLMError, match="stream ended early"):
+        client.chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert attempts == 1
+    assert sleeps == []
 
 
 def test_web_search_parses_output_text_citations_and_sources() -> None:
@@ -1429,3 +2568,76 @@ def test_chat_drops_temperature_when_model_rejects_it() -> None:
     assert resp2.content == "ok"
     assert len(calls) == 3
     assert "temperature" not in calls[2]
+
+
+def test_responses_chat_and_count_strip_state_from_different_credential_route() -> None:
+    sent: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode())
+        sent.append(body)
+        if str(request.url).endswith("/responses/input_tokens"):
+            return httpx.Response(200, json={"input_tokens": 12})
+        return httpx.Response(
+            200,
+            json={"id": "resp_new", "model": "route-model", "output_text": "ok", "output": []},
+        )
+
+    producer = OpenAIResponsesClient(
+        base_url="https://api.openai.com/v1",
+        api_key="credential-a",
+        model="route-model",
+    )
+    consumer = OpenAIResponsesClient(
+        base_url="https://api.openai.com/v1",
+        api_key="credential-b",
+        model="route-model",
+        transport=httpx.MockTransport(handler),
+    )
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": "public answer",
+            PROVIDER_METADATA_KEY: stamp_provider_metadata_for_route(
+                {
+                    "openai_responses": {
+                        "response_id": "private-response-id",
+                        "output_items": [
+                            {
+                                "type": "reasoning",
+                                "encrypted_content": "private-encrypted-state",
+                            }
+                        ],
+                    }
+                },
+                producer.route_identity,
+            ),
+        },
+        {"role": "user", "content": "follow up"},
+    ]
+
+    assert consumer.count_input_tokens(messages=messages) is not None
+    assert consumer.chat(messages=messages).content == "ok"
+
+    assert len(sent) == 2
+    assert all("private-" not in json.dumps(body) for body in sent)
+    assert any("public answer" in json.dumps(body) for body in sent)
+
+
+def test_responses_extra_headers_override_defaults_case_insensitively() -> None:
+    client = OpenAIResponsesClient(
+        base_url="https://api.openai.com/v1",
+        api_key="fallback-key",
+        model="route-model",
+        extra_headers={
+            "Authorization": "Bearer override",
+            "Content-Type": "application/custom+json",
+        },
+    )
+
+    headers = client._headers("https://api.openai.com/v1/responses")
+
+    assert headers["authorization"] == "Bearer override"
+    assert headers["content-type"] == "application/custom+json"
+    assert len({name.casefold() for name in headers}) == len(headers)

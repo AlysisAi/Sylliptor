@@ -134,7 +134,11 @@ def _event_payloads(path: Path, event_type: str) -> list[dict[str, Any]]:
 
 def test_final_step_nudge_only_applies_on_last_productive_call(tmp_path: Path) -> None:
     session = create_session(
-        cfg=AppConfig(model=SMOKE_MODEL, routing_mode="code_only"),
+        cfg=AppConfig(
+            model=SMOKE_MODEL,
+            routing_mode="code_only",
+            step_budget_policy="limited",
+        ),
         root=tmp_path,
         mode="auto",
         yes=True,
@@ -176,7 +180,11 @@ def test_final_step_nudge_only_applies_on_last_productive_call(tmp_path: Path) -
 
 def test_low_step_budget_nudge_applies_before_final_step(tmp_path: Path) -> None:
     session = create_session(
-        cfg=AppConfig(model=SMOKE_MODEL, routing_mode="code_only"),
+        cfg=AppConfig(
+            model=SMOKE_MODEL,
+            routing_mode="code_only",
+            step_budget_policy="limited",
+        ),
         root=tmp_path,
         mode="auto",
         yes=True,
@@ -243,6 +251,81 @@ def test_interactive_phase_budget_nudges_after_repeated_exploration(
     assert len(client.calls) == 4
     assert not _has_phase_exploration_nudge(client.calls[0]["messages"], exploration_steps=3)
     assert _has_phase_exploration_nudge(client.calls[3]["messages"], exploration_steps=3)
+
+
+def test_phase_budget_exploration_prompt_is_capped_but_telemetry_continues(
+    tmp_path: Path,
+) -> None:
+    session = create_session(
+        cfg=AppConfig(model=SMOKE_MODEL, routing_mode="code_only"),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=20,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+        enable_chat_turn_step_budget=True,
+    )
+    responses = [
+        LLMResponse(content=f"Inspecting {idx}.", tool_calls=[_tool_call(idx)], raw={})
+        for idx in range(1, 9)
+    ]
+    responses.append(LLMResponse(content="Blocked by missing requirements.", tool_calls=[], raw={}))
+    client = _ScriptedClient(responses)
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Investigate the repo before changing it.")
+        log_path = session.store.path
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    injected_steps = [
+        step
+        for step, call in enumerate(client.calls, start=1)
+        if any(
+            str(message.get("role")) == "system"
+            and str(message.get("content") or "").startswith("Phase budget pressure:")
+            for message in call["messages"]
+        )
+    ]
+    assert injected_steps == [4, 7]
+    assert _has_phase_exploration_nudge(client.calls[3]["messages"], exploration_steps=3)
+    assert _has_phase_exploration_nudge(client.calls[6]["messages"], exploration_steps=6)
+
+    intervention_events = [
+        payload
+        for payload in _event_payloads(log_path, "controller_intervention")
+        if payload.get("detail") == "phase_budget_exploration_prompt"
+    ]
+    assert [event["step"] for event in intervention_events] == [4, 5, 6, 7, 8, 9]
+    assert [event["headline_counted"] for event in intervention_events] == [
+        True,
+        False,
+        False,
+        True,
+        False,
+        False,
+    ]
+    assert [event["metadata"]["exploration_steps"] for event in intervention_events] == [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+    ]
+    suppressed_events = [event for event in intervention_events if not event["headline_counted"]]
+    assert suppressed_events
+    assert all(event["metadata"]["suppressed"] is True for event in suppressed_events)
+    headline_totals = [event["controller_interventions_total"] for event in intervention_events]
+    assert headline_totals[1] == headline_totals[0]
+    assert headline_totals[2] == headline_totals[0]
+    assert headline_totals[3] == headline_totals[0] + 1
+    assert headline_totals[4] == headline_totals[3]
+    assert headline_totals[5] == headline_totals[3]
 
 
 def test_final_step_nudge_keeps_tools_available_before_forced_summary(tmp_path: Path) -> None:

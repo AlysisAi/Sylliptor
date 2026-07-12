@@ -117,10 +117,8 @@ def test_native_provider_conformance_multiturn_tool_replay_exact_ids(provider: s
             ],
             tools=[_fs_read_tool(), _shell_tool()],
         )
+        assert calls[1]["previous_response_id"] == "resp_tools"
         assert calls[1]["input"] == [
-            {"role": "user", "content": "Inspect repo."},
-            output_items[0],
-            output_items[1],
             {"type": "function_call_output", "call_id": "call_read_exact", "output": "README"},
             {
                 "type": "function_call_output",

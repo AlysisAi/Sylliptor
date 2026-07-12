@@ -20,12 +20,10 @@ def _chat_plan_mode_enabled(plan_mode_state: _ChatPlanModeState | None) -> bool:
 def _forge_enter_usage_lines() -> tuple[str, ...]:
     return (
         "[yellow]Usage:[/yellow] /forge",
+        "                 /forge <goal>",
         "                 /forge resume",
-        "[dim]Plain /forge starts a fresh run for a new chat session.[/dim]",
-        "[dim]After /back, plain /forge resumes this chat session's run only in the same workspace.[/dim]",
-        "[dim]Same-workspace re-entry keeps the same run id and tracks the chat's current focus.[/dim]",
-        "[dim]Changing workspaces starts a fresh run instead of resuming prior session-local state.[/dim]",
-        "[dim]/forge resume explicitly attaches to the current run pointer.[/dim]",
+        "[dim]/forge opens Forge. /forge <goal> opens Forge and sets the goal.[/dim]",
+        "[dim]/forge resume reopens the current Forge run for this workspace.[/dim]",
     )
 
 
@@ -35,12 +33,17 @@ def _parse_forge_enter_command(*, cmd: str, arg: str) -> _ForgeEnterCommand | No
     normalized_arg = str(arg or "").strip()
     if not normalized_arg:
         return _ForgeEnterCommand(entry_mode="plain")
-    if normalized_arg.casefold() == "resume":
+    lowered = normalized_arg.casefold()
+    if lowered == "resume":
         return _ForgeEnterCommand(entry_mode="resume_pointer")
-    return _ForgeEnterCommand(
-        entry_mode="invalid",
-        usage_error="Unknown /forge argument. Use plain /forge or /forge resume.",
-    )
+    # Planner-choice flags: the TUI intro popup asks "Use the planner?" natively and
+    # submits one of these so Forge enters with the plan assistant forced on/off
+    # (never treating the flag as a project goal). Also usable directly.
+    if lowered in {"--planner", "planner"}:
+        return _ForgeEnterCommand(entry_mode="plain", planner_assistant_default=True)
+    if lowered in {"--no-planner", "no-planner"}:
+        return _ForgeEnterCommand(entry_mode="plain", planner_assistant_default=False)
+    return _ForgeEnterCommand(entry_mode="plain", initial_goal=normalized_arg)
 
 
 def _consume_forge_entry_request_mode(*, forge_state: _ForgeChatState) -> str:

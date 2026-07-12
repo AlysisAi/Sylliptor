@@ -42,6 +42,7 @@ def test_get_chat_specs_match_curated_visible_surface() -> None:
         "compact",
         "clear",
         "resume",
+        "stream",
         "trace",
         "config",
         "toolbar",
@@ -91,7 +92,7 @@ def test_forge_completions_include_general_chat_and_forge_commands() -> None:
     completer = ChatSlashCompleter(mode_provider=lambda: "forge")
 
     assert _completion_names(completer, "/go") == ["goal"]
-    assert _completion_names(completer, "/st") == ["status"]
+    assert _completion_names(completer, "/st") == ["status", "stream"]
     assert _completion_names(completer, "/ta") == ["task"]
 
 
@@ -113,6 +114,11 @@ def test_nested_chat_completions_cover_usage_subagent_and_skill_names() -> None:
         "terminals show",
         "terminals kill",
         "terminals help",
+    ]
+    assert _completion_names(completer, "/stream ") == [
+        "stream on",
+        "stream off",
+        "stream status",
     ]
     assert _completion_names(completer, "/subagent ") == [
         "subagent on",
@@ -140,6 +146,23 @@ def test_completion_carries_usage_and_description() -> None:
     assert "/usage hud" in _display_text(usage_completion.display)
     assert "Open usage HUD controls" in _display_text(usage_completion.display)
     assert _display_text(usage_completion.display_meta) == ""
+
+
+def test_completion_display_rows_are_bounded() -> None:
+    completer = ChatSlashCompleter(
+        mode_provider=lambda: "chat",
+        subagent_names_provider=lambda: ["reviewer-with-a-very-long-name-that-keeps-going"],
+        skill_names_provider=lambda: ["python"],
+    )
+
+    rows = [
+        _display_text(completion.display)
+        for completion in completer.get_completions(Document(text="/subagent "), None)
+    ]
+
+    assert rows
+    assert all(len(row) <= 72 for row in rows)
+    assert any("..." in row for row in rows)
 
 
 def test_completion_yields_all_matching_top_level_commands() -> None:

@@ -244,11 +244,39 @@ def _print_chat_context(*, console: Console, session: Any) -> None:
     table.add_column("field")
     table.add_column("value")
     table.add_row("model", str(getattr(ctx, "model_name", "-")))
-    table.add_row("source", str(getattr(ctx, "source", "-")))
+    table.add_row("model_metadata_source", str(getattr(ctx, "source", "-")))
+    table.add_row(
+        "capacity_provider_key",
+        str(getattr(ctx, "capacity_provider_key", None) or "-"),
+    )
+    table.add_row(
+        "context_window_source",
+        str(getattr(ctx, "context_window_source", None) or "-"),
+    )
+    table.add_row(
+        "max_output_source",
+        str(getattr(ctx, "max_output_source", None) or "-"),
+    )
+    table.add_row("token_count_source", str(getattr(ctx, "token_count_source", "-")))
+    table.add_row(
+        "token_count_confidence",
+        str(getattr(ctx, "token_count_confidence", "-")),
+    )
+    anchor_source = getattr(ctx, "anchor_token_count_source", None)
+    if anchor_source:
+        table.add_row("request_anchor_source", str(anchor_source))
+        table.add_row(
+            "request_anchor_confidence",
+            str(getattr(ctx, "anchor_token_count_confidence", "-")),
+        )
     table.add_row("context_window_tokens", str(context_window_tokens))
     table.add_row(
-        "estimated_total_request_tokens",
+        "projected_total_request_tokens",
         str(getattr(ctx, "used_input_tokens", "n/a")),
+    )
+    table.add_row(
+        "local_request_estimate_tokens",
+        str(getattr(ctx, "local_request_estimate_tokens", "n/a")),
     )
     table.add_row("context_window_left_tokens", str(context_window_remaining))
     table.add_row(

@@ -13,6 +13,7 @@ from .config import (
     ConfigError,
     get_api_key,
     resolve_llm_timeout_s,
+    resolve_model_access_api_key,
     resolve_prompt_cache_key,
     resolve_prompt_cache_retention,
     resolve_role_temperature,
@@ -512,29 +513,14 @@ def review_merge_conflict(
 ) -> ConflictReviewOutcome:
     task_id = str(task.get("id") or "").strip() or "(unknown)"
 
-    api_key = (api_key_override or "").strip()
-    if not api_key:
-        try:
-            api_key = get_api_key().strip()
-        except ConfigError as e:
-            review_md = _review_markdown(
-                task=task,
-                context=context,
-                review=None,
-                skipped_reason=str(e),
-                request_retry_count=0,
-                request_retry_state=_REQUEST_RETRY_STATE_NONE,
-            )
-            return ConflictReviewOutcome(
-                review_json=None,
-                review_markdown=review_md,
-                skipped_reason=str(e),
-                request_retry_count=0,
-                request_retry_state=_REQUEST_RETRY_STATE_NONE,
-            )
-
-    if not api_key:
-        reason = "missing API key"
+    try:
+        api_key = resolve_model_access_api_key(
+            cfg,
+            override=api_key_override,
+            legacy_resolver=get_api_key,
+        )
+    except ConfigError as exc:
+        reason = str(exc)
         review_md = _review_markdown(
             task=task,
             context=context,

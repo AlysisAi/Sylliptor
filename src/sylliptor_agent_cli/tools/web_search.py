@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -20,19 +21,23 @@ from ..config import (
     resolve_web_search_model,
     resolve_web_search_timeout_s,
 )
+from ..llm.metadata import endpoint_descriptor
 from ..llm.openai_responses import OpenAIResponsesClient, ResponsesError
-from ..llm.protocols import OPENAI_COMPAT_PROTOCOL
+from ..llm.protocols import OPENAI_COMPAT_PROTOCOL, OPENAI_RESPONSES_PROTOCOL
 from ..llm.provider_limits import ProviderRetrySettings, resolve_provider_retry_settings
-from ..profiles import get_active_profile
+from ..profiles import active_subscription_selection_ready, get_active_profile
 from ..provider_telemetry import record_web_search_call
 from ..safety.safe_http import Resolver
 from ..web_search_adapters import (
     ANTHROPIC_MESSAGES_ADAPTER,
     AUTO_WEB_SEARCH_ADAPTER,
+    COHERE_WEB_SEARCH_ADAPTER,
     DASHSCOPE_CHAT_ADAPTER,
+    DDGS_ADAPTER,
     EXTERNAL_WEB_SEARCH_ADAPTERS,
     GEMINI_GROUNDING_ADAPTER,
     GROQ_COMPOUND_ADAPTER,
+    MINIMAX_CODING_PLAN_ADAPTER,
     MISTRAL_CONVERSATIONS_ADAPTER,
     MOONSHOT_KIMI_ADAPTER,
     NATIVE_WEB_SEARCH_ADAPTERS,
@@ -49,12 +54,25 @@ from ..web_search_adapters import (
     web_search_adapter_is_external,
     web_search_adapter_is_native,
 )
-from .web_search_dashscope import DashScopeChatSearchError, dashscope_chat_search
+from .web_search_dashscope import (
+    DashScopeChatSearchError,
+    dashscope_chat_search,
+    dashscope_model_supports_web_search,
+)
+from .web_search_ddgs import (
+    KEYLESS_WEB_SEARCH_ENV,
+    DdgsSearchError,
+    ddgs_package_available,
+    ddgs_search,
+    keyless_web_search_enabled,
+)
 from .web_search_provider_adapters import (
     ProviderWebSearchError,
     anthropic_messages_search,
+    cohere_web_search,
     gemini_grounding_search,
     groq_compound_search,
+    minimax_coding_plan_search,
     mistral_conversations_search,
     moonshot_kimi_search,
     openrouter_web_search,
@@ -66,7 +84,17 @@ from .web_search_tavily import TavilySearchError, tavily_search
 
 
 class WebSearchError(RuntimeError):
-    pass
+    """Raised for any web_search failure.
+
+    ``recoverable=True`` marks failures the calling model can fix by adjusting its
+    own tool arguments (input validation, argument-contract violations). The agent
+    loop returns those to the model as plain errors instead of disabling web tools
+    for the rest of the turn.
+    """
+
+    def __init__(self, message: str, *, recoverable: bool = False) -> None:
+        super().__init__(message)
+        self.recoverable = recoverable
 
 
 _OPENAI_RESPONSES_PROVIDER = OPENAI_RESPONSES_ADAPTER
@@ -81,7 +109,10 @@ _VOLCENGINE_WEB_SEARCH_PROVIDER = VOLCENGINE_WEB_SEARCH_ADAPTER
 _PERPLEXITY_SONAR_PROVIDER = PERPLEXITY_SONAR_ADAPTER
 _GROQ_COMPOUND_PROVIDER = GROQ_COMPOUND_ADAPTER
 _MISTRAL_CONVERSATIONS_PROVIDER = MISTRAL_CONVERSATIONS_ADAPTER
+_MINIMAX_CODING_PLAN_PROVIDER = MINIMAX_CODING_PLAN_ADAPTER
+_COHERE_WEB_SEARCH_PROVIDER = COHERE_WEB_SEARCH_ADAPTER
 _TAVILY_PROVIDER = TAVILY_ADAPTER
+_DDGS_PROVIDER = DDGS_ADAPTER
 _WEB_SEARCH_PROVIDER_ENV = "SYLLIPTOR_WEB_SEARCH_PROVIDER"
 _WEB_SEARCH_ADAPTER_ENV = "SYLLIPTOR_WEB_SEARCH_ADAPTER"
 _VALID_WEB_SEARCH_PROVIDERS = set(VALID_WEB_SEARCH_ADAPTERS) - {AUTO_WEB_SEARCH_ADAPTER}
@@ -89,12 +120,6 @@ _WEB_SEARCH_MODE_OFF = "off"
 _WEB_SEARCH_MODE_AUTO = "auto"
 _WEB_SEARCH_MODE_NATIVE = "native"
 _WEB_SEARCH_MODE_EXTERNAL = "external"
-
-_DASHSCOPE_SEARCH_MODEL_PREFIXES = (
-    "qwen3.5-plus",
-    "qwen3.5-flash",
-    "qwen3-max",
-)
 
 # web_search runs as a one-shot tool call that the agent loop re-issues on its own
 # when needed, so a slow/failed provider call should fail fast rather than burn the
@@ -130,6 +155,7 @@ class WebSearchRuntimeConfig:
     api_key: str
     model: str | None
     timeout_s: float
+    auth_provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -146,7 +172,7 @@ class WebSearchRuntimeStatus:
         return {
             "mode": self.mode,
             "provider": self.provider,
-            "base_url": self.base_url,
+            "base_url_descriptor": (endpoint_descriptor(self.base_url) if self.base_url else None),
             "model": self.model,
             "api_key_available": self.api_key_available,
             "registration_ready": self.registration_ready,
@@ -177,8 +203,13 @@ class WebSearchRuntimeStatus:
         if self.registration_ready:
             if self.provider == _TAVILY_PROVIDER:
                 return (
-                    "Provider-agnostic web search is ready via TAVILY_API_KEY; chat and "
+                    "Provider-agnostic web search is ready via the external search key; chat and "
                     "top-level Plan/readonly sessions can use it."
+                )
+            if self.provider == _DDGS_PROVIDER:
+                return (
+                    "Keyless web search (DuckDuckGo metasearch) is ready — no API key needed; "
+                    "set TAVILY_API_KEY for a higher-quality external backend."
                 )
             if self.provider == _DASHSCOPE_CHAT_PROVIDER:
                 return (
@@ -210,6 +241,10 @@ class WebSearchRuntimeStatus:
                 return "Groq Compound web search is ready."
             if self.provider == _MISTRAL_CONVERSATIONS_PROVIDER:
                 return "Mistral Conversations web_search is ready."
+            if self.provider == _MINIMAX_CODING_PLAN_PROVIDER:
+                return "MiniMax Token Plan web_search is ready."
+            if self.provider == _COHERE_WEB_SEARCH_PROVIDER:
+                return "Cohere hosted web-search connector is ready."
             return "web_search is ready for chat and top-level Plan/readonly sessions."
 
         if self.mode == _WEB_SEARCH_MODE_OFF:
@@ -236,26 +271,37 @@ class WebSearchRuntimeStatus:
                     "does not use Tavily or other external fallback search providers."
                 )
             if self.mode == _WEB_SEARCH_MODE_EXTERNAL:
-                return "Set TAVILY_API_KEY for external web_search."
+                return (
+                    "Set SYLLIPTOR_WEB_SEARCH_API_KEY or TAVILY_API_KEY for external "
+                    "web_search, or install the 'ddgs' package for the keyless backend."
+                )
             return (
                 "Set an API key with `sylliptor config set-api-key`, "
-                "SYLLIPTOR_API_KEY, SYLLIPTOR_WEB_SEARCH_API_KEY, or set "
-                "TAVILY_API_KEY for provider-agnostic fallback."
+                "SYLLIPTOR_API_KEY, or set SYLLIPTOR_WEB_SEARCH_API_KEY/TAVILY_API_KEY "
+                "for provider-agnostic fallback; installing the 'ddgs' package enables "
+                "keyless fallback search."
             )
 
         if self.mode == _WEB_SEARCH_MODE_NATIVE:
             return (
                 "Use a native search-capable provider/profile (OpenAI, xAI, Anthropic, "
                 "Gemini, OpenRouter, DashScope/Qwen, Kimi, Zhipu/GLM, Doubao, "
-                "Perplexity, Groq, or Mistral). Native mode never falls back to Tavily."
+                "Perplexity, Groq, Mistral, MiniMax Token Plan, or Cohere). Native mode "
+                "never falls back to Tavily."
             )
         if self.mode == _WEB_SEARCH_MODE_EXTERNAL:
-            return "Use an external web_search adapter such as Tavily and set TAVILY_API_KEY."
+            return (
+                "Use an external web_search adapter: set SYLLIPTOR_WEB_SEARCH_API_KEY or "
+                "TAVILY_API_KEY for Tavily, or install the 'ddgs' package for the "
+                "keyless backend."
+            )
 
         return (
             "Use a native search-capable provider/profile (OpenAI, xAI, Anthropic, Gemini, "
-            "OpenRouter, DashScope/Qwen, Kimi, Zhipu/GLM, Doubao, Perplexity, Groq, or "
-            "Mistral), or set TAVILY_API_KEY."
+            "OpenRouter, DashScope/Qwen, Kimi, Zhipu/GLM, Doubao, Perplexity, Groq, "
+            "Mistral, MiniMax Token Plan, or Cohere), set "
+            "SYLLIPTOR_WEB_SEARCH_API_KEY/TAVILY_API_KEY, or install the 'ddgs' package "
+            "for keyless fallback search."
         )
 
 
@@ -328,6 +374,33 @@ def _resolve_runtime_base_url(
     return candidate_base_url, None
 
 
+def _responses_auth_provider_for_base_url(
+    *,
+    cfg: AppConfig | None,
+    base_url: str | None,
+) -> str | None:
+    if cfg is None:
+        return None
+    try:
+        profile = get_active_profile(cfg)
+    except Exception:  # noqa: BLE001
+        return None
+    provider_id = str(profile.auth_provider or "").strip()
+    if not provider_id or str(profile.protocol or "").strip() != OPENAI_RESPONSES_PROTOCOL:
+        return None
+    try:
+        from ..provider_auth import create_provider_auth
+
+        adapter = create_provider_auth(provider_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if str(getattr(adapter, "protocol", "") or "").strip() != OPENAI_RESPONSES_PROTOCOL:
+        return None
+    normalized_base = str(base_url or "").strip().rstrip("/")
+    adapter_base = str(getattr(adapter, "base_url", "") or "").strip().rstrip("/")
+    return provider_id if normalized_base and normalized_base == adapter_base else None
+
+
 def _is_dashscope_base_url(base_url: str | None) -> bool:
     normalized = str(base_url or "").strip()
     if not normalized:
@@ -351,10 +424,7 @@ def _is_dashscope_base_url(base_url: str | None) -> bool:
 
 
 def _dashscope_model_supports_web_search(model: str | None) -> bool:
-    normalized = str(model or "").strip().lower()
-    if "/" in normalized:
-        normalized = normalized.rsplit("/", 1)[-1]
-    return any(normalized.startswith(prefix) for prefix in _DASHSCOPE_SEARCH_MODEL_PREFIXES)
+    return dashscope_model_supports_web_search(model)
 
 
 def _base_url_host(base_url: str | None) -> str:
@@ -428,6 +498,22 @@ def _is_mistral_base_url(base_url: str | None) -> bool:
     return _is_host_or_subdomain(_base_url_host(base_url), "api.mistral.ai")
 
 
+def _is_minimax_base_url(base_url: str | None) -> bool:
+    host = _base_url_host(base_url)
+    return _is_host_or_subdomain(host, "api.minimax.io") or _is_host_or_subdomain(
+        host,
+        "api.minimaxi.com",
+    )
+
+
+def _is_cohere_base_url(base_url: str | None) -> bool:
+    host = _base_url_host(base_url)
+    return _is_host_or_subdomain(host, "api.cohere.ai") or _is_host_or_subdomain(
+        host,
+        "api.cohere.com",
+    )
+
+
 def _is_moonshot_base_url(base_url: str | None) -> bool:
     host = _base_url_host(base_url)
     return _is_host_or_subdomain(host, "api.moonshot.cn") or _is_host_or_subdomain(
@@ -468,17 +554,17 @@ def _groq_search_model(cfg: AppConfig | None) -> str | None:
     return "groq/compound-mini"
 
 
-def _resolve_tavily_api_key() -> str | None:
+def _resolve_tavily_api_key(cfg: AppConfig | None) -> str | None:
     value = str(env_get("TAVILY_API_KEY") or "").strip()
     if value:
         return value
-    return None
+    return resolve_web_search_api_key(cfg)
 
 
 def _validate_query(raw_query: Any) -> str:
     query = str(raw_query or "").strip()
     if not query:
-        raise WebSearchError("query must be a non-empty string.")
+        raise WebSearchError("query must be a non-empty string.", recoverable=True)
     return query
 
 
@@ -486,12 +572,18 @@ def _validate_allowed_domains(raw_allowed_domains: Any) -> list[str] | None:
     if raw_allowed_domains is None:
         return None
     if not isinstance(raw_allowed_domains, list):
-        raise WebSearchError("allowed_domains must be an array of non-empty domain strings.")
+        raise WebSearchError(
+            "allowed_domains must be an array of non-empty domain strings.",
+            recoverable=True,
+        )
     cleaned: list[str] = []
     for item in raw_allowed_domains:
         domain = str(item or "").strip().lower()
         if not domain:
-            raise WebSearchError("allowed_domains must contain only non-empty domain strings.")
+            raise WebSearchError(
+                "allowed_domains must contain only non-empty domain strings.",
+                recoverable=True,
+            )
         cleaned.append(domain)
     return cleaned
 
@@ -500,9 +592,12 @@ def _validate_max_sources(raw_max_sources: Any) -> int:
     try:
         max_sources = int(raw_max_sources if raw_max_sources is not None else 8)
     except (TypeError, ValueError) as e:
-        raise WebSearchError("max_sources must be an integer between 1 and 20.") from e
+        raise WebSearchError(
+            "max_sources must be an integer between 1 and 20.",
+            recoverable=True,
+        ) from e
     if max_sources < 1 or max_sources > 20:
-        raise WebSearchError("max_sources must be an integer between 1 and 20.")
+        raise WebSearchError("max_sources must be an integer between 1 and 20.", recoverable=True)
     return max_sources
 
 
@@ -510,7 +605,7 @@ def _validate_external_web_access(raw_external_web_access: Any) -> bool:
     if raw_external_web_access is None:
         return True
     if not isinstance(raw_external_web_access, bool):
-        raise WebSearchError("external_web_access must be a boolean.")
+        raise WebSearchError("external_web_access must be a boolean.", recoverable=True)
     return raw_external_web_access
 
 
@@ -519,7 +614,8 @@ def _enforce_external_web_access_contract(*, provider: str, external_web_access:
         return
     raise WebSearchError(
         "external_web_access=false is supported only by the openai_responses web_search backend; "
-        f"{provider} always uses external web access."
+        f"{provider} always uses external web access.",
+        recoverable=True,
     )
 
 
@@ -531,6 +627,16 @@ def _resolve_openai_readiness(
     base_url, registration_base_url = _resolve_runtime_base_url(cfg)
     model = resolve_web_search_model(cfg)
     resolved_api_key = resolve_web_search_api_key(cfg, api_key_fallback=api_key)
+    auth_provider = _responses_auth_provider_for_base_url(cfg=cfg, base_url=base_url)
+    subscription_selection_ready = True
+    if auth_provider:
+        registration_base_url = base_url
+        try:
+            profile = get_active_profile(cfg)  # type: ignore[arg-type]
+            model = profile.default_model
+            subscription_selection_ready = active_subscription_selection_ready(cfg)  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001
+            subscription_selection_ready = False
     notes: list[str] = []
     timeout_s: float | None = None
 
@@ -554,20 +660,33 @@ def _resolve_openai_readiness(
             notes,
             "missing model: set model or web_search_model (SYLLIPTOR_WEB_SEARCH_MODEL is an advanced override)",
         )
-    if not resolved_api_key:
+    if not resolved_api_key and not auth_provider:
         _append_unique_note(
             notes,
             "missing API key: set SYLLIPTOR_API_KEY or SYLLIPTOR_WEB_SEARCH_API_KEY",
         )
+    if auth_provider and not subscription_selection_ready:
+        _append_unique_note(
+            notes,
+            "choose the subscription model and reasoning effort in /config → Default Model",
+        )
 
     runtime: WebSearchRuntimeConfig | None = None
-    if registration_base_url and model and resolved_api_key and timeout_s is not None:
+    credentials_available = bool(resolved_api_key or auth_provider)
+    if (
+        registration_base_url
+        and model
+        and credentials_available
+        and timeout_s is not None
+        and subscription_selection_ready
+    ):
         runtime = WebSearchRuntimeConfig(
             provider=_OPENAI_RESPONSES_PROVIDER,
             base_url=registration_base_url,
-            api_key=resolved_api_key,
+            api_key=resolved_api_key or "",
             model=model,
             timeout_s=timeout_s,
+            auth_provider=auth_provider,
         )
 
     return _BackendReadiness(
@@ -575,7 +694,7 @@ def _resolve_openai_readiness(
         runtime=runtime,
         base_url=base_url or None,
         model=model or None,
-        api_key_available=bool(resolved_api_key),
+        api_key_available=credentials_available,
         notes=tuple(notes),
     )
 
@@ -608,7 +727,8 @@ def _resolve_dashscope_chat_readiness(
     elif not _dashscope_model_supports_web_search(model):
         _append_unique_note(
             notes,
-            "DashScope chat search requires a Qwen web-search capable model such as qwen3.5-plus",
+            "DashScope web search requires a supported Qwen model such as qwen3.7-plus, "
+            "qwen3.6-flash, or qwen3.5-plus",
         )
     if not resolved_api_key:
         _append_unique_note(
@@ -832,6 +952,36 @@ def _resolve_mistral_conversations_readiness(
     )
 
 
+def _resolve_minimax_coding_plan_readiness(
+    *,
+    cfg: AppConfig | None,
+    api_key: str | None,
+) -> _BackendReadiness:
+    return _resolve_native_provider_readiness(
+        cfg=cfg,
+        api_key=api_key,
+        provider=_MINIMAX_CODING_PLAN_PROVIDER,
+        base_url_label="MiniMax",
+        base_url_predicate=_is_minimax_base_url,
+        default_model="MiniMax-M2.7",
+    )
+
+
+def _resolve_cohere_web_search_readiness(
+    *,
+    cfg: AppConfig | None,
+    api_key: str | None,
+) -> _BackendReadiness:
+    return _resolve_native_provider_readiness(
+        cfg=cfg,
+        api_key=api_key,
+        provider=_COHERE_WEB_SEARCH_PROVIDER,
+        base_url_label="Cohere",
+        base_url_predicate=_is_cohere_base_url,
+        default_model="command-a-plus-05-2026",
+    )
+
+
 def _resolve_moonshot_kimi_readiness(
     *,
     cfg: AppConfig | None,
@@ -880,7 +1030,7 @@ def _resolve_volcengine_web_search_readiness(
 def _resolve_tavily_readiness(*, cfg: AppConfig | None) -> _BackendReadiness:
     notes: list[str] = []
     timeout_s: float | None = None
-    resolved_api_key = _resolve_tavily_api_key()
+    resolved_api_key = _resolve_tavily_api_key(cfg)
 
     try:
         timeout_s = resolve_web_search_timeout_s(cfg)
@@ -888,7 +1038,10 @@ def _resolve_tavily_readiness(*, cfg: AppConfig | None) -> _BackendReadiness:
         _append_unique_note(notes, str(e))
 
     if not resolved_api_key:
-        _append_unique_note(notes, "missing TAVILY_API_KEY for Tavily search")
+        _append_unique_note(
+            notes,
+            "missing TAVILY_API_KEY or SYLLIPTOR_WEB_SEARCH_API_KEY for Tavily search",
+        )
 
     runtime: WebSearchRuntimeConfig | None = None
     if resolved_api_key and timeout_s is not None:
@@ -910,6 +1063,48 @@ def _resolve_tavily_readiness(*, cfg: AppConfig | None) -> _BackendReadiness:
     )
 
 
+def _resolve_ddgs_readiness(*, cfg: AppConfig | None) -> _BackendReadiness:
+    notes: list[str] = []
+    timeout_s: float | None = None
+
+    try:
+        timeout_s = resolve_web_search_timeout_s(cfg)
+    except ConfigError as e:
+        _append_unique_note(notes, str(e))
+
+    enabled = keyless_web_search_enabled()
+    package_available = ddgs_package_available()
+    if not enabled:
+        _append_unique_note(
+            notes,
+            f"keyless web search is disabled ({KEYLESS_WEB_SEARCH_ENV}=0)",
+        )
+    elif not package_available:
+        _append_unique_note(
+            notes,
+            "keyless web search requires the 'ddgs' package (pip install ddgs)",
+        )
+
+    runtime: WebSearchRuntimeConfig | None = None
+    if enabled and package_available and timeout_s is not None:
+        runtime = WebSearchRuntimeConfig(
+            provider=_DDGS_PROVIDER,
+            base_url=None,
+            api_key="",
+            model=None,
+            timeout_s=timeout_s,
+        )
+
+    return _BackendReadiness(
+        provider=_DDGS_PROVIDER,
+        runtime=runtime,
+        base_url=None,
+        model=None,
+        api_key_available=runtime is not None,
+        notes=tuple(notes),
+    )
+
+
 def _readiness_order() -> tuple[str, ...]:
     return (
         _OPENAI_RESPONSES_PROVIDER,
@@ -924,7 +1119,10 @@ def _readiness_order() -> tuple[str, ...]:
         _PERPLEXITY_SONAR_PROVIDER,
         _GROQ_COMPOUND_PROVIDER,
         _MISTRAL_CONVERSATIONS_PROVIDER,
+        _MINIMAX_CODING_PLAN_PROVIDER,
+        _COHERE_WEB_SEARCH_PROVIDER,
         _TAVILY_PROVIDER,
+        _DDGS_PROVIDER,
     )
 
 
@@ -992,7 +1190,16 @@ def _resolve_backend_readiness_map(
             cfg=cfg,
             api_key=api_key,
         ),
+        _MINIMAX_CODING_PLAN_PROVIDER: _resolve_minimax_coding_plan_readiness(
+            cfg=cfg,
+            api_key=api_key,
+        ),
+        _COHERE_WEB_SEARCH_PROVIDER: _resolve_cohere_web_search_readiness(
+            cfg=cfg,
+            api_key=api_key,
+        ),
         _TAVILY_PROVIDER: _resolve_tavily_readiness(cfg=cfg),
+        _DDGS_PROVIDER: _resolve_ddgs_readiness(cfg=cfg),
     }
 
 
@@ -1045,7 +1252,8 @@ def _mode_unavailable_notes(
         return _combine_notes(
             (
                 "web_search_mode=external found no ready external web search adapter. "
-                "Configure TAVILY_API_KEY or select another external adapter when available.",
+                "Configure SYLLIPTOR_WEB_SEARCH_API_KEY/TAVILY_API_KEY or install the "
+                "'ddgs' package for the keyless backend.",
             ),
             combined,
         )
@@ -1205,7 +1413,7 @@ def _strict_runtime_error_message(
         details = "; ".join(combined) if combined else "no external adapter is ready"
         return (
             f"web_search is not available in external mode: {details}. "
-            "Configure TAVILY_API_KEY for Tavily external search."
+            "Configure SYLLIPTOR_WEB_SEARCH_API_KEY or TAVILY_API_KEY for Tavily external search."
         )
     if combined:
         return "web_search is not available in auto mode: " + "; ".join(combined)
@@ -1282,6 +1490,10 @@ def _with_web_search_observability(
     fallback_occurred: bool = False,
 ) -> dict[str, Any]:
     enriched = dict(result)
+    # Host wall-clock provenance: when this search actually ran. Lets the model
+    # anchor "today"/"current" reasoning to real time instead of its training
+    # prior (which otherwise poisons follow-up queries with a stale year).
+    enriched["retrieved_at"] = datetime.now(UTC).isoformat(timespec="seconds")
     citations = enriched.get("citations")
     sources = enriched.get("sources")
     queries = enriched.get("queries")
@@ -1337,7 +1549,13 @@ def _openai_responses_search(
     external_web_access: bool,
     transport: httpx.BaseTransport | None,
     client_factory: Callable[..., OpenAIResponsesClient],
+    session_id: str | None,
 ) -> dict[str, Any]:
+    provider_auth = None
+    if runtime.auth_provider:
+        from ..provider_auth import create_provider_auth
+
+        provider_auth = create_provider_auth(runtime.auth_provider, transport=transport)
     client = client_factory(
         base_url=str(runtime.base_url or ""),
         api_key=runtime.api_key,
@@ -1346,6 +1564,8 @@ def _openai_responses_search(
         transport=transport,
         provider_concurrency_caps=getattr(cfg, "provider_concurrency_caps", None),
         provider_retry_settings=_web_search_provider_retry_settings(cfg),
+        provider_auth=provider_auth,
+        session_id=session_id,
     )
 
     try:
@@ -1414,6 +1634,7 @@ def web_search(
     transport: httpx.BaseTransport | None = None,
     resolver: Resolver | None = None,
     client_factory: Callable[..., OpenAIResponsesClient] = OpenAIResponsesClient,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     validated_query = _validate_query(query)
     validated_allowed_domains = _validate_allowed_domains(allowed_domains)
@@ -1440,26 +1661,52 @@ def web_search(
             resolver=resolver,
         )
 
-    def _fallback_to_tavily_or_raise(provider: str, error: Exception) -> dict[str, Any]:
+    def _run_ddgs(ddgs_runtime: WebSearchRuntimeConfig) -> dict[str, Any]:
+        return ddgs_search(
+            query=validated_query,
+            max_results=validated_max_sources,
+            include_domains=validated_allowed_domains,
+            timeout_s=ddgs_runtime.timeout_s,
+        )
+
+    def _fallback_to_external_or_raise(provider: str, error: Exception) -> dict[str, Any]:
         if provider_override is not None:
             raise WebSearchError(str(error)) from error
         if resolve_web_search_mode(cfg) != "auto" or not validated_external_web_access:
             raise WebSearchError(str(error)) from error
-        tavily_runtime = _resolve_tavily_readiness(cfg=cfg).runtime
-        if tavily_runtime is None:
+        failures = [f"{provider}: {error}"]
+        last_error: Exception = error
+        if provider != _TAVILY_PROVIDER:
+            tavily_runtime = _resolve_tavily_readiness(cfg=cfg).runtime
+            if tavily_runtime is not None:
+                try:
+                    return _with_web_search_observability(
+                        result=_run_tavily(tavily_runtime),
+                        runtime=tavily_runtime,
+                        cfg=cfg,
+                        fallback_occurred=True,
+                    )
+                except TavilySearchError as tavily_error:
+                    failures.append(f"tavily: {tavily_error}")
+                    last_error = tavily_error
+        if provider != _DDGS_PROVIDER:
+            ddgs_runtime = _resolve_ddgs_readiness(cfg=cfg).runtime
+            if ddgs_runtime is not None:
+                try:
+                    return _with_web_search_observability(
+                        result=_run_ddgs(ddgs_runtime),
+                        runtime=ddgs_runtime,
+                        cfg=cfg,
+                        fallback_occurred=True,
+                    )
+                except DdgsSearchError as ddgs_error:
+                    failures.append(f"ddgs: {ddgs_error}")
+                    last_error = ddgs_error
+        if len(failures) == 1:
             raise WebSearchError(str(error)) from error
-        try:
-            return _with_web_search_observability(
-                result=_run_tavily(tavily_runtime),
-                runtime=tavily_runtime,
-                cfg=cfg,
-                fallback_occurred=True,
-            )
-        except TavilySearchError as tavily_error:
-            raise WebSearchError(
-                "web_search failed across auto backends: "
-                f"{provider}: {error}; tavily: {tavily_error}"
-            ) from tavily_error
+        raise WebSearchError(
+            "web_search failed across auto backends: " + "; ".join(failures)
+        ) from last_error
 
     if runtime.provider == _TAVILY_PROVIDER:
         try:
@@ -1469,6 +1716,16 @@ def web_search(
                 cfg=cfg,
             )
         except TavilySearchError as e:
+            return _fallback_to_external_or_raise(_TAVILY_PROVIDER, e)
+
+    if runtime.provider == _DDGS_PROVIDER:
+        try:
+            return _with_web_search_observability(
+                result=_run_ddgs(runtime),
+                runtime=runtime,
+                cfg=cfg,
+            )
+        except DdgsSearchError as e:
             raise WebSearchError(str(e)) from e
 
     if runtime.provider == _DASHSCOPE_CHAT_PROVIDER:
@@ -1491,7 +1748,7 @@ def web_search(
                 cfg=cfg,
             )
         except DashScopeChatSearchError as e:
-            return _fallback_to_tavily_or_raise(_DASHSCOPE_CHAT_PROVIDER, e)
+            return _fallback_to_external_or_raise(_DASHSCOPE_CHAT_PROVIDER, e)
 
     provider_retry_settings = _web_search_provider_retry_settings(cfg)
     native_kwargs = {
@@ -1516,7 +1773,7 @@ def web_search(
                 cfg=cfg,
             )
         except ProviderWebSearchError as e:
-            return _fallback_to_tavily_or_raise(_ANTHROPIC_MESSAGES_PROVIDER, e)
+            return _fallback_to_external_or_raise(_ANTHROPIC_MESSAGES_PROVIDER, e)
 
     if runtime.provider == _GEMINI_GROUNDING_PROVIDER:
         try:
@@ -1526,7 +1783,7 @@ def web_search(
                 cfg=cfg,
             )
         except ProviderWebSearchError as e:
-            return _fallback_to_tavily_or_raise(_GEMINI_GROUNDING_PROVIDER, e)
+            return _fallback_to_external_or_raise(_GEMINI_GROUNDING_PROVIDER, e)
 
     if runtime.provider == _OPENROUTER_WEB_PROVIDER:
         try:
@@ -1536,7 +1793,7 @@ def web_search(
                 cfg=cfg,
             )
         except ProviderWebSearchError as e:
-            return _fallback_to_tavily_or_raise(_OPENROUTER_WEB_PROVIDER, e)
+            return _fallback_to_external_or_raise(_OPENROUTER_WEB_PROVIDER, e)
 
     if runtime.provider == _MOONSHOT_KIMI_PROVIDER:
         try:
@@ -1546,7 +1803,7 @@ def web_search(
                 cfg=cfg,
             )
         except ProviderWebSearchError as e:
-            return _fallback_to_tavily_or_raise(_MOONSHOT_KIMI_PROVIDER, e)
+            return _fallback_to_external_or_raise(_MOONSHOT_KIMI_PROVIDER, e)
 
     if runtime.provider == _ZHIPU_WEB_SEARCH_PROVIDER:
         try:
@@ -1556,7 +1813,7 @@ def web_search(
                 cfg=cfg,
             )
         except ProviderWebSearchError as e:
-            return _fallback_to_tavily_or_raise(_ZHIPU_WEB_SEARCH_PROVIDER, e)
+            return _fallback_to_external_or_raise(_ZHIPU_WEB_SEARCH_PROVIDER, e)
 
     if runtime.provider == _VOLCENGINE_WEB_SEARCH_PROVIDER:
         try:
@@ -1566,7 +1823,7 @@ def web_search(
                 cfg=cfg,
             )
         except ProviderWebSearchError as e:
-            return _fallback_to_tavily_or_raise(_VOLCENGINE_WEB_SEARCH_PROVIDER, e)
+            return _fallback_to_external_or_raise(_VOLCENGINE_WEB_SEARCH_PROVIDER, e)
 
     if runtime.provider == _PERPLEXITY_SONAR_PROVIDER:
         try:
@@ -1576,7 +1833,7 @@ def web_search(
                 cfg=cfg,
             )
         except ProviderWebSearchError as e:
-            return _fallback_to_tavily_or_raise(_PERPLEXITY_SONAR_PROVIDER, e)
+            return _fallback_to_external_or_raise(_PERPLEXITY_SONAR_PROVIDER, e)
 
     if runtime.provider == _GROQ_COMPOUND_PROVIDER:
         try:
@@ -1586,7 +1843,7 @@ def web_search(
                 cfg=cfg,
             )
         except ProviderWebSearchError as e:
-            return _fallback_to_tavily_or_raise(_GROQ_COMPOUND_PROVIDER, e)
+            return _fallback_to_external_or_raise(_GROQ_COMPOUND_PROVIDER, e)
 
     if runtime.provider == _MISTRAL_CONVERSATIONS_PROVIDER:
         try:
@@ -1596,7 +1853,27 @@ def web_search(
                 cfg=cfg,
             )
         except ProviderWebSearchError as e:
-            return _fallback_to_tavily_or_raise(_MISTRAL_CONVERSATIONS_PROVIDER, e)
+            return _fallback_to_external_or_raise(_MISTRAL_CONVERSATIONS_PROVIDER, e)
+
+    if runtime.provider == _MINIMAX_CODING_PLAN_PROVIDER:
+        try:
+            return _with_web_search_observability(
+                result=minimax_coding_plan_search(**native_kwargs),
+                runtime=runtime,
+                cfg=cfg,
+            )
+        except ProviderWebSearchError as e:
+            return _fallback_to_external_or_raise(_MINIMAX_CODING_PLAN_PROVIDER, e)
+
+    if runtime.provider == _COHERE_WEB_SEARCH_PROVIDER:
+        try:
+            return _with_web_search_observability(
+                result=cohere_web_search(**native_kwargs),
+                runtime=runtime,
+                cfg=cfg,
+            )
+        except ProviderWebSearchError as e:
+            return _fallback_to_external_or_raise(_COHERE_WEB_SEARCH_PROVIDER, e)
 
     try:
         return _with_web_search_observability(
@@ -1609,9 +1886,10 @@ def web_search(
                 external_web_access=validated_external_web_access,
                 transport=transport,
                 client_factory=client_factory,
+                session_id=session_id,
             ),
             runtime=runtime,
             cfg=cfg,
         )
     except WebSearchError as openai_error:
-        return _fallback_to_tavily_or_raise(runtime.provider, openai_error)
+        return _fallback_to_external_or_raise(runtime.provider, openai_error)

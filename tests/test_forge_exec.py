@@ -756,7 +756,8 @@ def test_exec_sets_in_progress_then_done_and_writes_outputs(tmp_path: Path, monk
     assert budget_payload["truncation_strategy"].startswith("execution_priority")
     assert budget_payload["subagents_enabled"] is False
     assert budget_payload["step_budget"]["kind"] == "managed_task"
-    assert budget_payload["step_budget"]["reason"] == "adaptive_managed_task"
+    assert budget_payload["step_budget"]["reason"] == "autonomous_unbounded"
+    assert budget_payload["step_budget"]["resolved_max_steps"] is None
     assert budget_payload["image_count"] == 0
     assert budget_payload["image_budget_reserve_tokens"] == 0
     assert budget_payload["initial_request_token_estimate"] > 0
@@ -1267,9 +1268,7 @@ def test_exec_passes_runtime_kind_to_run_agent(tmp_path: Path, monkeypatch) -> N
     assert captured["runtime_kind"] == RuntimeKind.FORGE_EXEC
 
 
-def test_exec_uses_resolved_managed_task_budget_and_task_hard_cap(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_exec_uses_autonomous_unbounded_managed_task_policy(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1321,22 +1320,21 @@ def test_exec_uses_resolved_managed_task_budget_and_task_hard_cap(
     )
 
     assert result.exit_code == 0
-    assert captured["max_steps"] == 31
+    assert captured["max_steps"] is None
     assert captured["enable_chat_turn_step_budget"] is False
     assert captured["subagents_enabled"] is False
 
     pointer = _load_json(repo / ".sylliptor" / "current_run.json")
     budget_path = repo / pointer["run_path"] / "execution" / "budgets" / f"{task_id}.json"
     budget_payload = _load_json(budget_path)
-    assert budget_payload["step_budget"]["hard_cap"] == 31
-    assert budget_payload["step_budget"]["resolved_max_steps"] == 31
-    assert budget_payload["step_budget"]["reason"] == "adaptive_managed_task"
+    assert budget_payload["step_budget"]["hard_cap"] is None
+    assert budget_payload["step_budget"]["resolved_max_steps"] is None
+    assert budget_payload["step_budget"]["reason"] == "autonomous_unbounded"
+    assert budget_payload["step_budget"]["unlimited"] is True
     assert budget_payload["step_budget"]["signals_used"]["attempt_count"] == 3
 
 
-def test_exec_max_steps_cli_acts_as_fixed_override_for_execution(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_exec_max_steps_cli_acts_as_explicit_execution_limit(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1391,7 +1389,7 @@ def test_exec_max_steps_cli_acts_as_fixed_override_for_execution(
     budget_path = repo / pointer["run_path"] / "execution" / "budgets" / f"{task_id}.json"
     budget_payload = _load_json(budget_path)
     assert budget_payload["step_budget"]["resolved_max_steps"] == 7
-    assert budget_payload["step_budget"]["reason"] == "fixed_override"
+    assert budget_payload["step_budget"]["reason"] == "explicit_limit"
     assert budget_payload["step_budget"]["override_applied"] is True
     assert budget_payload["step_budget"]["hard_cap"] == 7
 
@@ -4912,11 +4910,11 @@ def test_exec_pr_review_rejection_blocks_merge_and_sets_changes_requested(
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_text("verification passed\n", encoding="utf-8")
         return VerifyRunResult(
-            commands=["go test ./... && go build ./..."],
+            commands=["go test ./..."],
             command_results=[
                 VerifyCommandResult(
-                    command="go test ./... && go build ./...",
-                    effective_command="go test ./... && go build ./...",
+                    command="go test ./...",
+                    effective_command="go test ./...",
                     exit_code=0,
                     output="ok\n",
                     real_execution=True,
@@ -4995,7 +4993,7 @@ def test_exec_pr_review_rejection_blocks_merge_and_sets_changes_requested(
             "--pr",
             "--review",
             "--verify-cmd",
-            "go test ./... && go build ./...",
+            "go test ./...",
         ],
         env=_env(tmp_path),
     )
@@ -5024,14 +5022,14 @@ def test_exec_pr_review_receives_current_verification_payload_before_report_exis
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
         artifact_path.write_text("verification passed\n", encoding="utf-8")
         return VerifyRunResult(
-            commands=["go test ./... && go build ./..."],
+            commands=["go test ./..."],
             command_results=[
                 VerifyCommandResult(
-                    command="go test ./... && go build ./...",
-                    effective_command="go test ./... && go build ./...",
+                    command="go test ./...",
+                    effective_command="go test ./...",
                     exit_code=0,
-                    output="? pkg/example [no test files]\n",
-                    real_execution=None,
+                    output="ok\texample/pkg\t0.012s\n",
+                    real_execution=True,
                 )
             ],
             artifact_path=artifact_path,
@@ -5048,7 +5046,7 @@ def test_exec_pr_review_receives_current_verification_payload_before_report_exis
         assert verification["all_passed"] is True
         command_results = verification["command_results"]
         assert isinstance(command_results, list)
-        assert command_results[0]["command"] == "go test ./... && go build ./..."
+        assert command_results[0]["command"] == "go test ./..."
         assert command_results[0]["exit_code"] == 0
         assert command_results[0]["ok"] is True
 
@@ -5148,7 +5146,7 @@ def test_exec_pr_review_receives_current_verification_payload_before_report_exis
             "--pr",
             "--review",
             "--verify-cmd",
-            "go test ./... && go build ./...",
+            "go test ./...",
         ],
         env=_env(tmp_path),
     )
@@ -5159,7 +5157,7 @@ def test_exec_pr_review_receives_current_verification_payload_before_report_exis
     report_path = run_dir / "execution" / "reports" / f"{task_id}.md"
     report = report_path.read_text(encoding="utf-8")
     assert "## Verification Results" in report
-    assert "go test ./... && go build ./..." in report
+    assert "go test ./..." in report
 
 
 def test_exec_pr_verify_strict_blocks_merge_and_sets_verify_failed(
@@ -5420,7 +5418,14 @@ def test_exec_pr_strict_scope_blocks_verification_time_out_of_scope_mutations(
         (root / "README.md").write_text("verify touched docs\n", encoding="utf-8")
         return VerifyRunResult(
             commands=["pytest -q"],
-            command_results=[VerifyCommandResult("pytest -q", 0, "ok")],
+            command_results=[
+                VerifyCommandResult(
+                    command="pytest -q",
+                    exit_code=0,
+                    output="1 passed\n",
+                    real_execution=True,
+                )
+            ],
             artifact_path=artifact_path,
         )
 
@@ -5467,7 +5472,9 @@ def test_exec_pr_strict_scope_blocks_verification_time_out_of_scope_mutations(
     assert "Verification commands modified repository state after the task commit." in report_text
 
 
-def test_exec_pr_verify_warn_failure_blocks_merge(tmp_path: Path, monkeypatch) -> None:
+def test_exec_pr_verify_warn_failure_records_warning_and_merges(
+    tmp_path: Path, monkeypatch
+) -> None:
     runner = CliRunner()
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -5570,11 +5577,15 @@ def test_exec_pr_verify_warn_failure_blocks_merge(tmp_path: Path, monkeypatch) -
         ],
         env=_env(tmp_path),
     )
-    assert result.exit_code == 1
+    # --verify warn is advisory: a failing verification is recorded as a warning
+    # but does not block the merge (only --verify strict blocks).
+    assert result.exit_code == 0
     final_plan = _load_json(plan_path)
-    assert final_plan["tasks"][0]["status"] == "verify_failed"
-    assert not any(cmd and cmd[0] == "merge" for cmd in calls)
+    assert final_plan["tasks"][0]["status"] == "done"
+    assert any(cmd and cmd[0] == "merge" for cmd in calls)
     assert verify_path.exists()
+    report_text = (run_dir / "execution" / "reports" / f"{task_id}.md").read_text(encoding="utf-8")
+    assert "Verification warning: verification failed (0/1); failed: pytest -q" in report_text
 
 
 def test_exec_writes_knowledge_and_injects_relevant_knowledge_context(

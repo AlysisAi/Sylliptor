@@ -33,6 +33,26 @@ def _cli_module() -> Any:
 profile_app = typer.Typer(add_completion=False, help="Provider profile commands.")
 
 
+def _ensure_generic_profile_mutation_allowed(
+    cfg: AppConfig,
+    name: str,
+    *,
+    operation: str,
+) -> None:
+    """Keep generic profile commands from taking ownership of auth profiles."""
+
+    from ...profiles import get_profile
+
+    existing = get_profile(cfg, name)
+    if existing is None or not existing.auth_provider:
+        return
+    raise ConfigError(
+        f"Profile {existing.name!r} is managed by the {existing.auth_provider!r} "
+        f"subscription connection and cannot be {operation} through generic profile "
+        "commands. Choose a different profile name or manage the connection through auth."
+    )
+
+
 def _parse_profile_headers(header_values: list[str] | None) -> dict[str, str]:
     headers: dict[str, str] = {}
     for raw_value in header_values or []:
@@ -111,6 +131,11 @@ def profile_add(
     api_key_env: str | None = typer.Option(None, "--api-key-env", help="API key env var."),
     header: list[str] | None = typer.Option(None, "--header", help="Extra request header k=v."),
     default_model: str = typer.Option("", "--default-model", help="Default model."),
+    reasoning_trace_adapter: str = typer.Option(
+        "auto",
+        "--reasoning-trace-adapter",
+        help="Safe reasoning-summary adapter for this provider profile.",
+    ),
     web_search_adapter: str = typer.Option(
         "auto",
         "--web-search-adapter",
@@ -130,6 +155,7 @@ def profile_add(
     console = _console()
     cfg = _patchable("load_config", load_config)()
     try:
+        _ensure_generic_profile_mutation_allowed(cfg, name, operation="overwritten")
         profile = ProfileSpec(
             name=name,
             protocol=protocol,
@@ -137,6 +163,7 @@ def profile_add(
             api_key_env=api_key_env,
             extra_headers=_parse_profile_headers(header),
             default_model=default_model,
+            reasoning_trace_adapter=reasoning_trace_adapter,
             web_search_adapter=web_search_adapter,
             web_search_model=web_search_model,
             notes=notes,
@@ -227,7 +254,13 @@ def profile_preset(
         raise typer.Exit(code=2)
     cfg = _patchable("load_config", load_config)()
     name = str(profile_name_as or preset.key).strip().lower()
-    if get_profile(cfg, name) is not None and not yes:
+    existing = get_profile(cfg, name)
+    try:
+        _ensure_generic_profile_mutation_allowed(cfg, name, operation="overwritten")
+    except ConfigError as exc:
+        console.print(f"[red]Profile error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+    if existing is not None and not yes:
         if not typer.confirm(f"Overwrite profile {name}?", default=False):
             console.print("Cancelled.")
             return
@@ -290,8 +323,9 @@ def profile_convert(
         console.print(f"[red]Profile not found:[/red] {profile_name}")
         raise typer.Exit(code=2)
     try:
+        _ensure_generic_profile_mutation_allowed(cfg, profile.name, operation="converted")
         normalized_target = normalize_conversion_target(target)
-    except ValueError as exc:
+    except (ConfigError, ValueError) as exc:
         console.print(f"[red]Profile error:[/red] {exc}")
         raise typer.Exit(code=2) from exc
     preset = target_preset_for_profile_conversion(profile, target=normalized_target)

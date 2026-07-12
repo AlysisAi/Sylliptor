@@ -39,6 +39,7 @@ _SUPPORT_SCOPE_DIRS = frozenset(
         "tests",
     }
 )
+SUCCESSFUL_TERMINAL_STATUSES = frozenset({"done", "already_satisfied"})
 
 
 def canonical_task_status(status: str) -> str:
@@ -247,7 +248,7 @@ def _runnable_status(
     retry_failed: bool,
     retry_changes_requested: bool,
 ) -> bool:
-    if status == "planned":
+    if status in {"planned", "interrupted", "cancelled"}:
         return True
     if status in {"failed", "verify_failed", "candidate_rejected"} and retry_failed:
         return True
@@ -271,7 +272,7 @@ def _deps_done(
             and _task_has_primary_implementation_scope(candidate.task)
         ):
             continue
-        if dep.status != "done":
+        if dep.status not in SUCCESSFUL_TERMINAL_STATUSES:
             return False, f"dependency not done: {dep_id} ({dep.status})"
     return True, ""
 
@@ -299,7 +300,7 @@ def select_task_candidates(
             skipped[candidate.task_id] = "filtered by --only"
             continue
 
-        if candidate.status == "done":
+        if candidate.status in SUCCESSFUL_TERMINAL_STATUSES:
             skipped[candidate.task_id] = "already done"
             continue
 

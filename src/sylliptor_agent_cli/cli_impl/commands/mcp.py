@@ -479,7 +479,8 @@ def mcp_auth_login(
         console.print(f"Expires: {_format_mcp_oauth_timestamp(result.token_record.expires_at)}")
         console.print(f"Granted scopes: {scopes_text}")
     except (ConfigError, McpOAuthError, McpOAuthTokenStoreError, typer.BadParameter) as exc:
-        console.print(f"[red]{exc}[/red]")
+        message = str(exc).replace("\n", " ")
+        console.print(f"[red]{message}[/red]", soft_wrap=True)
         raise typer.Exit(code=1) from exc
 
 

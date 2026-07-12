@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +11,12 @@ from rich.console import Console
 
 from sylliptor_agent_cli import cli as cli_mod
 from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.llm.metadata import (
+    PROVIDER_METADATA_KEY,
+    build_provider_route_identity,
+    endpoint_descriptor,
+    stamp_provider_metadata_for_route,
+)
 from sylliptor_agent_cli.runtime_kind import RuntimeKind
 from sylliptor_agent_cli.session_store import SessionInfo, SessionStore
 from sylliptor_agent_cli.web_research import build_web_research_artifact_from_events
@@ -32,6 +38,78 @@ def test_load_chat_resume_messages_reads_user_and_assistant_events(tmp_path: Pat
         {"role": "user", "content": "Hello"},
         {"role": "assistant", "content": "Hi there"},
     ]
+
+
+def test_load_chat_resume_runtime_settings_uses_latest_valid_event(tmp_path: Path) -> None:
+    log_path = tmp_path / "resume-settings.jsonl"
+    events = [
+        {"type": "session_start", "payload": {"stream": True}},
+        {
+            "type": "session_setting_changed",
+            "payload": {"setting": "trace_level", "value": "full"},
+        },
+        {
+            "type": "session_setting_changed",
+            "payload": {"setting": "stream", "value": False},
+        },
+        {"type": "session_start", "payload": {"mode": "review"}},
+        {
+            "type": "session_setting_changed",
+            "payload": {"setting": "trace_level", "value": "unsafe_raw"},
+        },
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    settings = cli_mod._load_chat_resume_runtime_settings(log_path)
+
+    assert settings == {"stream": False, "trace_level": "full"}
+
+
+def test_load_chat_resume_runtime_settings_defaults_legacy_trace_to_compact(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "resume-legacy-settings.jsonl"
+    log_path.write_text(
+        json.dumps({"type": "session_start", "payload": {"mode": "review"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert cli_mod._load_chat_resume_runtime_settings(log_path) == {
+        "stream": None,
+        "trace_level": "compact",
+    }
+
+
+def test_load_chat_resume_messages_uses_latest_compacted_snapshot(tmp_path: Path) -> None:
+    log_path = tmp_path / "resume-compacted.jsonl"
+    memory_message = {
+        "role": "user",
+        "content": '<<<SYLLIPTOR_CONVERSATION_MEMORY_JSON>>>\n{"goal":"ship"}',
+    }
+    events = [
+        {"type": "user_message", "payload": {"content": "old raw turn"}},
+        {"type": "assistant_message", "payload": {"content": "old raw reply"}},
+        {
+            "type": "conversation_summary_updated",
+            "payload": {
+                "active_conversation_messages": [
+                    memory_message,
+                    {"role": "user", "content": "recent retained turn"},
+                ]
+            },
+        },
+        {"type": "assistant_message", "payload": {"content": "reply after compaction"}},
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    loaded = cli_mod._load_chat_resume_messages(log_path)
+
+    assert loaded == [
+        memory_message,
+        {"role": "user", "content": "recent retained turn"},
+        {"role": "assistant", "content": "reply after compaction"},
+    ]
+    assert all("old raw" not in str(message.get("content") or "") for message in loaded)
 
 
 def test_load_chat_resume_messages_uses_shaped_tool_result_content(tmp_path: Path) -> None:
@@ -224,6 +302,191 @@ def test_collect_chat_resume_candidates_keeps_latest_50(tmp_path: Path, monkeypa
     assert len(candidates) == 50
     assert candidates[0].session_id == "s001"
     assert candidates[-1].session_id == "s050"
+
+
+def test_collect_chat_resume_candidates_scopes_to_current_workspace(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ws_a = tmp_path / "workspace_a"
+    ws_b = tmp_path / "workspace_b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    sessions = [
+        SessionInfo(
+            session_id="a1", path=tmp_path / "a1.jsonl", mtime=3.0, workspace_root=str(ws_a)
+        ),
+        SessionInfo(
+            session_id="b1", path=tmp_path / "b1.jsonl", mtime=2.0, workspace_root=str(ws_b)
+        ),
+        SessionInfo(
+            session_id="a2", path=tmp_path / "a2.jsonl", mtime=1.0, workspace_root=str(ws_a)
+        ),
+    ]
+    monkeypatch.setattr(cli_mod, "list_sessions", lambda _sessions_dir: sessions)
+
+    # Scoped to workspace A: only A's sessions surface (B's are hidden).
+    scoped = cli_mod._collect_chat_resume_candidates(
+        sessions_dir=tmp_path,
+        current_session_id="current",
+        workspace_root=str(ws_a),
+    )
+    assert [s.session_id for s in scoped] == ["a1", "a2"]
+
+    # No workspace passed => unscoped global listing (unchanged legacy behavior).
+    unscoped = cli_mod._collect_chat_resume_candidates(
+        sessions_dir=tmp_path,
+        current_session_id="current",
+    )
+    assert [s.session_id for s in unscoped] == ["a1", "b1", "a2"]
+
+
+def test_collect_chat_resume_candidates_legacy_gitroot_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
+    repo.mkdir()
+    other.mkdir()
+    sessions = [
+        # Legacy logs predate workspace_root recording: only git_root is present.
+        SessionInfo(session_id="match", path=tmp_path / "m.jsonl", mtime=3.0, git_root=str(repo)),
+        SessionInfo(session_id="other", path=tmp_path / "o.jsonl", mtime=2.0, git_root=str(other)),
+        # No deterministic identity at all -> hidden from the scoped picker.
+        SessionInfo(session_id="stray", path=tmp_path / "s.jsonl", mtime=1.0),
+    ]
+    monkeypatch.setattr(cli_mod, "list_sessions", lambda _sessions_dir: sessions)
+
+    scoped = cli_mod._collect_chat_resume_candidates(
+        sessions_dir=tmp_path,
+        current_session_id="current",
+        workspace_root=str(repo),
+        git_root=str(repo),
+    )
+    assert [s.session_id for s in scoped] == ["match"]
+
+
+def test_collect_chat_resume_candidates_hides_foreign_owner_sessions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sessions = [
+        SessionInfo(
+            session_id="mine",
+            path=tmp_path / "mine.jsonl",
+            mtime=3.0,
+            workspace_root=str(ws),
+            owner="alice@laptop",
+        ),
+        # Same workspace, different account: another user's conversation must
+        # never surface in this user's /resume, however the file arrived.
+        SessionInfo(
+            session_id="foreign",
+            path=tmp_path / "foreign.jsonl",
+            mtime=2.0,
+            workspace_root=str(ws),
+            owner="mallory@other-pc",
+        ),
+        # Legacy log predating owner stamping stays visible.
+        SessionInfo(
+            session_id="legacy",
+            path=tmp_path / "legacy.jsonl",
+            mtime=1.0,
+            workspace_root=str(ws),
+        ),
+    ]
+    monkeypatch.setattr(cli_mod, "list_sessions", lambda _sessions_dir: sessions)
+    # Owner comparison is case-insensitive (Windows usernames / DNS hostnames).
+    monkeypatch.setattr(cli_mod, "local_session_owner", lambda: "Alice@LAPTOP", raising=False)
+
+    scoped = cli_mod._collect_chat_resume_candidates(
+        sessions_dir=tmp_path,
+        current_session_id="current",
+        workspace_root=str(ws),
+    )
+    assert [s.session_id for s in scoped] == ["mine", "legacy"]
+
+    # Owner scoping applies even without workspace scoping (no workspace_root).
+    unscoped = cli_mod._collect_chat_resume_candidates(
+        sessions_dir=tmp_path,
+        current_session_id="current",
+    )
+    assert [s.session_id for s in unscoped] == ["mine", "legacy"]
+
+
+def test_collect_chat_resume_candidates_hides_owned_sessions_without_local_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sessions = [
+        SessionInfo(
+            session_id="stamped",
+            path=tmp_path / "stamped.jsonl",
+            mtime=2.0,
+            workspace_root=str(ws),
+            owner="alice@laptop",
+        ),
+        SessionInfo(
+            session_id="legacy",
+            path=tmp_path / "legacy.jsonl",
+            mtime=1.0,
+            workspace_root=str(ws),
+        ),
+    ]
+    monkeypatch.setattr(cli_mod, "list_sessions", lambda _sessions_dir: sessions)
+    monkeypatch.setattr(cli_mod, "local_session_owner", lambda: None, raising=False)
+
+    scoped = cli_mod._collect_chat_resume_candidates(
+        sessions_dir=tmp_path,
+        current_session_id="current",
+        workspace_root=str(ws),
+    )
+    # No local identity established: never show an owner-stamped conversation.
+    assert [s.session_id for s in scoped] == ["legacy"]
+
+
+def test_resume_dt_prefers_log_ts_over_mtime(tmp_path: Path) -> None:
+    now_local = datetime.now()
+    # File mtime says "now" (e.g. after a zip-extract reset it), but the log's
+    # own last-event ts says the user actually messaged ~2 hours ago.
+    log_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    info = SessionInfo(
+        session_id="s1",
+        path=tmp_path / "s1.jsonl",
+        mtime=now_local.timestamp(),
+        last_event_ts=log_ts,
+    )
+    dt = cli_mod._resume_dt_from_info(info)
+    assert dt is not None
+    delta = now_local - dt
+    assert timedelta(minutes=110) < delta < timedelta(minutes=130)
+
+
+def test_resume_dt_falls_back_to_mtime_without_log_ts(tmp_path: Path) -> None:
+    mtime = (datetime.now() - timedelta(days=3)).timestamp()
+    info = SessionInfo(session_id="s1", path=tmp_path / "s1.jsonl", mtime=mtime)
+    dt = cli_mod._resume_dt_from_info(info)
+    assert dt is not None
+    assert abs(dt.timestamp() - mtime) < 1.0
+
+
+def test_resume_when_label_reflects_log_ts_not_mtime(tmp_path: Path) -> None:
+    # mtime "now" would render "just now"; the log ts (~5h ago) must win.
+    log = tmp_path / "s1.jsonl"
+    log.write_text(
+        json.dumps({"type": "user_message", "payload": {"content": "hello there"}}) + "\n",
+        encoding="utf-8",
+    )
+    info = SessionInfo(
+        session_id="s1",
+        path=log,
+        mtime=datetime.now().timestamp(),
+        last_event_ts=(datetime.now(timezone.utc) - timedelta(hours=5)).isoformat(),
+    )
+    [row] = cli_mod._chat_resume_display_rows(sessions=[info])
+    assert row.when_label != "just now"
+    assert "min ago" not in row.when_label
 
 
 def test_chat_resume_panel_highlights_selected_session_case_insensitively(tmp_path: Path) -> None:
@@ -1001,12 +1264,34 @@ def test_resume_chat_session_replaces_current_session_state(tmp_path: Path, monk
     sessions_dir.mkdir(parents=True, exist_ok=True)
     target_id = "resume-target"
     target_path = sessions_dir / f"{target_id}.jsonl"
+    resumed_route_identity = build_provider_route_identity(
+        protocol="openai_compat",
+        base_url="https://api.openai.com/v1",
+        provider_key="openai",
+        model="resumed-model",
+        credential_scope="credential-scope:profile-default",
+        routing_headers={
+            "OpenAI-Organization": "org-resume",
+            "OpenAI-Project": "project-resume",
+        },
+        protocol_revision="2026-07-12",
+        session_scope="subscription-account:resume",
+    )
+    resumed_provider_metadata = stamp_provider_metadata_for_route(
+        {"provider_state": {"opaque": "same-route-state"}},
+        resumed_route_identity,
+    )
     target_events = [
         {
             "type": "session_start",
             "payload": {
                 "mode": "readonly",
                 "model": "resumed-model",
+                "profile_name": "default",
+                "protocol": "openai_compat",
+                "provider_base_url_descriptor": endpoint_descriptor("https://api.openai.com/v1"),
+                "auth_provider": None,
+                "reasoning_trace_adapter": "auto",
                 "temperature": 0.2,
                 "stream": True,
                 "routing_mode": "code_only",
@@ -1023,7 +1308,16 @@ def test_resume_chat_session_replaces_current_session_state(tmp_path: Path, monk
             },
         },
         {"type": "user_message", "payload": {"content": "previous question"}},
-        {"type": "assistant_message", "payload": {"content": "previous answer"}},
+        {
+            "type": "assistant_message",
+            "payload": {
+                "message": {
+                    "role": "assistant",
+                    "content": "previous answer",
+                    PROVIDER_METADATA_KEY: resumed_provider_metadata,
+                }
+            },
+        },
     ]
     target_path.write_text(
         "\n".join(json.dumps(ev) for ev in target_events) + "\n",
@@ -1076,7 +1370,7 @@ def test_resume_chat_session_replaces_current_session_state(tmp_path: Path, monk
         cfg = kwargs["cfg"]
         assert cfg.model == "resumed-model"
         assert cfg.max_steps == 11
-        assert cfg.step_budget_policy == "fixed"
+        assert cfg.step_budget_policy == "limited"
         assert cfg.task_max_steps == 41
         assert cfg.subagent_max_steps == 9
         assert cfg.temperature == 0.2
@@ -1098,7 +1392,10 @@ def test_resume_chat_session_replaces_current_session_state(tmp_path: Path, monk
             session_id=kwargs["session_id_override"],
             enabled=not kwargs["no_log"],
         )
-        new_session.client = SimpleNamespace(api_key="override-key")
+        new_session.client = SimpleNamespace(
+            api_key="override-key",
+            route_identity=resumed_route_identity,
+        )
         new_session.usage_role = kwargs["usage_role"]
         new_session.tool_output_offloader = object()
         new_session.conversation_compactor = None
@@ -1118,25 +1415,151 @@ def test_resume_chat_session_replaces_current_session_state(tmp_path: Path, monk
     assert current.store.session_id == target_id
     assert loaded_history == [
         {"role": "user", "content": "previous question"},
-        {"role": "assistant", "content": "previous answer"},
+        {
+            "role": "assistant",
+            "content": "previous answer",
+            PROVIDER_METADATA_KEY: resumed_provider_metadata,
+        },
     ]
-    assert current.messages[-2:] == [
-        {"role": "user", "content": "previous question"},
-        {"role": "assistant", "content": "previous answer"},
-    ]
+    assert current.messages[-2:] == loaded_history
     assert any(
         event_type == "system_note" and payload.get("message") == "chat_resume"
         for event_type, payload in current.store.notes
     )
 
 
+def test_resume_chat_session_strips_provider_metadata_when_connection_differs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    target_id = "resume-other-provider-route"
+    target_path = sessions_dir / f"{target_id}.jsonl"
+    active_route_identity = build_provider_route_identity(
+        protocol="openai_compat",
+        base_url="https://api.openai.com/v1",
+        provider_key="openai",
+        model="current-model",
+    )
+    matching_message_metadata = stamp_provider_metadata_for_route(
+        {"provider_state": {"opaque": "must-strip-on-session-route-mismatch"}},
+        active_route_identity,
+    )
+    target_events = [
+        {
+            "type": "session_start",
+            "payload": {
+                "mode": "review",
+                "model": "historical-model",
+                "profile_name": "default",
+                "protocol": "openai_compat",
+                "provider_base_url_descriptor": endpoint_descriptor(
+                    "https://other-provider.example/v1"
+                ),
+                "auth_provider": None,
+                "reasoning_trace_adapter": "auto",
+            },
+        },
+        {"type": "user_message", "payload": {"content": "continue safely"}},
+        {
+            "type": "assistant_message",
+            "payload": {
+                "message": {
+                    "role": "assistant",
+                    "content": "visible historical answer",
+                    PROVIDER_METADATA_KEY: matching_message_metadata,
+                }
+            },
+        },
+    ]
+    target_path.write_text(
+        "\n".join(json.dumps(event) for event in target_events) + "\n",
+        encoding="utf-8",
+    )
+
+    current = _FakeSession()
+    current.cfg = AppConfig(model="current-model", max_steps=10)
+    current.root = tmp_path
+    current.mode = "review"
+    current.yes = False
+    current.max_steps = 10
+    current.console = None
+    current.surface = object()
+    current.store = _FakeStore(sessions_dir=sessions_dir, session_id="current-session")
+    current.client = SimpleNamespace(api_key="override-key")
+    current.usage_role = "main"
+    current.tool_output_offloader = None
+    current.conversation_compactor = None
+    current.messages = []
+    current.close = lambda: None
+
+    def fake_create_session(**kwargs):  # type: ignore[no-untyped-def]
+        assert kwargs["cfg"].model == "current-model"
+        assert kwargs["session_source_metadata"]["loaded_message_count"] == 2
+        new_session = _FakeSession()
+        new_session.cfg = kwargs["cfg"]
+        new_session.root = kwargs["root"]
+        new_session.mode = kwargs["mode"]
+        new_session.yes = kwargs["yes"]
+        new_session.max_steps = kwargs["max_steps"]
+        new_session.console = kwargs["console"]
+        new_session.surface = kwargs["surface"]
+        new_session.store = _FakeStore(
+            sessions_dir=sessions_dir,
+            session_id=kwargs["session_id_override"],
+            enabled=not kwargs["no_log"],
+        )
+        new_session.client = SimpleNamespace(
+            api_key="override-key",
+            route_identity=active_route_identity,
+        )
+        new_session.usage_role = kwargs["usage_role"]
+        new_session.tool_output_offloader = None
+        new_session.conversation_compactor = None
+        new_session.messages = []
+        return new_session
+
+    monkeypatch.setattr(cli_mod, "create_session", fake_create_session)
+
+    ok, message, loaded_history = cli_mod._resume_chat_session(
+        session=current,
+        target_session_id=target_id,
+    )
+
+    assert ok is True
+    assert "current provider and model were kept for safety" in message
+    assert loaded_history == [
+        {"role": "user", "content": "continue safely"},
+        {"role": "assistant", "content": "visible historical answer"},
+    ]
+    assert current.messages[-2:] == loaded_history
+
+
 def test_resume_chat_session_uses_current_config_defaults_for_older_step_payloads(
     tmp_path: Path, monkeypatch
 ) -> None:
+    class _TraceSurface:
+        trace_level = "full"
+
+        def set_trace_level(self, level: str) -> str:
+            self.trace_level = level
+            return level
+
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     target_id = "resume-legacy"
     target_path = sessions_dir / f"{target_id}.jsonl"
+    active_route_identity = build_provider_route_identity(
+        protocol="openai_compat",
+        base_url="https://api.openai.com/v1",
+        provider_key="openai",
+        model="test-model",
+    )
+    matching_message_metadata = stamp_provider_metadata_for_route(
+        {"provider_state": {"opaque": "must-strip-without-session-identity"}},
+        active_route_identity,
+    )
     target_events = [
         {
             "type": "session_start",
@@ -1147,6 +1570,19 @@ def test_resume_chat_session_uses_current_config_defaults_for_older_step_payload
             },
         },
         {"type": "user_message", "payload": {"content": "legacy question"}},
+        {
+            "type": "assistant_message",
+            "payload": {
+                "message": {
+                    "role": "assistant",
+                    "content": "legacy answer",
+                    PROVIDER_METADATA_KEY: matching_message_metadata,
+                    "reasoning_content": "legacy raw reasoning",
+                    "reasoning": "legacy raw provider state",
+                    "reasoning_details": [{"opaque": "legacy detail"}],
+                }
+            },
+        },
     ]
     target_path.write_text(
         "\n".join(json.dumps(ev) for ev in target_events) + "\n",
@@ -1166,7 +1602,7 @@ def test_resume_chat_session_uses_current_config_defaults_for_older_step_payload
     current.yes = True
     current.max_steps = 5
     current.console = None
-    current.surface = object()
+    current.surface = _TraceSurface()
     current.store = _FakeStore(sessions_dir=sessions_dir, session_id="current-session")
     current.client = SimpleNamespace(api_key="override-key")
     current.usage_role = "main"
@@ -1180,16 +1616,16 @@ def test_resume_chat_session_uses_current_config_defaults_for_older_step_payload
         assert kwargs["session_source_metadata"] == {
             "from_session_id": "current-session",
             "resumed_session_id": target_id,
-            "loaded_message_count": 1,
+            "loaded_message_count": 2,
             "active_workdir_relpath": None,
         }
         assert kwargs["max_steps"] == 37
         assert kwargs["enable_chat_turn_step_budget"] is True
         assert kwargs["chat_turn_fixed_override"] is None
         cfg = kwargs["cfg"]
-        assert cfg.model == "resumed-model"
+        assert cfg.model == "test-model"
         assert cfg.max_steps == 37
-        assert cfg.step_budget_policy == "fixed"
+        assert cfg.step_budget_policy == "limited"
         assert cfg.task_max_steps == 91
         assert cfg.subagent_max_steps == 13
         new_session = _FakeSession()
@@ -1205,7 +1641,10 @@ def test_resume_chat_session_uses_current_config_defaults_for_older_step_payload
             session_id=kwargs["session_id_override"],
             enabled=not kwargs["no_log"],
         )
-        new_session.client = SimpleNamespace(api_key="override-key")
+        new_session.client = SimpleNamespace(
+            api_key="override-key",
+            route_identity=active_route_identity,
+        )
         new_session.usage_role = kwargs["usage_role"]
         new_session.tool_output_offloader = None
         new_session.conversation_compactor = None
@@ -1221,7 +1660,12 @@ def test_resume_chat_session_uses_current_config_defaults_for_older_step_payload
 
     assert ok is True
     assert "Resumed session:" in message
-    assert loaded_history == [{"role": "user", "content": "legacy question"}]
+    assert loaded_history == [
+        {"role": "user", "content": "legacy question"},
+        {"role": "assistant", "content": "legacy answer"},
+    ]
+    assert current.messages[-2:] == loaded_history
+    assert current.surface.trace_level == "compact"
 
 
 def test_resume_chat_session_preserves_web_provenance_in_reopened_store(
@@ -1433,3 +1877,196 @@ def test_resume_chat_session_merges_newer_web_artifact_ahead_of_log(
         current.store.classify_web_fetch_url("https://docs.example.com/guide")
         == "returned_by_web_search"
     )
+
+
+def _write_stamped_resume_log(
+    path: Path,
+    *,
+    session_id: str,
+    workspace_root: str,
+    owner: str | None,
+    ts: str,
+    content: str,
+) -> None:
+    stamp = {"owner": owner} if owner else {}
+    events = [
+        {
+            "type": "session_start",
+            "ts": ts,
+            "session_id": session_id,
+            "workspace_root": workspace_root,
+            **stamp,
+            "payload": {"mode": "auto", "workspace_root": workspace_root},
+        },
+        {
+            "type": "user_message",
+            "ts": ts,
+            "session_id": session_id,
+            "workspace_root": workspace_root,
+            **stamp,
+            "payload": {"content": content},
+        },
+    ]
+    path.write_text(
+        "".join(json.dumps(event, ensure_ascii=True) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+
+def test_collect_chat_resume_candidates_end_to_end_hides_foreign_log_on_disk(
+    tmp_path: Path,
+) -> None:
+    """Full composition, no stubs: disk -> list_sessions -> owner filter.
+
+    A foreign-stamped log file sitting in the real sessions dir (same
+    workspace) must never surface, while the local account's own store-written
+    session and a legacy unstamped log stay visible.
+    """
+    import uuid
+
+    from sylliptor_agent_cli.session_store import SessionStore
+
+    ws = tmp_path / "project"
+    ws.mkdir()
+
+    own_id = "20260711T120000Z_aaaaaaaa"
+    own_store = SessionStore(
+        enabled=True,
+        sessions_dir=tmp_path,
+        session_id=own_id,
+        cwd=str(ws),
+        repo_root=str(ws),
+        workspace_root=str(ws),
+    )
+    own_store.append("session_start", {"mode": "auto"})
+    own_store.append("user_message", {"content": "my own conversation"})
+    own_store.close()
+
+    foreign_id = "20260711T100000Z_bbbbbbbb"
+    _write_stamped_resume_log(
+        tmp_path / f"{foreign_id}.jsonl",
+        session_id=foreign_id,
+        workspace_root=str(ws),
+        owner=f"foreign-user@foreign-host-{uuid.uuid4().hex}",
+        ts="2026-07-11T10:00:00+00:00",
+        content="ANOTHER USER'S PRIVATE CHAT",
+    )
+
+    legacy_id = "20260710T090000Z_cccccccc"
+    _write_stamped_resume_log(
+        tmp_path / f"{legacy_id}.jsonl",
+        session_id=legacy_id,
+        workspace_root=str(ws),
+        owner=None,
+        ts="2026-07-10T09:00:00+00:00",
+        content="my old pre-upgrade chat",
+    )
+
+    candidates = cli_mod._collect_chat_resume_candidates(
+        sessions_dir=tmp_path,
+        current_session_id="current",
+        workspace_root=str(ws),
+    )
+    ids = [info.session_id for info in candidates]
+    assert own_id in ids
+    assert legacy_id in ids
+    assert foreign_id not in ids
+
+
+def test_collect_chat_resume_candidates_filters_before_max_candidates_slice(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sessions = [
+        SessionInfo(
+            session_id=f"foreign{i}",
+            path=tmp_path / f"foreign{i}.jsonl",
+            mtime=100.0 - i,
+            workspace_root=str(ws),
+            owner="mallory@other-pc",
+        )
+        for i in range(2)
+    ] + [
+        SessionInfo(
+            session_id="own",
+            path=tmp_path / "own.jsonl",
+            mtime=1.0,
+            workspace_root=str(ws),
+            owner="alice@laptop",
+        )
+    ]
+    monkeypatch.setattr(cli_mod, "list_sessions", lambda _sessions_dir: sessions)
+    monkeypatch.setattr(cli_mod, "local_session_owner", lambda: "alice@laptop", raising=False)
+
+    # Two newer foreign sessions must not consume the slice: filtering happens
+    # BEFORE max_candidates, so the older own session survives.
+    scoped = cli_mod._collect_chat_resume_candidates(
+        sessions_dir=tmp_path,
+        current_session_id="current",
+        workspace_root=str(ws),
+        max_candidates=1,
+    )
+    assert [s.session_id for s in scoped] == ["own"]
+
+
+def test_classic_resume_explicit_id_survives_fully_filtered_candidates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The documented escape hatch: '/resume <id>' must reach the direct-id
+    path even when owner scoping filters the candidate list down to nothing
+    (classic/non-TUI handler)."""
+    import io
+    import uuid
+
+    from sylliptor_agent_cli.cli_impl import chat as chat_impl_mod
+    from sylliptor_agent_cli.cli_impl.chat import commands as chat_commands_mod
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    foreign_id = "20260101T000000Z_feedbeef"
+    _write_stamped_resume_log(
+        sessions_dir / f"{foreign_id}.jsonl",
+        session_id=foreign_id,
+        workspace_root=str(ws),
+        owner=f"mallory@other-pc-{uuid.uuid4().hex}",
+        ts="2026-01-01T00:00:00+00:00",
+        content="foreign conversation",
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_resume(*, session: Any, target_session_id: str) -> tuple[bool, str, list]:
+        captured["target"] = target_session_id
+        return True, "Resumed.", []
+
+    chat_impl_mod._sync_cli_globals(cli_mod)
+    monkeypatch.setattr(cli_mod, "_resume_chat_session", fake_resume, raising=False)
+    monkeypatch.setattr(chat_commands_mod, "_resume_chat_session", fake_resume, raising=False)
+
+    session = SimpleNamespace(
+        cfg=AppConfig(model="test-model"),
+        store=SimpleNamespace(
+            sessions_dir=sessions_dir,
+            session_id="current",
+            workspace_root=str(ws),
+            git_root=None,
+        ),
+    )
+    out = io.StringIO()
+    result = chat_impl_mod._handle_chat_command(
+        input_text=f"/resume {foreign_id}",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=out, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert captured.get("target") == foreign_id
+    assert "No previous sessions" not in out.getvalue()

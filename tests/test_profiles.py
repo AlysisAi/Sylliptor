@@ -6,17 +6,24 @@ from pathlib import Path
 import pytest
 
 from sylliptor_agent_cli.config import AppConfig, ConfigError, load_config, save_config
+from sylliptor_agent_cli.llm.cache_capabilities import (
+    CACHE_STRATEGY_OPENAI_PROMPT_CACHE,
+    OPENROUTER_SESSION_ID_FIELD,
+    CacheCapabilitySpec,
+)
 from sylliptor_agent_cli.llm.protocols import SUPPORTED_LLM_PROTOCOLS
 from sylliptor_agent_cli.profile_presets import get_preset, make_profile_from_preset
 from sylliptor_agent_cli.profiles import (
     ProfileSpec,
     add_profile,
+    connection_fingerprint,
     get_active_profile,
     list_profiles,
     remove_profile,
     set_active_profile,
     sync_active_profile_to_config,
     update_active_profile_defaults,
+    update_profile,
 )
 
 
@@ -33,6 +40,91 @@ def test_profile_spec_roundtrip_to_dict() -> None:
     )
 
     assert ProfileSpec.from_dict("anthropic", profile.to_dict()) == profile
+
+
+def test_profile_extra_headers_are_canonical_and_case_duplicates_are_rejected() -> None:
+    profile = ProfileSpec(
+        name="gateway",
+        base_url="https://gateway.example/v1",
+        extra_headers={" X-Tenant-ID ": "  tenant-a  "},
+    )
+
+    assert profile.extra_headers == {"x-tenant-id": "tenant-a"}
+    with pytest.raises(ConfigError, match="Duplicate extra header name"):
+        ProfileSpec(
+            name="duplicate",
+            base_url="https://gateway.example/v1",
+            extra_headers={"X-Tenant-ID": "tenant-a", "x-tenant-id": "tenant-b"},
+        )
+
+
+def test_profile_spec_roundtrip_preserves_cache_capability_override() -> None:
+    profile = ProfileSpec(
+        name="custom",
+        base_url="https://gateway.example/v1",
+        cache_capability=CacheCapabilitySpec(
+            strategy=CACHE_STRATEGY_OPENAI_PROMPT_CACHE,
+            enabled=True,
+            supports_prompt_cache_key=True,
+            reports_cache_read_tokens=True,
+            request_fields=(OPENROUTER_SESSION_ID_FIELD,),
+        ),
+    )
+
+    data = profile.to_dict()
+    loaded = ProfileSpec.from_dict("custom", data)
+
+    assert data["cache_capability"]["strategy"] == CACHE_STRATEGY_OPENAI_PROMPT_CACHE
+    assert data["cache_capability"]["request_fields"] == [OPENROUTER_SESSION_ID_FIELD]
+    assert loaded.cache_capability is not None
+    assert loaded.cache_capability.to_dict() == profile.cache_capability.to_dict()
+
+
+def test_profile_spec_roundtrip_preserves_reasoning_trace_adapter_override() -> None:
+    profile = ProfileSpec(
+        name="custom",
+        base_url="https://gateway.example/v1",
+        reasoning_trace_adapter="openrouter_reasoning",
+    )
+
+    data = profile.to_dict()
+    loaded = ProfileSpec.from_dict("custom", data)
+
+    assert data["reasoning_trace_adapter"] == "openrouter_reasoning"
+    assert loaded.reasoning_trace_adapter == "openrouter_reasoning"
+
+
+def test_profile_spec_omits_auto_reasoning_trace_adapter_and_rejects_unknown() -> None:
+    profile = ProfileSpec(name="custom", base_url="https://gateway.example/v1")
+    assert "reasoning_trace_adapter" not in profile.to_dict()
+
+    with pytest.raises(ConfigError, match="reasoning_trace_adapter"):
+        ProfileSpec.from_dict(
+            "custom",
+            {
+                "base_url": "https://gateway.example/v1",
+                "reasoning_trace_adapter": "guess_every_field",
+            },
+        )
+
+    with pytest.raises(ConfigError, match="not valid for protocol"):
+        ProfileSpec(
+            name="custom",
+            protocol="anthropic_messages",
+            base_url="https://api.anthropic.com/v1",
+            reasoning_trace_adapter="openrouter_reasoning",
+        )
+
+
+def test_profile_cache_capability_rejects_unknown_strategy() -> None:
+    with pytest.raises(ConfigError, match="cache strategy"):
+        ProfileSpec.from_dict(
+            "custom",
+            {
+                "base_url": "https://gateway.example/v1",
+                "cache_capability": {"strategy": "magic_cache"},
+            },
+        )
 
 
 def test_profile_name_validation_rejects_invalid_chars() -> None:
@@ -169,6 +261,27 @@ def test_remove_active_profile_switches_to_first_remaining() -> None:
     assert get_active_profile(cfg).name == "a"
 
 
+def test_switching_active_profile_clears_only_router_overrides() -> None:
+    cfg = AppConfig()
+    cfg.extra_fields = {"profiles": {}, "active_profile": ""}
+    add_profile(cfg, ProfileSpec(name="gemini", base_url="https://gemini.example/v1"))
+    add_profile(cfg, ProfileSpec(name="anthropic", base_url="https://anthropic.example/v1"))
+    set_active_profile(cfg, "gemini")
+    cfg.extra_fields["role_models"] = {
+        "router": "gemini-router",
+        "coding": "shared-coder",
+    }
+    cfg.extra_fields["forge_role_models"] = {
+        "router": "gemini-forge-router",
+        "review": "shared-reviewer",
+    }
+
+    set_active_profile(cfg, "anthropic")
+
+    assert cfg.extra_fields["role_models"] == {"coding": "shared-coder"}
+    assert cfg.extra_fields["forge_role_models"] == {"review": "shared-reviewer"}
+
+
 def test_remove_only_profile_clears_active() -> None:
     cfg = AppConfig()
     cfg.extra_fields = {"profiles": {}, "active_profile": ""}
@@ -207,6 +320,83 @@ def test_sync_active_profile_to_config_repairs_stale_top_level_base_url() -> Non
     assert changed is True
     assert cfg.base_url == "https://api.deepseek.com"
     assert cfg.model == "deepseek-v4-flash"
+
+
+def test_subscription_model_and_effort_change_connection_fingerprint() -> None:
+    cfg = AppConfig(model="gpt-codex-a", llm_reasoning_effort="high")
+    cfg.extra_fields = {"profiles": {}, "active_profile": ""}
+    add_profile(
+        cfg,
+        ProfileSpec(
+            name="chatgpt-codex",
+            protocol="openai_responses",
+            base_url="https://chatgpt.com/backend-api/codex",
+            auth_provider="openai-codex",
+            default_model="gpt-codex-a",
+            reasoning_effort="high",
+        ),
+    )
+    set_active_profile(cfg, "chatgpt-codex")
+    original = connection_fingerprint(cfg)
+
+    update_profile(
+        cfg,
+        "chatgpt-codex",
+        default_model="gpt-codex-b",
+        reasoning_effort="high",
+        allow_subscription_selection=True,
+    )
+    model_changed = connection_fingerprint(cfg)
+
+    update_profile(
+        cfg,
+        "chatgpt-codex",
+        default_model="gpt-codex-b",
+        reasoning_effort="xhigh",
+        allow_subscription_selection=True,
+    )
+    effort_changed = connection_fingerprint(cfg)
+
+    assert model_changed != original
+    assert effort_changed != model_changed
+
+
+def test_api_profile_model_change_does_not_change_connection_fingerprint() -> None:
+    cfg = AppConfig(model="gpt-a")
+    cfg.extra_fields = {"profiles": {}, "active_profile": ""}
+    add_profile(
+        cfg,
+        ProfileSpec(
+            name="openai",
+            base_url="https://api.openai.com/v1",
+            default_model="gpt-a",
+        ),
+    )
+    set_active_profile(cfg, "openai")
+    original = connection_fingerprint(cfg)
+
+    update_profile(cfg, "openai", default_model="gpt-b")
+
+    assert connection_fingerprint(cfg) == original
+
+
+def test_reasoning_trace_adapter_change_rebuilds_connection() -> None:
+    cfg = AppConfig(model="custom-model")
+    cfg.extra_fields = {"profiles": {}, "active_profile": ""}
+    add_profile(
+        cfg,
+        ProfileSpec(
+            name="custom",
+            base_url="https://gateway.example/v1",
+            default_model="custom-model",
+        ),
+    )
+    set_active_profile(cfg, "custom")
+    original = connection_fingerprint(cfg)
+
+    update_profile(cfg, "custom", reasoning_trace_adapter="openrouter_reasoning")
+
+    assert connection_fingerprint(cfg) != original
 
 
 def test_update_active_profile_defaults_persists_model_and_base_url() -> None:

@@ -79,6 +79,8 @@ class _SymbolEntry:
     name: str
     simple_name: str
     signature: str
+    end_line: int | None = None
+    parent: str = ""
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,7 @@ class _JsTsPendingAssignment:
     rhs_fragments: list[str]
     scope_depth: int
     fallback_kind: str | None = None
+    parent: str = ""
 
 
 @dataclass(frozen=True)
@@ -247,6 +250,7 @@ def _extract_constant_entries(
                 name=name,
                 simple_name=name,
                 signature=signature,
+                end_line=getattr(node, "end_lineno", node.lineno),
             )
         )
     return out
@@ -268,6 +272,7 @@ def _extract_python_symbols(*, root: Path, path: Path, text: str) -> list[_Symbo
                     name=node.name,
                     simple_name=node.name,
                     signature=_format_class_signature(node),
+                    end_line=getattr(node, "end_lineno", node.lineno),
                 )
             )
             for body_item in node.body:
@@ -285,6 +290,8 @@ def _extract_python_symbols(*, root: Path, path: Path, text: str) -> list[_Symbo
                             body_item,
                             display_name=qualified_name,
                         ),
+                        end_line=getattr(body_item, "end_lineno", body_item.lineno),
+                        parent=node.name,
                     )
                 )
             continue
@@ -298,6 +305,7 @@ def _extract_python_symbols(*, root: Path, path: Path, text: str) -> list[_Symbo
                     name=node.name,
                     simple_name=node.name,
                     signature=_format_function_signature(node, display_name=node.name),
+                    end_line=getattr(node, "end_lineno", node.lineno),
                 )
             )
             continue
@@ -643,6 +651,7 @@ def _js_ts_assignment_entry(
     name: str,
     simple_name: str,
     signature_lines: list[str],
+    parent: str = "",
 ) -> _SymbolEntry:
     return _SymbolEntry(
         path=rel_path,
@@ -651,6 +660,8 @@ def _js_ts_assignment_entry(
         name=name,
         simple_name=simple_name,
         signature=_js_ts_pending_signature(signature_lines),
+        end_line=line + max(0, len(signature_lines) - 1),
+        parent=parent,
     )
 
 
@@ -664,6 +675,7 @@ def _start_js_ts_pending_assignment(
     rhs_fragment: str,
     scope_depth: int,
     fallback_kind: str | None = None,
+    parent: str = "",
 ) -> _JsTsPendingAssignment:
     return _JsTsPendingAssignment(
         line=line,
@@ -674,6 +686,7 @@ def _start_js_ts_pending_assignment(
         rhs_fragments=[rhs_fragment] if rhs_fragment else [],
         scope_depth=scope_depth,
         fallback_kind=fallback_kind,
+        parent=parent,
     )
 
 
@@ -695,6 +708,7 @@ def _finalize_js_ts_pending_assignment(
                 name=pending.name,
                 simple_name=pending.simple_name,
                 signature_lines=pending.signature_lines,
+                parent=pending.parent,
             )
         )
         return
@@ -707,6 +721,7 @@ def _finalize_js_ts_pending_assignment(
                 name=pending.name,
                 simple_name=pending.simple_name,
                 signature_lines=pending.signature_lines,
+                parent=pending.parent,
             )
         )
 
@@ -811,6 +826,7 @@ def _extract_js_ts_symbols(*, root: Path, path: Path, text: str) -> list[_Symbol
                         name=function_name,
                         simple_name=function_name,
                         signature=source_signature,
+                        end_line=line_number,
                     )
                 )
             else:
@@ -825,6 +841,7 @@ def _extract_js_ts_symbols(*, root: Path, path: Path, text: str) -> list[_Symbol
                             name=class_name,
                             simple_name=class_name,
                             signature=source_signature,
+                            end_line=line_number,
                         )
                     )
                     class_tail = stripped[class_match.end() :]
@@ -846,6 +863,7 @@ def _extract_js_ts_symbols(*, root: Path, path: Path, text: str) -> list[_Symbol
                                     name=const_name,
                                     simple_name=const_name,
                                     signature=source_signature,
+                                    end_line=line_number,
                                 )
                             )
                         elif _looks_like_js_ts_multiline_function_rhs(const_value):
@@ -868,6 +886,7 @@ def _extract_js_ts_symbols(*, root: Path, path: Path, text: str) -> list[_Symbol
                                     name=const_name,
                                     simple_name=const_name,
                                     signature=source_signature,
+                                    end_line=line_number,
                                 )
                             )
 
@@ -886,6 +905,8 @@ def _extract_js_ts_symbols(*, root: Path, path: Path, text: str) -> list[_Symbol
                             name=qualified_name,
                             simple_name=field_name,
                             signature=source_signature,
+                            end_line=line_number,
+                            parent=class_name,
                         )
                     )
                 elif _looks_like_js_ts_multiline_function_rhs(field_value):
@@ -897,6 +918,7 @@ def _extract_js_ts_symbols(*, root: Path, path: Path, text: str) -> list[_Symbol
                         signature_line=raw_line.strip(),
                         rhs_fragment=field_value,
                         scope_depth=depth_before,
+                        parent=class_name,
                     )
             if pending_assignment is None:
                 method_match = _JS_TS_METHOD_RE.match(stripped)
@@ -912,6 +934,8 @@ def _extract_js_ts_symbols(*, root: Path, path: Path, text: str) -> list[_Symbol
                                 name=qualified_name,
                                 simple_name=method_name,
                                 signature=source_signature,
+                                end_line=line_number,
+                                parent=class_name,
                             )
                         )
 
@@ -1010,6 +1034,7 @@ def _extract_java_symbols(*, root: Path, path: Path, text: str) -> list[_SymbolE
                     name=type_name,
                     simple_name=type_name,
                     signature=source_signature,
+                    end_line=line_number,
                 )
             )
             type_tail = stripped[type_match.end() :]
@@ -1031,6 +1056,8 @@ def _extract_java_symbols(*, root: Path, path: Path, text: str) -> list[_SymbolE
                         name=qualified_name,
                         simple_name=method_name,
                         signature=source_signature,
+                        end_line=line_number,
+                        parent=class_name,
                     )
                 )
             elif not method_match:
@@ -1046,6 +1073,8 @@ def _extract_java_symbols(*, root: Path, path: Path, text: str) -> list[_SymbolE
                             name=qualified_name,
                             simple_name=constructor_name,
                             signature=source_signature,
+                            end_line=line_number,
+                            parent=class_name,
                         )
                     )
 
@@ -1069,6 +1098,73 @@ def _add_note(notes: list[str], message: str) -> None:
         notes.append(message)
 
 
+def _entry_end_line(entry: _SymbolEntry) -> int:
+    end_line = entry.end_line if entry.end_line is not None else entry.line
+    return max(entry.line, int(end_line))
+
+
+def _entry_parent(entry: _SymbolEntry) -> str:
+    if entry.parent:
+        return entry.parent
+    if entry.kind == "method" and "." in entry.name:
+        return entry.name.rsplit(".", 1)[0]
+    return ""
+
+
+def _symbol_snippet(
+    *,
+    source_lines: list[str],
+    start_line: int,
+    end_line: int,
+    max_lines: int = 8,
+) -> dict[str, Any] | None:
+    if start_line < 1 or start_line > len(source_lines):
+        return None
+    bounded_end = min(max(start_line, end_line), len(source_lines), start_line + max_lines - 1)
+    lines = [
+        {
+            "line": line_number,
+            "text": _clip_inline(source_lines[line_number - 1], max_chars=160),
+        }
+        for line_number in range(start_line, bounded_end + 1)
+    ]
+    return {
+        "start_line": start_line,
+        "end_line": bounded_end,
+        "truncated": bounded_end < min(max(start_line, end_line), len(source_lines)),
+        "lines": lines,
+    }
+
+
+def _reference_hints_for_entry(
+    *,
+    entry: _SymbolEntry,
+    source_lines_by_path: dict[str, list[str]],
+    max_references: int = 5,
+) -> list[dict[str, Any]]:
+    needle = entry.simple_name or entry.name
+    if not needle:
+        return []
+    out: list[dict[str, Any]] = []
+    defining_range = range(entry.line, _entry_end_line(entry) + 1)
+    for rel_path, source_lines in source_lines_by_path.items():
+        for line_number, line in enumerate(source_lines, start=1):
+            if rel_path == entry.path and line_number in defining_range:
+                continue
+            if needle not in line:
+                continue
+            out.append(
+                {
+                    "path": rel_path,
+                    "line": line_number,
+                    "text": _clip_inline(line.strip(), max_chars=200),
+                }
+            )
+            if len(out) >= max_references:
+                return out
+    return out
+
+
 def symbol_search(
     *,
     root: Path,
@@ -1078,6 +1174,9 @@ def symbol_search(
     globs: list[str] | None = None,
     max_results: int = _DEFAULT_MAX_RESULTS,
     exact: bool = False,
+    include_details: bool = False,
+    include_snippet: bool = False,
+    include_references: bool = False,
 ) -> dict[str, Any]:
     cleaned_query = str(query or "").strip()
     if not cleaned_query:
@@ -1101,6 +1200,8 @@ def symbol_search(
     )
 
     matches: list[dict[str, Any]] = []
+    matched_entries: list[_SymbolEntry] = []
+    source_lines_by_path: dict[str, list[str]] = {}
     notes: list[str] = []
     truncated = False
     parsed_files = 0
@@ -1134,6 +1235,9 @@ def symbol_search(
             if len(skipped_unparsable) < _MAX_NOTE_PATHS:
                 skipped_unparsable.append(rel_path)
             continue
+        source_lines = text.splitlines()
+        if include_snippet or include_references:
+            source_lines_by_path[rel_path] = source_lines
 
         if backend == "python_ast":
             try:
@@ -1154,15 +1258,28 @@ def symbol_search(
                 continue
             if not _matches_query(entry, query=cleaned_query, exact=exact):
                 continue
-            matches.append(
-                {
-                    "path": entry.path,
-                    "line": entry.line,
-                    "kind": entry.kind,
-                    "name": entry.name,
-                    "signature": entry.signature,
-                }
-            )
+            match = {
+                "path": entry.path,
+                "line": entry.line,
+                "kind": entry.kind,
+                "name": entry.name,
+                "signature": entry.signature,
+            }
+            if include_details:
+                match["end_line"] = _entry_end_line(entry)
+                parent = _entry_parent(entry)
+                if parent:
+                    match["parent"] = parent
+            if include_snippet:
+                snippet = _symbol_snippet(
+                    source_lines=source_lines,
+                    start_line=entry.line,
+                    end_line=_entry_end_line(entry),
+                )
+                if snippet is not None:
+                    match["snippet"] = snippet
+            matches.append(match)
+            matched_entries.append(entry)
             if len(matches) > safe_max_results:
                 truncated = True
                 break
@@ -1207,12 +1324,24 @@ def symbol_search(
         if os.fspath(rel_base):
             scope_display = os.fspath(rel_base).replace("\\", "/")
 
+    if include_references and matches:
+        for match, entry in zip(matches, matched_entries, strict=False):
+            references = _reference_hints_for_entry(
+                entry=entry,
+                source_lines_by_path=source_lines_by_path,
+            )
+            if references:
+                match["references"] = references
+
     return {
         "query": cleaned_query,
         "kind": cleaned_kind,
         "root_path": scope_display,
         "globs": cleaned_globs or None,
         "exact": bool(exact),
+        "include_details": bool(include_details),
+        "include_snippet": bool(include_snippet),
+        "include_references": bool(include_references),
         "matches": matches[:safe_max_results],
         "truncated": truncated,
         "notes": notes,

@@ -33,10 +33,8 @@ cd /path/to/project
 sylliptor
 ```
 
-On a fresh install, the setup wizard asks for an API key, default model, optional
-router model, and workspace. Leave the router model unset to inherit the default,
-or choose a smaller/cheaper model for lightweight request routing. Re-run setup
-anytime:
+On a fresh install, the setup wizard guides you through connection, model, and
+workspace selection. Re-run setup anytime:
 
 ```bash
 sylliptor setup
@@ -49,6 +47,17 @@ export SYLLIPTOR_API_KEY="YOUR_KEY"
 sylliptor config set base_url "https://api.openai.com/v1"
 sylliptor config set model "gpt-4.1-mini"
 ```
+
+To connect a supported ChatGPT subscription instead of configuring an API key:
+
+```bash
+sylliptor auth list
+sylliptor auth login openai-codex
+sylliptor chat
+```
+
+After login, choose the model in `/config`. See
+[Providers and models](providers.md) for additional options.
 
 To avoid storing a key, pass it for one command:
 
@@ -131,10 +140,8 @@ Inspect the built-in tool surface:
 sylliptor tools
 ```
 
-Web search is optional and configuration-dependent. In this public build, `web_search` is available
-through supported provider-native search adapters and external backends such as Tavily when
-configured. Other provider profiles can still be valid chat providers without being native
-`web_search` backends.
+Web search works through supported provider adapters, configured external
+backends, or the keyless DDGS fallback. The active model decides when to use it.
 
 Inspect custom tools discovered for the current workspace:
 
@@ -144,9 +151,8 @@ sylliptor tool list --path .
 
 ## Updates
 
-Sylliptor checks for newer releases in the background at most once per configured interval, then
-shows cached notices in home/status surfaces. It never installs updates silently. To check PyPI for
-the latest package immediately:
+Sylliptor checks for newer releases in the background and may prompt before an
+interactive launch. It never installs updates silently. To check PyPI immediately:
 
 ```bash
 sylliptor update check
@@ -164,6 +170,7 @@ command, and asks before running it. Source or editable installs are left manual
 ## Next Steps
 
 - [Credentials](credentials.md): API key precedence and persisted credentials.
+- [Providers and models](providers.md): model access and subscription login.
 - [Execution modes](../README.md#execution-modes): readonly, review, auto, and fullaccess.
 - [Forge](forge.md): plan, execute, verify, and review larger tasks.
 - [MCP](mcp.md): connect external MCP servers.

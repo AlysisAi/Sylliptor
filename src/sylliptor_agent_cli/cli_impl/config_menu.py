@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
+import logging
 import math
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -16,8 +18,10 @@ from rich.panel import Panel
 from ..branding import env_get
 from ..config import (
     _ROLE_TEMPERATURE_FIELDS,
+    AgentRuntimeSettings,
     AppConfig,
     ConfigError,
+    _normalize_web_search_mode,
     clear_persisted_api_key,
     clear_persisted_profile_key,
     config_path,
@@ -29,6 +33,17 @@ from ..config import (
     save_persisted_profile_key,
     set_config_value,
 )
+from ..llm.cache_capabilities import (
+    EffectiveCacheCapability,
+    resolve_effective_cache_capability,
+)
+from ..llm.cache_policy import ResolvedPromptCachePolicy, resolve_prompt_cache_policy
+from ..llm.protocols import (
+    OPENAI_COMPAT_PROTOCOL,
+    get_provider_protocol_capabilities,
+    validate_reasoning_trace_adapter_for_protocol,
+)
+from ..model_registry import resolve_model_provider_key
 from ..profile_presets import (
     PROFILE_PRESETS,
     ProfilePreset,
@@ -42,9 +57,12 @@ from ..profile_presets import (
     provider_selection_presets,
 )
 from ..profiles import (
+    SUBSCRIPTION_SELECTION_REQUIRED_KEY,
     ProfileSpec,
+    get_active_profile,
     list_profiles,
     set_active_profile,
+    subscription_selection_supported,
     validate_base_url,
 )
 from ..provider_diagnostics import provider_diagnostic_warning_lines
@@ -56,6 +74,9 @@ from ..sandbox_settings import (
 from ..surface.console import make_console
 from ..surface.styles import STYLE_CONTENT, STYLE_DIM, STYLE_EMPHASIS
 from ..web_search_adapters import WEB_SEARCH_ADAPTER_CHOICES, normalize_web_search_adapter
+from ..web_search_policy import normalize_web_search_policy
+
+_LOGGER = logging.getLogger(__name__)
 
 ROLE_ORDER: tuple[str, ...] = (
     "coding",
@@ -71,20 +92,39 @@ SECTION_VALUES: tuple[tuple[str, str], ...] = (
     ("profile", "Provider Profile"),
     ("api_key", "API Key"),
     ("default", "Default Model"),
-    ("router", "Routing & Limits"),
+    ("web_search", "Web Search"),
+    ("cache", "Context & Cache"),
+    ("router", "Routing"),
     ("subagents", "Subagent model overrides"),
     ("forge", "Forge model overrides"),
     ("sandbox", "Sandbox"),
+    ("execution", "Model Access"),
 )
 SANDBOX_MODES: tuple[str, ...] = ("strict", "warn", "off")
-THINKING_LABELS: tuple[str, ...] = ("off", "minimal", "low", "medium", "high", "xhigh", "auto")
+THINKING_LABELS: tuple[str, ...] = (
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+    "auto",
+)
 ROUTING_MODES: tuple[str, ...] = ("auto", "code_only")
-STEP_BUDGET_POLICIES: tuple[str, ...] = ("adaptive", "fixed")
+STEP_BUDGET_POLICIES: tuple[str, ...] = ("autonomous", "limited", "adaptive", "fixed")
+PROMPT_CACHE_MODES: tuple[str, ...] = ("auto", "manual", "off")
+ANTHROPIC_PROMPT_CACHE_TTLS: tuple[str, ...] = ("5m", "1h")
+_CACHE_AWARE_COMPACTION_DEFAULT = True
+_CACHE_AWARE_MIN_TRIGGER_RATIO_DEFAULT = 0.72
+_CACHE_AWARE_MIN_TRIGGER_RATIO_MIN = 0.05
+_CACHE_AWARE_MIN_TRIGGER_RATIO_MAX = 0.98
 _THINKING_LABEL_EXTRA_FIELD = "llm_thinking_label"
-_TRUE_THINKING_LABELS = {"minimal", "low", "medium", "high", "xhigh"}
 _MISSING_REQUIRED = "[yellow]missing · required[/yellow]"
 _CLEAR_KEY_PENDING = "[yellow]will be cleared on save[/yellow]"
-_WARNING_SUMMARIES = {_MISSING_REQUIRED, _CLEAR_KEY_PENDING}
+_MISSING_RUNTIME = "[yellow]AI subscription · connection required[/yellow]"
+_WARNING_SUMMARIES = {_MISSING_REQUIRED, _CLEAR_KEY_PENDING, _MISSING_RUNTIME}
 _ROLE_DESCRIPTIONS: dict[str, str] = {
     "coding": "generating and editing code",
     "planner": "high-level task planning",
@@ -105,6 +145,41 @@ _SECRET_FORCE_TOKEN = "force"
 _CUSTOM_MODEL_VALUE = "__custom_model__"
 _INHERIT_DEFAULT_MODEL_VALUE = "__inherit_default_model__"
 _ADVANCED_PROVIDER_PRESETS_VALUE = "__advanced_provider_presets__"
+_EXECUTION_BACKENDS: tuple[str, ...] = ("native", "delegated")
+
+
+def _normalize_execution_backend(value: Any) -> str:
+    normalized = str(value or "native").strip().lower()
+    if normalized not in _EXECUTION_BACKENDS:
+        raise ValueError("Model access must be one of: API key, AI subscription.")
+    return normalized
+
+
+def _runtime_setup_options() -> tuple[Any, ...]:
+    from ..provider_auth import provider_auth_setup_options
+
+    return tuple(provider_auth_setup_options())
+
+
+def _runtime_setup_rows() -> list[tuple[str, str, str]]:
+    """Return registry-backed delegated runtime choices for both config UIs."""
+    rows: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for option in _runtime_setup_options():
+        runtime_id = str(getattr(option, "id", "") or "").strip()
+        if not runtime_id or runtime_id in seen:
+            continue
+        seen.add(runtime_id)
+        label = str(getattr(option, "label", "") or runtime_id).strip() or runtime_id
+        description = str(getattr(option, "description", "") or "").strip()
+        rows.append((runtime_id, label, description))
+    return rows
+
+
+def _is_direct_subscription_id(runtime_id: str) -> bool:
+    from ..provider_auth import provider_auth_ids
+
+    return str(runtime_id or "").strip() in provider_auth_ids()
 
 
 @dataclass(frozen=True)
@@ -124,14 +199,26 @@ class ConfigMenuState:
     role_temperatures: dict[str, str]
     profiles: dict[str, dict[str, Any]]
     active_profile: str
+    execution_backend: str = "native"
+    execution_runtime: str = ""
+    agent_runtimes: dict[str, Any] = field(default_factory=dict)
     api_key_source: str = "missing"
     masked_api_key: str = "(not set)"
     new_api_key: str = ""
+    new_api_key_profile: str | None = None
     clear_stored_key_confirmed: bool = False
     clear_stored_key_profile: str | None = None
     config_warning: str | None = None
+    model_catalog_warning: str | None = None
+    subscription_selection_required: bool = False
     default_workspace_path: str = ""
     thinking_label_explicitly_set: bool = field(default=False, repr=False)
+    _subscription_models_cache: tuple[Any, ...] = field(default=(), repr=False)
+    _subscription_models_loaded: bool = field(default=False, repr=False)
+    _provider_models_cache: tuple[Any, ...] = field(default=(), repr=False)
+    _provider_models_loaded: bool = field(default=False, repr=False)
+    _router_models_by_profile: dict[str, str] = field(default_factory=dict, repr=False)
+    _forge_router_models_by_profile: dict[str, str] = field(default_factory=dict, repr=False)
     _original: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -152,10 +239,42 @@ class ConfigMenuState:
             thinking_label = "auto"
         profiles = {profile.name: profile.to_dict() for profile in list_profiles(cfg)}
         active_profile = str(cfg.extra_fields.get("active_profile") or "")
+        execution = getattr(cfg, "execution", None)
+        execution_backend = _normalize_execution_backend(getattr(execution, "backend", "native"))
+        execution_runtime = str(getattr(execution, "runtime", None) or "").strip()
+        try:
+            active_spec = ProfileSpec.from_dict(active_profile, profiles[active_profile])
+        except (KeyError, ConfigError):
+            active_spec = None
+        if active_spec is not None and active_spec.auth_provider:
+            execution_backend = "delegated"
+            execution_runtime = active_spec.auth_provider
+            configured_model = active_spec.default_model
+            thinking_label = (
+                "auto"
+                if active_spec.reasoning_effort is None
+                else (
+                    "off"
+                    if active_spec.reasoning_effort == "none"
+                    else active_spec.reasoning_effort
+                )
+            )
+            selection_marker = cfg.extra_fields.get(SUBSCRIPTION_SELECTION_REQUIRED_KEY)
+            subscription_selection_required = bool(
+                selection_marker is True
+                or str(selection_marker or "").strip() == active_spec.auth_provider
+                or not active_spec.default_model
+                or active_spec.reasoning_effort is None
+            )
+        else:
+            configured_model = str(getattr(cfg, "model", "") or "")
+            subscription_selection_required = False
+        agent_runtimes = copy.deepcopy(dict(getattr(cfg, "agent_runtimes", {}) or {}))
         default_workspace_path = str(cfg.extra_fields.get("default_workspace_path") or "")
         role_models = _normalized_role_model_values(
             cfg.extra_fields.get("role_models") if isinstance(cfg.extra_fields, dict) else None
         )
+        raw_compaction = _raw_compaction_extra_fields(cfg)
         forge_role_models = _normalized_role_model_values(
             cfg.extra_fields.get("forge_role_models")
             if isinstance(cfg.extra_fields, dict)
@@ -175,20 +294,40 @@ class ConfigMenuState:
 
         state = cls(
             fields={
-                "model": str(getattr(cfg, "model", "") or ""),
+                "model": configured_model,
                 "base_url": str(getattr(cfg, "base_url", "") or ""),
                 "llm_timeout_s": _format_number(getattr(cfg, "llm_timeout_s", 60.0)),
                 "routing_mode": _normalize_routing_mode(
                     getattr(cfg, "routing_mode", "auto") or "auto"
                 ),
                 "step_budget_policy": _normalize_step_budget_policy(
-                    getattr(cfg, "step_budget_policy", "adaptive") or "adaptive"
+                    getattr(cfg, "step_budget_policy", "autonomous") or "autonomous"
                 ),
                 "max_steps": _format_integer(getattr(cfg, "max_steps", 25)),
                 "task_max_steps": _format_integer(getattr(cfg, "task_max_steps", 100)),
                 "subagent_max_steps": _format_integer(getattr(cfg, "subagent_max_steps", 16)),
-                "stream": "true" if bool(getattr(cfg, "stream", False)) else "false",
+                "stream": "true" if bool(getattr(cfg, "stream", True)) else "false",
+                "prompt_cache_mode": _normalize_prompt_cache_mode(
+                    getattr(cfg, "prompt_cache_mode", "manual") or "manual"
+                ),
+                "prompt_cache_key": str(getattr(cfg, "prompt_cache_key", "") or ""),
+                "prompt_cache_retention": str(getattr(cfg, "prompt_cache_retention", "") or ""),
+                "anthropic_prompt_cache_enabled": (
+                    "true"
+                    if bool(getattr(cfg, "anthropic_prompt_cache_enabled", False))
+                    else "false"
+                ),
+                "anthropic_prompt_cache_ttl": _normalize_anthropic_prompt_cache_ttl(
+                    getattr(cfg, "anthropic_prompt_cache_ttl", "5m") or "5m"
+                ),
+                "cache_aware_compaction": _cache_aware_compaction_text(
+                    raw_compaction.get("cache_aware_compaction")
+                ),
+                "cache_aware_min_trigger_ratio": _cache_aware_min_trigger_ratio_text(
+                    raw_compaction.get("cache_aware_min_trigger_ratio")
+                ),
                 "web_search_mode": str(getattr(cfg, "web_search_mode", "auto") or "auto"),
+                "web_search_policy": str(getattr(cfg, "web_search_policy", "auto") or "auto"),
                 "web_search_adapter": str(getattr(cfg, "web_search_adapter", "auto") or "auto"),
                 "web_search_base_url": str(getattr(cfg, "web_search_base_url", "") or ""),
                 "web_search_model": str(getattr(cfg, "web_search_model", "") or ""),
@@ -200,11 +339,22 @@ class ConfigMenuState:
             role_temperatures=role_temperatures,
             profiles=profiles,
             active_profile=active_profile,
+            execution_backend=execution_backend,
+            execution_runtime=execution_runtime,
+            agent_runtimes=agent_runtimes,
             api_key_source=api_key_source,
             masked_api_key=masked_api_key,
             config_warning="; ".join(warnings) or None,
+            subscription_selection_required=subscription_selection_required,
             default_workspace_path=default_workspace_path,
         )
+        if state.active_profile:
+            state._router_models_by_profile[state.active_profile] = str(
+                state.role_models.get("router", "") or ""
+            )
+            state._forge_router_models_by_profile[state.active_profile] = str(
+                state.forge_role_models.get("router", "") or ""
+            )
         state._original = state.snapshot()
         return state
 
@@ -227,11 +377,16 @@ class ConfigMenuState:
             },
             "profiles": {name: dict(data) for name, data in sorted(self.profiles.items())},
             "active_profile": self.active_profile,
+            "execution_backend": self.execution_backend,
+            "execution_runtime": self.execution_runtime,
+            "agent_runtimes": copy.deepcopy(self.agent_runtimes),
             "default_workspace_path": self.default_workspace_path,
             "new_api_key": self.new_api_key,
+            "new_api_key_profile": self.new_api_key_profile,
             "clear_stored_key_confirmed": self.clear_stored_key_confirmed,
             "clear_stored_key_profile": self.clear_stored_key_profile,
             "thinking_label_explicitly_set": self.thinking_label_explicitly_set,
+            "subscription_selection_required": self.subscription_selection_required,
         }
 
     def reset(self) -> None:
@@ -239,6 +394,9 @@ class ConfigMenuState:
         if isinstance(original_fields, dict):
             self.fields = {str(key): str(value) for key, value in original_fields.items()}
         self.thinking_label = str(self._original.get("thinking_label") or "auto")
+        self.subscription_selection_required = bool(
+            self._original.get("subscription_selection_required", False)
+        )
         self.role_models = _role_text_map_from_snapshot(self._original.get("role_models"))
         self.forge_role_models = _role_text_map_from_snapshot(
             self._original.get("forge_role_models")
@@ -253,8 +411,18 @@ class ConfigMenuState:
             if isinstance(data, dict)
         }
         self.active_profile = str(self._original.get("active_profile") or "")
+        self.execution_backend = _normalize_execution_backend(
+            self._original.get("execution_backend")
+        )
+        self.execution_runtime = str(self._original.get("execution_runtime") or "")
+        raw_agent_runtimes = self._original.get("agent_runtimes")
+        self.agent_runtimes = copy.deepcopy(
+            dict(raw_agent_runtimes) if isinstance(raw_agent_runtimes, dict) else {}
+        )
         self.default_workspace_path = str(self._original.get("default_workspace_path") or "")
         self.new_api_key = str(self._original.get("new_api_key") or "")
+        raw_new_key_profile = self._original.get("new_api_key_profile")
+        self.new_api_key_profile = str(raw_new_key_profile) if raw_new_key_profile else None
         self.clear_stored_key_confirmed = bool(
             self._original.get("clear_stored_key_confirmed", False)
         )
@@ -263,14 +431,26 @@ class ConfigMenuState:
         self.thinking_label_explicitly_set = bool(
             self._original.get("thinking_label_explicitly_set", False)
         )
+        self._router_models_by_profile = {}
+        self._forge_router_models_by_profile = {}
+        if self.active_profile:
+            self._router_models_by_profile[self.active_profile] = str(
+                self.role_models.get("router", "") or ""
+            )
+            self._forge_router_models_by_profile[self.active_profile] = str(
+                self.forge_role_models.get("router", "") or ""
+            )
+        self._invalidate_provider_model_catalog()
         self.refresh_api_key_status()
 
     def set_field(self, name: str, value: str) -> None:
         key = str(name).strip()
         if key == "new_api_key":
             self.new_api_key = str(value)
+            self.new_api_key_profile = self.active_profile or None
             self.clear_stored_key_confirmed = False
             self.clear_stored_key_profile = None
+            self._invalidate_provider_model_catalog()
             return
         if key not in {
             "model",
@@ -281,16 +461,38 @@ class ConfigMenuState:
             "max_steps",
             "task_max_steps",
             "subagent_max_steps",
+            "prompt_cache_mode",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "anthropic_prompt_cache_enabled",
+            "anthropic_prompt_cache_ttl",
+            "cache_aware_compaction",
+            "cache_aware_min_trigger_ratio",
+            "web_search_mode",
+            "web_search_policy",
+            "web_search_adapter",
+            "web_search_base_url",
+            "web_search_model",
         }:
             raise KeyError(f"Unknown config menu field: {name}")
+        previous_value = str(self.fields.get(key, "") or "")
         self.fields[key] = str(value)
+        if key == "model":
+            profile = _active_subscription_profile(self)
+            if profile is not None and str(value).strip() != profile.default_model:
+                self.subscription_selection_required = True
         if key == "base_url":
+            if previous_value.strip().rstrip("/") != str(value).strip().rstrip("/"):
+                self._clear_active_router_overrides()
+            self._invalidate_provider_model_catalog()
             self.refresh_api_key_status()
 
     def set_thinking_label(self, label: str) -> None:
         normalized = _normalize_thinking_label(label)
         self.thinking_label = normalized
         self.thinking_label_explicitly_set = True
+        if _active_subscription_profile(self) is not None:
+            self.subscription_selection_required = True
 
     def set_routing_mode(self, value: str) -> None:
         self.fields["routing_mode"] = _normalize_routing_mode(value)
@@ -310,10 +512,14 @@ class ConfigMenuState:
     def set_role_model(self, role: str, model: str) -> None:
         role_key = _normalize_role(role)
         self.role_models[role_key] = str(model)
+        if role_key == "router" and self.active_profile:
+            self._router_models_by_profile[self.active_profile] = str(model)
 
     def set_forge_role_model(self, role: str, model: str) -> None:
         role_key = _normalize_role(role)
         self.forge_role_models[role_key] = str(model)
+        if role_key == "router" and self.active_profile:
+            self._forge_router_models_by_profile[self.active_profile] = str(model)
 
     def set_role_temperature(self, role: str, value: str) -> None:
         role_key = _normalize_role(role)
@@ -325,23 +531,221 @@ class ConfigMenuState:
         self.clear_stored_key_confirmed = True
         self.clear_stored_key_profile = self.active_profile or None
         self.new_api_key = ""
+        self.new_api_key_profile = None
+        self._invalidate_provider_model_catalog()
 
     def set_default_workspace_path(self, path: str) -> None:
         self.default_workspace_path = str(path or "").strip()
 
-    def set_active_profile_name(self, name: str) -> None:
+    def set_execution_backend(self, backend: str, *, runtime: str | None = None) -> None:
+        normalized = _normalize_execution_backend(backend)
+        self.execution_backend = normalized
+        if normalized == "native":
+            self.execution_runtime = ""
+            if self.active_profile in self.profiles:
+                active = ProfileSpec.from_dict(
+                    self.active_profile,
+                    self.profiles[self.active_profile],
+                )
+                if active.auth_provider:
+                    replacement = next(
+                        (
+                            name
+                            for name, data in sorted(self.profiles.items())
+                            if not ProfileSpec.from_dict(name, data).auth_provider
+                        ),
+                        None,
+                    )
+                    if replacement:
+                        self.set_active_profile_name(replacement)
+            return
+        if runtime is not None:
+            self.execution_runtime = str(runtime or "").strip()
+        runtime_id = self.execution_runtime
+        if _is_direct_subscription_id(runtime_id):
+            from ..provider_auth import create_provider_auth
+
+            adapter = create_provider_auth(runtime_id)
+            existing_data = self.profiles.get(adapter.profile_name)
+            existing = (
+                ProfileSpec.from_dict(adapter.profile_name, existing_data)
+                if isinstance(existing_data, dict)
+                else None
+            )
+            if existing is not None and existing.auth_provider == runtime_id:
+                profile = ProfileSpec(
+                    name=existing.name,
+                    protocol=adapter.protocol,
+                    base_url=adapter.base_url,
+                    api_key_env=existing.api_key_env,
+                    auth_provider=runtime_id,
+                    extra_headers=dict(existing.extra_headers),
+                    default_model=existing.default_model,
+                    reasoning_effort=existing.reasoning_effort,
+                    web_search_adapter=existing.web_search_adapter,
+                    web_search_model=existing.web_search_model,
+                    notes=existing.notes,
+                    cache_capability=existing.cache_capability,
+                    reasoning_trace_adapter=existing.reasoning_trace_adapter,
+                )
+            else:
+                profile = ProfileSpec(
+                    name=adapter.profile_name,
+                    protocol=adapter.protocol,
+                    base_url=adapter.base_url,
+                    auth_provider=runtime_id,
+                    notes=f"{adapter.display_name}. Uses Sylliptor's native agent loop.",
+                )
+            self.add_profile_spec(
+                profile,
+                make_active=True,
+                allow_subscription_update=True,
+            )
+            self.subscription_selection_required = bool(
+                self.subscription_selection_required
+                or not profile.default_model
+                or profile.reasoning_effort is None
+            )
+            return
+        if not runtime_id or runtime_id in self.agent_runtimes:
+            return
+        option = next(
+            (
+                item
+                for item in _runtime_setup_options()
+                if str(getattr(item, "id", "") or "").strip() == runtime_id
+            ),
+            None,
+        )
+        if option is None:
+            return
+        self.agent_runtimes[runtime_id] = AgentRuntimeSettings(
+            adapter=str(getattr(option, "adapter", "") or "").strip(),
+            executable=str(getattr(option, "default_executable", "") or "").strip(),
+        )
+
+    def set_active_profile_name(self, name: str) -> bool:
         profile_name = str(name or "").strip().lower()
         if profile_name not in self.profiles:
             raise KeyError(f"Unknown profile: {name}")
+        previous_profile_name = self.active_profile
+        previous_router = str(self.role_models.get("router", "") or "")
+        previous_forge_router = str(self.forge_role_models.get("router", "") or "")
+        if previous_profile_name:
+            self._router_models_by_profile[previous_profile_name] = previous_router
+            self._forge_router_models_by_profile[previous_profile_name] = previous_forge_router
+        was_pending_for_profile = bool(
+            self.subscription_selection_required and self.active_profile == profile_name
+        )
+        original_pending_for_profile = bool(
+            self._original.get("subscription_selection_required")
+            and str(self._original.get("active_profile") or "") == profile_name
+        )
         self.active_profile = profile_name
+        self._subscription_models_cache = ()
+        self._subscription_models_loaded = False
+        self._invalidate_provider_model_catalog()
+        router_override_reset = False
+        if previous_profile_name != profile_name:
+            # Persisted role overrides are global rather than profile-scoped.
+            # Keep transient per-profile router values while this menu is open so
+            # switching back before Save restores the user's choice, but never
+            # carry one provider's id into another provider's requests.
+            next_router = self._router_models_by_profile.get(profile_name, "")
+            next_forge_router = self._forge_router_models_by_profile.get(profile_name, "")
+            self.role_models["router"] = next_router
+            self.forge_role_models["router"] = next_forge_router
+            router_override_reset = bool(
+                (previous_router.strip() and not next_router.strip())
+                or (previous_forge_router.strip() and not next_forge_router.strip())
+            )
         profile = ProfileSpec.from_dict(profile_name, self.profiles[profile_name])
         if profile.base_url:
             self.fields["base_url"] = profile.base_url
-        if profile.default_model:
+        if profile.auth_provider:
             self.fields["model"] = profile.default_model
+            self.thinking_label = (
+                "auto"
+                if profile.reasoning_effort is None
+                else ("off" if profile.reasoning_effort == "none" else profile.reasoning_effort)
+            )
+            self.subscription_selection_required = bool(
+                was_pending_for_profile
+                or original_pending_for_profile
+                or not profile.default_model
+                or profile.reasoning_effort is None
+            )
+        else:
+            if profile.default_model:
+                self.fields["model"] = profile.default_model
+            if profile.reasoning_effort is not None:
+                self.thinking_label = (
+                    "off" if profile.reasoning_effort == "none" else profile.reasoning_effort
+                )
+            self.subscription_selection_required = False
         self.refresh_api_key_status()
+        return router_override_reset
 
-    def add_profile_spec(self, profile: ProfileSpec, *, make_active: bool = True) -> None:
+    def _invalidate_provider_model_catalog(self) -> None:
+        self._provider_models_cache = ()
+        self._provider_models_loaded = False
+        self.model_catalog_warning = None
+
+    def _sync_active_profile_router_maps(self) -> None:
+        if not self.active_profile:
+            return
+        self._router_models_by_profile[self.active_profile] = str(
+            self.role_models.get("router", "") or ""
+        )
+        self._forge_router_models_by_profile[self.active_profile] = str(
+            self.forge_role_models.get("router", "") or ""
+        )
+
+    def _clear_active_router_overrides(self) -> bool:
+        changed = bool(
+            str(self.role_models.get("router", "") or "").strip()
+            or str(self.forge_role_models.get("router", "") or "").strip()
+        )
+        self.role_models["router"] = ""
+        self.forge_role_models["router"] = ""
+        self._sync_active_profile_router_maps()
+        return changed
+
+    def staged_api_key_target_profile(self) -> str | None:
+        if not self.new_api_key.strip():
+            return None
+        return self.new_api_key_profile or self.active_profile or None
+
+    def staged_api_key_for_active_profile(self) -> str:
+        target = self.staged_api_key_target_profile()
+        if target != (self.active_profile or None):
+            return ""
+        return self.new_api_key.strip()
+
+    def add_profile_spec(
+        self,
+        profile: ProfileSpec,
+        *,
+        make_active: bool = True,
+        allow_subscription_update: bool = False,
+    ) -> None:
+        existing_data = self.profiles.get(profile.name)
+        existing = (
+            ProfileSpec.from_dict(profile.name, existing_data)
+            if isinstance(existing_data, dict)
+            else None
+        )
+        if existing is not None and existing.auth_provider:
+            trusted_refresh = bool(
+                allow_subscription_update and profile.auth_provider == existing.auth_provider
+            )
+            if not trusted_refresh:
+                raise ConfigError(
+                    f"Profile {existing.name!r} is managed by the "
+                    f"{existing.auth_provider!r} subscription connection and cannot be "
+                    "overwritten through generic profile settings. Choose a different "
+                    "profile name or manage the connection through auth."
+                )
         self.profiles[profile.name] = profile.to_dict()
         if make_active:
             self.set_active_profile_name(profile.name)
@@ -350,25 +754,47 @@ class ConfigMenuState:
         if self.active_profile not in self.profiles:
             raise KeyError("No active profile configured.")
         profile = ProfileSpec.from_dict(self.active_profile, self.profiles[self.active_profile])
-        values = {
-            "name": profile.name,
-            "protocol": profile.protocol,
-            "base_url": profile.base_url,
-            "api_key_env": profile.api_key_env,
-            "extra_headers": dict(profile.extra_headers),
-            "default_model": profile.default_model,
-            "web_search_adapter": profile.web_search_adapter,
-            "web_search_model": profile.web_search_model,
-            "notes": profile.notes,
+        if profile.auth_provider:
+            protected = {
+                "protocol",
+                "base_url",
+                "api_key_env",
+                "auth_provider",
+                "extra_headers",
+                "default_model",
+                "reasoning_effort",
+                "reasoning_trace_adapter",
+            }
+            if any(key in protected and fields[key] != getattr(profile, key) for key in fields):
+                raise ConfigError(
+                    "Subscription connection fields are provider-managed; use Default Model "
+                    "for model and reasoning choices."
+                )
+        connection_fields = {
+            "protocol",
+            "base_url",
+            "auth_provider",
+            "extra_headers",
+            "reasoning_trace_adapter",
         }
-        values.update(fields)
-        self.profiles[self.active_profile] = ProfileSpec(**values).to_dict()
+        connection_changed = any(
+            key in fields and fields[key] != getattr(profile, key) for key in connection_fields
+        )
+        self.profiles[self.active_profile] = replace(profile, **fields).to_dict()
+        if connection_changed:
+            self._clear_active_router_overrides()
         self.set_active_profile_name(self.active_profile)
 
-    def remove_profile_name(self, name: str) -> None:
+    def remove_profile_name(self, name: str) -> bool:
         profile_name = str(name or "").strip().lower()
         if profile_name not in self.profiles:
             raise KeyError(f"Unknown profile: {name}")
+        staged_key_discarded = bool(
+            self.new_api_key.strip() and self.staged_api_key_target_profile() == profile_name
+        )
+        if staged_key_discarded:
+            self.new_api_key = ""
+            self.new_api_key_profile = None
         self.profiles.pop(profile_name, None)
         if self.active_profile == profile_name:
             next_profile = sorted(self.profiles)[0] if self.profiles else ""
@@ -376,15 +802,32 @@ class ConfigMenuState:
                 self.set_active_profile_name(next_profile)
             else:
                 self.active_profile = ""
+                self._invalidate_provider_model_catalog()
                 self.refresh_api_key_status()
+        self._router_models_by_profile.pop(profile_name, None)
+        self._forge_router_models_by_profile.pop(profile_name, None)
+        return staged_key_discarded
 
     def _resolution_cfg(self) -> AppConfig:
         cfg = AppConfig(
             model=str(self.fields.get("model", "") or ""),
             base_url=str(self.fields.get("base_url", "") or ""),
-            stream=str(self.fields.get("stream", "false")).strip().lower()
+            stream=str(self.fields.get("stream", "true")).strip().lower()
             in {"1", "true", "yes", "on"},
+            prompt_cache_mode=_normalize_prompt_cache_mode(
+                self.fields.get("prompt_cache_mode", "manual")
+            ),
+            prompt_cache_key=str(self.fields.get("prompt_cache_key", "") or ""),
+            prompt_cache_retention=str(self.fields.get("prompt_cache_retention", "") or ""),
+            anthropic_prompt_cache_enabled=_normalize_bool_text(
+                self.fields.get("anthropic_prompt_cache_enabled", "false"),
+                label="Anthropic prompt cache",
+            ),
+            anthropic_prompt_cache_ttl=_normalize_anthropic_prompt_cache_ttl(
+                self.fields.get("anthropic_prompt_cache_ttl", "5m")
+            ),
             web_search_mode=str(self.fields.get("web_search_mode", "auto") or "auto"),
+            web_search_policy=str(self.fields.get("web_search_policy", "auto") or "auto"),
             web_search_adapter=str(self.fields.get("web_search_adapter", "auto") or "auto"),
             web_search_base_url=str(self.fields.get("web_search_base_url", "") or "") or None,
             web_search_model=str(self.fields.get("web_search_model", "") or "") or None,
@@ -392,6 +835,15 @@ class ConfigMenuState:
         cfg.extra_fields = {"profiles": dict(self.profiles)}
         if self.active_profile:
             cfg.extra_fields["active_profile"] = self.active_profile
+        execution = getattr(cfg, "execution", None)
+        if execution is not None:
+            direct = self.execution_backend == "delegated" and _is_direct_subscription_id(
+                self.execution_runtime
+            )
+            execution.backend = "native" if direct else self.execution_backend
+            execution.runtime = None if direct else (self.execution_runtime or None)
+        if hasattr(cfg, "agent_runtimes"):
+            cfg.agent_runtimes = copy.deepcopy(self.agent_runtimes)
         return cfg
 
     def refresh_api_key_status(self) -> None:
@@ -415,6 +867,32 @@ class ConfigMenuState:
             )
 
         changes: dict[str, Any] = {}
+
+        execution = getattr(cfg, "execution", None)
+        if execution is None:
+            return ConfigMenuResult(
+                saved=False,
+                changes={},
+                api_key_changed=False,
+                error="Model access configuration is unavailable.",
+            )
+        current_backend = _normalize_execution_backend(getattr(execution, "backend", "native"))
+        current_runtime = str(getattr(execution, "runtime", None) or "").strip()
+        direct = self.execution_backend == "delegated" and _is_direct_subscription_id(
+            self.execution_runtime
+        )
+        desired_backend = "native" if direct else self.execution_backend
+        desired_runtime = None if direct else (self.execution_runtime or None)
+        if current_backend != desired_backend:
+            execution.backend = desired_backend
+            changes["execution.backend"] = desired_backend
+        if current_runtime != str(desired_runtime or ""):
+            execution.runtime = desired_runtime
+            changes["execution.runtime"] = desired_runtime
+        current_agent_runtimes = dict(getattr(cfg, "agent_runtimes", {}) or {})
+        if current_agent_runtimes != self.agent_runtimes:
+            cfg.agent_runtimes = copy.deepcopy(self.agent_runtimes)
+            changes["agent_runtimes"] = sorted(self.agent_runtimes)
 
         original_profiles = self._original.get("profiles")
         if self.profiles != (original_profiles if isinstance(original_profiles, dict) else {}):
@@ -444,8 +922,23 @@ class ConfigMenuState:
             changes["base_url"] = desired_base_url
 
         desired_model = str(self.fields.get("model", ""))
-        if str(getattr(cfg, "model", "") or "") != desired_model:
-            set_config_value(cfg, "model", desired_model)
+        original_fields = self._original.get("fields")
+        original_model = (
+            str(original_fields.get("model", "") or "")
+            if isinstance(original_fields, dict)
+            else str(getattr(cfg, "model", "") or "")
+        )
+        # Only write the model when the user changed it in this menu.  Subscription
+        # profiles can intentionally differ from the top-level compatibility field;
+        # comparing against ``cfg.model`` made an unrelated save rewrite the active
+        # subscription model.
+        if desired_model != original_model:
+            set_config_value(
+                cfg,
+                "model",
+                desired_model,
+                allow_subscription_selection=True,
+            )
             changes["model"] = desired_model
 
         desired_timeout = float(str(self.fields.get("llm_timeout_s", "")).strip())
@@ -460,7 +953,7 @@ class ConfigMenuState:
             changes["routing_mode"] = desired_routing_mode
 
         desired_step_budget_policy = _normalize_step_budget_policy(
-            self.fields.get("step_budget_policy", "adaptive")
+            self.fields.get("step_budget_policy", "autonomous")
         )
         if str(getattr(cfg, "step_budget_policy", "") or "") != desired_step_budget_policy:
             set_config_value(cfg, "step_budget_policy", desired_step_budget_policy)
@@ -473,6 +966,101 @@ class ConfigMenuState:
                 set_config_value(cfg, key, str(desired_int))
                 changes[key] = desired_int
 
+        desired_cache_mode = _normalize_prompt_cache_mode(
+            self.fields.get("prompt_cache_mode", "manual")
+        )
+        if str(getattr(cfg, "prompt_cache_mode", "") or "manual") != desired_cache_mode:
+            set_config_value(cfg, "prompt_cache_mode", desired_cache_mode)
+            changes["prompt_cache_mode"] = desired_cache_mode
+
+        for key in ("prompt_cache_key", "prompt_cache_retention"):
+            desired_text = str(self.fields.get(key, "") or "").strip()
+            current_text = str(getattr(cfg, key, "") or "").strip()
+            if current_text != desired_text:
+                set_config_value(cfg, key, desired_text)
+                changes[key] = desired_text or None
+
+        desired_anthropic_enabled = _normalize_bool_text(
+            self.fields.get("anthropic_prompt_cache_enabled", "false"),
+            label="Anthropic prompt cache",
+        )
+        if bool(getattr(cfg, "anthropic_prompt_cache_enabled", False)) != desired_anthropic_enabled:
+            set_config_value(
+                cfg,
+                "anthropic_prompt_cache_enabled",
+                "true" if desired_anthropic_enabled else "false",
+            )
+            changes["anthropic_prompt_cache_enabled"] = desired_anthropic_enabled
+
+        desired_anthropic_ttl = _normalize_anthropic_prompt_cache_ttl(
+            self.fields.get("anthropic_prompt_cache_ttl", "5m")
+        )
+        if str(getattr(cfg, "anthropic_prompt_cache_ttl", "") or "5m") != desired_anthropic_ttl:
+            set_config_value(cfg, "anthropic_prompt_cache_ttl", desired_anthropic_ttl)
+            changes["anthropic_prompt_cache_ttl"] = desired_anthropic_ttl
+
+        desired_web_search_policy = normalize_web_search_policy(
+            self.fields.get("web_search_policy", "auto")
+        )
+        if str(getattr(cfg, "web_search_policy", "auto") or "auto") != desired_web_search_policy:
+            set_config_value(cfg, "web_search_policy", desired_web_search_policy)
+            changes["web_search_policy"] = desired_web_search_policy
+
+        desired_web_search_mode = _normalize_web_search_mode(
+            self.fields.get("web_search_mode", "auto")
+        )
+        if str(getattr(cfg, "web_search_mode", "auto") or "auto") != desired_web_search_mode:
+            set_config_value(cfg, "web_search_mode", desired_web_search_mode)
+            changes["web_search_mode"] = desired_web_search_mode
+
+        desired_web_search_adapter = normalize_web_search_adapter(
+            self.fields.get("web_search_adapter", "auto")
+        )
+        if str(getattr(cfg, "web_search_adapter", "auto") or "auto") != desired_web_search_adapter:
+            set_config_value(cfg, "web_search_adapter", desired_web_search_adapter)
+            changes["web_search_adapter"] = desired_web_search_adapter
+
+        for key in ("web_search_base_url", "web_search_model"):
+            desired_text = str(self.fields.get(key, "") or "").strip()
+            current_text = str(getattr(cfg, key, "") or "").strip()
+            if current_text != desired_text:
+                set_config_value(cfg, key, desired_text)
+                changes[key] = desired_text or None
+
+        desired_cache_aware = _normalize_bool_text(
+            self.fields.get("cache_aware_compaction", "true"),
+            label="Cache-aware compaction",
+        )
+        desired_cache_aware_ratio = _parse_cache_aware_min_trigger_ratio(
+            self.fields.get("cache_aware_min_trigger_ratio", _CACHE_AWARE_MIN_TRIGGER_RATIO_DEFAULT)
+        )
+        raw_compaction = _raw_compaction_extra_fields(cfg)
+        compaction = dict(raw_compaction)
+        current_cache_aware = _cache_aware_compaction_bool(compaction.get("cache_aware_compaction"))
+        current_cache_aware_ratio = _cache_aware_min_trigger_ratio_value(
+            compaction.get("cache_aware_min_trigger_ratio")
+        )
+        compaction_changed = False
+        if current_cache_aware != desired_cache_aware:
+            if desired_cache_aware == _CACHE_AWARE_COMPACTION_DEFAULT:
+                compaction.pop("cache_aware_compaction", None)
+            else:
+                compaction["cache_aware_compaction"] = desired_cache_aware
+            changes["compaction.cache_aware_compaction"] = desired_cache_aware
+            compaction_changed = True
+        if current_cache_aware_ratio != desired_cache_aware_ratio:
+            if desired_cache_aware_ratio == _CACHE_AWARE_MIN_TRIGGER_RATIO_DEFAULT:
+                compaction.pop("cache_aware_min_trigger_ratio", None)
+            else:
+                compaction["cache_aware_min_trigger_ratio"] = desired_cache_aware_ratio
+            changes["compaction.cache_aware_min_trigger_ratio"] = desired_cache_aware_ratio
+            compaction_changed = True
+        if compaction_changed:
+            if compaction:
+                cfg.extra_fields["compaction"] = dict(sorted(compaction.items()))
+            else:
+                cfg.extra_fields.pop("compaction", None)
+
         desired_thinking_value = thinking_label_to_config_value(self.thinking_label)
         desired_reasoning_effort = thinking_label_to_reasoning_effort(self.thinking_label)
         original_thinking_label = str(self._original.get("thinking_label") or "auto")
@@ -480,17 +1068,26 @@ class ConfigMenuState:
             self.thinking_label_explicitly_set or self.thinking_label != original_thinking_label
         )
         if should_write_thinking:
-            if (
-                getattr(cfg, "llm_enable_thinking", None) != desired_thinking_value
-                or getattr(cfg, "llm_reasoning_effort", None) != desired_reasoning_effort
-            ):
+            if getattr(cfg, "llm_enable_thinking", None) != desired_thinking_value:
                 set_config_value(
                     cfg,
                     "llm_enable_thinking",
                     _thinking_config_text(desired_thinking_value),
+                    allow_subscription_selection=True,
                 )
-                set_config_value(cfg, "llm_reasoning_effort", desired_reasoning_effort or "auto")
                 changes["llm_enable_thinking"] = desired_thinking_value
+            profile_effort = get_active_profile(cfg).reasoning_effort
+            desired_profile_effort = desired_reasoning_effort or "auto"
+            if (
+                getattr(cfg, "llm_reasoning_effort", None) != desired_reasoning_effort
+                or profile_effort != desired_profile_effort
+            ):
+                set_config_value(
+                    cfg,
+                    "llm_reasoning_effort",
+                    desired_reasoning_effort or "auto",
+                    allow_subscription_selection=True,
+                )
                 changes["llm_reasoning_effort"] = desired_reasoning_effort
             _set_thinking_label_hint(cfg, self.thinking_label)
 
@@ -543,6 +1140,25 @@ class ConfigMenuState:
             apply_sandbox_mode_to_config(cfg, desired_sandbox_mode)
             changes["sandbox_mode"] = desired_sandbox_mode
 
+        active = get_active_profile(cfg)
+        selection_confirmed = bool(
+            active.default_model
+            and active.reasoning_effort is not None
+            and self.thinking_label_explicitly_set
+            and subscription_selection_supported(
+                active,
+                _subscription_models_for_state(self),
+            )
+        )
+        if active.auth_provider and self.subscription_selection_required and selection_confirmed:
+            cfg.extra_fields.pop(SUBSCRIPTION_SELECTION_REQUIRED_KEY, None)
+            cfg.extra_fields.pop("subscription_reconnect_required", None)
+            cfg.extra_fields["onboarded"] = True
+            self.subscription_selection_required = False
+            changes["subscription_model_selection"] = "configured"
+        elif active.auth_provider and self.subscription_selection_required:
+            cfg.extra_fields[SUBSCRIPTION_SELECTION_REQUIRED_KEY] = active.auth_provider
+
         return ConfigMenuResult(
             saved=True,
             changes=changes,
@@ -550,6 +1166,56 @@ class ConfigMenuState:
         )
 
     def validate(self) -> str | None:
+        try:
+            backend = _normalize_execution_backend(self.execution_backend)
+        except ValueError as exc:
+            return str(exc)
+        if not isinstance(self.agent_runtimes, dict):
+            return "Agent runtime settings must be a mapping."
+        if backend == "delegated":
+            runtime = str(self.execution_runtime or "").strip()
+            if not runtime:
+                return "Choose a supported AI subscription connection."
+            known_runtime_ids = {value for value, _label, _description in _runtime_setup_rows()}
+            if runtime not in known_runtime_ids:
+                return f"Unknown AI subscription connection: {runtime}"
+            if not _is_direct_subscription_id(runtime) and runtime not in self.agent_runtimes:
+                return f"AI subscription connection settings are missing: {runtime}"
+            if _is_direct_subscription_id(runtime):
+                try:
+                    active = ProfileSpec.from_dict(
+                        self.active_profile,
+                        self.profiles[self.active_profile],
+                    )
+                except (KeyError, ConfigError):
+                    return "AI subscription profile is missing."
+                if active.auth_provider != runtime:
+                    return "AI subscription profile does not match the selected connection."
+                if self.subscription_selection_required:
+                    try:
+                        from ..provider_auth import create_provider_auth
+
+                        connected = create_provider_auth(runtime).account_status().connected
+                    except Exception:
+                        connected = False
+                    if connected:
+                        model = str(self.fields.get("model") or "").strip()
+                        if not model:
+                            return "Choose a subscription model in Default Model."
+                        models = _subscription_models_for_state(self)
+                        if not models:
+                            return (
+                                self.config_warning or "Subscription model catalog is unavailable."
+                            )
+                        selected = next((item for item in models if item.id == model), None)
+                        if selected is None:
+                            return "Choose a model available to the connected subscription account."
+                        if not self.thinking_label_explicitly_set:
+                            return "Choose a reasoning effort for the subscription model."
+                        effort = thinking_label_to_reasoning_effort(self.thinking_label)
+                        supported = {item.id for item in selected.reasoning_efforts}
+                        if effort is not None and supported and effort not in supported:
+                            return "Choose a reasoning effort supported by the subscription model."
         timeout_text = str(self.fields.get("llm_timeout_s", "")).strip()
         try:
             timeout = float(timeout_text)
@@ -571,7 +1237,7 @@ class ConfigMenuState:
                 if key == "routing_mode":
                     _normalize_routing_mode(self.fields.get(key, "auto"))
                 else:
-                    _normalize_step_budget_policy(self.fields.get(key, "adaptive"))
+                    _normalize_step_budget_policy(self.fields.get(key, "autonomous"))
             except ValueError as exc:
                 return str(exc)
         for key in ("max_steps", "task_max_steps", "subagent_max_steps"):
@@ -583,6 +1249,50 @@ class ConfigMenuState:
                 return f"{label} must be a positive integer."
             if value <= 0:
                 return f"{label} must be a positive integer."
+        try:
+            _normalize_prompt_cache_mode(self.fields.get("prompt_cache_mode", "manual"))
+        except ValueError as exc:
+            return str(exc)
+        try:
+            normalize_web_search_policy(self.fields.get("web_search_policy", "auto"))
+            _normalize_web_search_mode(self.fields.get("web_search_mode", "auto"))
+            normalize_web_search_adapter(self.fields.get("web_search_adapter", "auto"))
+            validate_base_url(
+                str(self.fields.get("web_search_base_url", "") or "").strip(),
+                key="Web search base URL",
+                allow_empty=True,
+            )
+        except (ConfigError, ValueError) as exc:
+            return str(exc)
+        try:
+            _normalize_bool_text(
+                self.fields.get("anthropic_prompt_cache_enabled", "false"),
+                label="Anthropic prompt cache",
+            )
+        except ValueError as exc:
+            return str(exc)
+        try:
+            _normalize_anthropic_prompt_cache_ttl(
+                self.fields.get("anthropic_prompt_cache_ttl", "5m")
+            )
+        except ValueError as exc:
+            return str(exc)
+        try:
+            _normalize_bool_text(
+                self.fields.get("cache_aware_compaction", "true"),
+                label="Cache-aware compaction",
+            )
+        except ValueError as exc:
+            return str(exc)
+        try:
+            _parse_cache_aware_min_trigger_ratio(
+                self.fields.get(
+                    "cache_aware_min_trigger_ratio",
+                    _CACHE_AWARE_MIN_TRIGGER_RATIO_DEFAULT,
+                )
+            )
+        except ValueError as exc:
+            return str(exc)
         for role, raw_value in self.role_temperatures.items():
             text = str(raw_value).strip()
             if not text:
@@ -611,15 +1321,25 @@ def run_config_menu(
         _run_api_key_section(state, console)
     elif auto_focus == "model":
         _run_default_section(state, console)
+    elif auto_focus == "execution":
+        _run_execution_section(state, console)
+    elif auto_focus == "web_search":
+        _run_web_search_section(state, console)
 
     while True:
         action = _prompt_main_action(console, state)
-        if action == "profile":
+        if action == "execution":
+            _run_execution_section(state, console)
+        elif action == "profile":
             _run_provider_section(state, console)
         elif action == "api_key":
             _run_api_key_section(state, console)
         elif action == "default":
             _run_default_section(state, console)
+        elif action == "web_search":
+            _run_web_search_section(state, console)
+        elif action == "cache":
+            _run_cache_section(state, console)
         elif action == "router":
             _run_router_section(state, console)
         elif action == "subagents":
@@ -640,6 +1360,26 @@ def _resolve_console() -> Console:
     return make_console()
 
 
+def _execution_summary_text(state: ConfigMenuState) -> str:
+    if state.execution_backend == "native":
+        return "API key · Sylliptor agent"
+    runtime = str(state.execution_runtime or "").strip()
+    if not runtime:
+        return _MISSING_RUNTIME
+    labels = {value: label for value, label, _description in _runtime_setup_rows()}
+    return f"AI subscription · {labels.get(runtime, runtime)}"
+
+
+def _inactive_native_summary(summary: str) -> str:
+    if summary == _MISSING_REQUIRED:
+        base = "not configured"
+    elif summary == _CLEAR_KEY_PENDING:
+        base = "will be cleared on save"
+    else:
+        base = re.sub(r"\[/?[a-z][a-z0-9 _#-]*\]", "", str(summary)).strip()
+    return f"{base} · inactive while using an AI subscription"
+
+
 def _profile_summary_text(state: ConfigMenuState) -> str:
     if state.active_profile:
         return f"{state.active_profile} (active)"
@@ -649,9 +1389,12 @@ def _profile_summary_text(state: ConfigMenuState) -> str:
 
 
 def _api_key_summary_text(state: ConfigMenuState) -> str:
-    if state.clear_stored_key_confirmed:
+    if state.clear_stored_key_confirmed and (
+        not state.clear_stored_key_profile
+        or state.clear_stored_key_profile == (state.active_profile or None)
+    ):
         return _CLEAR_KEY_PENDING
-    pending_key = state.new_api_key.strip()
+    pending_key = state.staged_api_key_for_active_profile()
     if pending_key:
         return f"set ({mask_api_key(pending_key)})"
     if state.masked_api_key != "(not set)":
@@ -668,13 +1411,187 @@ def _default_model_summary_text(state: ConfigMenuState) -> str:
 
 def _limits_summary_text(state: ConfigMenuState) -> str:
     router_model = str(state.role_models.get("router", "") or "").strip() or "inherit default"
-    return (
-        f"router {router_model} · "
-        f"steps {state.fields['max_steps']}/{state.fields['task_max_steps']}/"
-        f"{state.fields['subagent_max_steps']} · "
-        f"routing {state.fields['routing_mode']} · "
-        f"budget {state.fields['step_budget_policy']}"
+    return f"router {router_model} · routing {state.fields['routing_mode']} · autonomous execution"
+
+
+def _cache_summary_text(state: ConfigMenuState) -> str:
+    mode = _normalize_prompt_cache_mode(state.fields.get("prompt_cache_mode", "manual"))
+    compaction = _cache_aware_summary_text(state)
+    policy, policy_error = _resolved_cache_policy_with_error_for_state(state)
+    policy_summary = _cache_policy_summary_text(policy, compact=True, error=policy_error)
+    if mode == "off":
+        return f"cache off · {policy_summary} · {compaction}"
+    if mode == "auto":
+        ttl = _normalize_anthropic_prompt_cache_ttl(
+            state.fields.get("anthropic_prompt_cache_ttl", "5m")
+        )
+        return f"auto · {policy_summary} · Anthropic TTL {ttl} · {compaction}"
+
+    key = str(state.fields.get("prompt_cache_key", "") or "").strip()
+    retention = str(state.fields.get("prompt_cache_retention", "") or "").strip()
+    key_summary = key or "no manual key"
+    retention_summary = retention or "default retention"
+    anthropic = (
+        "on"
+        if _normalize_bool_text(
+            state.fields.get("anthropic_prompt_cache_enabled", "false"),
+            label="Anthropic prompt cache",
+        )
+        else "off"
     )
+    return (
+        f"manual · {policy_summary} · {key_summary} · {retention_summary} · "
+        f"Anthropic {anthropic} · {compaction}"
+    )
+
+
+def _effective_cache_capability_for_state(
+    state: ConfigMenuState,
+) -> EffectiveCacheCapability | None:
+    if not state.active_profile or state.active_profile not in state.profiles:
+        return None
+    try:
+        profile = ProfileSpec.from_dict(state.active_profile, state.profiles[state.active_profile])
+        preview_profile = ProfileSpec(
+            name=profile.name,
+            protocol=profile.protocol or OPENAI_COMPAT_PROTOCOL,
+            base_url=str(state.fields.get("base_url", profile.base_url) or profile.base_url),
+            api_key_env=profile.api_key_env,
+            auth_provider=profile.auth_provider,
+            extra_headers=dict(profile.extra_headers),
+            default_model=str(
+                state.fields.get("model", profile.default_model) or profile.default_model
+            ),
+            reasoning_effort=profile.reasoning_effort,
+            web_search_adapter=profile.web_search_adapter,
+            web_search_model=profile.web_search_model,
+            notes=profile.notes,
+            cache_capability=profile.cache_capability,
+            reasoning_trace_adapter=profile.reasoning_trace_adapter,
+        )
+        cfg = state._resolution_cfg()
+        model = str(preview_profile.default_model or getattr(cfg, "model", "") or "").strip()
+        base_url = str(preview_profile.base_url or getattr(cfg, "base_url", "") or "").strip()
+        provider_key = (
+            resolve_model_provider_key(
+                cfg=cfg,
+                model_name=model,
+                base_url=base_url,
+                profile_name=preview_profile.name,
+            )
+            or preview_profile.name
+        )
+        protocol = str(preview_profile.protocol or OPENAI_COMPAT_PROTOCOL).strip()
+        capabilities = get_provider_protocol_capabilities(
+            provider_key=provider_key,
+            protocol=protocol,
+        )
+        preset = find_preset_for_profile(preview_profile)
+        return resolve_effective_cache_capability(
+            provider_key=provider_key,
+            protocol=protocol,
+            model=model,
+            base_url=base_url,
+            transport_capabilities=capabilities,
+            preset_cache_capability=(preset.cache_capability if preset is not None else None),
+            profile_cache_capability=preview_profile.cache_capability,
+        )
+    except Exception as exc:
+        _LOGGER.warning(
+            "Effective cache capability resolution failed for profile %s: %s",
+            state.active_profile,
+            exc,
+        )
+        return None
+
+
+def _resolved_cache_policy_for_state(
+    state: ConfigMenuState,
+) -> ResolvedPromptCachePolicy | None:
+    policy, _error = _resolved_cache_policy_with_error_for_state(state)
+    return policy
+
+
+def _resolved_cache_policy_with_error_for_state(
+    state: ConfigMenuState,
+) -> tuple[ResolvedPromptCachePolicy | None, str | None]:
+    if not state.active_profile or state.active_profile not in state.profiles:
+        return None, None
+    try:
+        profile = ProfileSpec.from_dict(state.active_profile, state.profiles[state.active_profile])
+        cfg = state._resolution_cfg()
+        model = str(state.fields.get("model", profile.default_model) or profile.default_model)
+        base_url = str(state.fields.get("base_url", profile.base_url) or profile.base_url)
+        provider_key = (
+            resolve_model_provider_key(
+                cfg=cfg,
+                model_name=model,
+                base_url=base_url,
+                profile_name=profile.name,
+            )
+            or profile.name
+        )
+        protocol = str(profile.protocol or OPENAI_COMPAT_PROTOCOL).strip()
+        capabilities = get_provider_protocol_capabilities(
+            provider_key=provider_key,
+            protocol=protocol,
+        )
+        cache_capability = _effective_cache_capability_for_state(state)
+        policy = resolve_prompt_cache_policy(
+            cfg=cfg,
+            capabilities=capabilities,
+            provider_key=provider_key,
+            protocol=protocol,
+            model=model,
+            prompt_cache_key=str(state.fields.get("prompt_cache_key", "") or ""),
+            prompt_cache_retention=str(state.fields.get("prompt_cache_retention", "") or ""),
+            prompt_cache_namespace=None,
+            cache_capability=cache_capability,
+        )
+        return policy, None
+    except Exception as exc:
+        _LOGGER.warning(
+            "Prompt cache policy resolution failed for profile %s: %s",
+            state.active_profile,
+            exc,
+        )
+        return None, str(exc)
+
+
+def _cache_policy_summary_text(
+    policy: ResolvedPromptCachePolicy | None,
+    *,
+    compact: bool,
+    error: str | None = None,
+) -> str:
+    if policy is None:
+        if error:
+            return f"policy unavailable: {error}"
+        return "policy unknown"
+    fields = ", ".join(policy.emitted_fields) if policy.emitted_fields else "no fields"
+    if compact:
+        return f"{policy.status} {policy.strategy}"
+    allowed = ", ".join(policy.allowed_fields) if policy.allowed_fields else "none"
+    usage = ", ".join(policy.trusted_usage_fields) if policy.trusted_usage_fields else "none"
+    return (
+        f"{policy.status}; strategy={policy.strategy}; source={policy.capability_source}; "
+        f"allowed={allowed}; emits={fields}; usage={usage}"
+    )
+
+
+def _cache_aware_summary_text(state: ConfigMenuState) -> str:
+    aware = (
+        "on"
+        if _normalize_bool_text(
+            state.fields.get("cache_aware_compaction", "true"),
+            label="Cache-aware compaction",
+        )
+        else "off"
+    )
+    ratio = _normalize_cache_aware_min_trigger_ratio(
+        state.fields.get("cache_aware_min_trigger_ratio", _CACHE_AWARE_MIN_TRIGGER_RATIO_DEFAULT)
+    )
+    return f"compaction {aware} · min {ratio}"
 
 
 def _override_summary_text(values: dict[str, str]) -> str:
@@ -684,16 +1601,76 @@ def _override_summary_text(values: dict[str, str]) -> str:
     return _pluralize(count, "override")
 
 
+def _web_search_summary_text(state: ConfigMenuState) -> str:
+    policy = normalize_web_search_policy(state.fields.get("web_search_policy", "auto"))
+    mode = _normalize_web_search_mode(state.fields.get("web_search_mode", "auto"))
+    adapter = normalize_web_search_adapter(state.fields.get("web_search_adapter", "auto"))
+    suffix = f" / adapter {adapter}" if adapter != "auto" else ""
+    access = "model decides" if policy == "auto" else "off"
+    return f"access {access} / backend {mode}{suffix}"
+
+
+def _web_search_policy_rows() -> list[tuple[str, str, str]]:
+    return [
+        (
+            "auto",
+            "Model decides (recommended)",
+            "Expose web search to the active model and let it decide when external evidence is needed.",
+        ),
+        ("off", "Off", "Do not expose web search to the active model."),
+    ]
+
+
+def _web_search_mode_rows() -> list[tuple[str, str, str]]:
+    return [
+        (
+            "auto",
+            "Auto (recommended)",
+            "Use provider-native search when ready, otherwise use configured external search.",
+        ),
+        (
+            "external",
+            "External",
+            "Use model-independent search only; Tavily requires an external search API key.",
+        ),
+        (
+            "native",
+            "Provider native",
+            "Use only the active model provider's supported search adapter.",
+        ),
+        ("off", "Off", "Disable all web search backends."),
+    ]
+
+
 def _top_level_menu_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
     subagent_values = {
         **{role: state.role_models.get(role, "") for role in ROLE_ORDER},
         **{f"{role}_temperature": value for role, value in state.role_temperatures.items()},
     }
+    delegated = state.execution_backend == "delegated" and not _is_direct_subscription_id(
+        state.execution_runtime
+    )
+    direct_subscription = state.execution_backend == "delegated" and _is_direct_subscription_id(
+        state.execution_runtime
+    )
+    profile_summary = _profile_summary_text(state)
+    api_key_summary = _api_key_summary_text(state)
+    model_summary = _default_model_summary_text(state)
+    if delegated:
+        profile_summary = _inactive_native_summary(profile_summary)
+        api_key_summary = _inactive_native_summary(api_key_summary)
+        model_summary = _inactive_native_summary(model_summary)
+    elif direct_subscription:
+        api_key_summary = "not used · managed by AI subscription"
+    native_suffix = " (inactive)" if delegated else ""
+    api_key_suffix = " (not used)" if direct_subscription else native_suffix
     return [
-        ("profile", "Provider Profile", _profile_summary_text(state)),
-        ("api_key", "API Key", _api_key_summary_text(state)),
-        ("default", "Default Model", _default_model_summary_text(state)),
-        ("router", "Routing & Limits", _limits_summary_text(state)),
+        ("profile", f"Provider Profile{native_suffix}", profile_summary),
+        ("api_key", f"API Key{api_key_suffix}", api_key_summary),
+        ("default", f"Default Model{native_suffix}", model_summary),
+        ("web_search", "Web Search", _web_search_summary_text(state)),
+        ("cache", "Context & Cache", _cache_summary_text(state)),
+        ("router", "Routing", _limits_summary_text(state)),
         ("subagents", "Subagent model overrides", _override_summary_text(subagent_values)),
         (
             "forge",
@@ -701,7 +1678,134 @@ def _top_level_menu_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
             _override_summary_text(state.forge_role_models),
         ),
         ("sandbox", "Sandbox", _sandbox_summary_text(state)),
+        ("execution", "Model Access", _execution_summary_text(state)),
     ]
+
+
+def _run_execution_section(state: ConfigMenuState, console: Console) -> None:
+    while True:
+        selected_backend = _run_config_picker(
+            console=console,
+            title="Model Access",
+            subtitle="How would you like to connect Sylliptor to AI models?",
+            rows=[
+                (
+                    "native",
+                    "Use an API key",
+                    "Connect directly to a supported model provider.",
+                ),
+                (
+                    "delegated",
+                    "Use an AI subscription",
+                    "Sign in through a supported provider connection; API-key settings stay saved.",
+                ),
+            ],
+            current_value=state.execution_backend,
+        )
+        if selected_backend is None:
+            _print_section_cancelled(console, "Model Access")
+            return
+        if selected_backend == "native":
+            state.set_execution_backend("native")
+            console.print("[green]Model access:[/green] API key. Save to apply.")
+            return
+
+        rows = _runtime_setup_rows()
+        if not rows:
+            console.print(
+                "[yellow]No AI subscription connections are available in this build.[/yellow]"
+            )
+            return
+        current_runtime = state.execution_runtime
+        if current_runtime not in {value for value, _label, _description in rows}:
+            current_runtime = rows[0][0]
+        selected_runtime = _run_config_picker(
+            console=console,
+            title="AI Subscription",
+            subtitle=(
+                "Connect during setup (or with `sylliptor auth login`), then choose the "
+                "subscription model and reasoning effort in Default Model."
+            ),
+            rows=rows,
+            current_value=current_runtime,
+        )
+        if selected_runtime is None:
+            continue
+        state.set_execution_backend("delegated", runtime=selected_runtime)
+        runtime_label = next(
+            (label for value, label, _description in rows if value == selected_runtime),
+            selected_runtime,
+        )
+        console.print(
+            f"[green]Model access:[/green] AI subscription via {escape(runtime_label)}. "
+            "Save to apply."
+        )
+        _run_subscription_account_section(selected_runtime, console)
+        return
+
+
+def _run_subscription_account_section(provider_id: str, console: Console) -> None:
+    from ..provider_auth import ProviderAuthError, create_provider_auth
+
+    try:
+        adapter = create_provider_auth(provider_id)
+    except (ProviderAuthError, ValueError) as exc:
+        console.print(f"[red]Subscription connection unavailable:[/red] {escape(str(exc))}")
+        return
+    while True:
+        try:
+            status = adapter.account_status()
+        except ProviderAuthError as exc:
+            console.print(f"[red]Authentication status failed:[/red] {escape(str(exc))}")
+            return
+        account = status.account_label or ("connected" if status.connected else "not connected")
+        rows = [
+            (
+                "connect",
+                "Reconnect / switch account" if status.connected else "Connect account",
+                "Open the provider sign-in flow in your browser.",
+            )
+        ]
+        if status.connected:
+            rows.append(
+                (
+                    "disconnect",
+                    "Disconnect account",
+                    "Remove locally stored subscription credentials.",
+                )
+            )
+        rows.append(("back", "Back", "Return to configuration."))
+        action = _run_config_picker(
+            console=console,
+            title="AI Subscription Account",
+            subtitle=f"Account: {account}",
+            rows=rows,
+            current_value="back",
+        )
+        if action in {None, "back"}:
+            return
+        try:
+            if action == "disconnect":
+                if not _prompt_yes_no("Disconnect this AI subscription account? [y/N]"):
+                    continue
+                result = adapter.logout()
+                console.print(
+                    f"[yellow]{escape(result.detail or 'Disconnected locally.')}[/yellow]"
+                )
+                continue
+            if status.connected:
+                adapter.logout()
+            result = adapter.login(
+                method="browser",
+                output_write=lambda message: console.print(message, highlight=False),
+            )
+            if not result.connected:
+                raise ProviderAuthError(result.detail or "Provider sign-in did not complete.")
+            console.print(
+                f"[green]Connected:[/green] {escape(result.account_label or provider_id)}"
+            )
+        except ProviderAuthError as exc:
+            console.print(f"[red]Subscription account action failed:[/red] {escape(str(exc))}")
 
 
 def _sandbox_summary_text(state: ConfigMenuState) -> str:
@@ -726,6 +1830,42 @@ def _sandbox_mode_env_override() -> str | None:
 
 def _print_section_cancelled(console: Console, section_name: str) -> None:
     console.print(f'[dim]Section "{section_name}" cancelled.[/dim]')
+
+
+def _run_web_search_section(state: ConfigMenuState, console: Console) -> None:
+    fields_snapshot = dict(state.fields)
+    try:
+        policy = _run_config_picker(
+            console=console,
+            title="Web Search",
+            subtitle="When Sylliptor should search before asking the selected model to answer.",
+            rows=_web_search_policy_rows(),
+            current_value=normalize_web_search_policy(
+                state.fields.get("web_search_policy", "auto")
+            ),
+        )
+        if policy is None:
+            raise Abort()
+        state.set_field("web_search_policy", normalize_web_search_policy(policy))
+
+        mode = _run_config_picker(
+            console=console,
+            title="Web Search Backend",
+            subtitle=(
+                "How Sylliptor executes searches. Auto can use model-independent Tavily "
+                "when an external search key is configured."
+            ),
+            rows=_web_search_mode_rows(),
+            current_value=_normalize_web_search_mode(state.fields.get("web_search_mode", "auto")),
+        )
+        if mode is None:
+            raise Abort()
+        state.set_field("web_search_mode", _normalize_web_search_mode(mode))
+    except (Abort, EOFError, KeyboardInterrupt):
+        state.fields = fields_snapshot
+        _print_section_cancelled(console, "Web Search")
+        return
+    console.print("[green]Web search settings updated.[/green] Save to apply.")
 
 
 def _run_sandbox_section(state: ConfigMenuState, console: Console) -> None:
@@ -1279,6 +2419,12 @@ def _prompt_main_action(console: Console, state: ConfigMenuState) -> str:
 def _run_provider_section(state: ConfigMenuState, console: Console) -> None:
     console.print()
     console.rule("[bold]Provider Profile[/bold]")
+    if state.execution_backend == "delegated" and not _is_direct_subscription_id(
+        state.execution_runtime
+    ):
+        console.print(
+            "[yellow]API-key provider settings are preserved but inactive while an AI subscription is selected.[/yellow]"
+        )
     console.print(
         "[dim]A profile bundles provider URL, headers, and the API key env variable. "
         "The active profile is what Sylliptor uses for all model calls.[/dim]"
@@ -1296,7 +2442,11 @@ def _run_provider_section(state: ConfigMenuState, console: Console) -> None:
                 ("switch", "Switch active profile", "Choose another configured profile."),
                 ("add_preset", "Add from preset", "Pick a known provider (OpenAI, Anthropic, ...)"),
                 ("add_custom", "Add custom", "Use any OpenAI-compatible base URL"),
-                ("edit", "Edit current", "Change URL, key env, default model, headers, notes"),
+                (
+                    "edit",
+                    "Edit current",
+                    "Change URL, model, trace adapter, headers, and notes",
+                ),
                 ("remove", "Remove", "Delete a profile (applied on save)"),
                 ("back", "Back", "Return to the menu"),
             ],
@@ -1335,7 +2485,27 @@ def _run_profile_switch(state: ConfigMenuState, console: Console) -> None:
         current_value=state.active_profile or rows[0][0],
     )
     if selected:
-        state.set_active_profile_name(selected)
+        router_reset = state.set_active_profile_name(selected)
+        if router_reset:
+            console.print(
+                "[yellow]Router overrides (including Forge) now inherit the new provider's "
+                "default model.[/yellow]"
+            )
+        staged_profile = state.staged_api_key_target_profile()
+        if staged_profile and staged_profile != selected:
+            console.print(
+                f"[yellow]The unsaved API key remains bound to profile "
+                f"{escape(staged_profile)}.[/yellow]"
+            )
+        if (
+            state.clear_stored_key_confirmed
+            and state.clear_stored_key_profile
+            and state.clear_stored_key_profile != selected
+        ):
+            console.print(
+                f"[yellow]Stored-key removal remains bound to profile "
+                f"{escape(state.clear_stored_key_profile)}.[/yellow]"
+            )
         _print_state_provider_diagnostic_warnings(state, console)
 
 
@@ -1356,7 +2526,7 @@ def _run_profile_add_preset(state: ConfigMenuState, console: Console) -> None:
         selected = _run_config_picker(
             console=console,
             title="Advanced Provider Profile",
-            subtitle="Pick a compatibility, gateway, local, custom, or legacy provider preset",
+            subtitle="Pick a local, custom, or legacy OpenAI-compatible provider preset",
             rows=advanced_rows,
             current_value=advanced_rows[0][0] if advanced_rows else "openai",
         )
@@ -1372,11 +2542,15 @@ def _run_profile_add_preset(state: ConfigMenuState, console: Console) -> None:
             protocol=profile.protocol,
             base_url=base_url,
             api_key_env=profile.api_key_env,
+            auth_provider=profile.auth_provider,
             extra_headers=profile.extra_headers,
             default_model=profile.default_model,
+            reasoning_effort=profile.reasoning_effort,
             web_search_adapter=profile.web_search_adapter,
             web_search_model=profile.web_search_model,
             notes=profile.notes,
+            cache_capability=profile.cache_capability,
+            reasoning_trace_adapter=profile.reasoning_trace_adapter,
         )
     state.add_profile_spec(profile)
     console.print(f"[green]Profile {profile.name} added.[/green]")
@@ -1410,9 +2584,9 @@ def _provider_picker_rows(presets: list[ProfilePreset]) -> list[tuple[str, str, 
     rows.append(
         (
             _ADVANCED_PROVIDER_PRESETS_VALUE,
-            "Advanced / gateway / legacy providers",
-            "Show OpenAI-compatible gateways, local endpoints, custom endpoints, and legacy "
-            "first-party compatibility presets.",
+            "Advanced / local / compatibility providers",
+            "Show local endpoints (Ollama, LM Studio, vLLM), custom URLs, and legacy "
+            "OpenAI-compatible first-party presets.",
         )
     )
     return rows
@@ -1459,6 +2633,32 @@ def _prompt_web_search_adapter(console: Console, current: str) -> str:
     return normalize_web_search_adapter(current or "auto")
 
 
+def _prompt_reasoning_trace_adapter(
+    console: Console,
+    *,
+    protocol: str,
+    current: str,
+) -> str:
+    for _attempt in range(3):
+        value = _prompt_non_secret_text(
+            console,
+            "Reasoning trace adapter",
+            current,
+            "Reasoning trace adapter",
+        )
+        try:
+            return validate_reasoning_trace_adapter_for_protocol(
+                protocol=protocol,
+                adapter=value or "auto",
+            )
+        except (ConfigError, ValueError) as exc:
+            console.print(f"[red]{exc}[/red]")
+    return validate_reasoning_trace_adapter_for_protocol(
+        protocol=protocol,
+        adapter=current or "auto",
+    )
+
+
 def _run_profile_edit_current(state: ConfigMenuState, console: Console) -> None:
     if not state.active_profile or state.active_profile not in state.profiles:
         console.print(
@@ -1466,6 +2666,12 @@ def _run_profile_edit_current(state: ConfigMenuState, console: Console) -> None:
         )
         return
     profile = ProfileSpec.from_dict(state.active_profile, state.profiles[state.active_profile])
+    if profile.auth_provider:
+        console.print(
+            "[yellow]This subscription connection is provider-managed. Use Default Model "
+            "to choose its model and reasoning effort.[/yellow]"
+        )
+        return
     console.print(f"[dim]Protocol:[/dim] {profile.protocol} [dim](advanced/read-only)[/dim]")
     console.print(_build_profile_edit_current_panel(profile.name))
     console.print(
@@ -1478,6 +2684,11 @@ def _run_profile_edit_current(state: ConfigMenuState, console: Console) -> None:
     )
     default_model = _prompt_non_secret_text(
         console, "Default model", profile.default_model, "Default model"
+    )
+    reasoning_trace_adapter = _prompt_reasoning_trace_adapter(
+        console,
+        protocol=profile.protocol,
+        current=profile.reasoning_trace_adapter,
     )
     web_search_adapter = _prompt_web_search_adapter(console, profile.web_search_adapter)
     web_search_model = _prompt_non_secret_text(
@@ -1495,6 +2706,7 @@ def _run_profile_edit_current(state: ConfigMenuState, console: Console) -> None:
         base_url=base_url,
         api_key_env=api_key_env or None,
         default_model=default_model,
+        reasoning_trace_adapter=reasoning_trace_adapter,
         web_search_adapter=web_search_adapter or "auto",
         web_search_model=web_search_model,
         extra_headers=headers,
@@ -1525,6 +2737,7 @@ def _build_profile_edit_current_panel(profile_name: str) -> Panel:
             Text("  Base URL", style="dim"),
             Text("  API key env var NAME", style="dim"),
             Text("  Default model", style="dim"),
+            Text("  Reasoning trace adapter", style="dim"),
             Text("  Web search adapter", style="dim"),
             Text("  Web search model", style="dim"),
             Text("  Extra headers", style="dim"),
@@ -1569,13 +2782,19 @@ def _run_profile_remove(state: ConfigMenuState, console: Console) -> None:
         current_value=state.active_profile or rows[0][0],
     )
     if selected and _prompt_yes_no(f"Remove profile {selected}? [y/N]"):
-        state.remove_profile_name(selected)
+        staged_key_discarded = state.remove_profile_name(selected)
         console.print(f"[yellow]Profile {selected} will be removed on save.[/yellow]")
+        if staged_key_discarded:
+            console.print("[yellow]Its unsaved API key was discarded.[/yellow]")
 
 
 def _run_api_key_section(state: ConfigMenuState, console: Console) -> None:
     console.print()
     console.rule("[bold]API Key[/bold]")
+    if state.execution_backend == "delegated":
+        console.print(
+            "[yellow]This API key is preserved separately while an AI subscription is selected.[/yellow]"
+        )
     console.print("[dim]Used by the active profile for all model calls.[/dim]")
     console.print(f"Stored: {state.masked_api_key} · source: {state.api_key_source}")
     try:
@@ -1607,15 +2826,28 @@ def _run_api_key_section(state: ConfigMenuState, console: Console) -> None:
 def _run_default_section(state: ConfigMenuState, console: Console) -> None:
     console.print()
     console.rule("[bold]Default Model[/bold]")
+    direct_subscription = _active_subscription_profile(state) is not None
+    if state.execution_backend == "delegated" and not direct_subscription:
+        console.print(
+            "[yellow]This API-key model is preserved but inactive while an AI subscription is selected.[/yellow]"
+        )
     console.print(
         "[dim]Used when you chat with the agent. Subagents and Forge roles fall back "
         "to this model unless overridden in the sections below.[/dim]"
     )
     try:
         model = _prompt_default_model(console, state)
-        base_url = _prompt_text("Base URL", state.fields["base_url"])
+        base_url = (
+            state.fields["base_url"]
+            if direct_subscription
+            else _prompt_text("Base URL", state.fields["base_url"])
+        )
         state.set_field("base_url", base_url)
-        thinking_label = _prompt_thinking_label(console, state.thinking_label)
+        thinking_label = _prompt_thinking_label(
+            console,
+            state.thinking_label,
+            labels=_thinking_labels_for_state(state, model=model),
+        )
         timeout = _prompt_positive_float_text(
             console,
             "Request timeout (seconds)",
@@ -1629,10 +2861,181 @@ def _run_default_section(state: ConfigMenuState, console: Console) -> None:
     state.set_field("model", model)
     state.set_thinking_label(thinking_label)
     state.set_field("llm_timeout_s", timeout)
+    if direct_subscription:
+        console.print("[dim]Model and reasoning choices came from your subscription account.[/dim]")
+    else:
+        console.print(
+            "[dim]Reasoning effort. Some providers ignore this until they add native "
+            "reasoning support.[/dim]"
+        )
+
+
+def _run_cache_section(state: ConfigMenuState, console: Console) -> None:
+    console.print()
+    console.rule("[bold]Context & Cache[/bold]")
     console.print(
-        "[dim]Reasoning effort. Some providers ignore this until they add native "
-        "reasoning support.[/dim]"
+        "[dim]Controls provider prompt caching for repeated system/context payloads. "
+        "Auto mode derives safe provider-aware cache settings when the active API supports them.[/dim]"
     )
+    policy, policy_error = _resolved_cache_policy_with_error_for_state(state)
+    console.print(
+        "[dim]Effective cache policy: "
+        + escape(
+            _cache_policy_summary_text(
+                policy,
+                compact=False,
+                error=policy_error,
+            )
+        )
+        + "[/dim]"
+    )
+    fields_snapshot = dict(state.fields)
+    try:
+        mode = _prompt_prompt_cache_mode(console, state.fields["prompt_cache_mode"])
+        state.set_field("prompt_cache_mode", mode)
+        state.set_field(
+            "prompt_cache_key",
+            _prompt_optional_config_text(
+                console,
+                "Manual cache key",
+                state.fields["prompt_cache_key"],
+                "manual cache key",
+            ),
+        )
+        state.set_field(
+            "prompt_cache_retention",
+            _prompt_optional_config_text(
+                console,
+                "Manual cache retention",
+                state.fields["prompt_cache_retention"],
+                "manual cache retention",
+            ),
+        )
+        state.set_field(
+            "anthropic_prompt_cache_enabled",
+            _prompt_anthropic_prompt_cache_enabled(
+                console,
+                state.fields["anthropic_prompt_cache_enabled"],
+            ),
+        )
+        state.set_field(
+            "anthropic_prompt_cache_ttl",
+            _prompt_anthropic_prompt_cache_ttl(
+                console,
+                state.fields["anthropic_prompt_cache_ttl"],
+            ),
+        )
+        state.set_field(
+            "cache_aware_compaction",
+            _prompt_cache_aware_compaction_enabled(
+                console,
+                state.fields["cache_aware_compaction"],
+            ),
+        )
+        state.set_field(
+            "cache_aware_min_trigger_ratio",
+            _prompt_cache_aware_min_trigger_ratio(
+                console,
+                state.fields["cache_aware_min_trigger_ratio"],
+            ),
+        )
+    except (Abort, EOFError, KeyboardInterrupt):
+        state.fields = dict(fields_snapshot)
+        console.print("")
+        _print_section_cancelled(console, "Context & Cache")
+        return
+    console.print("[green]Context/cache settings updated.[/green] Save to apply.")
+
+
+def _prompt_prompt_cache_mode(console: Console, current: str) -> str:
+    rows = [
+        (
+            "auto",
+            "Auto",
+            "Derive provider-aware cache settings when the active API supports caching.",
+        ),
+        (
+            "manual",
+            "Manual",
+            "Use the manual cache key/retention below for compatible providers.",
+        ),
+        ("off", "Off", "Disable prompt caching for all providers."),
+    ]
+    value = _run_config_picker(
+        console=console,
+        title="Context & Cache",
+        subtitle="Prompt cache mode.",
+        rows=rows,
+        current_value=_normalize_prompt_cache_mode(current),
+    )
+    if value is None:
+        raise Abort()
+    return _normalize_prompt_cache_mode(value)
+
+
+def _prompt_anthropic_prompt_cache_enabled(console: Console, current: str) -> str:
+    rows = [
+        ("true", "On", "Enable Anthropic cache_control in manual mode."),
+        ("false", "Off", "Only auto mode enables Anthropic cache_control."),
+    ]
+    value = _run_config_picker(
+        console=console,
+        title="Context & Cache",
+        subtitle="Anthropic cache_control override.",
+        rows=rows,
+        current_value="true"
+        if _normalize_bool_text(current, label="Anthropic prompt cache")
+        else "false",
+    )
+    if value is None:
+        raise Abort()
+    return "true" if _normalize_bool_text(value, label="Anthropic prompt cache") else "false"
+
+
+def _prompt_anthropic_prompt_cache_ttl(console: Console, current: str) -> str:
+    rows = [
+        ("5m", "5 minutes", "Lower cache lifetime; safest default."),
+        ("1h", "1 hour", "Longer lifetime for stable long-running coding sessions."),
+    ]
+    value = _run_config_picker(
+        console=console,
+        title="Context & Cache",
+        subtitle="Anthropic cache_control TTL.",
+        rows=rows,
+        current_value=_normalize_anthropic_prompt_cache_ttl(current),
+    )
+    if value is None:
+        raise Abort()
+    return _normalize_anthropic_prompt_cache_ttl(value)
+
+
+def _prompt_cache_aware_compaction_enabled(console: Console, current: str) -> str:
+    rows = [
+        ("true", "On", "Compact earlier when the next request is likely to miss provider cache."),
+        ("false", "Off", "Use only the normal compaction trigger ratio."),
+    ]
+    value = _run_config_picker(
+        console=console,
+        title="Context & Cache",
+        subtitle="Cache-aware compaction trigger.",
+        rows=rows,
+        current_value="true"
+        if _normalize_bool_text(current, label="Cache-aware compaction")
+        else "false",
+    )
+    if value is None:
+        raise Abort()
+    return "true" if _normalize_bool_text(value, label="Cache-aware compaction") else "false"
+
+
+def _prompt_cache_aware_min_trigger_ratio(console: Console, current: str) -> str:
+    for _attempt in range(3):
+        value = _prompt_text("Cache-aware min trigger ratio", current)
+        try:
+            return _normalize_cache_aware_min_trigger_ratio(value)
+        except ValueError as exc:
+            console.print(f"[red]{escape(str(exc))}[/red]")
+    return _normalize_cache_aware_min_trigger_ratio(current)
 
 
 def _prompt_default_model(console: Console, state: ConfigMenuState) -> str:
@@ -1655,6 +3058,8 @@ def _prompt_default_model(console: Console, state: ConfigMenuState) -> str:
 
 
 def _default_model_picker_subtitle(state: ConfigMenuState) -> str:
+    if _active_subscription_profile(state) is not None:
+        return "Pick a model currently advertised for your connected subscription."
     preset = _active_preset(state)
     if preset is None:
         return "Pick the active profile model, or type a custom model ID."
@@ -1704,6 +3109,27 @@ def _default_model_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
     seen: set[str] = set()
     current_model = str(state.fields.get("model") or "").strip()
 
+    if _active_subscription_profile(state) is not None:
+        subscription_models = _subscription_models_for_state(state)
+        for model in subscription_models:
+            if model.id in seen:
+                continue
+            seen.add(model.id)
+            efforts = ", ".join(effort.id for effort in model.reasoning_efforts)
+            description = model.description
+            if efforts:
+                description = f"{description} · reasoning: {efforts}" if description else efforts
+            rows.append((model.id, model.label, description))
+        if not rows and current_model:
+            rows.append(
+                (
+                    current_model,
+                    current_model,
+                    "saved model · live subscription catalog unavailable",
+                )
+            )
+        return rows
+
     if current_model:
         rows.append((current_model, current_model, "current configured model"))
         seen.add(current_model)
@@ -1745,19 +3171,22 @@ def _prompt_router_model(console: Console, state: ConfigMenuState) -> str:
     rows = _router_model_rows(state)
     current_model = str(state.role_models.get("router", "") or "").strip()
     row_values = {value for value, _label, _description in rows}
-    current_value = (
-        current_model
-        if current_model in row_values
-        else (_CUSTOM_MODEL_VALUE if current_model else _INHERIT_DEFAULT_MODEL_VALUE)
-    )
+    if current_model in row_values:
+        current_value = current_model
+    elif current_model and _CUSTOM_MODEL_VALUE in row_values:
+        current_value = _CUSTOM_MODEL_VALUE
+    else:
+        current_value = _INHERIT_DEFAULT_MODEL_VALUE
     selected = _run_config_picker(
         console=console,
         title="Router Model",
-        subtitle="Pick a cheap model for request routing, or inherit the default model.",
+        subtitle=_router_model_picker_subtitle(state),
         rows=rows,
         current_value=current_value,
     )
     if selected is None:
+        raise Abort()
+    if selected not in row_values:
         raise Abort()
     if selected == _INHERIT_DEFAULT_MODEL_VALUE:
         return ""
@@ -1778,24 +3207,68 @@ def _router_model_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
     rows.append(
         (
             _INHERIT_DEFAULT_MODEL_VALUE,
-            "Inherit default model",
+            "Same as default model (recommended)",
             inherit_description,
         )
     )
     seen.add(_INHERIT_DEFAULT_MODEL_VALUE)
 
     current_model = str(state.role_models.get("router", "") or "").strip()
+
+    # Subscription transports must use a model advertised by the connected
+    # account.  Provider preset suggestions and arbitrary model ids are not a
+    # reliable capability signal for these managed endpoints.  When the live
+    # catalog cannot be loaded, keep the already-saved override selectable so an
+    # offline visit to /config cannot silently strand or erase it.
+    if _active_subscription_profile(state) is not None:
+        subscription_models = _subscription_models_for_state(state)
+        for model in subscription_models:
+            model_id = str(getattr(model, "id", "") or "").strip()
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            rows.append(
+                (
+                    model_id,
+                    str(getattr(model, "label", "") or model_id).strip() or model_id,
+                    str(getattr(model, "description", "") or "").strip(),
+                )
+            )
+        if not subscription_models and current_model and current_model not in seen:
+            rows.append(
+                (
+                    current_model,
+                    current_model,
+                    "saved router override · live subscription catalog unavailable",
+                )
+            )
+        return rows
+
     if current_model:
         rows.append((current_model, current_model, "current router override"))
         seen.add(current_model)
 
     preset = _active_preset(state)
-    if preset is not None:
+    provider_models = _provider_models_for_state(state)
+    if not provider_models and preset is not None:
         for value, label, description in _preset_model_option_rows(preset):
             if value in seen:
                 continue
             seen.add(value)
             rows.append((value, label, description))
+
+    for model in provider_models:
+        model_id = str(getattr(model, "id", "") or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        rows.append(
+            (
+                model_id,
+                str(getattr(model, "label", "") or model_id).strip() or model_id,
+                str(getattr(model, "description", "") or "live provider catalog").strip(),
+            )
+        )
 
     rows.append(
         (
@@ -1807,12 +3280,37 @@ def _router_model_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
     return rows
 
 
+def _router_model_picker_subtitle(state: ConfigMenuState) -> str:
+    default_model = str(state.fields.get("model") or "").strip()
+    current_override = str(state.role_models.get("router", "") or "").strip()
+    if current_override:
+        subtitle = (
+            f"The router currently uses {current_override}. Choose another active-provider model, "
+            "or select Same as default to keep it synchronized with the main model."
+        )
+    elif default_model:
+        subtitle = (
+            f"The router currently follows {default_model}. Choose an override from the active "
+            "provider, or keep it synchronized with the default model."
+        )
+    else:
+        subtitle = (
+            "The router follows the default model unless you choose an active-provider override."
+        )
+    warning = str(state.model_catalog_warning or "").strip()
+    if not warning and _active_subscription_profile(state) is not None:
+        warning = str(state.config_warning or "").strip()
+    if warning:
+        subtitle = f"{subtitle} {warning}"
+    return subtitle
+
+
 def _run_router_section(state: ConfigMenuState, console: Console) -> None:
     console.print()
-    console.rule("[bold]Routing & Limits[/bold]")
+    console.rule("[bold]Routing[/bold]")
     console.print(
-        "[dim]Choose the model used for lightweight request routing and how many tool steps "
-        "the agent may take.[/dim]"
+        "[dim]Choose the model and behavior used for lightweight request routing. "
+        "Agent execution continues until completion unless an explicit safety limit is supplied.[/dim]"
     )
     role_model_snapshot = dict(state.role_models)
     fields_snapshot = dict(state.fields)
@@ -1832,39 +3330,12 @@ def _run_router_section(state: ConfigMenuState, console: Console) -> None:
         if routing_mode is None:
             raise Abort()
         state.set_routing_mode(routing_mode)
-        step_budget_rows = [
-            ("adaptive", "Adaptive", "Sylliptor adjusts the budget based on task complexity"),
-            ("fixed", "Fixed", "Always use the configured limit, no adjustment"),
-        ]
-        step_budget_policy = _run_config_picker(
-            console=console,
-            title="Step budget policy",
-            subtitle=f"Active: {state.fields['step_budget_policy']}",
-            rows=step_budget_rows,
-            current_value=state.fields["step_budget_policy"],
-        )
-        if step_budget_policy is None:
-            raise Abort()
-        state.set_step_budget_policy(step_budget_policy)
-
-        state.set_max_steps(
-            _prompt_positive_int_text(console, "Max steps per response", state.fields["max_steps"])
-        )
-        state.set_task_max_steps(
-            _prompt_positive_int_text(console, "Max steps per task", state.fields["task_max_steps"])
-        )
-        state.set_subagent_max_steps(
-            _prompt_positive_int_text(
-                console,
-                "Max steps per subagent run",
-                state.fields["subagent_max_steps"],
-            )
-        )
     except (Abort, EOFError, KeyboardInterrupt):
         state.role_models = dict(role_model_snapshot)
         state.fields = dict(fields_snapshot)
+        state._sync_active_profile_router_maps()
         console.print("")
-        _print_section_cancelled(console, "Routing & Limits")
+        _print_section_cancelled(console, "Routing")
         return
 
 
@@ -1875,6 +3346,12 @@ def _run_subagent_section(state: ConfigMenuState, console: Console) -> None:
         "[dim]Override the model used by the agent's internal roles. Leave empty to inherit "
         "the default model.[/dim]"
     )
+    temperature_controls_available = _temperature_controls_available(state)
+    if not temperature_controls_available:
+        console.print(
+            "[dim]Temperature is managed by the active AI subscription. Choose the model "
+            "and reasoning effort in Default Model instead.[/dim]"
+        )
     _print_role_explainer(console, roles=ROLE_ORDER)
     role_model_snapshot = dict(state.role_models)
     role_temp_snapshot = dict(state.role_temperatures)
@@ -1886,7 +3363,7 @@ def _run_subagent_section(state: ConfigMenuState, console: Console) -> None:
                 state.role_models.get(role, ""),
             )
             state.set_role_model(role, model)
-            if role in _ROLE_TEMPERATURE_FIELDS:
+            if temperature_controls_available and role in _ROLE_TEMPERATURE_FIELDS:
                 temperature = _prompt_override_text(
                     f"  {role_label} temperature (Enter to skip)",
                     state.role_temperatures.get(role, ""),
@@ -1924,6 +3401,7 @@ def _run_forge_section(state: ConfigMenuState, console: Console) -> None:
             state.set_forge_role_model(role, model)
     except (Abort, EOFError, KeyboardInterrupt):
         state.forge_role_models = dict(role_model_snapshot)
+        state._sync_active_profile_router_maps()
         console.print("")
         _print_section_cancelled(console, "Forge model overrides")
         return
@@ -1947,8 +3425,9 @@ def _save_and_exit(
     try:
         save_config(cfg)
         if state.new_api_key.strip():
-            if state.active_profile:
-                save_persisted_profile_key(state.active_profile, state.new_api_key.strip())
+            key_profile = state.staged_api_key_target_profile()
+            if key_profile:
+                save_persisted_profile_key(key_profile, state.new_api_key.strip())
             else:
                 save_persisted_api_key(state.new_api_key.strip())
         if state.clear_stored_key_confirmed:
@@ -1995,6 +3474,25 @@ def _prompt_text(prompt: str, default: str) -> str:
     return value.strip()
 
 
+def _prompt_optional_config_text(
+    console: Console,
+    prompt: str,
+    current: str,
+    field_name: str,
+) -> str:
+    display_value = str(current or "").strip() or "(not set)"
+    console.print(
+        f"[dim]Current {field_name}: {escape(display_value)}. "
+        "Enter keeps it; type 'clear' to unset.[/dim]"
+    )
+    value = str(typer.prompt(prompt, default="", show_default=False)).strip()
+    if not value:
+        return str(current or "").strip()
+    if value.casefold() == "clear":
+        return ""
+    return value
+
+
 def _prompt_non_secret_text(
     console: Console,
     prompt: str,
@@ -2035,7 +3533,14 @@ def _prompt_override_text(prompt: str, default: str) -> str:
     return value.strip()
 
 
-def _prompt_thinking_label(console: Console, current: str) -> str:
+def _prompt_thinking_label(
+    console: Console,
+    current: str,
+    *,
+    labels: tuple[str, ...] | None = None,
+) -> str:
+    resolved_labels = labels or THINKING_LABELS
+    current_value = current if current in resolved_labels else "auto"
     rows = [
         (
             label,
@@ -2047,10 +3552,12 @@ def _prompt_thinking_label(console: Console, current: str) -> str:
                 "medium": "medium reasoning budget",
                 "high": "large reasoning budget",
                 "xhigh": "maximum reasoning budget when supported",
+                "max": "provider maximum reasoning budget when supported",
+                "ultra": "provider ultra reasoning budget when supported",
                 "auto": "let the provider decide",
-            }[label],
+            }.get(label, "provider-specific reasoning budget"),
         )
-        for label in THINKING_LABELS
+        for label in resolved_labels
     ]
     value = _run_config_picker(
         console=console,
@@ -2059,11 +3566,193 @@ def _prompt_thinking_label(console: Console, current: str) -> str:
             "Reasoning effort. Some providers ignore this until they add native reasoning support."
         ),
         rows=rows,
-        current_value=current,
+        current_value=current_value,
     )
     if value is None:
         return current
     return _normalize_thinking_label(value)
+
+
+def _active_subscription_profile(state: ConfigMenuState) -> ProfileSpec | None:
+    if not state.active_profile or state.active_profile not in state.profiles:
+        return None
+    profile = ProfileSpec.from_dict(state.active_profile, state.profiles[state.active_profile])
+    return profile if profile.auth_provider else None
+
+
+def _temperature_controls_available(state: ConfigMenuState) -> bool:
+    """Return whether the active transport accepts caller-controlled sampling."""
+
+    profile = _active_subscription_profile(state)
+    if profile is None:
+        return True
+    try:
+        from ..provider_auth import create_provider_auth
+
+        adapter = create_provider_auth(profile.auth_provider or "")
+    except Exception:  # noqa: BLE001 - unknown adapters must not expose a false control
+        return False
+    return bool(getattr(adapter, "supports_temperature", False))
+
+
+def _provider_catalog_profile_for_state(state: ConfigMenuState) -> ProfileSpec | None:
+    """Build the active API profile as currently staged in the config UI."""
+
+    if not state.active_profile or state.active_profile not in state.profiles:
+        return None
+    profile = ProfileSpec.from_dict(
+        state.active_profile,
+        state.profiles[state.active_profile],
+    )
+    if profile.auth_provider:
+        return None
+    staged_base_url = str(state.fields.get("base_url", "") or "").strip()
+    return ProfileSpec(
+        name=profile.name,
+        protocol=profile.protocol,
+        base_url=staged_base_url or profile.base_url,
+        api_key_env=profile.api_key_env,
+        auth_provider=None,
+        extra_headers=dict(profile.extra_headers),
+        default_model=str(state.fields.get("model", "") or profile.default_model).strip(),
+        reasoning_effort=profile.reasoning_effort,
+        web_search_adapter=profile.web_search_adapter,
+        web_search_model=profile.web_search_model,
+        notes=profile.notes,
+        cache_capability=profile.cache_capability,
+        reasoning_trace_adapter=profile.reasoning_trace_adapter,
+    )
+
+
+def _provider_models_for_state(state: ConfigMenuState) -> tuple[Any, ...]:
+    """Load and cache the active API provider's live router-capable models.
+
+    Curated preset rows remain the offline fallback. Discovery is deliberately
+    state-local so repeatedly repainting the TUI, or opening Default Model after
+    Router Model, never repeats a provider request.
+    """
+
+    if state._provider_models_loaded:
+        return state._provider_models_cache
+
+    state._provider_models_loaded = True
+    state._provider_models_cache = ()
+    state.model_catalog_warning = None
+    profile = _provider_catalog_profile_for_state(state)
+    if profile is None or not profile.base_url:
+        return ()
+
+    # The hosted trial has its own public, proxy-aware discovery path in
+    # _preset_model_option_rows; do not make a duplicate generic /models call.
+    preset = _active_preset(state)
+    try:
+        from ..sylliptor_cloud import PROFILE_KEY
+
+        if preset is not None and preset.key == PROFILE_KEY:
+            return ()
+    except Exception:  # noqa: BLE001 - optional cloud configuration cannot break /config
+        pass
+
+    api_key = state.staged_api_key_for_active_profile()
+    clearing_active_key = bool(
+        state.clear_stored_key_confirmed
+        and (not state.clear_stored_key_profile or state.clear_stored_key_profile == profile.name)
+    )
+    if not api_key and not clearing_active_key:
+        try:
+            api_key = str(resolve_api_key(state._resolution_cfg()).key or "").strip()
+        except ConfigError:
+            api_key = ""
+
+    # Avoid a guaranteed authentication failure for hosted profiles that require
+    # a key. Local/custom endpoints without api_key_env are still queried.
+    if not api_key and profile.api_key_env and not profile.extra_headers:
+        return ()
+
+    try:
+        from ..provider_model_catalog import (
+            ProviderModelCatalogError,
+            discover_provider_models,
+        )
+    except Exception:  # noqa: BLE001 - an optional catalog path cannot break /config
+        state.model_catalog_warning = (
+            "Live model catalog unavailable; showing saved and curated models."
+        )
+        return ()
+    try:
+        models = tuple(
+            discover_provider_models(
+                profile=profile,
+                api_key=api_key or None,
+                timeout_s=3.0,
+            )
+        )
+    except ProviderModelCatalogError as exc:
+        detail = str(exc).strip()
+        suffix = f" ({detail})" if detail and len(detail) <= 120 else ""
+        state.model_catalog_warning = (
+            f"Live model catalog unavailable{suffix}; showing saved and curated models."
+        )
+        return ()
+    except Exception:  # noqa: BLE001 - never surface third-party exception text or secrets
+        state.model_catalog_warning = (
+            "Live model catalog unavailable; showing saved and curated models."
+        )
+        return ()
+
+    state._provider_models_cache = models
+    if not models:
+        state.model_catalog_warning = (
+            "The provider returned no router-capable models; showing saved and curated models."
+        )
+    return models
+
+
+def _subscription_models_for_state(state: ConfigMenuState) -> tuple[Any, ...]:
+    profile = _active_subscription_profile(state)
+    if profile is None or not profile.auth_provider:
+        return ()
+    if state._subscription_models_loaded:
+        return state._subscription_models_cache
+    try:
+        from ..provider_auth import create_provider_auth
+
+        models = tuple(create_provider_auth(profile.auth_provider).list_models(refresh=True))
+        state._subscription_models_cache = models
+        state._subscription_models_loaded = True
+        state.config_warning = None
+        return models
+    except Exception as exc:  # noqa: BLE001 - config remains usable while offline
+        state.config_warning = f"Subscription model catalog unavailable: {exc}"
+        state._subscription_models_cache = ()
+        state._subscription_models_loaded = True
+        return ()
+
+
+def _thinking_labels_for_state(
+    state: ConfigMenuState,
+    *,
+    model: str | None = None,
+) -> tuple[str, ...]:
+    profile = _active_subscription_profile(state)
+    if profile is None:
+        return THINKING_LABELS
+    model_id = str(model or state.fields.get("model") or "").strip()
+    selected = next(
+        (item for item in _subscription_models_for_state(state) if item.id == model_id),
+        None,
+    )
+    if selected is None:
+        current = _normalize_thinking_label(state.thinking_label)
+        if not state._subscription_models_cache and current != "auto":
+            return ("auto", current)
+        return ("auto",)
+    labels: list[str] = ["auto"]
+    for effort in selected.reasoning_efforts:
+        label = "off" if effort.id == "none" else effort.id
+        if label in THINKING_LABELS and label not in labels:
+            labels.append(label)
+    return tuple(labels)
 
 
 def _prompt_positive_float_text(console: Console, prompt: str, current: str) -> str:
@@ -2109,7 +3798,14 @@ def _pending_change_count(state: ConfigMenuState) -> int:
     original = state._original
     current = state.snapshot()
     count = 0
-    for key in ("fields", "role_models", "forge_role_models", "role_temperatures", "profiles"):
+    for key in (
+        "fields",
+        "role_models",
+        "forge_role_models",
+        "role_temperatures",
+        "profiles",
+        "agent_runtimes",
+    ):
         original_values = original.get(key) if isinstance(original.get(key), dict) else {}
         current_values = current.get(key) if isinstance(current.get(key), dict) else {}
         for field_name in set(original_values) | set(current_values):
@@ -2117,10 +3813,13 @@ def _pending_change_count(state: ConfigMenuState) -> int:
                 count += 1
     for key in (
         "active_profile",
+        "execution_backend",
+        "execution_runtime",
         "default_workspace_path",
         "thinking_label",
         "thinking_label_explicitly_set",
         "new_api_key",
+        "new_api_key_profile",
         "clear_stored_key_confirmed",
     ):
         if current.get(key) != original.get(key):
@@ -2161,7 +3860,7 @@ def thinking_label_from_cfg(cfg: AppConfig) -> str:
     reasoning_effort = resolve_llm_reasoning_effort(cfg)
     if reasoning_effort == "none":
         return "off"
-    if reasoning_effort in _TRUE_THINKING_LABELS:
+    if reasoning_effort and reasoning_effort != "none":
         return reasoning_effort
     if value is False:
         return "off"
@@ -2170,14 +3869,14 @@ def thinking_label_from_cfg(cfg: AppConfig) -> str:
     hint = ""
     if isinstance(cfg.extra_fields, dict):
         hint = str(cfg.extra_fields.get(_THINKING_LABEL_EXTRA_FIELD) or "").strip().lower()
-    if hint in _TRUE_THINKING_LABELS:
+    if hint in THINKING_LABELS and hint not in {"auto", "off"}:
         return hint
     return "medium"
 
 
 def _set_thinking_label_hint(cfg: AppConfig, label: str) -> None:
     normalized = _normalize_thinking_label(label)
-    if normalized in _TRUE_THINKING_LABELS:
+    if normalized not in {"off", "auto"}:
         cfg.extra_fields[_THINKING_LABEL_EXTRA_FIELD] = normalized
         return
     cfg.extra_fields.pop(_THINKING_LABEL_EXTRA_FIELD, None)
@@ -2208,10 +3907,92 @@ def _normalize_routing_mode(value: str) -> str:
 
 def _normalize_step_budget_policy(value: str) -> str:
     normalized = str(value or "").strip().lower()
+    aliases = {"adaptive": "autonomous", "fixed": "limited"}
     if normalized not in STEP_BUDGET_POLICIES:
         allowed = ", ".join(STEP_BUDGET_POLICIES)
         raise ValueError(f"Step budget policy must be one of: {allowed}")
+    return aliases.get(normalized, normalized)
+
+
+def _normalize_prompt_cache_mode(value: Any) -> str:
+    normalized = str(value or "").strip().lower() or "manual"
+    if normalized not in PROMPT_CACHE_MODES:
+        allowed = ", ".join(PROMPT_CACHE_MODES)
+        raise ValueError(f"Prompt cache mode must be one of: {allowed}")
     return normalized
+
+
+def _normalize_anthropic_prompt_cache_ttl(value: Any) -> str:
+    normalized = str(value or "").strip().lower() or "5m"
+    if normalized not in ANTHROPIC_PROMPT_CACHE_TTLS:
+        allowed = ", ".join(ANTHROPIC_PROMPT_CACHE_TTLS)
+        raise ValueError(f"Anthropic prompt cache TTL must be one of: {allowed}")
+    return normalized
+
+
+def _raw_compaction_extra_fields(cfg: AppConfig) -> dict[str, Any]:
+    raw = cfg.extra_fields.get("compaction") if isinstance(cfg.extra_fields, dict) else None
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _cache_aware_compaction_bool(value: Any) -> bool:
+    if value is None:
+        return _CACHE_AWARE_COMPACTION_DEFAULT
+    try:
+        return _normalize_bool_text(value, label="Cache-aware compaction")
+    except ValueError:
+        return _CACHE_AWARE_COMPACTION_DEFAULT
+
+
+def _cache_aware_compaction_text(value: Any) -> str:
+    return "true" if _cache_aware_compaction_bool(value) else "false"
+
+
+def _parse_cache_aware_min_trigger_ratio(value: Any) -> float:
+    raw = _CACHE_AWARE_MIN_TRIGGER_RATIO_DEFAULT if value is None else value
+    try:
+        ratio = float(str(raw).strip() or _CACHE_AWARE_MIN_TRIGGER_RATIO_DEFAULT)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(_cache_aware_min_trigger_ratio_error()) from exc
+    if (
+        not math.isfinite(ratio)
+        or ratio <= _CACHE_AWARE_MIN_TRIGGER_RATIO_MIN
+        or ratio >= _CACHE_AWARE_MIN_TRIGGER_RATIO_MAX
+    ):
+        raise ValueError(_cache_aware_min_trigger_ratio_error())
+    return ratio
+
+
+def _cache_aware_min_trigger_ratio_value(value: Any) -> float:
+    try:
+        return _parse_cache_aware_min_trigger_ratio(value)
+    except ValueError:
+        return _CACHE_AWARE_MIN_TRIGGER_RATIO_DEFAULT
+
+
+def _cache_aware_min_trigger_ratio_text(value: Any) -> str:
+    return _format_number(_cache_aware_min_trigger_ratio_value(value))
+
+
+def _normalize_cache_aware_min_trigger_ratio(value: Any) -> str:
+    return _format_number(_parse_cache_aware_min_trigger_ratio(value))
+
+
+def _cache_aware_min_trigger_ratio_error() -> str:
+    return (
+        "Cache-aware compaction min trigger ratio must be greater than "
+        f"{_CACHE_AWARE_MIN_TRIGGER_RATIO_MIN} and less than "
+        f"{_CACHE_AWARE_MIN_TRIGGER_RATIO_MAX}."
+    )
+
+
+def _normalize_bool_text(value: Any, *, label: str) -> bool:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{label} must be true or false.")
 
 
 def _thinking_config_text(value: bool | None) -> str:

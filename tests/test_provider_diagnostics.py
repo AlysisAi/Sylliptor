@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -16,6 +17,11 @@ from sylliptor_agent_cli.provider_diagnostics import (
     build_provider_diagnostics,
     validate_active_provider_live,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_generic_web_search_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_API_KEY", raising=False)
 
 
 def _env(tmp_path: Path) -> dict[str, str]:
@@ -105,6 +111,67 @@ def test_provider_diagnostics_shows_compatibility_protocol_and_external_search(
     assert "api.openai.com" in output
     assert "sk-openai-secret-value" not in output
     assert "tvly-secret-value" not in output
+
+
+def test_provider_diagnostics_surfaces_effective_cache_policy() -> None:
+    cfg = _cfg_with_profile(
+        ProfileSpec(
+            name="openai-responses",
+            protocol="openai_responses",
+            base_url="https://api.openai.com/v1",
+            api_key_env="OPENAI_API_KEY",
+            default_model="gpt-5.5",
+            web_search_adapter="openai_responses",
+        )
+    )
+
+    diagnostics = build_provider_diagnostics(cfg)
+    rows = dict(diagnostics.rows())
+
+    assert rows["cache_status"] == "available"
+    assert rows["cache_strategy"] == "openai_prompt_cache"
+    assert rows["cache_capability_source"] in {"preset", "protocol"}
+    assert "prompt_cache_key" in rows["cache_allowed_fields"]
+    assert rows["cache_emitted_fields"] == "none"
+
+
+def test_provider_diagnostics_accepts_auth_backed_responses_endpoint() -> None:
+    cfg = _cfg_with_profile(
+        ProfileSpec(
+            name="chatgpt-codex",
+            protocol="openai_responses",
+            base_url="https://chatgpt.com/backend-api/codex",
+            auth_provider="openai-codex",
+            default_model="gpt-5.4",
+        ),
+        web_search_mode="off",
+    )
+
+    diagnostics = build_provider_diagnostics(cfg)
+
+    assert not any("intended for the OpenAI Responses API" in issue for issue in diagnostics.issues)
+
+
+def test_provider_diagnostics_marks_cache_policy_disabled_when_cache_mode_off() -> None:
+    cfg = _cfg_with_profile(
+        ProfileSpec(
+            name="openai-responses",
+            protocol="openai_responses",
+            base_url="https://api.openai.com/v1",
+            api_key_env="OPENAI_API_KEY",
+            default_model="gpt-5.5",
+            web_search_adapter="openai_responses",
+        )
+    )
+    cfg.prompt_cache_mode = "off"
+
+    diagnostics = build_provider_diagnostics(cfg)
+    rows = dict(diagnostics.rows())
+
+    assert rows["cache_status"] == "disabled"
+    assert rows["cache_strategy"] == "openai_prompt_cache"
+    assert "prompt_cache_key" in rows["cache_allowed_fields"]
+    assert rows["cache_emitted_fields"] == "none"
 
 
 def test_provider_diagnostics_allows_openai_responses_streaming() -> None:
@@ -238,6 +305,27 @@ def test_provider_diagnostics_reports_external_search_missing_credentials(
     assert diagnostics.web_search_registration_ready is False
     assert any("TAVILY_API_KEY" in issue for issue in diagnostics.issues)
     assert any("sylliptor config set web_search_mode auto" in issue for issue in diagnostics.issues)
+
+
+def test_provider_diagnostics_reports_policy_disabled_registration(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    cfg = _cfg_with_profile(
+        ProfileSpec(
+            name="openai",
+            protocol="openai_responses",
+            base_url="https://api.openai.com/v1",
+            api_key_env="OPENAI_API_KEY",
+            default_model="gpt-5.5",
+            web_search_adapter="openai_responses",
+        )
+    )
+    cfg.web_search_policy = "off"
+
+    diagnostics = build_provider_diagnostics(cfg)
+
+    assert diagnostics.web_search_policy == "off"
+    assert diagnostics.web_search_registration_ready is False
+    assert any("prevents web_search tool registration" in note for note in diagnostics.notes)
 
 
 def test_provider_diagnostics_reports_missing_active_profile_api_key(
@@ -542,6 +630,18 @@ class _FakeClient:
         return self._response
 
 
+class _CapturingClient(_FakeClient):
+    supports_tool_calling = True
+
+    def __init__(self, response: LLMResponse | Exception) -> None:
+        super().__init__(response)
+        self.chat_kwargs: dict[str, object] = {}
+
+    def chat(self, **kwargs):
+        self.chat_kwargs = dict(kwargs)
+        return super().chat(**kwargs)
+
+
 def test_live_provider_validation_uses_mocked_client_without_printing_secret(
     monkeypatch,
     tmp_path: Path,
@@ -559,10 +659,11 @@ def test_live_provider_validation_uses_mocked_client_without_printing_secret(
         )
     )
     captured: dict[str, object] = {}
+    client = _CapturingClient(LLMResponse(content="ok", tool_calls=[], raw={}))
 
     def factory(**kwargs):
         captured.update(kwargs)
-        return _FakeClient(LLMResponse(content="ok", tool_calls=[], raw={}))
+        return client
 
     validation = validate_active_provider_live(cfg, client_factory=factory)
 
@@ -572,6 +673,45 @@ def test_live_provider_validation_uses_mocked_client_without_printing_secret(
     assert "sk-openai-secret-value" not in validation.message
     assert captured["api_key"] == "sk-openai-secret-value"
     assert captured["timeout_s"] == 15.0
+    assert client.chat_kwargs["tools"]
+
+
+def test_live_provider_validation_fails_when_tool_probe_is_rejected(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("SYLLIPTOR_API_KEY", "secret-value")
+    cfg = _cfg_with_profile(
+        ProfileSpec(
+            name="tool-probe",
+            base_url="https://gateway.example.test/v1",
+            api_key_env="SYLLIPTOR_API_KEY",
+            default_model="test-model",
+            web_search_adapter="auto",
+        )
+    )
+    response = LLMResponse(
+        content="ok",
+        tool_calls=[],
+        raw={},
+        provider_metadata={
+            "transport": {
+                "tools_omitted": True,
+                "tools_omit_reason": "provider_rejected_tool_calling",
+                "tools_retry_used": True,
+            }
+        },
+    )
+
+    validation = validate_active_provider_live(
+        cfg,
+        client_factory=lambda **_kwargs: _CapturingClient(response),
+    )
+
+    assert validation.status == "failed"
+    assert "rejected tool calling" in validation.message
+    assert "secret-value" not in validation.message
 
 
 def test_live_provider_validation_classifies_model_availability_errors(

@@ -6,11 +6,14 @@ from typing import Any
 
 import httpx
 
+from .run_outcome import AGENT_FAILURE_EXIT_CODE, INFRASTRUCTURE_FAILURE_EXIT_CODE
+
 
 class FailureCategory(StrEnum):
     INFRA_UNAVAILABLE = "infra_unavailable"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     PROVIDER_THROTTLED = "provider_throttled"
+    PROVIDER_ERROR = "provider_error"
     PLANNER_FAILED = "planner_failed"
     IMPLEMENTATION_FAILED = "implementation_failed"
     VERIFICATION_FAILED = "verification_failed"
@@ -81,8 +84,22 @@ _PROVIDER_STREAM_TRUNCATED_MESSAGE_MARKERS = (
     "stream truncated",
     "response body ended early",
 )
-_PROVIDER_UNAVAILABLE_STATUS_CODES = frozenset({408, 502, 503, 504})
+_PROVIDER_UNAVAILABLE_STATUS_CODES = frozenset({408, *range(500, 600)})
 _PROVIDER_PERMANENT_4XX_STATUS_CODES = frozenset(range(400, 500)) - {408, 429}
+_CONTEXT_WINDOW_ERROR_MARKERS = (
+    "context_length_exceeded",
+    "context length exceeded",
+    "maximum context length",
+    "context window exceeded",
+    "exceeds the context window",
+    "exceeds this model's context",
+    "exceeds the model's context",
+    "prompt is too long",
+    "input is too long",
+    "input token count exceeds",
+    "too many input tokens",
+    "input token limit exceeded",
+)
 
 
 def failure_category_value(category: FailureCategory | str | None) -> str | None:
@@ -177,6 +194,67 @@ def is_infra_unavailable_error(error: Any) -> bool:
     if not message:
         return False
     return any(marker in message for marker in _INFRA_UNAVAILABLE_MARKERS)
+
+
+def is_context_window_exceeded_error(error: Any) -> bool:
+    """Recognize provider context-capacity failures across protocol adapters.
+
+    Adapters currently normalize provider error objects into ``LLMError`` text,
+    so this checks the full exception chain and deliberately requires
+    context/input/prompt-specific phrases rather than treating every HTTP 400
+    as compactable.
+    """
+
+    message = _exception_chain_message(error)
+    if not message:
+        return False
+    return any(marker in message for marker in _CONTEXT_WINDOW_ERROR_MARKERS)
+
+
+def extract_status_code(error: Any) -> int | None:
+    """Best-effort HTTP status code from an error or its exception chain.
+
+    Reads a ``status_code``/``code`` attribute, a ``response.status_code``, or a
+    ``... error NNN ...`` marker in the message, walking ``__cause__``/``__context__``.
+    Returns ``None`` when no status can be recovered.
+    """
+    return _extract_status_code_from_chain(error)
+
+
+def classify_failure_category(error: Any) -> FailureCategory:
+    """Map an arbitrary exception onto a :class:`FailureCategory`.
+
+    Reuses the existing provider classifiers so the diagnostic vocabulary stays
+    consistent across the chat/run path and Forge workers.
+    Ordering reflects specificity: throttling (HTTP 429 / rate-limit markers) and
+    infra-unavailability are checked before generic provider-unavailability, and a
+    readable-but-non-transient provider status (e.g. 400/401/403/404) is reported as
+    :attr:`FailureCategory.PROVIDER_ERROR` rather than being mistaken for a transient
+    outage or for an agent implementation failure. Errors carrying no provider signal
+    fall through to :attr:`FailureCategory.IMPLEMENTATION_FAILED`.
+    """
+    if is_provider_throttling_error(error):
+        return FailureCategory.PROVIDER_THROTTLED
+    if is_infra_unavailable_error(error):
+        return FailureCategory.INFRA_UNAVAILABLE
+    if is_provider_unavailable_error(error):
+        return FailureCategory.PROVIDER_UNAVAILABLE
+    if extract_status_code(error) is not None:
+        return FailureCategory.PROVIDER_ERROR
+    return FailureCategory.IMPLEMENTATION_FAILED
+
+
+def exit_code_for_failure(error: Any) -> int:
+    """Return a process exit code that separates transient infrastructure failures."""
+
+    category = classify_failure_category(error)
+    if category in {
+        FailureCategory.INFRA_UNAVAILABLE,
+        FailureCategory.PROVIDER_UNAVAILABLE,
+        FailureCategory.PROVIDER_THROTTLED,
+    }:
+        return INFRASTRUCTURE_FAILURE_EXIT_CODE
+    return AGENT_FAILURE_EXIT_CODE
 
 
 def _extract_status_code(error: Any) -> int | None:

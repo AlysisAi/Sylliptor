@@ -127,18 +127,19 @@ def test_login_full_flow_wires_access_key_as_bearer(tmp_path: Path, monkeypatch)
         # The handshake delivered the right code to the exchange endpoint.
         assert stub.received and stub.received[0]["code"] == "THE-ONE-TIME-CODE"
 
-        # Result reflects an active sylliptor profile with MiMo as default.
+        # Result reflects an active sylliptor profile with NO model auto-selected
+        # (the free MiMo default was removed); the user picks one after login.
         assert result.email == "u@example.com"
         assert result.profile_name == "sylliptor"
-        assert result.model == "mimo-v2.5-pro"
+        assert result.model == ""
 
         # The access_key is persisted as the sylliptor profile key.
         assert load_persisted_profile_keys()["sylliptor"] == _ACCESS_KEY
 
-        # Reloaded config has sylliptor active with MiMo as the default model.
+        # Reloaded config has sylliptor active with no default model preselected.
         reloaded = load_config()
         assert reloaded.extra_fields["active_profile"] == "sylliptor"
-        assert reloaded.model == "mimo-v2.5-pro"
+        assert reloaded.model == ""
 
         # The crucial wiring: resolve_api_key returns the access_key as the
         # Bearer for the sylliptor profile (so requests hit the proxy authed).
@@ -349,11 +350,12 @@ def test_login_preserves_user_chosen_model_across_relogin(tmp_path: Path, monkey
     stub = _StubExchangeServer(access_key=_ACCESS_KEY, email=None)
     monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
     try:
-        # First connect: no profile yet, so it defaults to the flagship MiMo.
+        # First connect: no profile yet, and we no longer auto-select MiMo, so the
+        # default model is empty until the user picks one.
         first = account_login.login(
             load_config(), browser_opener=_callback_browser("code"), timeout_s=10
         )
-        assert first.model == "mimo-v2.5-pro"
+        assert first.model == ""
 
         # Simulate the user picking another model in `/config`.
         cfg = load_config()
@@ -370,7 +372,14 @@ def test_login_preserves_user_chosen_model_across_relogin(tmp_path: Path, monkey
         stub.close()
 
 
-def test_login_migrates_legacy_bare_mimo_model(tmp_path: Path, monkeypatch) -> None:
+def test_login_preserves_existing_mimo_selection_via_preset_alias(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A user who ALREADY chose the MiMo trial keeps that choice across re-login: the
+    # `sylliptor` preset (kept intact) canonicalizes the legacy bare "mimo" id up to
+    # its real flagship name via model_aliases at config-load — this is preserving a
+    # prior selection, not auto-defaulting a fresh user (see test_login_does_not_
+    # default_to_mimo for the fresh case).
     from dataclasses import replace
 
     from sylliptor_agent_cli.config import save_config
@@ -386,10 +395,30 @@ def test_login_migrates_legacy_bare_mimo_model(tmp_path: Path, monkeypatch) -> N
         add_profile(cfg, replace(get_profile(cfg, "sylliptor"), default_model="mimo"))
         save_config(cfg)
 
-        # Re-login migrates that placeholder up to the named flagship (not "mimo").
+        # Re-login canonicalizes the placeholder to the named flagship via the preset
+        # alias (NOT via any login-time auto-default, which was removed).
         again = account_login.login(
             load_config(), browser_opener=_callback_browser("code"), timeout_s=10
         )
         assert again.model == "mimo-v2.5-pro"
+    finally:
+        stub.close()
+
+
+def test_login_does_not_default_to_mimo(tmp_path: Path, monkeypatch) -> None:
+    # Regression: the Xiaomi MiMo partnership ended and the free key is gone, so a
+    # fresh `sylliptor login` must NOT silently select a MiMo model (or any model).
+    # The login path itself stays — only the auto-default is removed.
+    _config_env(tmp_path, monkeypatch)
+    stub = _StubExchangeServer(access_key=_ACCESS_KEY, email=None)
+    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
+    try:
+        result = account_login.login(
+            load_config(), browser_opener=_callback_browser("code"), timeout_s=10
+        )
+        assert result.profile_name == "sylliptor"  # path is kept
+        assert result.model == ""  # but no model is auto-selected
+        assert "mimo" not in result.model.casefold()
+        assert load_config().model == ""  # persisted profile carries no default
     finally:
         stub.close()

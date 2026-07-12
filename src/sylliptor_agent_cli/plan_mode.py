@@ -6,7 +6,7 @@ from typing import Any
 
 from .llm.types import LLMError
 from .plan_assistant import compact_workspace_context_for_planner
-from .usage_tracker import build_usage_record
+from .usage_tracker import build_usage_record, usage_context_from_client_response
 
 PLAN_CONTEXT_MAX_MESSAGES = 20
 TOOL_RESULT_SUMMARY_CHARS = 200
@@ -367,6 +367,7 @@ def record_plan_usage(
             api_prompt_tokens=(
                 getattr(usage, "prompt_tokens", None) if usage is not None else None
             ),
+            api_usage=usage,
             api_cached_prompt_tokens=(
                 getattr(usage, "cached_prompt_tokens", None) if usage is not None else None
             ),
@@ -375,6 +376,11 @@ def record_plan_usage(
             ),
             api_total_tokens=(getattr(usage, "total_tokens", None) if usage is not None else None),
             registry=registry,
+            **usage_context_from_client_response(
+                client=getattr(session, "client", None),
+                response=response,
+                operation="plan_llm",
+            ),
         )
         add_record = getattr(usage_summary, "add_record", None)
         if callable(add_record):

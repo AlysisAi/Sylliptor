@@ -15,11 +15,12 @@ from typer.testing import CliRunner
 from sylliptor_agent_cli import cli as cli_mod
 from sylliptor_agent_cli import workspace_binding as workspace_binding_mod
 from sylliptor_agent_cli.cli import app as sylliptor_app
+from sylliptor_agent_cli.cli_impl import chat as chat_facade
 from sylliptor_agent_cli.cli_impl import setup_wizard as setup_wizard_mod
 from sylliptor_agent_cli.cli_impl.commands import welcome as welcome_mod
 from sylliptor_agent_cli.compaction.conversation_compactor import CompactionState
-from sylliptor_agent_cli.config import AppConfig, ConfigError
-from sylliptor_agent_cli.step_budget import DEFAULT_CHAT_MAX_STEPS
+from sylliptor_agent_cli.config import AppConfig, ConfigError, load_config, save_config
+from sylliptor_agent_cli.profiles import ProfileSpec
 
 
 def _env(tmp_path: Path) -> dict[str, str]:
@@ -29,6 +30,24 @@ def _env(tmp_path: Path) -> dict[str, str]:
         "SYLLIPTOR_API_KEY": "",
         "OPENAI_API_KEY": "",
     }
+
+
+def _subscription_cfg(*, model: str = "gpt-codex-test", effort: str = "high") -> AppConfig:
+    cfg = AppConfig(model=model, llm_reasoning_effort=effort)
+    profile = ProfileSpec(
+        name="chatgpt-codex",
+        protocol="openai_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        auth_provider="openai-codex",
+        default_model=model,
+        reasoning_effort=effort,
+    )
+    cfg.extra_fields = {
+        "profiles": {profile.name: profile.to_dict()},
+        "active_profile": profile.name,
+        "onboarded": True,
+    }
+    return cfg
 
 
 def _patch_setup_wizard_dependencies(monkeypatch) -> None:
@@ -42,6 +61,37 @@ def _patch_setup_wizard_dependencies(monkeypatch) -> None:
         "_prompt_and_check_sandbox",
         lambda _console, _cfg: setup_wizard_mod._SandboxStepResult(ready=True, status="docker"),
     )
+
+
+def test_forge_llm_commands_use_subscription_readiness_gate(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def _gate(**kwargs: object) -> None:
+        calls.append(dict(kwargs))
+        raise cli_mod.typer.Exit(code=17)
+
+    monkeypatch.setattr(cli_mod, "_require_active_subscription_ready", _gate)
+    runner = CliRunner()
+    cases = [
+        (["forge", "plan"], {"model": None, "base_url": None}),
+        (
+            ["forge", "review", "T01", "--model", "override"],
+            {"model": "override", "base_url": None},
+        ),
+        (
+            ["forge", "swarm", "--base-url", "https://override.example/v1"],
+            {"model": None, "base_url": "https://override.example/v1"},
+        ),
+        (
+            ["forge", "exec", "T01", "--model", "override"],
+            {"model": "override", "base_url": None},
+        ),
+    ]
+
+    for argv, expected in cases:
+        result = runner.invoke(sylliptor_app, argv)
+        assert result.exit_code == 17, result.output
+        assert calls[-1] == expected
 
 
 def test_no_args_shows_home_screen(tmp_path: Path) -> None:
@@ -73,6 +123,7 @@ def test_no_args_interactive_defaults_to_chat(monkeypatch) -> None:
     monkeypatch.setattr(cli_mod, "chat", _fake_chat)
     monkeypatch.setattr(cli_mod, "_maybe_run_first_run_setup_wizard", lambda: True)
     monkeypatch.setattr(cli_mod, "_maybe_run_startup_config_menu", lambda: None)
+    monkeypatch.setattr(cli_mod, "_provider_auth_ready_for_chat", lambda: False)
 
     cli_mod.main(type("Ctx", (), {"invoked_subcommand": None})())
 
@@ -94,6 +145,7 @@ def test_no_args_interactive_defaults_to_chat(monkeypatch) -> None:
         "api_key_stdin": False,
         "api_key": None,
         "yes": False,
+        "diagnostic_log": None,
     }
 
 
@@ -103,7 +155,7 @@ def test_setup_wizard_saves_config(monkeypatch, tmp_path: Path) -> None:
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
+        input=f"\n1\n2\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
@@ -120,7 +172,7 @@ def test_setup_wizard_can_persist_api_key(monkeypatch, tmp_path: Path) -> None:
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
+        input=f"\n1\n2\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
@@ -257,6 +309,13 @@ def test_chat_status_surfaces_web_search_runtime_details(monkeypatch) -> None:
     cli_mod._print_chat_status(console=console, session=_DummySession(), pending_images=[])
     rendered = console.export_text()
 
+    assert "execution_policy" in rendered
+    assert "autonomous" in rendered
+    assert "chat_step_limit" in rendered
+    assert "task_step_limit" in rendered
+    assert "subagent_step_limit" in rendered
+    assert "active_step_limit" in rendered
+    assert rendered.count("unlimited") >= 4
     assert "web_search" in rendered
     assert "available" in rendered
     assert "web_search_mode" in rendered
@@ -404,7 +463,7 @@ def test_chat_help_panel_describes_plan_workflow_and_explicit_readonly_mode() ->
     assert "/plan <task>" in rendered
     assert "default planning path" in rendered
     assert "draft, review, approve, then execute" in rendered
-    assert "bare /plan prompts for the task" in rendered
+    assert "bare /plan shows usage" in rendered
     assert "/plan mode" in rendered
     assert "/plan approve" in rendered
     assert "/pwd" in rendered
@@ -537,6 +596,7 @@ def test_suggest_chat_command_respects_forge_visibility() -> None:
 def test_chat_visible_command_lists_match_curated_surface() -> None:
     assert cli_mod._CHAT_GLOBAL_VISIBLE_COMMANDS == [
         "/help",
+        "/login",
         "/mode",
         "/status",
         "/terminals",
@@ -546,6 +606,7 @@ def test_chat_visible_command_lists_match_curated_surface() -> None:
         "/compact",
         "/clear",
         "/resume",
+        "/stream",
         "/trace",
         "/config",
         "/toolbar",
@@ -655,6 +716,198 @@ def test_chat_config_menu_reload_uses_injected_helpers_without_login_shadowing(
     assert "session reload failed" not in rendered
 
 
+def test_chat_stream_command_toggles_session_and_reports_status(tmp_path: Path) -> None:
+    cfg = AppConfig(model="test-model")
+    events: list[tuple[str, dict[str, object]]] = []
+    session = SimpleNamespace(
+        cfg=cfg,
+        stream=True,
+        store=SimpleNamespace(append=lambda kind, payload: events.append((kind, payload))),
+    )
+    stream = io.StringIO()
+    console = Console(file=stream, force_terminal=False)
+
+    result = cli_mod._handle_chat_command(
+        input_text="/stream off",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=console,
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+    status_result = cli_mod._handle_chat_command(
+        input_text="/stream status",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=console,
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert status_result == "handled"
+    assert session.stream is False
+    assert cfg.stream is False
+    assert events == [
+        (
+            "session_setting_changed",
+            {"setting": "stream", "value": False},
+        )
+    ]
+    assert "Streaming set for this session: off" in stream.getvalue()
+    assert "Streaming is off" in stream.getvalue()
+
+
+def test_chat_trace_setting_records_only_actual_changes() -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class _Surface:
+        trace_level = "compact"
+
+        def set_trace_level(self, level: str) -> str:
+            self.trace_level = level
+            return level
+
+    session = SimpleNamespace(
+        surface=_Surface(),
+        store=SimpleNamespace(append=lambda kind, payload: events.append((kind, payload))),
+    )
+
+    assert cli_mod._set_chat_trace_level(session=session, level="full") == "full"
+    assert cli_mod._set_chat_trace_level(session=session, level="full") == "full"
+    assert events == [
+        (
+            "session_setting_changed",
+            {"setting": "trace_level", "value": "full"},
+        )
+    ]
+
+
+def test_chat_config_menu_closes_session_when_connection_protocol_changes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from sylliptor_agent_cli.cli_impl import config_menu as config_menu_mod
+    from sylliptor_agent_cli.cli_impl.chat import loop as chat_loop_mod
+
+    monkeypatch.setattr(cli_mod, "_is_non_interactive_terminal", lambda: False)
+    monkeypatch.setattr(
+        config_menu_mod,
+        "run_config_menu",
+        lambda: SimpleNamespace(saved=True, changes=["active_profile"], api_key_changed=False),
+    )
+    monkeypatch.setattr(cli_mod, "load_config", lambda: _subscription_cfg())
+    applied: list[bool] = []
+    monkeypatch.setattr(
+        chat_loop_mod,
+        "_apply_config_menu_changes_to_session",
+        lambda **_kwargs: applied.append(True),
+    )
+    session = SimpleNamespace(cfg=AppConfig(model="old"), client=SimpleNamespace(model="old"))
+    stream = io.StringIO()
+
+    result = cli_mod._handle_chat_command(
+        input_text="/config",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=stream, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "exit"
+    assert applied == []
+    assert "session is closing" in stream.getvalue()
+
+
+def test_chat_login_closes_session_when_connection_protocol_changes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from sylliptor_agent_cli import config as config_mod
+    from sylliptor_agent_cli.cli_impl.chat import loop as chat_loop_mod
+    from sylliptor_agent_cli.cli_impl.commands import auth as auth_mod
+
+    monkeypatch.setattr(
+        auth_mod,
+        "login_connection_interactively",
+        lambda _selected, *, console: None,
+    )
+    monkeypatch.setattr(config_mod, "load_config", lambda: _subscription_cfg())
+    applied: list[bool] = []
+    monkeypatch.setattr(
+        chat_loop_mod,
+        "_apply_config_menu_changes_to_session",
+        lambda **_kwargs: applied.append(True),
+    )
+    session = SimpleNamespace(cfg=AppConfig(model="old"), client=SimpleNamespace(model="old"))
+    stream = io.StringIO()
+
+    result = cli_mod._handle_chat_command(
+        input_text="/login openai-codex",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=stream, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "exit"
+    assert applied == []
+    assert "session is closing" in stream.getvalue()
+
+
+def test_chat_config_menu_closes_subscription_session_when_model_pair_changes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from sylliptor_agent_cli.cli_impl import config_menu as config_menu_mod
+    from sylliptor_agent_cli.cli_impl.chat import loop as chat_loop_mod
+
+    previous = _subscription_cfg(model="gpt-codex-old", effort="high")
+    reloaded = _subscription_cfg(model="gpt-codex-new", effort="xhigh")
+    monkeypatch.setattr(cli_mod, "_is_non_interactive_terminal", lambda: False)
+    monkeypatch.setattr(
+        config_menu_mod,
+        "run_config_menu",
+        lambda: SimpleNamespace(
+            saved=True,
+            changes=["model", "llm_reasoning_effort"],
+            api_key_changed=False,
+        ),
+    )
+    monkeypatch.setattr(cli_mod, "load_config", lambda: reloaded)
+    applied: list[bool] = []
+    monkeypatch.setattr(
+        chat_loop_mod,
+        "_apply_config_menu_changes_to_session",
+        lambda **_kwargs: applied.append(True),
+    )
+    session = SimpleNamespace(
+        cfg=previous,
+        client=SimpleNamespace(model="gpt-codex-old"),
+    )
+    stream = io.StringIO()
+
+    result = cli_mod._handle_chat_command(
+        input_text="/config",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=stream, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "exit"
+    assert applied == []
+    assert "session is closing" in stream.getvalue()
+
+
 def test_chat_config_set_model_reports_success_after_reload(
     monkeypatch,
     tmp_path: Path,
@@ -693,6 +946,423 @@ def test_chat_config_set_model_reports_success_after_reload(
     rendered = stream.getvalue()
     assert "Saved model" in rendered
     assert "Config update failed" not in rendered
+
+
+def test_chat_config_set_cannot_bypass_subscription_model_picker(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "cfg"))
+    cfg = _subscription_cfg()
+    save_config(cfg)
+    session = SimpleNamespace(cfg=cfg, client=SimpleNamespace(model=cfg.model))
+    stream = io.StringIO()
+
+    result = cli_mod._handle_chat_command(
+        input_text="/config set model not-in-catalog",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=stream, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert load_config().model == "gpt-codex-test"
+    assert "Default Model" in stream.getvalue()
+
+
+def test_model_command_cannot_bypass_subscription_config_selection(tmp_path: Path) -> None:
+    cfg = _subscription_cfg()
+    session = SimpleNamespace(cfg=cfg, client=SimpleNamespace(model=cfg.model))
+    stream = io.StringIO()
+
+    result = cli_mod._handle_chat_command(
+        input_text="/model not-in-catalog",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=stream, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert session.client.model == "gpt-codex-test"
+    assert "/config" in stream.getvalue()
+
+
+def test_model_command_refresh_failure_keeps_verified_model_and_route(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from sylliptor_agent_cli.cli_impl.chat import loop as chat_loop_mod
+
+    cfg = AppConfig(model="verified-model")
+    verified_route = SimpleNamespace(fingerprint="verified-route")
+    client = SimpleNamespace(model="verified-model", route_identity=verified_route)
+    session = SimpleNamespace(cfg=cfg, client=client)
+
+    def fail_after_partial_mutation(*, session: Any, cfg: AppConfig) -> None:
+        session.cfg = cfg
+        session.client.model = cfg.model
+        session.client.route_identity = SimpleNamespace(fingerprint="unverified-route")
+        raise RuntimeError("refresh failed")
+
+    monkeypatch.setattr(
+        chat_loop_mod,
+        "_apply_config_menu_changes_to_session",
+        fail_after_partial_mutation,
+    )
+    stream = io.StringIO()
+
+    result = cli_mod._handle_chat_command(
+        input_text="/model unverified-model",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=stream, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert session.cfg is cfg
+    assert session.cfg.model == "verified-model"
+    assert session.client.model == "verified-model"
+    assert session.client.route_identity is verified_route
+    assert "Model was not changed" in stream.getvalue()
+    assert "Model set for this session" not in stream.getvalue()
+
+
+def test_model_command_without_config_refuses_unsafe_bare_client_mutation(tmp_path: Path) -> None:
+    client = SimpleNamespace(model="verified-model")
+    session = SimpleNamespace(client=client)
+    stream = io.StringIO()
+
+    result = cli_mod._handle_chat_command(
+        input_text="/model unverified-model",
+        root=tmp_path,
+        session=session,
+        pending_images=[],
+        console=Console(file=stream, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert client.model == "verified-model"
+    assert "cannot safely refresh" in stream.getvalue()
+
+
+def test_explicit_chat_defers_subscription_readiness_to_tui(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    gates: list[dict[str, object]] = []
+    launches: list[dict[str, object]] = []
+
+    def _gate(**kwargs: object) -> None:
+        gates.append(dict(kwargs))
+
+    monkeypatch.setattr(cli_mod, "_require_active_subscription_ready", _gate)
+    monkeypatch.setattr(
+        chat_facade,
+        "chat_impl",
+        lambda _cli, *args, **kwargs: launches.append({"args": args, "kwargs": dict(kwargs)}),
+    )
+
+    result = CliRunner().invoke(sylliptor_app, ["chat"], env=_env(tmp_path))
+
+    assert result.exit_code == 0
+    assert gates == [{"model": None, "base_url": None, "require_ready": False}]
+    assert len(launches) == 1
+
+
+def test_subscription_availability_distinguishes_login_from_model_selection(
+    monkeypatch,
+) -> None:
+    from sylliptor_agent_cli import provider_auth as provider_auth_mod
+    from sylliptor_agent_cli.cli_impl.commands import startup as startup_mod
+    from sylliptor_agent_cli.profiles import SUBSCRIPTION_SELECTION_REQUIRED_KEY
+
+    cfg = _subscription_cfg()
+    adapter = SimpleNamespace(
+        protocol="openai_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        account_status=lambda: SimpleNamespace(
+            connected=False,
+            verified=True,
+            detail="No ChatGPT subscription account is connected.",
+        ),
+    )
+    monkeypatch.setattr(provider_auth_mod, "create_provider_auth", lambda _provider_id: adapter)
+
+    disconnected = startup_mod._subscription_availability(cfg)
+
+    assert disconnected.active is True
+    assert disconnected.ready is False
+    assert disconnected.provider_id == "openai-codex"
+    assert disconnected.selection_required is False
+    assert "/login" in disconnected.message
+
+    cfg.extra_fields[SUBSCRIPTION_SELECTION_REQUIRED_KEY] = "openai-codex"
+    adapter.account_status = lambda: SimpleNamespace(
+        connected=True,
+        verified=True,
+        detail="Connected with ChatGPT.",
+    )
+
+    selection = startup_mod._subscription_availability(cfg)
+
+    assert selection.ready is False
+    assert selection.selection_required is True
+    assert "Default Model" in selection.message
+
+
+def test_disconnected_subscription_opens_tui_without_creating_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from sylliptor_agent_cli.cli_impl import tui as tui_pkg
+    from sylliptor_agent_cli.cli_impl.commands import startup as startup_mod
+
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "cfg"))
+    save_config(_subscription_cfg())
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(cli_mod, "_is_non_interactive_terminal", lambda: False)
+    monkeypatch.setattr(tui_pkg, "is_tui_enabled", lambda: True)
+    monkeypatch.setattr(
+        startup_mod,
+        "_subscription_availability",
+        lambda _cfg: startup_mod._SubscriptionAvailability(
+            active=True,
+            ready=False,
+            provider_id="openai-codex",
+            message="The selected AI subscription is not connected.",
+        ),
+    )
+
+    def _no_session(**_kwargs: object) -> object:
+        raise AssertionError("a disconnected subscription must not build a model session")
+
+    def _fake_tui(state: object, **kwargs: object):
+        captured["state"] = state
+        captured.update(kwargs)
+        return "/exit", []
+
+    monkeypatch.setattr(cli_mod, "create_session", _no_session)
+    monkeypatch.setattr(tui_pkg, "run_tui", _fake_tui)
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        ["chat", "--path", os.fspath(tmp_path)],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["session_builder"] is None
+    assert captured["subscription_provider_id"] == "openai-codex"
+    assert captured["unavailable_message"] == ("The selected AI subscription is not connected.")
+    assert captured["open_config_on_start"] is False
+    assert captured["state"].connection_status == "subscription not connected"
+    login_picker = captured["picker_providers"]["/login"]
+    login_spec = login_picker()
+    assert [row["value"] for row in login_spec["rows"]] == ["sylliptor", "openai-codex"]
+    assert login_spec["on_select"]("openai-codex") == {"exit": ("login_connection", "openai-codex")}
+
+
+def test_tui_login_runs_auth_then_relaunches_chat(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from sylliptor_agent_cli.cli_impl import tui as tui_pkg
+    from sylliptor_agent_cli.cli_impl.commands import auth as auth_mod
+    from sylliptor_agent_cli.cli_impl.commands import startup as startup_mod
+
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "cfg"))
+    save_config(_subscription_cfg())
+    connected: list[str] = []
+    relaunched: list[dict[str, object]] = []
+
+    monkeypatch.setattr(cli_mod, "_is_non_interactive_terminal", lambda: False)
+    monkeypatch.setattr(tui_pkg, "is_tui_enabled", lambda: True)
+    monkeypatch.setattr(
+        startup_mod,
+        "_subscription_availability",
+        lambda _cfg: startup_mod._SubscriptionAvailability(
+            active=True,
+            ready=False,
+            provider_id="openai-codex",
+            message="Connect first.",
+        ),
+    )
+    monkeypatch.setattr(
+        tui_pkg,
+        "run_tui",
+        lambda _state, **_kwargs: (("login_connection", "openai-codex"), []),
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "login_connection_interactively",
+        lambda connection_id, *, console: connected.append(connection_id),
+    )
+    monkeypatch.setattr(
+        startup_mod,
+        "_run_default_chat_action",
+        lambda **kwargs: relaunched.append(dict(kwargs)),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "create_session",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected session build")),
+    )
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        ["chat", "--path", os.fspath(tmp_path)],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert connected == ["openai-codex"]
+    assert len(relaunched) == 1
+    assert relaunched[0]["path"] == tmp_path.resolve()
+    assert relaunched[0]["model"] is None
+    assert relaunched[0]["base_url"] is None
+
+
+def test_tui_routing_restart_preserves_cli_connection_overrides(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from prompt_toolkit.application import current as prompt_toolkit_current
+
+    from sylliptor_agent_cli.cli_impl import tui as tui_pkg
+    from sylliptor_agent_cli.cli_impl.commands import startup as startup_mod
+
+    relaunched: list[dict[str, object]] = []
+    exits: list[tuple[str, str]] = []
+    base_url = "https://router-restart.example/v1"
+
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "cfg"))
+    save_config(
+        AppConfig(
+            model="persisted-model",
+            base_url="https://persisted.example/v1",
+            routing_mode="auto",
+        )
+    )
+    monkeypatch.delenv("SYLLIPTOR_ROUTING_MODE", raising=False)
+    monkeypatch.setattr(cli_mod, "_is_non_interactive_terminal", lambda: False)
+    monkeypatch.setattr(tui_pkg, "is_tui_enabled", lambda: True)
+
+    def _create_session(**kwargs: object) -> SimpleNamespace:
+        cfg = kwargs["cfg"]
+        assert isinstance(cfg, AppConfig)
+        return SimpleNamespace(
+            cfg=cfg.model_copy(deep=True),
+            root=kwargs["root"],
+            mode=kwargs["mode"],
+            routing_mode=cfg.routing_mode,
+            router_client=object(),
+            close=lambda: None,
+        )
+
+    def _run_tui(_state: object, **kwargs: object) -> tuple[tuple[str, str], list[object]]:
+        session_builder = kwargs["session_builder"]
+        assert callable(session_builder)
+        session_builder(SimpleNamespace())
+
+        updated = load_config()
+        updated.routing_mode = "code_only"
+        save_config(updated)
+
+        on_config_saved = kwargs["on_config_saved"]
+        assert callable(on_config_saved)
+        assert on_config_saved() is True
+        assert exits == [("restart_routing_config", os.fspath(tmp_path.resolve()))]
+        return exits[-1], []
+
+    monkeypatch.setattr(
+        prompt_toolkit_current,
+        "get_app",
+        lambda: SimpleNamespace(exit=lambda *, result: exits.append(result)),
+    )
+    monkeypatch.setattr(
+        tui_pkg,
+        "run_tui",
+        _run_tui,
+    )
+    monkeypatch.setattr(
+        startup_mod,
+        "_run_default_chat_action",
+        lambda **kwargs: relaunched.append(dict(kwargs)),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "create_session",
+        _create_session,
+    )
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        [
+            "chat",
+            "--path",
+            os.fspath(tmp_path),
+            "--model",
+            "cli-model",
+            "--base-url",
+            base_url,
+            "--api-key",
+            "k",
+            "--no-log",
+        ],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(relaunched) == 1
+    assert relaunched[0]["path"] == tmp_path.resolve()
+    assert relaunched[0]["model"] == "cli-model"
+    assert relaunched[0]["base_url"] == base_url
+
+
+def test_one_shot_run_checks_subscription_readiness_before_launch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "cfg"))
+    save_config(_subscription_cfg())
+    monkeypatch.setattr(cli_mod, "_provider_auth_ready_for_chat", lambda: False)
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        ["run", "inspect"],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 1
+
+
+def test_explicit_subscription_model_override_is_rejected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "cfg"))
+    save_config(_subscription_cfg())
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        ["chat", "--model", "outside-config"],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 2
+    assert "managed in `/config`" in result.output
 
 
 def test_chat_command_sections_describe_forge_workspace_safe_resume_contract() -> None:
@@ -811,6 +1481,7 @@ def test_clear_command_wipes_conversation_but_preserves_session_identity(monkeyp
     session.binding_created_path = None
     session.active_workdir_relpath = "."
     session.store = _Store()
+    session.request_context_measurement = object()
     session.conversation_compactor = type(
         "Compactor",
         (),
@@ -852,6 +1523,7 @@ def test_clear_command_wipes_conversation_but_preserves_session_identity(monkeyp
     assert session.conversation_compactor.state.pins == []
     assert session.conversation_compactor.state.pins_message_index is None
     assert session.conversation_compactor.state.pinned_prefix_len == len(startup_messages)
+    assert session.request_context_measurement is None
     assert pending_images == []
     assert refresh_calls == [session]
     assert session.store.events[-1] == ("conversation_cleared", {"trigger": "user_command"})
@@ -999,7 +1671,7 @@ def test_dark_owl_panel_remaps_pale_grays() -> None:
     assert "\x1b[48;5;231m  " in output
 
 
-def test_print_welcome_banner_keeps_compact_owl_left_at_80_columns(monkeypatch) -> None:
+def test_print_welcome_banner_keeps_compact_owl_beside_text_at_80_columns(monkeypatch) -> None:
     monkeypatch.setattr(
         cli_mod.shutil,
         "get_terminal_size",
@@ -1021,9 +1693,13 @@ def test_print_welcome_banner_keeps_compact_owl_left_at_80_columns(monkeypatch) 
     assert "/forge     begin an autonomous run" in plain
     assert "/status    view run state and usage" in plain
     assert "/help      show all commands" in plain
-    assert any("█" in line and "Sylliptor" in line for line in plain_lines)
-    assert any("█" in line and "workspace ~/myproject" in line for line in plain_lines)
+    # At 80 columns the cropped compact owl can sit beside the brand/details
+    # without truncating the content or reaching the terminal edge.
     assert any("▝▜██▅▅▅▅▅▅▅██▛▘" in line for line in plain_lines)
+    assert any("█" in line for line in plain_lines)
+    owl_index = next(i for i, line in enumerate(plain_lines) if "█" in line)
+    brand_index = next(i for i, line in enumerate(plain_lines) if "Sylliptor" in line)
+    assert owl_index == brand_index
 
 
 def test_print_welcome_banner_keeps_dark_panel_owl_left_at_80_columns(
@@ -1422,6 +2098,7 @@ def test_home_chat_action_forwards_plain_defaults(monkeypatch) -> None:
     monkeypatch.setattr(cli_mod.typer, "prompt", _fake_prompt)
     monkeypatch.setattr(cli_mod, "chat", _fake_chat)
     monkeypatch.setattr(cli_mod, "_maybe_run_startup_config_menu", lambda: None)
+    monkeypatch.setattr(cli_mod, "_provider_auth_ready_for_chat", lambda: True)
     cli_mod.main(type("Ctx", (), {"invoked_subcommand": None})())
 
     assert captured == {
@@ -1442,6 +2119,7 @@ def test_home_chat_action_forwards_plain_defaults(monkeypatch) -> None:
         "api_key_stdin": False,
         "api_key": None,
         "yes": False,
+        "diagnostic_log": None,
     }
 
 
@@ -1482,6 +2160,10 @@ def test_home_run_action_forwards_plain_defaults(monkeypatch) -> None:
         "api_key_stdin": False,
         "api_key": None,
         "yes": False,
+        "benchmark": False,
+        "deadline_seconds": None,
+        "require_deadline": False,
+        "diagnostic_log": None,
     }
 
 
@@ -1511,7 +2193,7 @@ def test_forge_enter_command_detection() -> None:
     assert cli_mod._is_forge_enter_command(cmd=":forge", arg="")
     assert cli_mod._is_forge_enter_command(cmd="/forge", arg="resume")
     assert cli_mod._is_forge_enter_command(cmd=":forge", arg="resume")
-    assert not cli_mod._is_forge_enter_command(cmd="/forge", arg="later")
+    assert cli_mod._is_forge_enter_command(cmd="/forge", arg="later")
     assert not cli_mod._is_forge_enter_command(cmd="/plan", arg="")
 
 
@@ -1521,7 +2203,7 @@ def test_setup_wizard_can_pick_first_suggested_model(monkeypatch, tmp_path: Path
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\npersisted-key\n1\n1\n{tmp_path}\n",
+        input=f"\n1\n2\npersisted-key\n1\n1\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
@@ -1538,7 +2220,7 @@ def test_setup_wizard_reprompts_invalid_workspace(monkeypatch, tmp_path: Path) -
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\npersisted-key\n6\ngpt-5-nano\n1\n/does/not/exist\n{tmp_path}\n",
+        input=f"\n1\n2\npersisted-key\n6\ngpt-5-nano\n1\n/does/not/exist\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
@@ -1586,6 +2268,10 @@ def test_home_run_action_accepts_numeric_shortcut(monkeypatch) -> None:
         "api_key_stdin": False,
         "api_key": None,
         "yes": False,
+        "benchmark": False,
+        "deadline_seconds": None,
+        "require_deadline": False,
+        "diagnostic_log": None,
     }
 
 
@@ -1721,9 +2407,7 @@ def test_chat_passes_explicit_max_steps_as_chat_turn_fixed_override(
     assert captured["chat_turn_fixed_override"] == 7
 
 
-def test_chat_raises_legacy_adaptive_max_steps_to_current_default(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_chat_keeps_legacy_cap_dormant_under_autonomous_policy(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1766,8 +2450,9 @@ def test_chat_raises_legacy_adaptive_max_steps_to_current_default(
     )
 
     assert result.exit_code == 0
-    assert captured["max_steps"] == DEFAULT_CHAT_MAX_STEPS
+    assert captured["max_steps"] == 25
     assert captured["chat_turn_fixed_override"] is None
+    assert captured["cfg"].step_budget_policy == "autonomous"
 
 
 def test_chat_home_path_uses_guarded_binding_flow(tmp_path: Path, monkeypatch) -> None:

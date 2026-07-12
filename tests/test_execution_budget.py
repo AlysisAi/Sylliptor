@@ -487,7 +487,7 @@ def test_managed_execution_startup_headroom_reduces_first_request_below_trigger(
 def test_managed_execution_startup_headroom_skips_adjustment_when_request_already_fits(
     tmp_path,
 ) -> None:
-    cfg = AppConfig(model="managed-10k")
+    cfg = AppConfig(model="managed-16k")
     cfg.extra_fields = {
         "compaction": {
             "trigger_ratio": 0.85,
@@ -495,8 +495,8 @@ def test_managed_execution_startup_headroom_skips_adjustment_when_request_alread
         },
         "model_metadata_overrides": {
             "models": {
-                "managed-10k": {
-                    "context_window_tokens": 10_000,
+                "managed-16k": {
+                    "context_window_tokens": 16384,
                     "max_output_tokens": 1024,
                     "supports_vision": False,
                 }
@@ -527,7 +527,7 @@ def test_managed_execution_startup_headroom_skips_adjustment_when_request_alread
         task=task,
         root=tmp_path,
         cfg=cfg,
-        role_model="managed-10k",
+        role_model="managed-16k",
         mode="auto",
         yes=True,
         non_interactive=True,

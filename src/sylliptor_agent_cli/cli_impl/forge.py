@@ -24,6 +24,7 @@ from ..assets.worker_mirror import TaskAssetMirror, mirror_task_assets
 from ..assets.worker_section import render_relevant_assets_section
 from ..assets.worker_tools import build_worker_asset_mcp_manager, compose_worker_asset_mcp_manager
 from ..error_text import sanitize_error_summary, sanitize_optional_error_summary
+from ..failure_category import FailureCategory
 from ..model_registry import ModelRegistry
 from ..plan_validation import PlannerFailedError, raise_for_execution_ready_plan
 from ..runtime_kind import RuntimeKind
@@ -1905,17 +1906,21 @@ def forge_exec(
                                 )
                             else:
                                 scope_warnings.append(verify_mutation_msg)
-                    if not verify_result.all_passed:
+                    if not verify_result.all_passed and verify_mode == "strict":
                         success = False
                         verify_blocked = True
-                        merge_result = (
-                            "not merged: strict verification failed"
-                            if verify_mode == "strict"
-                            else "not merged: verification failed"
-                        )
+                        merge_result = "not merged: strict verification failed"
                         run_err = (run_err + "; " if run_err else "") + (
                             f"verification failed: {verify_result.summary}"
                         )
+                    elif not verify_result.all_passed:
+                        warning_prefix = (
+                            "Verification infrastructure warning"
+                            if verify_result.failure_category_value
+                            == FailureCategory.INFRA_UNAVAILABLE.value
+                            else "Verification warning"
+                        )
+                        scope_warnings.append(f"{warning_prefix}: {verify_result.summary}")
                 elif verify_mode == "strict":
                     success = False
                     verify_blocked = True

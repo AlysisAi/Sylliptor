@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
 from ...tools.registry import get_builtin_tool_metadata
 from ...turn_intent import contains_any_normalized_marker as _contains_any_normalized_marker
 from ...turn_intent import normalize_turn_intent_text as _normalize_marker_text
+from ...verification_command_analysis import (
+    VerificationCommandEvidentiaryCapability,
+    analyze_verification_command,
+)
 from ..prompt_context import (
     MAX_POST_EXPLORE_ANCHOR_PATHS,
     _extract_repo_relative_paths_from_text,
@@ -106,6 +112,7 @@ _EXPLORATION_FALLBACK_TOOL_NAMES = {
     "fs_read_lines",
     "fs_list",
     "symbol_search",
+    "repo_map",
     "search_rg",
     "history_search",
     "git_status",
@@ -121,12 +128,23 @@ _ACTION_PROGRESS_FALLBACK_TOOL_NAMES = {
     "fs_write",
     "git_apply_patch",
     "verify_run",
-    "shell_run",
     "subagent_run",
 }
-_ACTION_PROGRESS_TOOL_CATEGORIES = {"write", "verify", "shell", "subagent"}
+_ACTION_PROGRESS_TOOL_CATEGORIES = {"write", "verify", "subagent"}
 _EXPLORATION_TOOL_CATEGORIES = {"read", "search", "history"}
 _FAILED_EDIT_STAGNATION_TOOL_NAMES = {"fs_edit", "git_apply_patch", "fs_write"}
+_SHELL_TOOL_NAMES = {
+    "shell_run",
+    "shell_background",
+    "shell_service_start",
+    "shell_service_status",
+    "workspace_preview_start",
+}
+_SHELL_SERVICE_PROGRESS_TOOL_NAMES = {
+    "shell_background",
+    "shell_service_start",
+    "workspace_preview_start",
+}
 _UNEXECUTED_TOOL_CALL_MARKUP_MARKERS = (
     "<tool_call",
     "</tool_call",
@@ -205,6 +223,7 @@ def _exploration_similarity_key(name: str, arguments: dict[str, Any]) -> str:
     relevant_fields = (
         "path",
         "root_path",
+        "cmd",
         "query",
         "pattern",
         "ref",
@@ -397,20 +416,212 @@ def _tool_categories(tool_name: str) -> set[str]:
     return {str(category).strip().lower() for category in metadata.categories}
 
 
-def _is_action_progress_tool(tool_name: str) -> bool:
+def _normal_tool_name(tool_name: str) -> str:
+    return str(tool_name or "").strip().lower()
+
+
+def _shell_cmd(arguments: dict[str, Any] | None) -> str:
+    if not isinstance(arguments, dict):
+        return ""
+    return str(arguments.get("cmd") or arguments.get("command") or "").strip()
+
+
+def _shell_exit_code(result: dict[str, Any] | None) -> int | None:
+    if not isinstance(result, dict):
+        return None
+    value = result.get("exit_code")
+    return value if isinstance(value, int) else None
+
+
+def _shell_touched_paths(
+    *,
+    result: dict[str, Any] | None,
+    touched_paths: Collection[str] | None,
+) -> tuple[str, ...]:
+    out: list[str] = []
+    for raw in touched_paths or ():
+        text = str(raw or "").strip()
+        if text:
+            out.append(text)
+    if isinstance(result, dict):
+        for key in (
+            "touched_repo_paths",
+            "material_touched_repo_paths",
+            "verification_relevant_touched_paths",
+        ):
+            value = result.get(key)
+            if isinstance(value, (list, tuple, set)):
+                for raw in value:
+                    text = str(raw or "").strip()
+                    if text:
+                        out.append(text)
+    deduped: list[str] = []
+    for item in out:
+        if not any(existing.casefold() == item.casefold() for existing in deduped):
+            deduped.append(item)
+    return tuple(deduped)
+
+
+def _shell_result_has_mutation_effect(
+    *,
+    result: dict[str, Any] | None,
+    touched_paths: Collection[str] | None,
+) -> bool:
+    return bool(_shell_touched_paths(result=result, touched_paths=touched_paths))
+
+
+def _shell_command_is_assertive_verification(
+    *,
+    cmd: str,
+    result: dict[str, Any] | None,
+) -> bool:
+    if not cmd:
+        return False
+    if isinstance(result, dict) and (
+        bool(result.get("trusted_shell_verification"))
+        or bool(result.get("verification_evidence_allowed"))
+    ):
+        return True
+    try:
+        analysis = analyze_verification_command(cmd, trusted=False)
+    except Exception:  # noqa: BLE001
+        return False
+    if analysis.rejection_reason:
+        return False
+    return analysis.evidentiary_capability == VerificationCommandEvidentiaryCapability.ASSERTIVE
+
+
+def _shell_command_head(cmd: str) -> str:
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return ""
+    if not parts:
+        return ""
+    head = parts[0].rsplit("/", 1)[-1].casefold()
+    if (
+        head in {"python", "python3", "node"}
+        and len(parts) >= 3
+        and parts[1]
+        in {
+            "-m",
+            "-c",
+        }
+    ):
+        return f"{head} {parts[1]} {parts[2].casefold()}"
+    return head
+
+
+def _shell_command_is_low_value_exploration(cmd: str) -> bool:
+    head = _shell_command_head(cmd)
+    if not head:
+        return True
+    if head in {
+        "awk",
+        "cat",
+        "cut",
+        "env",
+        "file",
+        "find",
+        "grep",
+        "head",
+        "ls",
+        "pwd",
+        "rg",
+        "sed",
+        "stat",
+        "tail",
+        "type",
+        "wc",
+        "which",
+    }:
+        return True
+    return head.startswith(("python -c", "python3 -c", "node -c"))
+
+
+def _shell_command_is_focused_progress(
+    *,
+    cmd: str,
+    focused: bool,
+    result: dict[str, Any] | None,
+) -> bool:
+    if not focused or not cmd:
+        return False
+    if _shell_command_is_low_value_exploration(cmd):
+        return False
+    exit_code = _shell_exit_code(result)
+    return exit_code is None or exit_code == 0
+
+
+def _is_shell_action_progress_tool(
+    tool_name: str,
+    *,
+    arguments: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    touched_paths: Collection[str] | None = None,
+    focused: bool = False,
+) -> bool:
+    normalized = _normal_tool_name(tool_name)
+    if normalized in _SHELL_SERVICE_PROGRESS_TOOL_NAMES:
+        return True
+    if normalized == "shell_service_status":
+        return isinstance(result, dict) and bool(result.get("ready") or result.get("healthy"))
+    if normalized != "shell_run":
+        return False
+    if _shell_result_has_mutation_effect(result=result, touched_paths=touched_paths):
+        return True
+    cmd = _shell_cmd(arguments)
+    if _shell_command_is_assertive_verification(cmd=cmd, result=result):
+        return True
+    return _shell_command_is_focused_progress(cmd=cmd, focused=focused, result=result)
+
+
+def _is_action_progress_tool(
+    tool_name: str,
+    *,
+    arguments: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    touched_paths: Collection[str] | None = None,
+    focused: bool = False,
+) -> bool:
+    normalized = _normal_tool_name(tool_name)
+    if normalized in _SHELL_TOOL_NAMES:
+        return _is_shell_action_progress_tool(
+            normalized,
+            arguments=arguments,
+            result=result,
+            touched_paths=touched_paths,
+            focused=focused,
+        )
     categories = _tool_categories(tool_name)
     if categories:
         return bool(categories & _ACTION_PROGRESS_TOOL_CATEGORIES)
-    return tool_name.strip().lower() in _ACTION_PROGRESS_FALLBACK_TOOL_NAMES
+    return normalized in _ACTION_PROGRESS_FALLBACK_TOOL_NAMES
 
 
-def _is_exploration_only_tool(tool_name: str) -> bool:
+def _is_exploration_only_tool(
+    tool_name: str,
+    *,
+    arguments: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    touched_paths: Collection[str] | None = None,
+    focused: bool = False,
+) -> bool:
+    normalized = _normal_tool_name(tool_name)
+    if normalized in _SHELL_TOOL_NAMES:
+        return not _is_shell_action_progress_tool(
+            normalized,
+            arguments=arguments,
+            result=result,
+            touched_paths=touched_paths,
+            focused=focused,
+        )
     categories = _tool_categories(tool_name)
     if categories:
         if categories & _ACTION_PROGRESS_TOOL_CATEGORIES:
             return False
         return bool(categories & _EXPLORATION_TOOL_CATEGORIES)
-    return tool_name.strip().lower() in _EXPLORATION_FALLBACK_TOOL_NAMES
+    return normalized in _EXPLORATION_FALLBACK_TOOL_NAMES
 
 
 def _is_failed_edit_stagnation_tool(tool_name: str) -> bool:

@@ -333,7 +333,16 @@ from ...sandbox_doctor import (
     sandbox_env_summary,
 )
 from ...session_metrics import score_session_log
-from ...session_store import SessionInfo, list_sessions, read_session_events, resolve_sessions_dir
+from ...session_store import (
+    SessionInfo,
+    canonical_workspace_path,
+    list_sessions,
+    local_session_owner,
+    read_session_events,
+    resolve_sessions_dir,
+    session_belongs_to_owner,
+    session_belongs_to_workspace,
+)
 from ...skills import (
     build_explicit_skill_context_message,
     discover_skills,
@@ -488,6 +497,7 @@ from .root import (
     _ToolAvailabilityRow,
     _tools_table,
     chat,
+    auth_app,
     config_app,
     conventions_app,
     doctor,
@@ -730,6 +740,7 @@ def _forge_task_status_counts(plan: dict[str, Any]) -> tuple[int, int, int]:
     done = 0
     failed = 0
     remaining = 0
+    done_states = {"done", "already_satisfied"}
     failure_states = {
         "failed",
         "verify_failed",
@@ -738,6 +749,8 @@ def _forge_task_status_counts(plan: dict[str, Any]) -> tuple[int, int, int]:
         "merge_conflict",
         "blocked_integration",
         "blocked",
+        "interrupted",
+        "cancelled",
     }
     non_executable_obsolete_states = {"superseded", "invalidated"}
     for task in tasks:
@@ -745,7 +758,7 @@ def _forge_task_status_counts(plan: dict[str, Any]) -> tuple[int, int, int]:
             remaining += 1
             continue
         status = canonical_task_status(str(task.get("status") or ""))
-        if status == "done":
+        if status in done_states:
             done += 1
         elif status in failure_states:
             failed += 1
@@ -762,7 +775,7 @@ def _forge_task_status_markup(status: str) -> str:
     raw = str(status or "").strip()
     canonical = canonical_task_status(raw)
     display = raw or canonical or "planned"
-    if canonical in {"done", "completed"}:
+    if canonical in {"done", "completed", "already_satisfied"}:
         return f"[bold]{display}[/bold]"
     if canonical in {
         "failed",
@@ -772,6 +785,8 @@ def _forge_task_status_markup(status: str) -> str:
         "merge_conflict",
         "blocked_integration",
         "blocked",
+        "interrupted",
+        "cancelled",
     }:
         return f"[red]{display}[/red]"
     if canonical in {"in_progress", "running"}:
@@ -1096,6 +1111,7 @@ def _ordered_unique_strings(values: list[str]) -> list[str]:
 _CHAT_RETIRED_COMMANDS = {"/keys", "/tour", "/examples"}
 _CHAT_GLOBAL_VISIBLE_COMMANDS = [
     "/help",
+    "/login",
     "/mode",
     "/status",
     "/terminals",
@@ -1105,6 +1121,7 @@ _CHAT_GLOBAL_VISIBLE_COMMANDS = [
     "/compact",
     "/clear",
     "/resume",
+    "/stream",
     "/trace",
     "/config",
     "/toolbar",
@@ -1137,6 +1154,7 @@ _FORGE_VISIBLE_COMMAND_TOKENS = [
 ]
 _FORGE_SHARED_CHAT_COMMANDS = [
     "/help",
+    "/login",
     "/mode",
     "/status",
     "/terminals",
@@ -1145,6 +1163,7 @@ _FORGE_SHARED_CHAT_COMMANDS = [
     "/ctx",
     "/compact",
     "/resume",
+    "/stream",
     "/trace",
     "/config",
     "/toolbar",

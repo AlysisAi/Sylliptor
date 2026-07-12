@@ -28,11 +28,12 @@ from .errors import (
     McpTokenStoreVersionError,
 )
 
-CURRENT_ENVELOPE_VERSION = 1
+CURRENT_ENVELOPE_VERSION = 2
 TOKEN_STORE_AAD = b"sylliptor-mcp-oauth-store"
 KEY_SOURCE_KEYRING = "keyring"
 KEY_SOURCE_WEAK_FALLBACK = "weak-derived-fallback"
 KEY_SOURCE_DPAPI = "dpapi"
+KEY_SOURCE_FILESYSTEM = "filesystem-random"
 
 _ENVELOPE_KEYS = frozenset({"version", "key_source", "nonce", "ciphertext"})
 _KEYRING_SERVICE = "sylliptor-agent-cli"
@@ -44,6 +45,11 @@ _AES_GCM_NONCE_BYTES = 12
 _CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 logger = logging.getLogger(__name__)
+# Library loggers must not fall through to logging.lastResort, which writes
+# WARNING records directly to stderr and corrupts prompt_toolkit full-screen
+# applications. Configured application/test handlers still receive records via
+# normal propagation.
+logger.addHandler(logging.NullHandler())
 
 
 @dataclass(frozen=True)
@@ -94,6 +100,12 @@ def weak_fallback_salt_path(store_path: Path) -> Path:
 
 def dpapi_master_key_path(store_path: Path) -> Path:
     return store_path.with_name(_DPAPI_KEY_FILE_NAME)
+
+
+def filesystem_master_key_path(store_path: Path) -> Path:
+    """Return the per-store random master-key path used without an OS keyring."""
+
+    return store_path.with_suffix(".key")
 
 
 def _read_json_file(path: Path) -> Any:
@@ -148,7 +160,7 @@ def _validate_envelope(payload: dict[str, Any], *, path: Path) -> tuple[int, str
     if version < 1:
         raise McpTokenStoreCorruptError(f"OAuth token store envelope version is invalid: {path}")
     key_source = payload.get("key_source")
-    if key_source not in {KEY_SOURCE_KEYRING, KEY_SOURCE_WEAK_FALLBACK, KEY_SOURCE_DPAPI}:
+    if key_source not in _allowed_key_sources(version):
         raise McpTokenStoreCorruptError(f"OAuth token store key source is invalid: {path}")
     try:
         nonce = base64.b64decode(_require_string(payload.get("nonce")), validate=True)
@@ -166,6 +178,12 @@ def _require_string(value: object) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError("expected non-empty string")
     return value
+
+
+def _allowed_key_sources(version: int) -> frozenset[str]:
+    if version == 1:
+        return frozenset({KEY_SOURCE_KEYRING, KEY_SOURCE_WEAK_FALLBACK, KEY_SOURCE_DPAPI})
+    return frozenset({KEY_SOURCE_KEYRING, KEY_SOURCE_FILESYSTEM, KEY_SOURCE_DPAPI})
 
 
 def _decrypt_envelope(path: Path, envelope: dict[str, Any]) -> dict[str, Any]:
@@ -207,7 +225,7 @@ def _maybe_rewrite_envelope_after_read(
         preferred = _preferred_key_material(path)
     except (McpTokenStoreError, OSError) as exc:
         logger.warning(
-            "Skipped MCP OAuth token store rotation after successful decrypt: "
+            "Skipped OAuth credential store rotation after successful decrypt: "
             "path=%s version=%s key_source=%s error_type=%s",
             path,
             version,
@@ -221,7 +239,7 @@ def _maybe_rewrite_envelope_after_read(
         _write_encrypted_payload(path, payload, key_material=preferred)
     except (McpTokenStoreError, OSError) as exc:
         logger.warning(
-            "Skipped MCP OAuth token store rewrite after successful decrypt: "
+            "Skipped OAuth credential store rewrite after successful decrypt: "
             "path=%s version=%s key_source=%s preferred_key_source=%s error_type=%s",
             path,
             version,
@@ -238,6 +256,10 @@ def _write_encrypted_payload(
     key_material: _KeyMaterial | None = None,
 ) -> None:
     key_material = key_material or _preferred_key_material(path)
+    if key_material.source not in _allowed_key_sources(CURRENT_ENVELOPE_VERSION):
+        raise McpTokenStoreUnavailableError(
+            "Refusing to write an OAuth credential envelope with a legacy key source."
+        )
     plaintext = json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
@@ -257,7 +279,9 @@ def _write_encrypted_payload(
     except OSError as exc:
         raise McpTokenStoreUnavailableError(f"Failed to write OAuth token store: {path}") from exc
     logger.info(
-        "Wrote encrypted MCP OAuth token store: path=%s key_source=%s", path, key_material.source
+        "Wrote encrypted OAuth credential store: path=%s key_source=%s",
+        path,
+        key_material.source,
     )
 
 
@@ -267,11 +291,7 @@ def _preferred_key_material(path: Path) -> _KeyMaterial:
         return keyring_material
     if _platform_system().lower() == "windows":
         return _dpapi_key_material(path)
-    logger.warning(
-        "MCP OAuth token store is using weak-derived-fallback because OS keyring is unavailable; "
-        "this fallback is weak against same-user compromise."
-    )
-    return _weak_fallback_key_material(path)
+    return _filesystem_key_material(path)
 
 
 def _key_material_for_source(source: str, *, path: Path) -> _KeyMaterial:
@@ -284,6 +304,8 @@ def _key_material_for_source(source: str, *, path: Path) -> _KeyMaterial:
         return material
     if source == KEY_SOURCE_DPAPI:
         return _dpapi_key_material(path)
+    if source == KEY_SOURCE_FILESYSTEM:
+        return _filesystem_key_material(path)
     if source == KEY_SOURCE_WEAK_FALLBACK:
         return _weak_fallback_key_material(path)
     raise McpTokenStoreCorruptError(f"Unsupported OAuth token store key source: {source}")
@@ -339,10 +361,84 @@ def _set_keyring_password(service: str, account: str, password: str) -> None:
 
 
 def _weak_fallback_key_material(path: Path) -> _KeyMaterial:
+    """Load legacy v1 key material for migration only.
+
+    New stores never use this deterministic derivation. Keeping the reader
+    allows existing encrypted credentials to be upgraded without signing users
+    out.
+    """
+
     salt = _load_or_create_salt(weak_fallback_salt_path(path))
     identity = f"{platform.node()}\0{getpass.getuser()}".encode()
     kdf = Scrypt(salt=salt, length=_AES_KEY_BYTES, n=2**14, r=8, p=1)
     return _KeyMaterial(KEY_SOURCE_WEAK_FALLBACK, kdf.derive(identity))
+
+
+def _filesystem_key_material(path: Path) -> _KeyMaterial:
+    key_path = filesystem_master_key_path(path)
+    key = (
+        _read_filesystem_master_key(key_path)
+        if key_path.exists()
+        else _create_filesystem_master_key(key_path)
+    )
+    return _KeyMaterial(KEY_SOURCE_FILESYSTEM, key)
+
+
+def _read_filesystem_master_key(path: Path) -> bytes:
+    try:
+        key = path.read_bytes()
+    except OSError as exc:
+        raise McpTokenStoreUnavailableError(
+            f"Failed to read filesystem OAuth credential key: {path}"
+        ) from exc
+    if len(key) != _AES_KEY_BYTES:
+        raise McpTokenStoreCorruptError(
+            f"Filesystem OAuth credential key has invalid length: {path}"
+        )
+    _set_restrictive_permissions(path)
+    return key
+
+
+def _create_filesystem_master_key(path: Path) -> bytes:
+    """Create a fully-written random key without replacing a racing writer.
+
+    The temporary file is fsynced before an atomic hard link publishes it.
+    If another process wins the race, its completed key is loaded instead.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = secrets.token_bytes(_AES_KEY_BYTES)
+    fd, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        handle = os.fdopen(fd, "wb")
+        fd = -1
+        with handle:
+            handle.write(key)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temp_path, path)
+        except FileExistsError:
+            return _read_filesystem_master_key(path)
+        except OSError as exc:
+            raise McpTokenStoreUnavailableError(
+                f"Failed to create filesystem OAuth credential key: {path}"
+            ) from exc
+        _set_restrictive_permissions(path)
+        _fsync_dir(path.parent)
+        return key
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with suppress(FileNotFoundError):
+            temp_path.unlink()
 
 
 def _load_or_create_salt(path: Path) -> bytes:

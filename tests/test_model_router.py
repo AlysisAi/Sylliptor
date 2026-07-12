@@ -12,6 +12,8 @@ from sylliptor_agent_cli.model_router import (
     ROLE_ROUTER,
     resolve_model_for_role,
 )
+from sylliptor_agent_cli.profiles import ProfileSpec
+from sylliptor_agent_cli.provider_auth import ProviderModel
 
 
 def test_resolve_model_for_role_env_overrides_plan_and_config(monkeypatch) -> None:
@@ -43,6 +45,48 @@ def test_resolve_model_for_role_plan_overrides_config(monkeypatch) -> None:
     assert resolved == "plan-coding-model"
 
 
+def test_subscription_profile_ignores_role_models_outside_account_catalog(monkeypatch) -> None:
+    class _Catalog:
+        def list_models(self, *, refresh: bool = False):  # type: ignore[no-untyped-def]
+            assert refresh is False
+            return (
+                ProviderModel(id="sub-default", label="Default"),
+                ProviderModel(id="sub-alt", label="Alt"),
+            )
+
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.provider_auth.create_provider_auth",
+        lambda _provider_id: _Catalog(),
+    )
+    cfg = AppConfig(model="sub-default")
+    profile = ProfileSpec(
+        name="chatgpt-codex",
+        protocol="openai_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        auth_provider="openai-codex",
+        default_model="sub-default",
+        reasoning_effort="high",
+    )
+    cfg.extra_fields = {
+        "profiles": {profile.name: profile.to_dict()},
+        "active_profile": profile.name,
+        "role_models": {ROLE_ROUTER: "claude-old"},
+        "forge_role_models": {ROLE_REVIEW: "gemini-old"},
+    }
+
+    assert resolve_model_for_role(cfg=cfg, role=ROLE_ROUTER) == "sub-default"
+    assert (
+        resolve_model_for_role(
+            cfg=cfg,
+            role=ROLE_REVIEW,
+            prefer_context=PREFER_CONTEXT_FORGE,
+        )
+        == "sub-default"
+    )
+    cfg.extra_fields["role_models"] = {ROLE_ROUTER: "sub-alt"}
+    assert resolve_model_for_role(cfg=cfg, role=ROLE_ROUTER) == "sub-alt"
+
+
 def test_resolve_router_model_prefers_forge_override(monkeypatch) -> None:
     cfg = AppConfig(model="default-model")
     cfg.extra_fields = {
@@ -68,6 +112,21 @@ def test_resolve_model_for_role_falls_back_to_cfg_model(monkeypatch) -> None:
 
     resolved = resolve_model_for_role(cfg=cfg, role=ROLE_REVIEW, plan=None)
     assert resolved == "default-model"
+
+
+def test_inherited_router_tracks_default_until_explicitly_overridden(monkeypatch) -> None:
+    monkeypatch.delenv("SYLLIPTOR_MODEL_ROUTER", raising=False)
+    cfg = AppConfig(model="first-setup-model")
+    cfg.extra_fields = {"role_models": {}}
+
+    assert resolve_model_for_role(cfg=cfg, role=ROLE_ROUTER) == "first-setup-model"
+
+    cfg.model = "new-default-model"
+    assert resolve_model_for_role(cfg=cfg, role=ROLE_ROUTER) == "new-default-model"
+
+    cfg.extra_fields["role_models"][ROLE_ROUTER] = "explicit-router-model"
+    cfg.model = "later-default-model"
+    assert resolve_model_for_role(cfg=cfg, role=ROLE_ROUTER) == "explicit-router-model"
 
 
 def test_resolve_model_for_role_raises_when_all_empty(monkeypatch) -> None:

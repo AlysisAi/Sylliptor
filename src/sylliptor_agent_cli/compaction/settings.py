@@ -17,8 +17,8 @@ from sylliptor_agent_cli.model_metadata_utils import (
 class CompactionSettings:
     enabled: bool = True
     offload_tool_outputs: bool = True
-    tool_output_offload_threshold_chars: int = 2500
-    tool_output_preview_chars: int = 400
+    tool_output_offload_threshold_chars: int = 6000
+    tool_output_preview_chars: int = 2000
     summarize_conversation: bool = True
     recent_user_turns_to_keep: int = 8
     trigger_ratio: float = 0.90
@@ -35,6 +35,8 @@ class CompactionSettings:
     pin_snippet_chars: int = 600
     importance_use_llm: bool = False
     importance_llm_max_turns: int = 12
+    cache_aware_compaction: bool = True
+    cache_aware_min_trigger_ratio: float = 0.72
 
 
 def _resolve_bool(*, raw: Any, fallback: bool) -> bool:
@@ -166,6 +168,14 @@ def resolve_compaction_settings(cfg: AppConfig) -> CompactionSettings:
         raw=env_get("SYLLIPTOR_IMPORTANCE_LLM_MAX_TURNS"),
         fallback=settings.importance_llm_max_turns,
     )
+    cache_aware_compaction = _resolve_bool(
+        raw=env_get("SYLLIPTOR_CACHE_AWARE_COMPACTION"),
+        fallback=settings.cache_aware_compaction,
+    )
+    cache_aware_min_trigger_ratio = _resolve_ratio(
+        raw=env_get("SYLLIPTOR_CACHE_AWARE_MIN_TRIGGER_RATIO"),
+        fallback=settings.cache_aware_min_trigger_ratio,
+    )
 
     raw_compaction = (
         cfg.extra_fields.get("compaction") if isinstance(cfg.extra_fields, dict) else None
@@ -248,6 +258,14 @@ def resolve_compaction_settings(cfg: AppConfig) -> CompactionSettings:
             raw=raw_compaction.get("importance_llm_max_turns"),
             fallback=importance_llm_max_turns,
         )
+        cache_aware_compaction = _resolve_bool(
+            raw=raw_compaction.get("cache_aware_compaction"),
+            fallback=cache_aware_compaction,
+        )
+        cache_aware_min_trigger_ratio = _resolve_ratio(
+            raw=raw_compaction.get("cache_aware_min_trigger_ratio"),
+            fallback=cache_aware_min_trigger_ratio,
+        )
 
     if target_ratio >= trigger_ratio:
         trigger_ratio = settings.trigger_ratio
@@ -274,4 +292,6 @@ def resolve_compaction_settings(cfg: AppConfig) -> CompactionSettings:
         pin_snippet_chars=pin_snippet_chars,
         importance_use_llm=importance_use_llm,
         importance_llm_max_turns=importance_llm_max_turns,
+        cache_aware_compaction=cache_aware_compaction,
+        cache_aware_min_trigger_ratio=cache_aware_min_trigger_ratio,
     )

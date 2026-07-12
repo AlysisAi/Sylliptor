@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import os
 import shlex
 import socket
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 from sylliptor_agent_cli.durable_service_manager import (
     SERVICE_METADATA,
+    SERVICE_PREVIEW_TOKEN,
     DurableServiceManager,
 )
 from sylliptor_agent_cli.sandbox_settings import ShellSandboxSettings
@@ -132,12 +136,154 @@ def test_tcp_readiness_failure_stops_process_without_leak(tmp_path: Path) -> Non
         manager.stop(started.service_id)
 
 
+def test_failed_service_returns_sanitized_startup_error(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    state_dir = tmp_path / "sessions" / "durable_services"
+    root.mkdir()
+    manager = _manager(root, state_dir)
+    port = _free_tcp_port()
+
+    started = manager.start(
+        cmd=_python_cmd(
+            "import sys; print('image pull unauthorized', file=sys.stderr); sys.exit(2)"
+        ),
+        cwd=root,
+        readiness={"type": "tcp", "host": "127.0.0.1", "port": port, "timeout_s": 1},
+    )
+
+    try:
+        assert started.payload["failure_category"] == "readiness_failed"
+        assert started.payload["startup_error"] == "image pull unauthorized"
+    finally:
+        manager.stop(started.service_id)
+
+
+def test_workspace_preview_serves_loopback_without_docker(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    state_dir = tmp_path / "sessions" / "durable_services"
+    root.mkdir()
+    (root / "index.html").write_text("preview-ok\n", encoding="utf-8")
+    manager = DurableServiceManager(
+        root=root,
+        state_dir=state_dir,
+        settings=ShellSandboxSettings(
+            mode="strict",
+            backend="docker",
+            docker_image="private.invalid/sandbox:dev",
+        ),
+    )
+    service_id = ""
+    try:
+        started = manager.start_preview(cwd=root)
+        service_id = started.service_id
+
+        assert started.payload["status"] == "running"
+        assert started.payload["backend"] == "host-preview"
+        assert started.payload["preview_access"] == "local"
+        assert started.payload["preview_port"] > 0
+        assert started.payload["access_url"] == started.payload["preview_url"]
+        with urllib.request.urlopen(started.payload["access_url"], timeout=2) as response:
+            assert response.status == 200
+            assert response.read() == b"preview-ok\n"
+    finally:
+        if service_id:
+            manager.stop(service_id)
+
+
+def test_workspace_preview_rejects_symlink_escape_and_directory_listing(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    state_dir = tmp_path / "sessions" / "durable_services"
+    root.mkdir()
+    outside = tmp_path / "secret.txt"
+    outside.write_text("do-not-serve\n", encoding="utf-8")
+    (root / "escape.txt").symlink_to(outside)
+    (root / ".env").write_text("secret=value\n", encoding="utf-8")
+    (root / "nested").mkdir()
+    (root / "escaped-index").mkdir()
+    (root / "escaped-index" / "index.html").symlink_to(outside)
+    port = _free_tcp_port()
+    manager = _manager(root, state_dir)
+    service_id = ""
+    try:
+        started = manager.start_preview(cwd=root, port=port)
+        service_id = started.service_id
+        base = str(started.payload["preview_url"])
+
+        with pytest.raises(urllib.error.HTTPError) as escape_error:
+            urllib.request.urlopen(f"{base}/escape.txt", timeout=2)
+        assert escape_error.value.code == 403
+        with pytest.raises(urllib.error.HTTPError) as listing_error:
+            urllib.request.urlopen(f"{base}/nested/", timeout=2)
+        assert listing_error.value.code == 403
+        with pytest.raises(urllib.error.HTTPError) as hidden_error:
+            urllib.request.urlopen(f"{base}/.env", timeout=2)
+        assert hidden_error.value.code == 403
+        with pytest.raises(urllib.error.HTTPError) as index_error:
+            urllib.request.urlopen(f"{base}/escaped-index/", timeout=2)
+        assert index_error.value.code == 403
+    finally:
+        if service_id:
+            manager.stop(service_id)
+
+
+def test_lan_preview_is_dynamically_addressed_and_temporarily_authenticated(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    state_dir = tmp_path / "sessions" / "durable_services"
+    root.mkdir()
+    (root / "index.html").write_text("lan-preview-ok\n", encoding="utf-8")
+    manager = _manager(root, state_dir)
+    service_id = ""
+    try:
+        started = manager.start_preview(cwd=root, access="lan")
+        service_id = started.service_id
+        payload = started.payload
+
+        assert payload["preview_access"] == "lan"
+        assert payload["authentication_required"] is True
+        assert payload["preview_port"] > 0
+        assert "sylliptor_token=" not in payload["preview_url"]
+        assert "sylliptor_token=" in payload["access_url"]
+        token = parse_qs(urlsplit(payload["access_url"]).query)["sylliptor_token"][0]
+        metadata_text = (state_dir / service_id / SERVICE_METADATA).read_text(encoding="utf-8")
+        assert token not in metadata_text
+
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+        )
+        with pytest.raises(urllib.error.HTTPError) as unauthenticated:
+            opener.open(payload["preview_url"], timeout=2)
+        assert unauthenticated.value.code == 401
+        with opener.open(payload["access_url"], timeout=2) as response:
+            assert response.status == 200
+            assert response.read() == b"lan-preview-ok\n"
+            assert "sylliptor_token=" not in response.geturl()
+        service_dir = state_dir / service_id
+        assert token not in (service_dir / "stdout.log").read_text(encoding="utf-8")
+        assert token not in (service_dir / "stderr.log").read_text(encoding="utf-8")
+
+        fresh = _manager(root, state_dir)
+        fresh_status = fresh.status(service_id)
+        assert fresh_status["access_url"] == payload["access_url"]
+        stopped = fresh.stop(service_id)
+        assert stopped["stopped"] is True
+        _wait_loaded_popen(manager, service_id)
+        assert not (state_dir / service_id / SERVICE_PREVIEW_TOKEN).exists()
+    finally:
+        if service_id:
+            manager.stop(service_id)
+
+
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets unavailable")
 def test_unix_socket_readiness(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     state_dir = tmp_path / "sessions" / "durable_services"
     root.mkdir()
-    socket_path = tmp_path / "service.sock"
+    # Darwin limits AF_UNIX paths to roughly 104 bytes; pytest's temp root can
+    # exceed that before the socket filename is appended.
+    socket_path = Path("/tmp") / f"sylliptor-{os.getpid()}-{tmp_path.name[-12:]}.sock"
     manager = _manager(root, state_dir)
     service_id = ""
 
@@ -169,6 +315,7 @@ time.sleep(30)
     finally:
         if service_id:
             manager.stop(service_id)
+        socket_path.unlink(missing_ok=True)
 
 
 def test_metadata_excludes_secret_env_and_command_contents(

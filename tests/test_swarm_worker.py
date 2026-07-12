@@ -238,6 +238,7 @@ def test_run_task_worker_mirrors_plan_assets_into_worktree(tmp_path: Path, monke
             workspace_root=worktree_repo,
             threshold_chars=20,
             preview_chars=20,
+            workspace_artifacts_enabled=False,
         )
         offload_result = offloader.maybe_offload(
             tool_name="fs_read",
@@ -250,6 +251,8 @@ def test_run_task_worker_mirrors_plan_assets_into_worktree(tmp_path: Path, monke
         assert stub["artifact_locator"] == "session_artifacts/tool_outputs/step1_fs_read_tc.json"
         assert "artifact_path" not in stub
         assert stub["artifact_readable_via_fs"] is False
+        assert "fs_read_path" not in stub
+        assert "the rest is not readable via fs" in stub["full_output"]
         return 0
 
     monkeypatch.setattr("sylliptor_agent_cli.swarm_worker.run_agent", fake_run_agent)
@@ -1181,7 +1184,130 @@ def test_run_task_worker_accepts_verified_zero_diff_as_noop_success(
     report = (paths.execution_reports_dir / f"{task['id']}.md").read_text(encoding="utf-8")
     assert "- Result Kind: success_noop" in report
     assert "- No-Op Reason: already_satisfied" in report
-    assert "- Merge Result: no merge required (verified no-op)" in report
+    assert "- Merge Result: no merge required (already-satisfied no-op)" in report
+
+
+def test_run_task_worker_suppresses_generic_pytest_for_static_zero_diff(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A generic ``pytest -q`` preset is only trusted once a real test surface is
+    # confirmed. For a static-file task in a worktree with no discoverable Python
+    # test surface, verification is suppressed to the first-class, non-failing
+    # ``task_refinement.no_authoritative_commands`` selection: run_task_verification
+    # is never invoked and the zero-diff no-op still succeeds cleanly.
+    _repo, paths, _task, worktree_repo = _prepare_zero_diff_worker_case(tmp_path)
+    plan = load_plan(paths)
+    task = plan["tasks"][0]
+    task["title"] = "Create static site files"
+    task["estimated_files"] = ["index.html", "style.css"]
+    task["write_scope"] = ["index.html", "style.css"]
+    save_plan(paths, plan)
+    _configure_zero_diff_worker(monkeypatch)
+    verify_calls: list[dict[str, object]] = []
+
+    def fake_verify(**kwargs):  # type: ignore[no-untyped-def]
+        verify_calls.append(dict(kwargs))
+        raise AssertionError("verification must be suppressed for a scope-irrelevant task")
+
+    monkeypatch.setattr("sylliptor_agent_cli.swarm_worker.run_task_verification", fake_verify)
+
+    result = run_task_worker(
+        task=task,
+        plan=load_plan(paths),
+        worktree_repo_path=worktree_repo,
+        base_branch="main",
+        run_paths=paths,
+        cfg=AppConfig(model="test-model", verify_commands=["pytest -q"]),
+        mode="auto",
+        yes=True,
+        max_steps=5,
+        api_key_override="k",
+        no_log=True,
+        console=_console(),
+        scope_mode="strict",
+        verify_mode="warn",
+    )
+
+    assert result.success is True
+    assert result.effective_result_kind == "success_noop"
+    assert result.noop_reason == "already_satisfied"
+    assert result.verify_summary == "verification skipped: no changes needed"
+    assert result.verify_command_source == "task_refinement.no_authoritative_commands"
+    assert result.verify_payload is None
+    assert verify_calls == []
+    assert "zero-diff" not in result.summary
+
+
+def test_run_task_worker_runs_trusted_pytest_and_accepts_no_tests(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # When a real Python test surface is present the configured ``pytest -q`` is
+    # trusted and executed; a pytest exit code 5 (no tests collected) is threaded
+    # through as a benign, non-failing "nothing to verify" skip rather than a
+    # verification failure.
+    _repo, paths, _task, worktree_repo = _prepare_zero_diff_worker_case(tmp_path)
+    (worktree_repo / "pyproject.toml").write_text(
+        "[project]\nname = 'demo'\nversion = '0.0.0'\n", encoding="utf-8"
+    )
+    (worktree_repo / "tests").mkdir(parents=True, exist_ok=True)
+    (worktree_repo / "tests" / "test_smoke.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8"
+    )
+    plan = load_plan(paths)
+    task = plan["tasks"][0]
+    save_plan(paths, plan)
+    _configure_zero_diff_worker(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_verify(**kwargs):  # type: ignore[no-untyped-def]
+        captured["commands"] = list(kwargs["commands"])
+        artifact_path = kwargs["artifact_path"]
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text("no tests collected\n", encoding="utf-8")
+        return VerifyRunResult(
+            commands=list(kwargs["commands"]),
+            command_results=[
+                VerifyCommandResult(
+                    command="pytest -q",
+                    effective_command="pytest -q",
+                    exit_code=5,
+                    output="collected 0 items\n\nno tests ran\n",
+                    real_execution=False,
+                    non_execution_reason="pytest_no_tests_collected",
+                )
+            ],
+            artifact_path=artifact_path,
+        )
+
+    monkeypatch.setattr("sylliptor_agent_cli.swarm_worker.run_task_verification", fake_verify)
+
+    result = run_task_worker(
+        task=task,
+        plan=load_plan(paths),
+        worktree_repo_path=worktree_repo,
+        base_branch="main",
+        run_paths=paths,
+        cfg=AppConfig(model="test-model", verify_commands=["pytest -q"]),
+        mode="auto",
+        yes=True,
+        max_steps=5,
+        api_key_override="k",
+        no_log=True,
+        console=_console(),
+        scope_mode="strict",
+        verify_mode="warn",
+    )
+
+    assert result.success is True
+    assert result.effective_result_kind == "success_noop"
+    assert result.noop_reason == "already_satisfied"
+    assert captured["commands"] == ["pytest -q"]
+    assert result.verify_command_source == "repo_scan.likely_test_commands"
+    assert result.verify_summary == "verification skipped: nothing to verify (1/1)"
+    assert result.verify_payload is not None
+    assert result.verify_payload["all_passed"] is True
+    assert result.verify_payload["command_results"][0]["status"] == "skipped"
+    assert "zero-diff" not in result.summary
 
 
 def test_run_task_worker_accepts_diagnostic_zero_diff_without_verification(
@@ -1782,7 +1908,7 @@ def test_run_task_worker_suppresses_wrong_pytest_fallback_for_js_bootstrap_commi
     assert "pytest -q" not in report
 
 
-def test_worker_reports_no_authoritative_commands_for_docs_only_task_under_generic_preset(
+def test_worker_reports_no_authoritative_commands_for_docs_only_task_under_default_fallback(
     tmp_path: Path, monkeypatch
 ) -> None:
     repo = tmp_path / "repo"
@@ -1851,7 +1977,7 @@ def test_worker_reports_no_authoritative_commands_for_docs_only_task_under_gener
         worktree_repo_path=worktree_repo,
         base_branch="main",
         run_paths=paths,
-        cfg=AppConfig(model="test-model", verify_commands=["pytest -q", "ruff check ."]),
+        cfg=AppConfig(model="test-model"),
         mode="auto",
         yes=True,
         max_steps=5,
@@ -1874,7 +2000,6 @@ def test_worker_reports_no_authoritative_commands_for_docs_only_task_under_gener
     assert "- Verify Command Source: task_refinement.no_authoritative_commands" in report
     assert "No authoritative verification commands were available for this task yet." in report
     assert "pytest -q" not in report
-    assert "ruff check ." not in report
 
 
 def test_run_task_worker_refreshes_verify_commands_after_creating_test_surface(
@@ -2178,7 +2303,7 @@ def test_run_task_worker_rejects_verified_zero_diff_after_nonzero_exit(
     assert "agent exited non-zero (1)" in (result.error or "")
 
 
-def test_run_task_worker_rejects_zero_diff_when_verification_is_off(
+def test_run_task_worker_accepts_zero_diff_when_verification_is_off(
     tmp_path: Path, monkeypatch
 ) -> None:
     _repo, paths, task, worktree_repo = _prepare_zero_diff_worker_case(tmp_path)
@@ -2207,17 +2332,19 @@ def test_run_task_worker_rejects_zero_diff_when_verification_is_off(
         verify_mode="off",
     )
 
-    assert result.success is False
+    assert result.success is True
     assert result.commit_hash is None
     assert result.verify_failed is False
-    assert result.verify_summary == "verification disabled (--verify off)"
-    assert result.effective_result_kind == "failure"
-    assert result.noop_success is False
-    assert "zero-diff worker outcomes require passing authoritative verification" in result.summary
+    assert result.verify_summary == "verification skipped: no changes needed"
+    assert result.effective_result_kind == "success_noop"
+    assert result.noop_success is True
+    assert result.noop_reason == "already_satisfied"
+    assert "already satisfied" in result.summary
+    assert "zero-diff" not in result.summary
     payload = result.to_json()
-    assert payload["result_kind"] == "failure"
-    assert payload["noop_success"] is False
-    assert payload["noop_reason"] is None
+    assert payload["result_kind"] == "success_noop"
+    assert payload["noop_success"] is True
+    assert payload["noop_reason"] == "already_satisfied"
 
 
 def test_run_task_worker_rejects_zero_diff_agent_exception_when_verification_is_off(
@@ -4829,11 +4956,12 @@ def test_swarm_worker_trace_surface_full_emits_richer_detail() -> None:
 
     messages = [event.message for event in sink.events]
     assert any("Worker output progress" in msg for msg in messages)
-    assert any(msg.startswith("Goal:") for msg in messages)
-    assert any(msg.startswith("Action:") for msg in messages)
     assert any(msg.startswith("Input:") for msg in messages)
-    assert any(msg.startswith("Fallback:") for msg in messages)
-    assert any("Decision: Tool failed" in msg for msg in messages)
+    assert any("Read File failed (50ms)" in msg for msg in messages)
+    assert not any(msg.startswith("Goal:") for msg in messages)
+    assert not any(msg.startswith("Action:") for msg in messages)
+    assert not any(msg.startswith("Fallback:") for msg in messages)
+    assert not any(msg.startswith("Decision:") for msg in messages)
     assert any("Worker response preview" in msg for msg in messages)
 
 
@@ -5114,9 +5242,10 @@ def test_run_task_worker_uses_adaptive_managed_task_budget_without_override(
     budget_payload = json.loads(budget_path.read_text(encoding="utf-8"))
     step_budget = budget_payload["step_budget"]
     assert step_budget["kind"] == "managed_task"
-    assert step_budget["reason"] == "adaptive_managed_task"
-    assert step_budget["hard_cap"] == 31
-    assert step_budget["resolved_max_steps"] <= 31
+    assert step_budget["reason"] == "autonomous_unbounded"
+    assert step_budget["hard_cap"] is None
+    assert step_budget["resolved_max_steps"] is None
+    assert step_budget["unlimited"] is True
     assert step_budget["override_applied"] is False
     assert step_budget["signals_used"]["attempt_count"] == 3
     assert step_budget["signals_used"]["image_count"] == 1
@@ -5206,5 +5335,5 @@ def test_run_task_worker_uses_fixed_override_for_explicit_max_steps(
     step_budget = budget_payload["step_budget"]
     assert step_budget["resolved_max_steps"] == 7
     assert step_budget["hard_cap"] == 7
-    assert step_budget["reason"] == "fixed_override"
+    assert step_budget["reason"] == "explicit_limit"
     assert step_budget["override_applied"] is True

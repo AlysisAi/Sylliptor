@@ -23,6 +23,44 @@ class DashScopeChatSearchError(RuntimeError):
     pass
 
 
+_DASHSCOPE_RESPONSES_SEARCH_MODEL_PREFIXES = (
+    "qwen3.7-plus",
+    "qwen3.7-max",
+    "qwen3.6-plus",
+    "qwen3.6-flash",
+    "qwen3.6-max",
+)
+_DASHSCOPE_CHAT_SEARCH_MODEL_PREFIXES = (
+    "qwen3.5-plus",
+    "qwen3.5-flash",
+    "qwen3-max",
+    "qwen-plus",
+    "qwen-flash",
+    "qwen-max",
+)
+
+
+def _normalized_dashscope_model(model: str | None) -> str:
+    normalized = str(model or "").strip().lower()
+    if "/" in normalized:
+        normalized = normalized.rsplit("/", 1)[-1]
+    return normalized
+
+
+def dashscope_model_uses_responses_search(model: str | None) -> bool:
+    normalized = _normalized_dashscope_model(model)
+    return any(
+        normalized.startswith(prefix) for prefix in _DASHSCOPE_RESPONSES_SEARCH_MODEL_PREFIXES
+    )
+
+
+def dashscope_model_supports_web_search(model: str | None) -> bool:
+    normalized = _normalized_dashscope_model(model)
+    return dashscope_model_uses_responses_search(normalized) or any(
+        normalized.startswith(prefix) for prefix in _DASHSCOPE_CHAT_SEARCH_MODEL_PREFIXES
+    )
+
+
 def _extract_error_message(data: Any) -> str | None:
     if not isinstance(data, dict):
         return None
@@ -38,23 +76,25 @@ def _extract_error_message(data: Any) -> str | None:
     return None
 
 
-def _dashscope_error_from_response(response: httpx.Response) -> DashScopeChatSearchError:
+def _dashscope_error_from_response(
+    response: httpx.Response,
+    *,
+    operation_label: str = "DashScope chat search",
+) -> DashScopeChatSearchError:
     try:
         data = response.json()
     except Exception:
         body = response.text
         if len(body) > 1000:
             body = body[:1000] + "...(truncated)"
-        return DashScopeChatSearchError(
-            f"DashScope chat search error {response.status_code}: {body}"
-        )
+        return DashScopeChatSearchError(f"{operation_label} error {response.status_code}: {body}")
     if isinstance(data, dict):
         error_message = _extract_error_message(data)
         if error_message:
             return DashScopeChatSearchError(
-                f"DashScope chat search error {response.status_code}: {error_message}"
+                f"{operation_label} error {response.status_code}: {error_message}"
             )
-    return DashScopeChatSearchError(f"DashScope chat search error {response.status_code}: {data!r}")
+    return DashScopeChatSearchError(f"{operation_label} error {response.status_code}: {data!r}")
 
 
 def _choice_message_text(data: dict[str, Any]) -> str:
@@ -71,6 +111,70 @@ def _choice_message_text(data: dict[str, Any]) -> str:
         if isinstance(content, str):
             return content.strip()
     return ""
+
+
+def _responses_message_text(data: dict[str, Any]) -> str:
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+    parts: list[str] = []
+    output = data.get("output")
+    for item in output if isinstance(output, list) else []:
+        if not isinstance(item, dict) or str(item.get("type") or "") != "message":
+            continue
+        content = item.get("content")
+        for chunk in content if isinstance(content, list) else []:
+            if not isinstance(chunk, dict):
+                continue
+            text = chunk.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts).strip()
+
+
+def _responses_sources(data: dict[str, Any]) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, dict):
+            source = _coerce_source(value)
+            if source is not None:
+                sources.append(source)
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    _walk(nested)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+
+    _walk(data.get("output"))
+    return sources
+
+
+def _responses_queries(data: dict[str, Any]) -> list[str]:
+    queries: list[str] = []
+
+    def _append(raw: Any) -> None:
+        value = str(raw or "").strip()
+        if value and value not in queries:
+            queries.append(value)
+
+    def _walk(value: Any) -> None:
+        if isinstance(value, dict):
+            _append(value.get("query"))
+            raw_queries = value.get("queries")
+            if isinstance(raw_queries, list):
+                for query in raw_queries:
+                    _append(query)
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    _walk(nested)
+        elif isinstance(value, list):
+            for item in value:
+                _walk(item)
+
+    _walk(data.get("output"))
+    return queries
 
 
 def _sse_json_events(text: str) -> list[dict[str, Any]]:
@@ -235,18 +339,23 @@ def _dedupe_sources(
     allowed_domains: list[str] | None,
 ) -> list[dict[str, str]]:
     deduped: list[dict[str, str]] = []
-    seen: set[str] = set()
+    index_by_url: dict[str, int] = {}
     for source in sources:
         raw_url = str(source.get("url") or "").strip()
         if not raw_url:
             continue
         effective_url = _effective_source_url(source)
         dedupe_key = effective_url or raw_url
-        if dedupe_key in seen:
+        if dedupe_key in index_by_url:
+            existing = deduped[index_by_url[dedupe_key]]
+            if not existing.get("title") and source.get("title"):
+                existing["title"] = str(source["title"]).strip()
+            if not existing.get("snippet") and source.get("snippet"):
+                existing["snippet"] = str(source["snippet"]).strip()
             continue
         if not _host_matches_allowed_domains(effective_url or raw_url, allowed_domains):
             continue
-        seen.add(dedupe_key)
+        index_by_url[dedupe_key] = len(deduped)
         cleaned = {
             "url": effective_url or raw_url,
             "title": str(source.get("title") or "").strip(),
@@ -300,19 +409,33 @@ def dashscope_chat_search(
     if not str(model or "").strip():
         raise DashScopeChatSearchError("model is required for DashScope chat search.")
 
-    url = f"{base_url.rstrip('/')}/chat/completions"
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": [{"role": "user", "content": _search_prompt(query, include_domains)}],
-        "enable_search": True,
-        "search_options": {
-            "forced_search": True,
-            "search_strategy": "agent",
-            "enable_source": True,
-        },
-        "enable_thinking": False,
-        "stream": True,
-    }
+    use_responses = dashscope_model_uses_responses_search(model)
+    operation_label = "DashScope Responses search" if use_responses else "DashScope chat search"
+    if use_responses:
+        url = f"{base_url.rstrip('/')}/responses"
+        prompt = f"Use live web search and cite source URLs.\n\n{query}"
+        if include_domains:
+            prompt += "\nOnly use sources from these domains: " + ", ".join(include_domains) + "."
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": prompt,
+            "tools": [{"type": "web_search"}],
+            "stream": False,
+        }
+    else:
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": _search_prompt(query, include_domains)}],
+            "enable_search": True,
+            "search_options": {
+                "forced_search": True,
+                "search_strategy": "agent",
+                "enable_source": True,
+            },
+            "enable_thinking": False,
+            "stream": True,
+        }
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -341,17 +464,17 @@ def dashscope_chat_search(
         except httpx.TimeoutException as e:
             raise DashScopeChatSearchError(
                 format_http_timeout_error(
-                    operation="DashScope chat search",
+                    operation=operation_label,
                     budget=timeout_budget,
                     error=e,
                 )
             ) from e
         except SafeHttpError as e:
-            raise DashScopeChatSearchError(f"DashScope chat search request blocked: {e}") from e
+            raise DashScopeChatSearchError(f"{operation_label} request blocked: {e}") from e
         except Exception as e:  # noqa: BLE001
-            raise DashScopeChatSearchError(f"DashScope chat search request failed: {e}") from e
+            raise DashScopeChatSearchError(f"{operation_label} request failed: {e}") from e
         if response.status_code >= 400:
-            raise _dashscope_error_from_response(response)
+            raise _dashscope_error_from_response(response, operation_label=operation_label)
         return response
 
     response = run_provider_limited_call(
@@ -359,7 +482,7 @@ def dashscope_chat_search(
         provider_key=resolved_provider_key,
         provider_concurrency_caps=provider_concurrency_caps,
         retry_settings=provider_retry_settings,
-        operation="dashscope_chat_search",
+        operation=("dashscope_responses_search" if use_responses else "dashscope_chat_search"),
         sleep_fn=provider_sleep_fn,
         random_fn=provider_random_fn,
     )
@@ -387,9 +510,16 @@ def dashscope_chat_search(
             f"DashScope chat search error {response.status_code}: {data!r}"
         )
 
-    raw_answer = _choice_message_text(data)
-    answer, json_sources = _json_answer_and_sources(raw_answer)
-    payload_sources = _sources_from_json_payload(data)
+    raw_answer = _responses_message_text(data) if use_responses else _choice_message_text(data)
+    if use_responses:
+        answer = raw_answer
+        json_sources: list[dict[str, str]] = []
+        payload_sources = _responses_sources(data)
+        queries = _responses_queries(data) or [query]
+    else:
+        answer, json_sources = _json_answer_and_sources(raw_answer)
+        payload_sources = _sources_from_json_payload(data)
+        queries = [query]
     url_sources = _sources_from_urls(answer)
     deduped_sources = _dedupe_sources(
         [*json_sources, *payload_sources, *url_sources],
@@ -417,9 +547,9 @@ def dashscope_chat_search(
         "answer": answer,
         "citations": citations,
         "sources": final_sources,
-        "queries": [query],
+        "queries": queries,
         "model": response_model or model,
-        "backend": "dashscope_chat",
+        "backend": "dashscope_responses" if use_responses else "dashscope_chat",
         "allowed_domains": include_domains or [],
         "external_web_access": True,
         "response_id": response_id,

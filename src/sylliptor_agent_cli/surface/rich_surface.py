@@ -16,7 +16,7 @@ from rich.text import Text
 
 from ..approval_scope import approval_session_scope_for_request
 from ..interactive_input_guard import interactive_prompt_guard
-from ..llm_error_display import classify_llm_error_display
+from ..llm_error_display import classify_llm_error_display, friendly_llm_error_message
 from ..plan_mode import extract_approved_plan_user_message
 from ..tools.registry import (
     summarize_tool_output_chunk as _summarize_tool_output,
@@ -26,9 +26,6 @@ from ..tools.registry import (
 )
 from ..tools.registry import (
     tool_input_preview as _tool_input_preview,
-)
-from ..tools.registry import (
-    tool_reasoning_hints as _tool_reasoning_hints,
 )
 from .console import (
     ascii_sanitize,
@@ -86,6 +83,7 @@ _SENSITIVE_PATTERNS = [
 ]
 _TRACE_LEVELS = {"off", "compact", "full"}
 _MAX_ERROR_CHARS = 520
+_MAX_REASONING_SUMMARY_PREVIEW_CHARS = 180
 _STYLE_EMPHASIS = STYLE_EMPHASIS
 _STYLE_CONTENT = STYLE_CONTENT
 _STYLE_META = STYLE_DIM
@@ -204,7 +202,7 @@ def _surface_text(console: Console, text: str) -> str:
 
 
 def _error_renderable(err: str) -> Group:
-    clean = _redact(str(err).strip())
+    clean = _redact(friendly_llm_error_message(err).strip())
     if not clean:
         clean = "No additional error details."
     if len(clean) > _MAX_ERROR_CHARS:
@@ -345,14 +343,27 @@ class RichSurface:
         self._spinner_label: str = "Thinking..."
         self._spinner_active = False
         self._stream_buffer: list[str] = []
+        self._reasoning_summary_buffer: list[str] = []
+        self._reasoning_summary_live: Live | None = None
+        self._reasoning_summary_block_id: str | None = None
         self._event_tool_names: dict[str, str] = {}
 
     @property
     def trace_level(self) -> str:
         return self._trace_level
 
+    @property
+    def reasoning_trace_enabled(self) -> bool:
+        """Return whether safe provider-generated summaries are visible."""
+
+        return self._trace_level != "off"
+
     def set_trace_level(self, level: str) -> str:
         self._trace_level = _normalize_trace_level(level, fallback=self._trace_level)
+        if self._trace_level == "off":
+            self._stop_reasoning_summary_live()
+            self._reasoning_summary_buffer.clear()
+            self._reasoning_summary_block_id = None
         return self._trace_level
 
     def _emit_trace_line(
@@ -365,6 +376,7 @@ class RichSurface:
         dedupe_key: str | None = None,
     ) -> None:
         self._stop_thinking_spinner()
+        self._stop_reasoning_summary_live()
         clean = _redact(message.strip())
         if not clean:
             return
@@ -390,9 +402,68 @@ class RichSurface:
 
     def _reset_thinking(self) -> None:
         self._stop_thinking_spinner()
+        self._stop_reasoning_summary_live()
         self._thinking_open = False
         self._last_trace_line_key = ""
         self._stream_buffer.clear()
+        self._reasoning_summary_buffer.clear()
+        self._reasoning_summary_block_id = None
+
+    def _flush_reasoning_summary(self) -> None:
+        self._stop_reasoning_summary_live()
+        if not self._reasoning_summary_buffer:
+            return
+        summary = _redact("".join(self._reasoning_summary_buffer)).strip()
+        self._reasoning_summary_buffer.clear()
+        self._reasoning_summary_block_id = None
+        if self._trace_level == "off" or not summary:
+            return
+        if self._trace_level == "compact":
+            preview = _truncate_inline(
+                summary,
+                max_chars=_MAX_REASONING_SUMMARY_PREVIEW_CHARS,
+            )
+            self._emit_thinking(f"Reasoning summary: {preview}", style=_STYLE_META)
+            return
+        self._emit_thinking("Reasoning summary:", style=_STYLE_CHROME)
+        for line in _split_lines(summary):
+            self._emit_thinking(line, style=_STYLE_META)
+
+    def _reasoning_summary_renderable(self) -> Text:
+        summary = _redact("".join(self._reasoning_summary_buffer)).strip()
+        if self._trace_level == "compact":
+            summary = _truncate_inline(
+                summary,
+                max_chars=_MAX_REASONING_SUMMARY_PREVIEW_CHARS,
+            )
+        label = "Reasoning summary… " if summary else "Reasoning summary…"
+        return Text.assemble(
+            (console_glyph(self.console, "• ", "* "), _STYLE_CHROME),
+            (label, _STYLE_CHROME),
+            (_surface_text(self.console, summary), _STYLE_META),
+        )
+
+    def _update_reasoning_summary_live(self) -> None:
+        if not bool(getattr(self.console, "is_terminal", False)):
+            return
+        self._stop_thinking_spinner()
+        renderable = self._reasoning_summary_renderable()
+        if self._reasoning_summary_live is None:
+            self._reasoning_summary_live = Live(
+                renderable,
+                console=self.console,
+                auto_refresh=False,
+                transient=True,
+            )
+            self._reasoning_summary_live.start(refresh=True)
+            return
+        self._reasoning_summary_live.update(renderable, refresh=True)
+
+    def _stop_reasoning_summary_live(self) -> None:
+        live = self._reasoning_summary_live
+        self._reasoning_summary_live = None
+        if live is not None:
+            live.stop()
 
     def _supports_live_thinking_spinner(self) -> bool:
         if console_uses_ascii(self.console):
@@ -611,6 +682,7 @@ class RichSurface:
     def on_assistant_token(self, delta: str) -> None:
         self._turn_started = False
         self._working_banner_shown = False
+        self._flush_reasoning_summary()
         self._stop_thinking_spinner()
         if not self._assistant_stream_open:
             self._open_answer_section()
@@ -620,9 +692,41 @@ class RichSurface:
         safe_write(stream, clean_delta)
         self._stream_buffer.append(clean_delta)
 
+    def on_reasoning_start(self, block_id: str) -> None:
+        """Open a provider-call-scoped safe-summary block."""
+
+        if self._trace_level == "off":
+            return
+        normalized = str(block_id or "").strip()
+        if not normalized or normalized == self._reasoning_summary_block_id:
+            return
+        if self._reasoning_summary_buffer:
+            self._flush_reasoning_summary()
+        self._reasoning_summary_block_id = normalized
+
+    def on_reasoning_token(self, delta: str) -> None:
+        """Buffer a safe provider-generated reasoning summary for display."""
+
+        if self._trace_level == "off" or not delta:
+            return
+        if self._reasoning_summary_block_id is None:
+            self._reasoning_summary_block_id = "legacy"
+        self._reasoning_summary_buffer.append(delta)
+        # Streaming clients call this incrementally; buffered clients call it
+        # only after the provider response completes, so live rendering follows
+        # `/stream` timing without a second surface-level mode switch.
+        self._update_reasoning_summary_live()
+
+    def on_reasoning_end(self, block_id: str) -> None:
+        normalized = str(block_id or "").strip()
+        if normalized and normalized != self._reasoning_summary_block_id:
+            return
+        self._flush_reasoning_summary()
+
     def on_assistant_message_done(self, text: str) -> None:
         self._turn_started = False
         self._working_banner_shown = False
+        self._flush_reasoning_summary()
         self._stop_thinking_spinner()
         clean = _redact(text.strip())
         if self._assistant_stream_open:
@@ -740,6 +844,7 @@ class RichSurface:
         )
 
     def on_tool_start(self, event: ToolStartEvent) -> None:
+        self._flush_reasoning_summary()
         self._stop_thinking_spinner()
         if self._turn_started and not self._working_banner_shown:
             elapsed = self._consume_turn_elapsed_label()
@@ -770,40 +875,18 @@ class RichSurface:
             self._emit_thinking(f"Step {event.step}: {display}", style=_STYLE_CHROME)
         if self._trace_level != "full":
             return
-        why, expect, fallback = _tool_reasoning_hints(event.name)
         if event.subagent_name:
-            self._emit_subagent_trace(
-                subagent_name=event.subagent_name,
-                message=f"Goal: {why}",
-                style=_STYLE_META,
-                nesting_depth=event.nesting_depth,
-            )
-            self._emit_subagent_trace(
-                subagent_name=event.subagent_name,
-                message=f"Action: {expect}",
-                style=_STYLE_META,
-                nesting_depth=event.nesting_depth,
-            )
             self._emit_subagent_trace(
                 subagent_name=event.subagent_name,
                 message=f"Input: {_tool_input_preview(event.name, event.args)}",
                 style=_STYLE_META,
                 nesting_depth=event.nesting_depth,
             )
-            self._emit_subagent_trace(
-                subagent_name=event.subagent_name,
-                message=f"Fallback: {fallback}",
-                style=_STYLE_META,
-                nesting_depth=event.nesting_depth,
-            )
         else:
-            self._emit_thinking(f"Goal: {why}", style=_STYLE_META)
-            self._emit_thinking(f"Action: {expect}", style=_STYLE_META)
             self._emit_thinking(
                 f"Input: {_tool_input_preview(event.name, event.args)}",
                 style=_STYLE_META,
             )
-            self._emit_thinking(f"Fallback: {fallback}", style=_STYLE_META)
 
     def on_tool_output(self, event: ToolOutputEvent) -> None:
         summary = _summarize_tool_output(event.name, event.chunk)
@@ -820,7 +903,12 @@ class RichSurface:
             detail = f": {err_preview}"
         self._tool_start_info.pop(event.tool_call_id, None)
         summary = self._tool_output_summary.pop(event.tool_call_id, "").strip()
-        if self._trace_level != "off":
+        should_render_outcome = (
+            self._trace_level != "off"
+            or event.status != "done"
+            or bool(event.meta.get("approval_declined"))
+        )
+        if should_render_outcome:
             if event.status == "done":
                 outcome = f"{display} ({elapsed})"
                 if summary:
@@ -832,20 +920,19 @@ class RichSurface:
                         style=_STYLE_CHROME,
                         nesting_depth=event.nesting_depth,
                     )
-                    if self._trace_level == "full":
-                        self._emit_subagent_trace(
-                            subagent_name=event.subagent_name,
-                            message="Decision: Accepted tool output and continued to next step.",
-                            style=_STYLE_META,
-                            nesting_depth=event.nesting_depth,
-                        )
                 else:
                     self._emit_thinking(outcome, style=_STYLE_CHROME)
-                    if self._trace_level == "full":
-                        self._emit_thinking(
-                            "Decision: Accepted tool output and continued to next step.",
-                            style=_STYLE_META,
-                        )
+            elif event.meta.get("approval_declined"):
+                message = f"{display} approval declined ({elapsed}){detail}"
+                if event.subagent_name:
+                    self._emit_subagent_trace(
+                        subagent_name=event.subagent_name,
+                        message=message,
+                        style="red",
+                        nesting_depth=event.nesting_depth,
+                    )
+                else:
+                    self._emit_thinking(message, style="red")
             elif event.subagent_name:
                 self._emit_subagent_trace(
                     subagent_name=event.subagent_name,
@@ -853,24 +940,13 @@ class RichSurface:
                     style="red",
                     nesting_depth=event.nesting_depth,
                 )
-                if self._trace_level == "full":
-                    self._emit_subagent_trace(
-                        subagent_name=event.subagent_name,
-                        message="Decision: Tool failed; switching to fallback path or narrower action.",
-                        style=_STYLE_META,
-                        nesting_depth=event.nesting_depth,
-                    )
             else:
                 self._emit_thinking(f"{display} failed ({elapsed}){detail}", style="red")
-                if self._trace_level == "full":
-                    self._emit_thinking(
-                        "Decision: Tool failed; switching to fallback path or narrower action.",
-                        style=_STYLE_META,
-                    )
         if not self._assistant_stream_open and not self._tool_start_info:
             self._start_thinking_spinner(label="Reasoning...")
 
     def on_patch_generated(self, event: PatchEvent) -> None:
+        self._flush_reasoning_summary()
         self._stop_thinking_spinner()
         self.console.print(
             _prefixed_text(
@@ -914,6 +990,7 @@ class RichSurface:
             )
 
     def on_error(self, err: str) -> None:
+        self._flush_reasoning_summary()
         self._stop_thinking_spinner()
         if self._assistant_stream_open:
             self.console.print("")
@@ -931,6 +1008,7 @@ class RichSurface:
             )
 
     def on_warning(self, warning: str) -> None:
+        self._flush_reasoning_summary()
         self._stop_thinking_spinner()
         if self._assistant_stream_open:
             self.console.print("")

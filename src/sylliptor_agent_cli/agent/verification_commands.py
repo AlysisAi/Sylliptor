@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import (
-    normalize_verify_module_invocation,
-    split_verify_command_parts,
     strip_verify_runner_prefix,
+)
+from ..verification_command_analysis import (
+    VerificationCommandEvidentiaryCapability,
+    analyze_verification_command,
 )
 from .prompt_context import _normalized_verify_commands
 
@@ -130,62 +132,93 @@ def _normalize_and_unwrap_verification_command(raw: str) -> str | None:
 
 
 def _has_disallowed_shell_control_flow(raw: str) -> bool:
-    if "\n" in str(raw) or "\r" in str(raw):
-        return True
-    normalized = _normalize_and_unwrap_verification_command(raw)
-    if not normalized:
-        return True
-    try:
-        lexer = shlex.shlex(normalized, posix=True, punctuation_chars="|&;")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = list(lexer)
-    except ValueError:
-        return True
-    if not tokens:
-        return True
-    if len(tokens) >= 4 and tokens[0] == "cd" and tokens[2] == "&&":
-        tokens = tokens[3:]
-        if not tokens:
-            return True
-    return any(token in _DISALLOWED_VERIFICATION_SHELL_TOKENS for token in tokens)
+    analysis = analyze_verification_command(raw, trusted=True)
+    return analysis.shell_control_flow in {"unsafe", "pipeline"} or analysis.rejection_reason in {
+        "disallowed_shell_control_flow",
+        "unsafe_pipeline",
+    }
+
+
+def _top_level_shell_chain_segments(raw: str) -> tuple[list[str], tuple[str, ...]] | None:
+    command = str(raw or "")
+    segments: list[str] = []
+    separators: list[str] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if command.startswith("&&", index) or command.startswith("||", index):
+            segments.append(command[start:index].strip())
+            separators.append(command[index : index + 2])
+            index += 2
+            start = index
+            continue
+        if char in {";", "|", "&"}:
+            segments.append(command[start:index].strip())
+            separators.append(char)
+            index += 1
+            start = index
+            continue
+        index += 1
+    if quote is not None:
+        return None
+    if not separators:
+        return None
+    segments.append(command[start:].strip())
+    return segments, tuple(separators)
+
+
+def _expand_simple_verify_command_chain(
+    raw: str,
+    *,
+    workspace_root: Path | None = None,
+) -> list[str]:
+    split = _top_level_shell_chain_segments(raw)
+    if split is None:
+        return [raw]
+    segments, separators = split
+    if any(separator not in {"&&", ";"} for separator in separators):
+        return [raw]
+    if any(not segment for segment in segments):
+        return [raw]
+
+    expanded: list[str] = []
+    for segment in segments:
+        analysis = analyze_verification_command(segment, workspace_root=workspace_root)
+        if (
+            analysis.rejection_reason
+            or analysis.shell_control_flow != "none"
+            or analysis.evidentiary_capability != VerificationCommandEvidentiaryCapability.ASSERTIVE
+        ):
+            return [raw]
+        expanded.append(segment)
+    return expanded
 
 
 def _canonicalize_verification_command_for_match(raw: str) -> str | None:
-    normalized = _normalize_and_unwrap_verification_command(raw)
-    if not normalized or _has_disallowed_shell_control_flow(normalized):
+    analysis = analyze_verification_command(raw, trusted=True)
+    if analysis.rejection_reason:
         return None
-
-    parts = split_verify_command_parts(normalized)
-    if not parts:
-        return None
-    if len(parts) >= 4 and parts[0] == "cd" and parts[2] == "&&":
-        parts = parts[3:]
-        if not parts:
-            return None
-
-    while True:
-        changed = False
-        stripped_env = _strip_verification_env_prefix(parts)
-        if stripped_env is None:
-            return None
-        if stripped_env != parts:
-            parts = stripped_env
-            changed = True
-
-        stripped_runner = _strip_verification_runner_prefix(parts)
-        if stripped_runner is None:
-            return None
-        if stripped_runner != parts:
-            parts = stripped_runner
-            changed = True
-
-        if not changed:
-            break
-
-    parts = normalize_verify_module_invocation(parts)
-
-    return " ".join(parts) if parts else None
+    return analysis.canonical_command
 
 
 def _split_verification_shape_args(args: list[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -448,16 +481,19 @@ def _looks_like_verification_entrypoint(parts: list[str]) -> bool:
 
 
 def _marker_fallback_is_verification_attempt(normalized_cmd: str) -> bool:
-    canonical = _canonicalize_verification_command_for_match(normalized_cmd)
+    analysis = analyze_verification_command(normalized_cmd, trusted=True)
+    if analysis.rejection_reason:
+        return False
+    if analysis.command_family is not None:
+        return True
+    canonical = analysis.canonical_command
     if not canonical:
         return False
     try:
         parts = shlex.split(canonical, posix=True)
     except ValueError:
         return False
-    if _looks_like_verification_entrypoint(parts):
-        return True
-    return False
+    return _looks_like_verification_entrypoint(parts)
 
 
 def _shell_command_is_verification_attempt(
@@ -470,5 +506,7 @@ def _shell_command_is_verification_attempt(
     evidence = classify_verification_evidence(
         cmd,
         known_verification_commands=known_verification_commands,
+        exit_code=0,
+        real_execution=True,
     )
     return bool(evidence.allowed_to_satisfy_contract)

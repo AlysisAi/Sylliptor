@@ -7,6 +7,8 @@ panel renderer that backs ``/plan markdown`` (PLAN.md without a pager).
 
 from __future__ import annotations
 
+import threading
+import time
 from types import SimpleNamespace
 
 from prompt_toolkit.input import create_pipe_input
@@ -53,7 +55,9 @@ def _values(spec) -> str:
 
 def test_forge_status_tone_buckets():
     assert panels._forge_status_tone("done") == "accent"
+    assert panels._forge_status_tone("already_satisfied") == "accent"
     assert panels._forge_status_tone("verify_failed") == "err"
+    assert panels._forge_status_tone("interrupted") == "err"
     assert panels._forge_status_tone("superseded") == "dim"
     assert panels._forge_status_tone("planned") == "plain"
 
@@ -257,6 +261,93 @@ def test_forge_intro_popup_cancel_does_not_enter():
     assert calls == ["/exit"]  # cancel routed nothing; only the real /exit ran
 
 
+def _planner_prompt() -> dict:
+    # Mirror loop._tui_forge_planner_prompt: on_confirm returns a picker whose
+    # pick submits the flagged /forge form.
+    def _choice(value):
+        submit = (
+            "/forge --planner" if str(value).strip().lower() == "yes" else "/forge --no-planner"
+        )
+        return {"submit": submit}
+
+    return {
+        "picker": {
+            "title": "Use the planner assistant?",
+            "rows": [
+                {"value": "yes", "label": "Yes", "description": "use planner", "current": True},
+                {"value": "no", "label": "No", "description": "plan manually"},
+            ],
+            "on_select": _choice,
+        }
+    }
+
+
+def _forge_intro_with_planner(arg=""):
+    if arg.strip():
+        return None  # "/forge --planner" etc. fall through to the runner
+    return {
+        "title": "Forge",
+        "body": "# Forge\n\nHow it works.\n\n- /execute plan",
+        "hint": "Enter to choose planner",
+        "on_confirm": _planner_prompt,
+    }
+
+
+def test_forge_intro_enter_opens_planner_prompt_then_enters_with_planner():
+    # /forge → intro popup; Enter opens the "Use the planner?" picker; selecting
+    # "Yes" (the default row) submits "/forge --planner" to the runner exactly once.
+    state = TuiState(model_name="m", username="t")
+    calls: list = []
+
+    _run_headless(
+        state,
+        # intro (Enter) → picker (Enter) → pick the default "yes" row (Enter, which
+        # closes the picker) → then /exit. The picker must close BEFORE /exit is
+        # typed, else the picker swallows those keys and the app never exits.
+        "/forge\r\r\r/exit\r",
+        session_builder=_FakeSession,
+        command_runner=_runner(calls),
+        panel_providers={"/forge": _forge_intro_with_planner},
+        background_turns=False,
+    )
+    assert "/forge --planner" in calls
+    assert "/forge" not in calls  # the bare intro command was never routed
+    assert "/forge --no-planner" not in calls
+
+
+def test_forge_intro_planner_prompt_can_choose_no_planner():
+    # Choosing the second row submits "/forge --no-planner" instead.
+    state = TuiState(model_name="m", username="t")
+    calls: list = []
+
+    _run_headless(
+        state,
+        "/forge\r\r2/exit\r",  # intro, Enter → picker, "2" picks the "No" row, exit
+        session_builder=_FakeSession,
+        command_runner=_runner(calls),
+        panel_providers={"/forge": _forge_intro_with_planner},
+        background_turns=False,
+    )
+    assert "/forge --no-planner" in calls
+    assert "/forge --planner" not in calls
+
+
+def test_forge_intro_planner_prompt_esc_cancels():
+    # Esc on the planner picker cancels without entering Forge.
+    state = TuiState(model_name="m", username="t")
+    calls: list = []
+
+    _run_headless(
+        state,
+        "/forge\r\r\x1b/exit\r",  # intro, Enter → picker, Esc cancels the picker, exit
+        session_builder=_FakeSession,
+        command_runner=_runner(calls),
+        panel_providers={"/forge": _forge_intro_with_planner},
+        background_turns=False,
+    )
+    assert calls == ["/exit"]  # nothing forge-related routed
+
+
 # --------------------------------------------------- picker submit (Phase 2)
 
 
@@ -372,6 +463,16 @@ def test_forge_task_visual_glyphs():
     assert _forge_task_visual("planned", True, spinner)[0] == spinner
 
 
+def test_forge_task_visual_terminal_satisfied_and_interrupted_states():
+    spinner = "spin"
+    done_visual = _forge_task_visual("done", False, spinner)
+    failed_visual = _forge_task_visual("verify_failed", False, spinner)
+
+    assert _forge_task_visual("already_satisfied", False, spinner) == done_visual
+    assert _forge_task_visual("interrupted", False, spinner) == failed_visual
+    assert _forge_task_visual("interrupted", True, spinner) == failed_visual
+
+
 def test_forge_view_rows_renders_table_within_width():
     view = {
         "run_id": "run-1a2b",
@@ -437,6 +538,46 @@ def test_surface_on_swarm_event_drives_view(tmp_path):
     assert snap["done"] is True
     assert snap["tasks"][0]["status"] == "done"
     assert snap["tasks"][1]["status"] == "failed"
+
+
+def test_surface_interrupt_forge_marks_running_tasks_and_finishes_view(tmp_path):
+    import json
+
+    plan_path = _write_plan_json(
+        tmp_path,
+        [
+            {"id": "T01", "title": "first", "status": "done"},
+            {"id": "T02", "title": "second", "status": "in_progress"},
+            {"id": "T03", "title": "third", "status": "running"},
+            {"id": "T04", "title": "fourth", "status": "planned"},
+        ],
+    )
+    t = TuiTranscript()
+    surface = TuiSurface(t, auto_approve=lambda: True)
+    surface.begin_forge(SimpleNamespace(run_id="run-stop", plan_json_path=plan_path))
+    t.forge_set_active("T02", phase="worker.lifecycle", message="running")
+
+    surface.interrupt_forge()
+
+    data = json.loads(plan_path.read_text(encoding="utf-8"))
+    statuses = {task["id"]: task["status"] for task in data["tasks"]}
+    assert statuses == {
+        "T01": "done",
+        "T02": "interrupted",
+        "T03": "interrupted",
+        "T04": "planned",
+    }
+    assert data["tasks"][1]["last_error"] == "Interrupted by user."
+    assert data["tasks"][2]["last_error"] == "Interrupted by user."
+
+    snap = t.forge_snapshot()
+    assert snap["done"] is True
+    assert snap["active"] is None
+    assert snap["ok"] is False
+    assert snap["message"] == "Interrupted."
+    rendered_statuses = {task["id"]: task["status"] for task in snap["tasks"]}
+    assert rendered_statuses["T02"] == "interrupted"
+    assert rendered_statuses["T03"] == "interrupted"
 
 
 def test_transcript_forge_sync_adds_new_tasks():
@@ -556,7 +697,7 @@ def test_serialized_sink_prefers_on_swarm_event(tmp_path):
 
 
 def test_forge_execute_callable_dispatched_on_worker():
-    # A command_runner returning ("run", …, {"_forge_execute": cb}) makes the turn
+    # A command_runner returning ("run", …, {"_deferred_execute": cb}) makes the turn
     # machinery call cb instead of session.run_turn.
     state = TuiState(model_name="m", username="t")
     ran: list = []
@@ -566,7 +707,12 @@ def test_forge_execute_callable_dispatched_on_worker():
         if low in ("/exit", "exit"):
             return ("exit", "", None, None)
         if low == "/execute plan":
-            return ("run", "", "/execute plan", {"_forge_execute": lambda token: ran.append(True)})
+            return (
+                "run",
+                "",
+                "/execute plan",
+                {"_deferred_execute": lambda token: ran.append(True)},
+            )
         return ("handled", "", None, None)
 
     _run_headless(
@@ -577,6 +723,86 @@ def test_forge_execute_callable_dispatched_on_worker():
         background_turns=False,
     )
     assert ran == [True]
+
+
+def test_deferred_command_keeps_tui_responsive_to_interrupt_and_exit():
+    state = TuiState(model_name="m", username="t")
+    started = threading.Event()
+    stopped = threading.Event()
+    worker_ids: list[int] = []
+    feed_errors: list[str] = []
+    tui_thread_id = threading.get_ident()
+
+    def runner(session, text, width):
+        low = text.strip().lower()
+        if low in ("/exit", "exit"):
+            return ("exit", "", None, None)
+        if low == "slow planner":
+
+            def _deferred(token):
+                worker_ids.append(threading.get_ident())
+                started.set()
+                while not getattr(token, "is_cancelled", False):
+                    time.sleep(0.005)
+                stopped.set()
+
+            return (
+                "run",
+                "",
+                text,
+                {"_deferred_execute": _deferred},
+            )
+        return ("handled", "", None, None)
+
+    with create_pipe_input() as pipe:
+
+        def _feed() -> None:
+            pipe.send_text("slow planner\r")
+            if not started.wait(timeout=2):
+                feed_errors.append("deferred planner did not start")
+                pipe.send_text("/exit\r")
+                return
+            pipe.send_text("\x03")  # Ctrl+C must be handled while the job is blocked.
+            if not stopped.wait(timeout=2):
+                feed_errors.append("deferred planner did not observe cancellation")
+            pipe.send_text("/exit\r")
+
+        feeder = threading.Thread(target=_feed, daemon=True)
+        feeder.start()
+        result, transcript = run_tui(
+            state,
+            owl_color=False,
+            input=pipe,
+            output=DummyOutput(),
+            session_builder=_FakeSession,
+            command_runner=runner,
+            background_turns=True,
+        )
+        feeder.join(timeout=2)
+
+    assert result == "/exit"
+    assert ("user", "slow planner") in transcript
+    assert ("warn", "Interrupted.") in transcript
+    assert worker_ids and worker_ids[0] != tui_thread_id
+    assert not feeder.is_alive()
+    assert feed_errors == []
+
+
+def test_only_planner_backed_plain_forge_messages_are_deferred():
+    from sylliptor_agent_cli.cli_impl.chat.loop import (
+        _should_defer_forge_planner_submission,
+    )
+
+    enabled = SimpleNamespace(ui_mode="forge", assistant_enabled=True)
+    disabled = SimpleNamespace(ui_mode="forge", assistant_enabled=False)
+    chat = SimpleNamespace(ui_mode="chat", assistant_enabled=True)
+
+    assert _should_defer_forge_planner_submission(forge_state=enabled, text="build an app")
+    assert not _should_defer_forge_planner_submission(forge_state=enabled, text="/show")
+    assert not _should_defer_forge_planner_submission(forge_state=enabled, text=":q")
+    assert not _should_defer_forge_planner_submission(forge_state=enabled, text="   ")
+    assert not _should_defer_forge_planner_submission(forge_state=disabled, text="build an app")
+    assert not _should_defer_forge_planner_submission(forge_state=chat, text="build an app")
 
 
 # ------------------------------------------------ assets picker/detail (Phase 4)

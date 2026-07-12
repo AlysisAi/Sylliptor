@@ -4,7 +4,7 @@ Holds only what the footer/header need to render. The footer HUD fields
 (``context_pct`` / ``tokens`` / ``cost_usd``) are wired live: ``loop.py`` seeds
 them when the session is built and refreshes them after each turn (and mid-turn,
 throttled) from the session's usage summary + context cache. Other fields are
-toggled by the user via Tab / Shift+Tab / F2.
+toggled by the user via Tab / Shift+Tab.
 """
 
 from __future__ import annotations
@@ -18,6 +18,9 @@ ACT_MODE = "act"
 @dataclass
 class TuiState:
     model_name: str = ""
+    # Non-empty while the shell is available but model calls are not (for
+    # example, a selected subscription still needs browser authentication).
+    connection_status: str = ""
     tokens: int = 0
     # Session cost. ``None`` means pricing is unknown (an unmetered/free model with
     # real usage) — the footer renders that as "n/a" rather than a misleading
@@ -34,12 +37,8 @@ class TuiState:
     username: str = ""
     workspace: str = ""  # short display form, e.g. "~/coder-plugin-install"
     branch: str = ""  # git branch name, e.g. "feat/tui-rebuild"
+    usage_hud_enabled: bool = True
     context_pct: float = 100.0  # % of context window remaining
-    # Mouse capture: when True the app owns the mouse (wheel-scroll), which blocks
-    # the terminal's own click-drag text selection. Default OFF so plain mouse
-    # select + copy of transcript text just works; F2 flips it ON for wheel-scroll
-    # (keyboard PageUp/PageDown/Ctrl+End scroll regardless).
-    mouse_capture: bool = False
 
     @property
     def plan_mode(self) -> bool:
@@ -52,10 +51,6 @@ class TuiState:
     def toggle_auto_approve(self) -> bool:
         self.auto_approve = not self.auto_approve
         return self.auto_approve
-
-    def toggle_mouse_capture(self) -> bool:
-        self.mouse_capture = not self.mouse_capture
-        return self.mouse_capture
 
 
 __all__ = ["TuiState", "PLAN_MODE", "ACT_MODE"]

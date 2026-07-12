@@ -14,6 +14,7 @@ from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse, ToolCall
 from sylliptor_agent_cli.session_store import read_session_events
+from sylliptor_agent_cli.surface.noop_surface import NoopSurface
 from sylliptor_agent_cli.verify_gate import VerifyCommandResult, VerifyRunResult
 
 
@@ -24,6 +25,7 @@ class _ScriptedClient:
     def __init__(self, responses: list[LLMResponse]) -> None:
         self._responses = list(responses)
         self.calls = 0
+        self._exhausted_final_repeats = 0
 
     def chat(
         self,
@@ -35,9 +37,47 @@ class _ScriptedClient:
         temperature: float | None = None,
     ) -> LLMResponse:
         _ = messages, tools, stream, on_text_delta, temperature
+        if self.calls >= len(self._responses):
+            previous = self._responses[-1] if self._responses else None
+            if (
+                previous is not None
+                and not previous.tool_calls
+                and str(previous.content or "").strip()
+                and self._exhausted_final_repeats < 1
+            ):
+                self._exhausted_final_repeats += 1
+                self.calls += 1
+                return previous
         response = self._responses[self.calls]
         self.calls += 1
         return response
+
+
+class _RecordingTuiLikeSurface(NoopSurface):
+    def __init__(self) -> None:
+        super().__init__()
+        self.errors: list[str] = []
+        self.final_messages: list[str] = []
+
+    def emit_error(
+        self,
+        code: str,
+        message: str,
+        recoverable: bool,
+        *,
+        worker_id: str | None = None,
+        role: str | None = None,
+    ) -> None:
+        _ = worker_id, role
+        prefix = f"{code}: " if code else ""
+        suffix = "" if recoverable else " (not recoverable)"
+        self.errors.append(f"{prefix}{message}{suffix}")
+
+    def on_error(self, err: str) -> None:
+        self.errors.append(str(err))
+
+    def on_assistant_message_done(self, text: str) -> None:
+        self.final_messages.append(str(text))
 
 
 class _RouterSequenceClient:
@@ -181,6 +221,42 @@ def _fake_infra_unavailable_verify_run(
         artifact_path=artifact_path,
         failure_category="infra_unavailable",
     )
+
+
+def _fake_verify_sequence(results: list[bool]):
+    remaining = list(results)
+    last_result = bool(remaining[-1]) if remaining else False
+
+    def fake_run(
+        *,
+        root: Path,
+        commands: list[str],
+        artifact_path: Path,
+        cfg: AppConfig,
+    ) -> VerifyRunResult:
+        nonlocal last_result
+        _ = root, cfg
+        passed = remaining.pop(0) if remaining else last_result
+        last_result = bool(passed)
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        output = "verification ok\n" if passed else "ZeroDivisionError: division by zero\n"
+        artifact_path.write_text(output, encoding="utf-8")
+        return VerifyRunResult(
+            commands=list(commands),
+            command_results=[
+                VerifyCommandResult(
+                    command=command,
+                    effective_command=command,
+                    exit_code=0 if passed else 1,
+                    output=output,
+                    real_execution=True,
+                )
+                for command in commands
+            ],
+            artifact_path=artifact_path,
+        )
+
+    return fake_run
 
 
 def _write_skill(root: Path, name: str, body: str) -> None:
@@ -602,6 +678,273 @@ def test_interactive_completion_certificate_allows_required_output_finalization(
     assert exit_code == 0
     assert (tmp_path / "result.txt").read_text(encoding="utf-8") == "ok\n"
     _assert_no_interactive_guard_fallbacks(log_path)
+    finalized = _event_payloads(log_path, "turn_intent_finalized")
+    assert finalized
+    assert finalized[-1]["acceptance_problems"] == []
+
+
+def test_interactive_failed_verification_with_clarification_hedge_repairs_without_surface_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_loop_mod,
+        "_route_turn",
+        lambda **_kwargs: _route_decision("repo", "execute"),
+    )
+    monkeypatch.setattr(
+        agent_loop_mod,
+        "run_task_verification",
+        _fake_verify_sequence([False, True]),
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    surface = _RecordingTuiLikeSurface()
+    session = create_session(
+        cfg=AppConfig(
+            model="test-model",
+            routing_mode="auto",
+            verify_commands=["python -m pytest -q"],
+        ),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=8,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=sessions_dir,
+        session_id_override="interactive-verify-fail-hedge-repair",
+        enable_chat_turn_step_budget=True,
+        surface=surface,
+    )
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc1",
+                        name="fs_write",
+                        arguments={
+                            "path": "calc.py",
+                            "content": "def divide(a, b):\n    return a / b\n",
+                        },
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="tc2", name="verify_run", arguments={})],
+                raw={},
+            ),
+            LLMResponse(content="Should I add more tests?", tool_calls=[], raw={}),
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="tc3", name="verify_run", arguments={})],
+                raw={},
+            ),
+            LLMResponse(
+                content="Completed calc.py and verification passes.",
+                tool_calls=[],
+                raw={},
+            ),
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Create calc.py.")
+        log_path = session.store.path
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert surface.errors == []
+    assert _event_payloads(log_path, "interactive_completion_gate_failed") == []
+    assert _event_payloads(log_path, "completion_gate_nudge") == []
+    assert _event_payloads(log_path, "interactive_completion_gate_incomplete_after_retries") == []
+
+
+def test_interactive_failed_verification_with_clarification_hedge_terminal_error_is_verification_scoped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_loop_mod,
+        "_route_turn",
+        lambda **_kwargs: _route_decision("repo", "execute"),
+    )
+    monkeypatch.setattr(
+        agent_loop_mod,
+        "run_task_verification",
+        _fake_verify_sequence([False]),
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    surface = _RecordingTuiLikeSurface()
+    session = create_session(
+        cfg=AppConfig(
+            model="test-model",
+            routing_mode="auto",
+            verify_commands=["python -m pytest -q"],
+        ),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=9,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=sessions_dir,
+        session_id_override="interactive-verify-fail-hedge-terminal",
+        enable_chat_turn_step_budget=True,
+        surface=surface,
+    )
+    repeated_hedge = "Should I add more tests?"
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc1",
+                        name="fs_write",
+                        arguments={
+                            "path": "calc.py",
+                            "content": "def divide(a, b):\n    return a / b\n",
+                        },
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="tc2", name="verify_run", arguments={})],
+                raw={},
+            ),
+            LLMResponse(content=repeated_hedge, tool_calls=[], raw={}),
+            LLMResponse(content=repeated_hedge, tool_calls=[], raw={}),
+            LLMResponse(content=repeated_hedge, tool_calls=[], raw={}),
+            LLMResponse(
+                content=(
+                    "Completed work: calc.py was created.\n"
+                    "Remaining work: verification is still failing.\n"
+                    "Known issues or risks: completion-gate repair attempts were exhausted."
+                ),
+                tool_calls=[],
+                raw={},
+            ),
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Create calc.py.")
+        log_path = session.store.path
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert surface.errors == []
+    assert _event_payloads(log_path, "completion_gate_nudge") == []
+    assert _event_payloads(log_path, "interactive_completion_gate_failed") == []
+    assert _event_payloads(log_path, "interactive_completion_gate_incomplete_after_retries") == []
+
+
+def test_interactive_greenfield_unavailable_verification_ignores_manufactured_verify_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_loop_mod,
+        "_route_turn",
+        lambda **_kwargs: _route_decision("repo", "execute"),
+    )
+    observed_commands: list[list[str]] = []
+
+    def fake_run_task_verification(
+        *,
+        root: Path,
+        commands: list[str],
+        artifact_path: Path,
+        cfg: AppConfig,
+    ) -> VerifyRunResult:
+        _ = root, cfg
+        observed_commands.append(list(commands))
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text("verification skipped: no commands\n", encoding="utf-8")
+        return VerifyRunResult(
+            commands=list(commands), command_results=[], artifact_path=artifact_path
+        )
+
+    monkeypatch.setattr(agent_loop_mod, "run_task_verification", fake_run_task_verification)
+
+    sessions_dir = tmp_path / "sessions"
+    surface = _RecordingTuiLikeSurface()
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="auto"),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=5,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=sessions_dir,
+        session_id_override="interactive-greenfield-unavailable-verify",
+        enable_chat_turn_step_budget=True,
+        surface=surface,
+    )
+    manufactured_command = 'python -c "from calc import divide; divide(1, 0)"'
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc1",
+                        name="fs_write",
+                        arguments={
+                            "path": "calc.py",
+                            "content": (
+                                "def divide(a, b):\n"
+                                "    if b == 0:\n"
+                                "        raise ZeroDivisionError('division by zero')\n"
+                                "    return a / b\n"
+                            ),
+                        },
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc2",
+                        name="verify_run",
+                        arguments={"commands": [manufactured_command]},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="Created calc.py.", tool_calls=[], raw={}),
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Create calc.py.")
+        log_path = session.store.path
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert observed_commands == [[]]
+    assert surface.errors == []
+    assert session.verification_contract_type == "unavailable"
+    verify_events = _event_payloads(log_path, "verify_run")
+    assert verify_events
+    assert verify_events[-1]["commands"] == []
+    assert verify_events[-1]["ignored_model_verification_commands"] == [manufactured_command]
+    assert verify_events[-1]["verification_skip_reason"] == "verification_contract_unavailable"
+    assert _event_payloads(log_path, "interactive_completion_gate_failed") == []
     finalized = _event_payloads(log_path, "turn_intent_finalized")
     assert finalized
     assert finalized[-1]["acceptance_problems"] == []

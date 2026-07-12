@@ -3,6 +3,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from .llm.cache_capabilities import (
+    CACHE_STRATEGY_ANTHROPIC_CACHE_CONTROL,
+    CACHE_STRATEGY_GEMINI_EXPLICIT_CACHED_CONTENT,
+    CACHE_STRATEGY_MISTRAL_PROMPT_CACHE_KEY,
+    CACHE_STRATEGY_OPENAI_PROMPT_CACHE,
+    CACHE_STRATEGY_OPENROUTER_STICKY_SESSION,
+    CACHE_STRATEGY_QWEN_CACHE_CONTROL_BLOCKS,
+    CACHE_STRATEGY_XAI_CONVERSATION_HEADER,
+    CACHE_USAGE_SCHEMA_ANTHROPIC,
+    CACHE_USAGE_SCHEMA_GEMINI,
+    CACHE_USAGE_SCHEMA_OPENAI,
+    CACHE_USAGE_SCHEMA_PROVIDER,
+    OPENROUTER_SESSION_ID_FIELD,
+    XAI_CONVERSATION_ID_HEADER_FIELD,
+    CacheCapabilitySpec,
+)
 from .llm.protocols import (
     ANTHROPIC_MESSAGES_PROTOCOL,
     GEMINI_GENERATE_CONTENT_PROTOCOL,
@@ -14,9 +30,11 @@ from .profiles import ProfileSpec
 from .web_search_adapters import (
     ANTHROPIC_MESSAGES_ADAPTER,
     AUTO_WEB_SEARCH_ADAPTER,
+    COHERE_WEB_SEARCH_ADAPTER,
     DASHSCOPE_CHAT_ADAPTER,
     GEMINI_GROUNDING_ADAPTER,
     GROQ_COMPOUND_ADAPTER,
+    MINIMAX_CODING_PLAN_ADAPTER,
     MISTRAL_CONVERSATIONS_ADAPTER,
     MOONSHOT_KIMI_ADAPTER,
     OPENAI_RESPONSES_ADAPTER,
@@ -40,6 +58,10 @@ FIRST_PARTY_NATIVE_PRESET_KEYS: tuple[str, ...] = (
     "anthropic",
     "gemini",
 )
+FIRST_CLASS_SETUP_PRESET_KEYS: tuple[str, ...] = (
+    "sylliptor",
+    *FIRST_PARTY_NATIVE_PRESET_KEYS,
+)
 FIRST_PARTY_COMPATIBILITY_PRESET_KEYS: tuple[str, ...] = (
     "openai",
     "anthropic-compat",
@@ -47,6 +69,7 @@ FIRST_PARTY_COMPATIBILITY_PRESET_KEYS: tuple[str, ...] = (
 )
 LEGACY_NATIVE_ALIAS_PRESET_KEYS: tuple[str, ...] = ("anthropic-native", "gemini-native")
 LOCAL_PROFILE_PRESET_KEYS: tuple[str, ...] = ("ollama", "lm-studio", "vllm")
+_CUSTOM_PRESET_KEY = "custom"
 _CONVERSION_PRESET_BY_FAMILY: dict[str, dict[str, str]] = {
     "openai": {"native": "openai-responses", "compatibility": "openai"},
     "anthropic": {"native": "anthropic", "compatibility": "anthropic-compat"},
@@ -70,6 +93,89 @@ class ProfilePreset:
     web_search_model: str = ""
     setup_warning: str = ""
     notes: str = ""
+    cache_capability: CacheCapabilitySpec | None = None
+    # Keep new optional fields at the end so extensions using the legacy
+    # positional constructor continue to bind the sixth argument to headers.
+    provider_key: str = ""
+
+
+_OPENAI_PROMPT_CACHE_CAPABILITY = CacheCapabilitySpec(
+    strategy=CACHE_STRATEGY_OPENAI_PROMPT_CACHE,
+    enabled=True,
+    supports_prompt_cache_key=True,
+    supports_prompt_cache_retention=True,
+    reports_cache_read_tokens=True,
+    usage_schema=CACHE_USAGE_SCHEMA_OPENAI,
+    min_cacheable_tokens=1024,
+    source="preset",
+)
+_ANTHROPIC_CACHE_CONTROL_CAPABILITY = CacheCapabilitySpec(
+    strategy=CACHE_STRATEGY_ANTHROPIC_CACHE_CONTROL,
+    enabled=True,
+    supports_cache_control=True,
+    reports_cache_read_tokens=True,
+    reports_cache_write_tokens=True,
+    usage_schema=CACHE_USAGE_SCHEMA_ANTHROPIC,
+    source="preset",
+)
+_GEMINI_EXPLICIT_CACHED_CONTENT_CAPABILITY = CacheCapabilitySpec(
+    strategy=CACHE_STRATEGY_GEMINI_EXPLICIT_CACHED_CONTENT,
+    enabled=True,
+    supports_explicit_cached_content=True,
+    reports_cache_read_tokens=True,
+    usage_schema=CACHE_USAGE_SCHEMA_GEMINI,
+    min_cacheable_tokens=4096,
+    source="preset",
+)
+_MISTRAL_PROMPT_CACHE_CAPABILITY = CacheCapabilitySpec(
+    strategy=CACHE_STRATEGY_MISTRAL_PROMPT_CACHE_KEY,
+    enabled=True,
+    supports_prompt_cache_key=True,
+    reports_cache_read_tokens=True,
+    usage_schema=CACHE_USAGE_SCHEMA_OPENAI,
+    min_cacheable_tokens=1024,
+    emits_request_fields=True,
+    notes=("Emits Mistral prompt_cache_key for stable server routing and prompt-cache hits.",),
+    source="preset",
+)
+_OPENROUTER_STICKY_SESSION_CACHE_CAPABILITY = CacheCapabilitySpec(
+    strategy=CACHE_STRATEGY_OPENROUTER_STICKY_SESSION,
+    enabled=True,
+    reports_cache_read_tokens=True,
+    reports_cache_write_tokens=True,
+    usage_schema=CACHE_USAGE_SCHEMA_PROVIDER,
+    emits_request_fields=True,
+    request_fields=(OPENROUTER_SESSION_ID_FIELD,),
+    notes=(
+        "Emits OpenRouter session_id for sticky routing; upstream cache semantics remain "
+        "route-dependent.",
+    ),
+    source="preset",
+)
+_XAI_CONVERSATION_HEADER_CACHE_CAPABILITY = CacheCapabilitySpec(
+    strategy=CACHE_STRATEGY_XAI_CONVERSATION_HEADER,
+    enabled=True,
+    reports_cache_read_tokens=True,
+    usage_schema=CACHE_USAGE_SCHEMA_PROVIDER,
+    emits_request_fields=True,
+    request_fields=(XAI_CONVERSATION_ID_HEADER_FIELD,),
+    notes=("Emits x-grok-conv-id for sticky cache routing on xAI Chat Completions.",),
+    source="preset",
+)
+_QWEN_DIAGNOSTIC_CACHE_CAPABILITY = CacheCapabilitySpec(
+    strategy=CACHE_STRATEGY_QWEN_CACHE_CONTROL_BLOCKS,
+    enabled=True,
+    reports_cache_read_tokens=True,
+    reports_cache_write_tokens=True,
+    usage_schema=CACHE_USAGE_SCHEMA_PROVIDER,
+    min_cacheable_tokens=1024,
+    emits_request_fields=False,
+    notes=(
+        "Diagnostic-only in auto mode; Qwen cache_control content markers mutate "
+        "message shape and require request-shape gating.",
+    ),
+    source="preset",
+)
 
 
 def preset_protocol_kind(preset: ProfilePreset) -> str:
@@ -86,12 +192,14 @@ def preset_protocol_summary(preset: ProfilePreset) -> str:
 
 def preset_selection_label(preset: ProfilePreset) -> str:
     """Return a setup/config label that keeps protocol details out of the primary choice."""
+    if preset.key == "sylliptor":
+        return "Sylliptor MiMo (Xiaomi) - free trial, no API key"
     if preset.key == "openai-responses":
-        return "OpenAI - Recommended native Responses"
+        return "OpenAI - Native Responses"
     if preset.key in {"anthropic", "anthropic-native"}:
-        return "Anthropic Claude - native Messages, recommended"
+        return "Anthropic Claude - Native Messages"
     if preset.key in {"gemini", "gemini-native"}:
-        return "Google Gemini - native GenerateContent, recommended"
+        return "Google Gemini - Native GenerateContent"
     if preset.key == "openai":
         return "OpenAI - Compatibility/gateway Chat Completions"
     if preset.key == "anthropic-compat":
@@ -105,45 +213,70 @@ def preset_selection_label(preset: ProfilePreset) -> str:
     return preset.label
 
 
-def provider_selection_presets() -> list[ProfilePreset]:
-    """Order setup/config presets around user-facing provider choices.
+def _advanced_only_preset_keys() -> frozenset[str]:
+    """Preset keys deliberately kept off the primary provider picker.
 
-    Native first-party providers are first for new users. Compatibility/gateway, local, custom, and
-    one-release alias presets remain available through the advanced/legacy picker instead of the
-    normal first screen.
+    Everything else in :data:`PROFILE_PRESETS` is a real hosted provider — the
+    native first-party APIs *and* the third-party API/gateway endpoints — and is
+    surfaced directly so users are not limited to the big-three brands. Only the
+    OpenAI-compatible duplicates of the native first-party providers, local
+    endpoints (Ollama/LM Studio/vLLM), the manual custom-URL entry, and the
+    one-release legacy aliases stay behind the advanced picker.
+    """
+    return frozenset(
+        {
+            _CUSTOM_PRESET_KEY,
+            *FIRST_PARTY_COMPATIBILITY_PRESET_KEYS,
+            *LOCAL_PROFILE_PRESET_KEYS,
+            *LEGACY_NATIVE_ALIAS_PRESET_KEYS,
+        }
+    )
+
+
+def provider_selection_presets() -> list[ProfilePreset]:
+    """Presets shown directly on the primary provider picker.
+
+    The hosted MiMo trial and native first-party providers lead — the best
+    defaults for new users — followed by every other hosted provider in
+    registration order. Compatibility duplicates, local endpoints, the custom-URL
+    entry, and one-release legacy aliases are the only presets held back for the
+    advanced picker, so the user sees the full range of hosted providers up front
+    instead of just OpenAI/Anthropic/Gemini.
     """
     by_key = PRESET_BY_KEY
-    return [by_key[key] for key in FIRST_PARTY_NATIVE_PRESET_KEYS if key in by_key]
+    advanced = _advanced_only_preset_keys()
+    leading = [by_key[key] for key in FIRST_CLASS_SETUP_PRESET_KEYS if key in by_key]
+    leading_keys = {preset.key for preset in leading}
+    rest = [
+        preset
+        for preset in PROFILE_PRESETS
+        if preset.key not in advanced and preset.key not in leading_keys
+    ]
+    return [*leading, *rest]
 
 
 def advanced_provider_selection_presets() -> list[ProfilePreset]:
-    """Return compatibility, gateway, local, custom, and legacy alias presets."""
+    """Return the compatibility, local, custom, and legacy alias presets.
+
+    These are exactly the presets held off the primary provider picker: the
+    OpenAI-compatible duplicates of the native first-party providers, local
+    endpoints (Ollama/LM Studio/vLLM), the manual custom-URL entry, and the
+    one-release legacy aliases.
+    """
     by_key = PRESET_BY_KEY
     first_party_compat = [
         by_key[key] for key in FIRST_PARTY_COMPATIBILITY_PRESET_KEYS if key in by_key
     ]
     local = [by_key[key] for key in LOCAL_PROFILE_PRESET_KEYS if key in by_key]
-    custom = [by_key["custom"]] if "custom" in by_key else []
-    used = {
-        preset.key
-        for preset in (
-            *first_party_compat,
-            *local,
-            *custom,
-        )
-    }
-    gateways = [
-        preset
-        for preset in PROFILE_PRESETS
-        if preset.key not in used and preset.protocol == OPENAI_COMPAT_PROTOCOL
-    ]
+    custom = [by_key[_CUSTOM_PRESET_KEY]] if _CUSTOM_PRESET_KEY in by_key else []
     aliases = [by_key[key] for key in LEGACY_NATIVE_ALIAS_PRESET_KEYS if key in by_key]
-    return [*first_party_compat, *gateways, *local, *custom, *aliases]
+    return [*first_party_compat, *local, *custom, *aliases]
 
 
 PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ProfilePreset(
         key="sylliptor",
+        provider_key="sylliptor",
         label="Sylliptor MiMo (Xiaomi) — free trial",
         protocol="openai_compat",
         # The hosted proxy. It authenticates the user's access_key, enforces the
@@ -165,6 +298,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         # Migrate the legacy bare "mimo" placeholder up to the flagship model.
         model_aliases={"mimo": "mimo-v2.5-pro"},
         web_search_adapter=OPENROUTER_WEB_ADAPTER,
+        cache_capability=_OPENROUTER_STICKY_SESSION_CACHE_CAPABILITY,
         setup_warning=(
             "No API key needed — run `sylliptor login` to connect your Sylliptor "
             "account and unlock the free MiMo trial."
@@ -173,6 +307,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="openai",
+        provider_key="openai",
         label="OpenAI",
         protocol="openai_compat",
         base_url="https://api.openai.com/v1",
@@ -190,9 +325,11 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         },
         validation_model="gpt-5.4-mini",
         web_search_adapter=OPENAI_RESPONSES_ADAPTER,
+        cache_capability=_OPENAI_PROMPT_CACHE_CAPABILITY,
     ),
     ProfilePreset(
         key="openai-responses",
+        provider_key="openai",
         label="OpenAI Responses",
         protocol="openai_responses",
         base_url="https://api.openai.com/v1",
@@ -210,6 +347,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         },
         validation_model="gpt-5.4-mini",
         web_search_adapter=OPENAI_RESPONSES_ADAPTER,
+        cache_capability=_OPENAI_PROMPT_CACHE_CAPABILITY,
         notes=(
             "Native OpenAI Responses API chat with SSE streaming support. Use the OpenAI compat "
             "preset to keep Chat Completions-compatible behavior."
@@ -217,6 +355,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="anthropic",
+        provider_key="anthropic",
         label="Anthropic Claude",
         protocol="anthropic_messages",
         base_url="https://api.anthropic.com/v1",
@@ -240,6 +379,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         },
         validation_model="claude-sonnet-4-6",
         web_search_adapter=ANTHROPIC_MESSAGES_ADAPTER,
+        cache_capability=_ANTHROPIC_CACHE_CONTROL_CAPABILITY,
         notes=(
             "Native Anthropic Messages API chat with SSE streaming support. Compatibility mode "
             "remains available as anthropic-compat for legacy OpenAI-compatible fallback."
@@ -247,6 +387,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="anthropic-compat",
+        provider_key="anthropic",
         label="Anthropic Claude compatibility",
         protocol="openai_compat",
         base_url="https://api.anthropic.com/v1/",
@@ -281,6 +422,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="anthropic-native",
+        provider_key="anthropic",
         label="Anthropic Claude (native alias)",
         protocol="anthropic_messages",
         base_url="https://api.anthropic.com/v1",
@@ -304,6 +446,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         },
         validation_model="claude-sonnet-4-6",
         web_search_adapter=ANTHROPIC_MESSAGES_ADAPTER,
+        cache_capability=_ANTHROPIC_CACHE_CONTROL_CAPABILITY,
         notes=(
             "Legacy alias for the native anthropic preset. Prefer the anthropic preset for new "
             "first-party Claude profiles."
@@ -311,6 +454,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="gemini",
+        provider_key="gemini",
         label="Google Gemini",
         protocol="gemini_generate_content",
         base_url="https://generativelanguage.googleapis.com/v1beta",
@@ -343,6 +487,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         },
         validation_model="gemini-2.5-flash",
         web_search_adapter=GEMINI_GROUNDING_ADAPTER,
+        cache_capability=_GEMINI_EXPLICIT_CACHED_CONTENT_CAPABILITY,
         setup_warning=(
             "Gemini native GenerateContent uses the Google Gemini API v1beta surface and "
             "model availability can vary by account, region, and provider rollout."
@@ -355,6 +500,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="gemini-compat",
+        provider_key="gemini",
         label="Google Gemini compatibility",
         protocol="openai_compat",
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -394,6 +540,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="gemini-native",
+        provider_key="gemini",
         label="Google Gemini (native alias)",
         protocol="gemini_generate_content",
         base_url="https://generativelanguage.googleapis.com/v1beta",
@@ -426,6 +573,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         },
         validation_model="gemini-2.5-flash",
         web_search_adapter=GEMINI_GROUNDING_ADAPTER,
+        cache_capability=_GEMINI_EXPLICIT_CACHED_CONTENT_CAPABILITY,
         setup_warning=(
             "Gemini native GenerateContent uses the Google Gemini API v1beta surface and "
             "model availability can vary by account, region, and provider rollout."
@@ -437,6 +585,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="deepseek",
+        provider_key="deepseek",
         label="DeepSeek",
         protocol="openai_compat",
         base_url="https://api.deepseek.com",
@@ -453,6 +602,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="qwen-intl",
+        provider_key="qwen",
         label="Alibaba Qwen / DashScope (Intl)",
         protocol="openai_compat",
         base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
@@ -466,12 +616,14 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         },
         web_search_adapter=DASHSCOPE_CHAT_ADAPTER,
         web_search_model="qwen3.7-plus",
+        cache_capability=_QWEN_DIAGNOSTIC_CACHE_CAPABILITY,
         setup_warning=(
             "DashScope API keys are region-specific; use a key from the Singapore region."
         ),
     ),
     ProfilePreset(
         key="qwen-us",
+        provider_key="qwen",
         label="Alibaba Qwen / DashScope (US)",
         protocol="openai_compat",
         base_url="https://dashscope-us.aliyuncs.com/compatible-mode/v1",
@@ -485,10 +637,12 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         },
         web_search_adapter=DASHSCOPE_CHAT_ADAPTER,
         web_search_model="qwen3.7-plus",
+        cache_capability=_QWEN_DIAGNOSTIC_CACHE_CAPABILITY,
         setup_warning="DashScope API keys are region-specific; use a key from the US region.",
     ),
     ProfilePreset(
         key="qwen-cn",
+        provider_key="qwen",
         label="Alibaba Qwen / DashScope (China)",
         protocol="openai_compat",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -502,10 +656,12 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         },
         web_search_adapter=DASHSCOPE_CHAT_ADAPTER,
         web_search_model="qwen3.7-plus",
+        cache_capability=_QWEN_DIAGNOSTIC_CACHE_CAPABILITY,
         setup_warning="DashScope API keys are region-specific; use a key from the China region.",
     ),
     ProfilePreset(
         key="zhipu",
+        provider_key="zhipu",
         label="Zhipu / GLM",
         protocol="openai_compat",
         base_url="https://open.bigmodel.cn/api/paas/v4/",
@@ -521,6 +677,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="moonshot",
+        provider_key="moonshot",
         label="Moonshot / Kimi",
         protocol="openai_compat",
         base_url="https://api.moonshot.cn/v1",
@@ -531,6 +688,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="minimax",
+        provider_key="minimax",
         label="MiniMax",
         protocol="openai_compat",
         base_url="https://api.minimax.io/v1",
@@ -541,9 +699,19 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
             "MiniMax-M2.7-highspeed": "fast - lower-latency M2.7 variant",
             "MiniMax-M2": "fallback - previous-generation M2 model",
         },
+        web_search_adapter=MINIMAX_CODING_PLAN_ADAPTER,
+        setup_warning=(
+            "MiniMax hosted web search requires a Token Plan key; pay-as-you-go model keys "
+            "cannot call the Token Plan search endpoint."
+        ),
+        notes=(
+            "Chat uses the OpenAI-compatible MiniMax API. Web search uses MiniMax's Token Plan "
+            "search endpoint when the configured key has Token Plan access."
+        ),
     ),
     ProfilePreset(
         key="bytedance",
+        provider_key="bytedance",
         label="ByteDance Doubao",
         protocol="openai_compat",
         base_url="https://ark.cn-beijing.volces.com/api/v3",
@@ -559,10 +727,10 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
             "doubao-seed-1-6-250615": "fallback - stable Doubao Seed 1.6 model",
         },
         web_search_adapter=VOLCENGINE_WEB_SEARCH_ADAPTER,
-        web_search_model="doubao-seed-1-6-250615",
     ),
     ProfilePreset(
         key="01ai",
+        provider_key="01ai",
         label="01.AI / Yi",
         protocol="openai_compat",
         base_url="https://api.lingyiwanwu.com/v1",
@@ -571,6 +739,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="groq",
+        provider_key="groq",
         label="Groq",
         protocol="openai_compat",
         base_url="https://api.groq.com/openai/v1",
@@ -593,6 +762,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="cerebras",
+        provider_key="cerebras",
         label="Cerebras",
         protocol="openai_compat",
         base_url="https://api.cerebras.ai/v1",
@@ -601,6 +771,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="mistral",
+        provider_key="mistral",
         label="Mistral AI",
         protocol="openai_compat",
         base_url="https://api.mistral.ai/v1",
@@ -613,9 +784,11 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         },
         web_search_adapter=MISTRAL_CONVERSATIONS_ADAPTER,
         web_search_model="mistral-medium-latest",
+        cache_capability=_MISTRAL_PROMPT_CACHE_CAPABILITY,
     ),
     ProfilePreset(
         key="xai",
+        provider_key="xai",
         label="xAI Grok",
         protocol="openai_compat",
         base_url="https://api.x.ai/v1",
@@ -636,6 +809,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
             "grok-4.3-latest": "grok-4.3",
         },
         web_search_adapter=XAI_RESPONSES_ADAPTER,
+        cache_capability=_XAI_CONVERSATION_HEADER_CACHE_CAPABILITY,
         setup_warning=(
             "Older grok-4, grok-4-fast, and grok-3 IDs are retiring; use Grok 4.3 for "
             "general chat or grok-code-fast-1 for code-focused workflows."
@@ -643,6 +817,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="cohere",
+        provider_key="cohere",
         label="Cohere (compat)",
         protocol="openai_compat",
         base_url="https://api.cohere.ai/compatibility/v1",
@@ -657,9 +832,19 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
             "command-a-reasoning-08-2025": "reasoning - Command A reasoning model",
             "command-a-03-2025": "fallback - stable Command A model",
         },
+        web_search_adapter=COHERE_WEB_SEARCH_ADAPTER,
+        setup_warning=(
+            "Cohere hosted web search currently uses the deprecated v1 web-search connector; "
+            "Cohere v2 requires a user-defined external search tool."
+        ),
+        notes=(
+            "Chat uses Cohere's OpenAI compatibility API. Web search uses the Cohere Platform "
+            "v1 hosted web-search connector while that deprecated endpoint remains available."
+        ),
     ),
     ProfilePreset(
         key="openrouter",
+        provider_key="openrouter",
         label="OpenRouter (gateway)",
         protocol="openai_compat",
         base_url="https://openrouter.ai/api/v1",
@@ -679,6 +864,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
             "deepseek/deepseek-v4-pro": "reasoning - DeepSeek V4 Pro through OpenRouter",
         },
         web_search_adapter=OPENROUTER_WEB_ADAPTER,
+        cache_capability=_OPENROUTER_STICKY_SESSION_CACHE_CAPABILITY,
         setup_warning=(
             "OpenRouter routes through upstream providers; availability, pricing, privacy, "
             "and parameter support can vary by route."
@@ -687,6 +873,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="perplexity",
+        provider_key="perplexity",
         label="Perplexity Sonar",
         protocol="openai_compat",
         base_url="https://api.perplexity.ai",
@@ -698,6 +885,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="together",
+        provider_key="together",
         label="Together AI",
         protocol="openai_compat",
         base_url="https://api.together.ai/v1",
@@ -720,6 +908,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="fireworks",
+        provider_key="fireworks",
         label="Fireworks AI",
         protocol="openai_compat",
         base_url="https://api.fireworks.ai/inference/v1",
@@ -741,6 +930,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="ollama",
+        provider_key="ollama",
         label="Ollama (local)",
         protocol="openai_compat",
         base_url="http://localhost:11434/v1",
@@ -750,6 +940,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="lm-studio",
+        provider_key="lm-studio",
         label="LM Studio (local)",
         protocol="openai_compat",
         base_url="http://localhost:1234/v1",
@@ -759,6 +950,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
     ),
     ProfilePreset(
         key="vllm",
+        provider_key="vllm",
         label="vLLM (self-hosted)",
         protocol="openai_compat",
         base_url="http://localhost:8000/v1",
@@ -933,6 +1125,7 @@ def convert_profile_to_preset(profile: ProfileSpec, preset: ProfilePreset) -> Pr
         api_key_env=profile.api_key_env or preset.api_key_env,
         extra_headers=dict(profile.extra_headers),
         default_model=default_model,
+        reasoning_effort=profile.reasoning_effort,
         web_search_adapter=preset.web_search_adapter,
         web_search_model=preset.web_search_model,
         notes=notes,

@@ -17,6 +17,7 @@ from sylliptor_agent_cli.llm.metadata import (
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse, ToolCall
 from sylliptor_agent_cli.model_registry import ModelMeta
 from sylliptor_agent_cli.session_store import SessionStore
+from sylliptor_agent_cli.subagents import SubagentDefinition, built_in_subagents
 from sylliptor_agent_cli.surface.events import (
     Event,
     MessageDelta,
@@ -191,10 +192,12 @@ def _make_session(
     surface: _RecordingEventSurface,
     stream: bool = False,
     tool: ToolDef | None = None,
+    subagent_registry: dict[str, SubagentDefinition] | None = None,
 ) -> AgentSession:
     tools = {} if tool is None else {tool.name: tool}
     tool_list = [] if tool is None else [tool.as_openai_tool()]
     return AgentSession(
+        subagent_registry=subagent_registry,
         cfg=AppConfig(model="test-model", routing_mode="code_only", stream=stream),
         root=root,
         mode="auto",
@@ -413,8 +416,13 @@ def test_run_turn_tool_success_emits_lifecycle_events_and_legacy(tmp_path: Path)
 
 
 def test_run_turn_dispatches_same_batch_subagent_runs_in_parallel(tmp_path: Path) -> None:
+    # Generous rendezvous timeout: only reached when dispatch is broken (serial),
+    # so a large value costs nothing on the happy path but absorbs arbitrary
+    # scheduler delays on loaded CI runners.
+    barrier_timeout = 30.0
     start_times: dict[str, float] = {}
     end_times: dict[str, float] = {}
+    rendezvous_results: dict[str, bool] = {}
     lock = threading.Lock()
     both_started = threading.Event()
 
@@ -424,8 +432,13 @@ def test_run_turn_dispatches_same_batch_subagent_runs_in_parallel(tmp_path: Path
             start_times[task] = perf_counter()
             if len(start_times) == 2:
                 both_started.set()
-        both_started.wait(timeout=1.0)
+        # Rendezvous: released only once BOTH subagents have started. If the
+        # batch were dispatched serially, the first call would block here for
+        # the full timeout (the sibling cannot start until this call returns)
+        # and record False, deterministically failing the assertion below.
+        reached_rendezvous = both_started.wait(timeout=barrier_timeout)
         with lock:
+            rendezvous_results[task] = reached_rendezvous
             end_times[task] = perf_counter()
         return {
             "subagent": "explorer",
@@ -461,7 +474,17 @@ def test_run_turn_dispatches_same_batch_subagent_runs_in_parallel(tmp_path: Path
             LLMResponse(content="done", tool_calls=[], raw={}),
         ]
     )
-    session = _make_session(root=tmp_path, client=client, surface=surface, tool=tool)
+    session = _make_session(
+        root=tmp_path,
+        client=client,
+        surface=surface,
+        tool=tool,
+        # Parallel prelaunch of a same-batch subagent group requires every call
+        # to resolve a readonly/review subagent. Real sessions always carry a
+        # resolved registry (built-ins at minimum), so mirror that here to make
+        # "explorer" resolve to its built-in readonly definition.
+        subagent_registry=built_in_subagents(),
+    )
 
     try:
         exit_code = session.run_turn("catalog two areas")
@@ -471,7 +494,18 @@ def test_run_turn_dispatches_same_batch_subagent_runs_in_parallel(tmp_path: Path
     assert exit_code == 0
     assert set(start_times) == {"alpha", "beta"}
     assert set(end_times) == {"alpha", "beta"}
-    assert max(start_times.values()) < min(end_times.values())
+    # Primary parallelism proof: every subagent saw its sibling start before it
+    # finished. This is scheduling-independent — no wall-clock comparison.
+    assert rendezvous_results == {"alpha": True, "beta": True}, (
+        "same-batch subagent_run calls were not dispatched concurrently: each "
+        f"fake subagent waited up to {barrier_timeout}s for its sibling to start, "
+        f"but the rendezvous never completed (rendezvous_results="
+        f"{rendezvous_results}, start_times={start_times}, end_times={end_times})"
+    )
+    # Secondary sanity check: the recorded windows must overlap (both runs
+    # started before either finished). Guaranteed by the rendezvous above;
+    # <= tolerates identical perf_counter readings.
+    assert max(start_times.values()) <= min(end_times.values())
 
     tool_messages = [
         message for message in client.call_messages[1] if message.get("role") == "tool"

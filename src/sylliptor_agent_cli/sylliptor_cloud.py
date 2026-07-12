@@ -19,12 +19,6 @@ _DEFAULT_SITE_URL = "https://sylliptor.alysisai.com"
 # The profile/preset key used for the hosted MiMo provider.
 PROFILE_KEY = "sylliptor"
 
-# Default model the CLI selects on first login — Xiaomi's flagship reasoning/
-# coding/agent model. The proxy honours any model in its server-side allowlist
-# (MIMO_ALLOWED_MODELS) and otherwise pins to its canonical MiMo model, so this is
-# just the first-connect default; the user can switch in /config or via /model.
-SYLLIPTOR_MIMO_MODEL = "mimo-v2.5-pro"
-
 # Default proxy base URL (kept in sync with the `sylliptor` profile preset).
 DEFAULT_PROXY_BASE_URL = f"{_DEFAULT_SUPABASE_URL}/functions/v1/llm/v1"
 

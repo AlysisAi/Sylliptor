@@ -3,10 +3,13 @@
 This directory is for maintainer scripts that are not imported by the runtime
 package during normal Sylliptor execution.
 
-## Current Script
+## Catalog Scripts
 
 - `refresh_litellm_model_catalog.py` refreshes the bundled LiteLLM model pricing
   snapshot used by model metadata and packaging checks.
+- `refresh_chatgpt_codex_model_catalog.py` refreshes the bundled ChatGPT Codex
+  subscription model snapshot. It is a maintainer operation and requires an
+  authenticated source configured by the caller.
 
 ## Scope
 

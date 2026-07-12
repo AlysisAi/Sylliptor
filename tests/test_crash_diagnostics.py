@@ -4,10 +4,13 @@ import json
 import threading
 from pathlib import Path
 
+import pytest
+
 from sylliptor_agent_cli.crash_diagnostics import (
     CRASH_DIAGNOSTIC_SCHEMA_VERSION,
     CrashDiagnosticLogger,
     build_crash_diagnostic_logger,
+    build_error_event_fields,
 )
 
 
@@ -117,9 +120,63 @@ def test_diagnostic_logger_failure_is_isolated_for_unwritable_path(tmp_path: Pat
         session_id="session-dir",
     )
 
-    logger.event("terminal_error", {"failure_category": "io"}, durable=True)
+    # A broken sink must not crash the run, but it must be observable, not silent.
+    with pytest.warns(RuntimeWarning):
+        logger.event("terminal_error", {"failure_category": "io"}, durable=True)
 
     assert tmp_path.is_dir()
+    assert logger.write_failures >= 1
+
+
+def test_build_error_event_fields_redacts_classifies_and_extracts_status() -> None:
+    fields = build_error_event_fields(
+        Exception(
+            'LLM error 400: {"error":{"message":"Thinking mode does not support this tool_choice"}}'
+        ),
+        operation="main_llm",
+        step=7,
+    )
+
+    assert fields["error_type"] == "Exception"
+    assert fields["failure_category"] == "provider_error"
+    assert fields["provider_status_code"] == 400
+    assert fields["operation"] == "main_llm"
+    assert fields["step"] == 7
+    assert "tool_choice" in fields["error_summary"]
+
+
+def test_build_error_event_fields_redacts_api_key_in_summary() -> None:
+    fields = build_error_event_fields(
+        Exception("LLM error 401: Incorrect API key provided: sk-ABCDEFGHIJKLMNOP1234"),
+    )
+
+    assert fields["failure_category"] == "provider_error"
+    assert fields["provider_status_code"] == 401
+    assert "sk-ABCDEFGHIJKLMNOP1234" not in fields["error_summary"]
+
+
+def test_diagnostic_logger_keeps_terminal_error_block(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    logger = build_crash_diagnostic_logger(
+        path=path,
+        run_id="run-term",
+        session_id="session-term",
+    )
+
+    logger.event(
+        "terminal_error",
+        build_error_event_fields(
+            Exception("LLM error 503: upstream temporarily unavailable"),
+            operation="main_llm",
+        ),
+        durable=True,
+    )
+
+    payload = _read_jsonl(path)[-1]["payload"]
+    assert payload["failure_category"] == "provider_unavailable"
+    assert payload["provider_status_code"] == 503
+    assert payload["error_type"] == "Exception"
+    assert "upstream temporarily unavailable" in payload["error_summary"]
 
 
 def test_diagnostic_logger_concurrent_writes_are_complete_json_lines(tmp_path: Path) -> None:

@@ -13,7 +13,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .. import __version__
 from ..agent import _patchable
+from ..agentbox_integration import AgentBoxTelemetry
 from ..background_runner import (
     DisabledBackgroundRunner,
     LazyBackgroundShellRunner,
@@ -36,7 +38,11 @@ from ..config import (
     resolve_prompt_cache_retention,
     resolve_role_temperature,
 )
-from ..crash_diagnostics import CrashDiagnosticLogger, build_crash_diagnostic_logger
+from ..crash_diagnostics import (
+    CrashDiagnosticLogger,
+    build_crash_diagnostic_logger,
+    build_error_event_fields,
+)
 from ..custom_tools import CustomToolSessionState, build_custom_tool_session_state
 from ..durable_service_manager import DurableServiceManager
 from ..execution_deadline import (
@@ -57,19 +63,36 @@ from ..hooks import (
     ResolvedHookConfig,
     load_resolved_hooks_config,
 )
-from ..llm.base import ChatClient
+from ..llm.base import (
+    ChatClient,
+    count_input_tokens_if_supported,
+    effective_tools_for_client,
+)
+from ..llm.cache_policy import build_prompt_cache_namespace
 from ..llm.factory import _resolve_base_url, make_llm_client
-from ..llm.metadata import PROVIDER_METADATA_KEY, assistant_message_from_response
+from ..llm.metadata import (
+    PROVIDER_METADATA_KEY,
+    assistant_message_from_response,
+    endpoint_descriptor,
+)
 from ..llm.openai_compat import OpenAICompatClient as _OpenAICompatClient
 from ..llm.protocols import OPENAI_COMPAT_PROTOCOL, get_provider_protocol_capabilities
+from ..llm.types import UsageConfidence, UsageSource
 from ..mcp.config import load_resolved_mcp_config
 from ..mcp.manager import ForgeTaskScopedMcpManager, McpManager, create_mcp_manager
 from ..model_metadata_policy import ActiveModelRef, evaluate_active_model_metadata_policy
 from ..model_registry import ModelRegistry, resolve_model_provider_key
 from ..model_router import ROLE_CODING, ROLE_COMPACTOR, ROLE_ROUTER, resolve_model_for_role
-from ..profiles import get_active_profile
+from ..profiles import get_active_profile, resolve_effective_base_url
+from ..provider_telemetry import set_provider_telemetry_sink
 from ..repo_scan import scan_workspace as scan_workspace
-from ..request_estimation import estimate_request_token_breakdown
+from ..request_estimation import (
+    estimate_request_token_breakdown,
+    estimate_request_tokens,
+    request_contains_media,
+    request_message_signatures,
+    tool_schema_signature,
+)
 from ..runtime_context_features import resolve_runtime_context_features
 from ..runtime_kind import RuntimeKind, resolve_session_runtime_kind
 from ..sandbox_runner import (
@@ -81,13 +104,20 @@ from ..sandbox_runner import (
 from ..sandbox_settings import resolve_shell_sandbox_settings
 from ..session_store import SessionStore, make_session_id, resolve_sessions_dir
 from ..skills import ConventionDocument, SkillBundle, SkillCatalogEntry
-from ..step_budget import StepBudgetRuntime
+from ..step_budget import StepBudgetRuntime, normalize_step_budget_policy
 from ..subagents import SubagentDefinition
 from ..surface import ApprovalRequest, NoopSurface, StatusEvent
 from ..surface.base import Surface
 from ..terminal_manager import TerminalManager
 from ..tools.registry import iter_builtin_tool_metadata
-from ..usage_tracker import ContextLeft, UsageSummary, build_usage_record, compute_context_left
+from ..usage_tracker import (
+    ContextLeft,
+    RequestContextMeasurement,
+    UsageSummary,
+    build_usage_record,
+    compute_context_left,
+    usage_context_from_client_response,
+)
 from ..verify_gate import (
     ResolvedVerifyCommands,
     is_authoritative_verify_command_selection,
@@ -214,8 +244,10 @@ def _make_session_llm_client(
     temperature: float,
     prompt_cache_key: str | None,
     prompt_cache_retention: str | None,
+    prompt_cache_namespace: str | None,
     enable_thinking: bool | None,
     reasoning_effort: str | None,
+    session_id: str | None,
 ) -> ChatClient:
     openai_client_cls = _patchable("OpenAICompatClient", OpenAICompatClient)
     if openai_client_cls is _OpenAICompatClient:
@@ -227,8 +259,10 @@ def _make_session_llm_client(
             temperature=temperature,
             prompt_cache_key=prompt_cache_key,
             prompt_cache_retention=prompt_cache_retention,
+            prompt_cache_namespace=prompt_cache_namespace,
             enable_thinking=enable_thinking,
             reasoning_effort=reasoning_effort,
+            session_id=session_id,
         )
 
     profile = get_active_profile(cfg)
@@ -335,11 +369,10 @@ def _disable_unsupported_native_streaming(
         provider_key=provider_key,
         protocol=protocol,
     )
-    streaming_supported = (
-        capabilities.supports_streaming
-        if capabilities is not None
-        else protocol == OPENAI_COMPAT_PROTOCOL
-    )
+    # Unknown provider capabilities must not disable streaming: assume it works
+    # and rely on the per-step stream-unsupported fallback in the turn loop to
+    # downgrade at runtime if the provider rejects it.
+    streaming_supported = capabilities.supports_streaming if capabilities is not None else True
     if streaming_supported:
         return cfg, None
     warning = (
@@ -369,6 +402,17 @@ def _normalize_forced_summary_termination_kind(
     return ForcedFinalSummaryTerminationKind.OTHER
 
 
+def _add_event_diagnostics(
+    payload: dict[str, Any],
+    diagnostics: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not diagnostics:
+        return payload
+    for key, value in diagnostics.items():
+        payload.setdefault(key, value)
+    return payload
+
+
 @dataclass
 class AgentSession:
     cfg: AppConfig
@@ -377,7 +421,7 @@ class AgentSession:
     yes: bool
     stream: bool
     routing_mode: str
-    max_steps: int
+    max_steps: int | None
     console: Any | None
     surface: Surface
     store: SessionStore
@@ -443,14 +487,19 @@ class AgentSession:
     session_source_metadata: dict[str, Any] = field(default_factory=dict)
     pinned_prefix_len: int = 0
     startup_context_baseline_tokens: int = 0
+    request_context_measurement: RequestContextMeasurement | None = None
     workspace_touched_paths: set[str] = field(default_factory=set)
     custom_tool_session_state: CustomToolSessionState | None = None
     hook_dispatcher: HookDispatcher | None = None
     execution_deadline: ExecutionDeadline | None = None
     crash_diagnostics: CrashDiagnosticLogger | None = None
     crash_diagnostic_log_path: str | None = None
+    agentbox_telemetry: AgentBoxTelemetry | None = None
 
     def close(self, *, reason: str = "session_close") -> None:
+        if self.subagent_depth == 0:
+            # Release the process-wide telemetry sink registered for this top-level run.
+            set_provider_telemetry_sink(None)
         if self.terminal_manager is not None:
             try:
                 self.terminal_manager.shutdown_all()
@@ -521,6 +570,8 @@ class AgentSession:
             if self.mcp_manager is not None:
                 self.mcp_manager.close()
         finally:
+            if self.agentbox_telemetry is not None:
+                self.agentbox_telemetry.close(error=reason not in {"session_close", "completed"})
             self.store.close()
 
     def _hook_warning(self, message: str, *, code: str = "hook_warning") -> None:
@@ -602,14 +653,75 @@ class AgentSession:
 
     def context_left(self) -> ContextLeft:
         compaction_settings = resolve_compaction_settings(self.cfg)
+        effective_tool_list = effective_tools_for_client(self.client, self.tool_list)
+        startup_baseline_tokens = self.startup_context_baseline_tokens
+        if self.startup_messages:
+            # Tool support can change after the provider rejects a tool-bearing
+            # request. Keep the dynamic HUD baseline aligned with what the
+            # client's current transport state will actually send.
+            startup_baseline_tokens = estimate_request_token_breakdown(
+                messages=self.startup_messages,
+                tool_list=effective_tool_list,
+                pinned_prefix_len=self.pinned_prefix_len,
+            ).total_tokens
+        usage_context = usage_context_from_client_response(
+            client=self.client,
+            response=None,
+            operation="main_llm",
+        )
+        request_measurement = self.request_context_measurement
+        if request_measurement is not None and not request_measurement.matches_route(
+            requested_model=self.client.model,
+            provider_key=usage_context.get("provider_key"),
+            protocol=usage_context.get("protocol"),
+            base_url_host=usage_context.get("base_url_host"),
+        ):
+            request_measurement = None
+        calibration = self.usage_summary.recent_calibration_snapshot(
+            requested_model=self.client.model,
+            provider_key=usage_context.get("provider_key"),
+            protocol=usage_context.get("protocol"),
+            base_url_host=usage_context.get("base_url_host"),
+            operation="main_llm",
+            request_mode=(request_measurement.request_mode if request_measurement else None),
+            cache_strategy=(request_measurement.cache_strategy if request_measurement else None),
+            limit=20,
+        )
+        estimate_multiplier = calibration.get("prompt_estimate_error_ratio_p90")
         return compute_context_left(
             messages=self.messages,
             model_name=self.client.model,
             registry=self.model_registry,
-            tool_list=self.tool_list,
+            tool_list=effective_tool_list,
             pinned_prefix_len=self.pinned_prefix_len,
             safety_margin_tokens=compaction_settings.safety_margin_tokens,
-            startup_baseline_tokens=self.startup_context_baseline_tokens,
+            startup_baseline_tokens=startup_baseline_tokens,
+            prompt_estimate_multiplier=(
+                float(estimate_multiplier) if isinstance(estimate_multiplier, int | float) else None
+            ),
+            request_measurement=request_measurement,
+        )
+
+    def refresh_compactor_calibration_filters(self) -> None:
+        compactor = self.conversation_compactor
+        updater = getattr(compactor, "update_calibration_filters", None)
+        if not callable(updater):
+            return
+        updater(
+            usage_context_from_client_response(
+                client=self.client,
+                response=None,
+                operation="main_llm",
+            )
+        )
+
+    def invalidate_request_context(self, *, reason: str) -> None:
+        if self.request_context_measurement is None:
+            return
+        self.request_context_measurement = None
+        self.store.append(
+            "request_context_invalidated",
+            {"reason": str(reason or "request_shape_changed")},
         )
 
     @staticmethod
@@ -649,6 +761,141 @@ class AgentSession:
         self.surface.on_assistant_message_done(text)
         return normalized_text
 
+    def _record_llm_usage(
+        self,
+        *,
+        client: Any,
+        response: Any,
+        messages: list[dict[str, Any]],
+        tool_list: list[dict[str, Any]] | None,
+        operation: str,
+    ) -> Any | None:
+        """Record one provider call without allowing telemetry to break the turn."""
+        if response is None:
+            return None
+        try:
+            tool_list = effective_tools_for_client(client, tool_list)
+            usage = getattr(response, "usage", None)
+            prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+            usage_context = usage_context_from_client_response(
+                client=client,
+                response=response,
+                operation=operation,
+            )
+            prompt_token_source = str(
+                usage_context.get("api_usage_source_detail") or UsageSource.PROVIDER_RESPONSE.value
+            )
+            prompt_token_confidence = str(
+                usage_context.get("api_usage_confidence") or UsageConfidence.REPORTED.value
+            )
+            if prompt_tokens is None:
+                try:
+                    counted_input = count_input_tokens_if_supported(
+                        client=client,
+                        messages=list(messages or []),
+                        tools=tool_list,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- fallback must not break a turn
+                    self.store.append(
+                        "warning",
+                        {
+                            "warning": "provider_input_token_count_failed",
+                            "operation": operation,
+                            "error": str(exc),
+                        },
+                    )
+                else:
+                    if counted_input is not None:
+                        prompt_tokens = counted_input.input_tokens
+                        usage_context["api_usage_source_detail"] = counted_input.source.value
+                        usage_context["api_usage_confidence"] = counted_input.confidence.value
+                        usage_context["api_prompt_tokens_authoritative"] = (
+                            counted_input.confidence.value == "authoritative"
+                        )
+                        prompt_token_source = counted_input.source.value
+                        prompt_token_confidence = counted_input.confidence.value
+            response_tool_calls = [
+                {
+                    "id": getattr(tool_call, "id", ""),
+                    "name": getattr(tool_call, "name", ""),
+                    "arguments": getattr(tool_call, "arguments", {}),
+                }
+                for tool_call in (getattr(response, "tool_calls", None) or [])
+            ]
+            usage_record = build_usage_record(
+                role=self.usage_role,
+                requested_model=getattr(client, "model", None) or self.client.model,
+                response_model=getattr(response, "response_model", None),
+                messages=list(messages or []),
+                response_content=str(getattr(response, "content", "") or ""),
+                response_tool_calls=response_tool_calls,
+                api_prompt_tokens=prompt_tokens,
+                api_completion_tokens=(
+                    getattr(usage, "completion_tokens", None) if usage else None
+                ),
+                api_total_tokens=(getattr(usage, "total_tokens", None) if usage else None),
+                api_usage=usage,
+                api_cached_prompt_tokens=(
+                    getattr(usage, "cached_prompt_tokens", None) if usage else None
+                ),
+                tool_list=tool_list,
+                pinned_prefix_len=self.pinned_prefix_len,
+                registry=self.model_registry,
+                **usage_context,
+            )
+            self.usage_summary.add_record(usage_record)
+            if operation in {"main_llm", "context_overflow_retry"}:
+                if prompt_tokens is None or usage_record.prompt_tokens != prompt_tokens:
+                    prompt_token_source = UsageSource.LOCAL_ESTIMATE.value
+                    prompt_token_confidence = UsageConfidence.ESTIMATED.value
+                measurement_tools = tool_list
+                request_plan = usage_record.request_plan or {}
+                try:
+                    planned_tool_count = int(request_plan.get("tool_count"))
+                except (TypeError, ValueError):
+                    planned_tool_count = -1
+                if planned_tool_count == 0:
+                    measurement_tools = None
+                self.request_context_measurement = RequestContextMeasurement(
+                    input_tokens=max(0, usage_record.prompt_tokens),
+                    anchor_estimate_tokens=estimate_request_tokens(
+                        list(messages or []),
+                        measurement_tools,
+                    ),
+                    persistent_anchor_estimate_tokens=estimate_request_tokens(
+                        self.messages,
+                        measurement_tools,
+                    ),
+                    source=prompt_token_source,
+                    confidence=prompt_token_confidence,
+                    requested_model=usage_record.requested_model,
+                    provider_key=usage_record.provider_key,
+                    protocol=usage_record.protocol,
+                    base_url_host=usage_record.base_url_host,
+                    operation=usage_record.operation,
+                    request_mode=usage_record.request_mode,
+                    cache_strategy=usage_record.cache_strategy,
+                    request_message_signatures=request_message_signatures(list(messages or [])),
+                    persistent_message_signatures=request_message_signatures(self.messages),
+                    tool_schema_signature=tool_schema_signature(measurement_tools),
+                    request_has_media=request_contains_media(list(messages or [])),
+                    persistent_has_media=request_contains_media(self.messages),
+                )
+            self.store.append("llm_usage", usage_record.to_payload())
+            if self.agentbox_telemetry is not None:
+                self.agentbox_telemetry.record_usage(usage_record)
+            return usage_record
+        except Exception as exc:  # noqa: BLE001 -- accounting cannot break the agent turn
+            self.store.append(
+                "warning",
+                {
+                    "warning": "llm_usage_record_failed",
+                    "operation": operation,
+                    "error": str(exc),
+                },
+            )
+            return None
+
     def _emit_final_assistant_text(
         self,
         *,
@@ -659,6 +906,7 @@ class AgentSession:
         explicit_language_override: bool = False,
         prior_visible_text: str = "",
         streamed_text_emitted: bool = False,
+        final_event_payload: dict[str, Any] | None = None,
     ) -> str:
         emitted_text = str(final_text or "").strip()
         emitted_text, rewrite_payload = _rewrite_final_summary_for_language(
@@ -667,6 +915,7 @@ class AgentSession:
             language=language,
             script=script,
             explicit_language_override=explicit_language_override,
+            record_usage=lambda **kw: self._record_llm_usage(client=self.client, **kw),
         )
         if rewrite_payload is not None:
             self.store.append("final_summary_rewrite", rewrite_payload)
@@ -687,7 +936,10 @@ class AgentSession:
         )
         if assistant_message is not None:
             self.messages.append(assistant_message)
-        self.store.append("final", {"content": emitted_text})
+        self.store.append(
+            "final",
+            _add_event_diagnostics({"content": emitted_text}, final_event_payload),
+        )
         return emitted_text
 
     def _forced_final_summary_activity_snapshot(self) -> dict[str, Any]:
@@ -792,7 +1044,7 @@ class AgentSession:
         *,
         termination_cause: str,
         termination_kind: str = "step_budget_exhausted",
-        max_steps: int,
+        max_steps: int | None,
         fallback_reason: str,
         latest_assistant_text: str = "",
     ) -> str:
@@ -857,7 +1109,10 @@ class AgentSession:
 
         kind = _normalize_forced_summary_termination_kind(termination_kind)
         if kind == ForcedFinalSummaryTerminationKind.STEP_BUDGET_EXHAUSTED:
-            stop_risk = f"- The turn exhausted its {max_steps}-step budget before completion."
+            if max_steps is None:
+                stop_risk = "- The turn stopped before completion."
+            else:
+                stop_risk = f"- The turn exhausted its {max_steps}-step limit before completion."
         elif kind == ForcedFinalSummaryTerminationKind.COMPLETION_GATE_STAGNATION:
             stop_risk = (
                 "- Execution stopped after repeated invalid finalization attempts without "
@@ -891,12 +1146,13 @@ class AgentSession:
         reason: str,
         termination_cause: str,
         termination_kind: str = "step_budget_exhausted",
-        max_steps: int,
+        max_steps: int | None,
         language: str = "",
         script: str = "",
         explicit_language_override: bool = False,
         latest_assistant_text: str = "",
         allow_llm_summary: bool = True,
+        final_event_payload: dict[str, Any] | None = None,
     ) -> str:
         normalized_termination_kind = _normalize_forced_summary_termination_kind(
             termination_kind
@@ -952,26 +1208,13 @@ class AgentSession:
                 fallback_reason = "finalization_error"
                 fallback_error = str(exc)
             else:
-                usage = resp.usage
-                usage_record = build_usage_record(
-                    role=self.usage_role,
-                    requested_model=self.client.model,
-                    response_model=resp.response_model,
+                self._record_llm_usage(
+                    client=self.client,
+                    response=resp,
                     messages=request_messages,
-                    response_content=resp.content or "",
-                    response_tool_calls=[
-                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                        for tc in resp.tool_calls
-                    ],
-                    api_prompt_tokens=(usage.prompt_tokens if usage else None),
-                    api_completion_tokens=(usage.completion_tokens if usage else None),
-                    api_total_tokens=(usage.total_tokens if usage else None),
-                    api_cached_prompt_tokens=(usage.cached_prompt_tokens if usage else None),
-                    pinned_prefix_len=self.pinned_prefix_len,
-                    registry=self.model_registry,
+                    tool_list=None,
+                    operation="forced_final_summary_llm",
                 )
-                self.usage_summary.add_record(usage_record)
-                self.store.append("llm_usage", usage_record.to_payload())
                 final_text = str(resp.content or "").strip()
                 if resp.tool_calls:
                     fallback_reason = "tool_call_response"
@@ -997,6 +1240,7 @@ class AgentSession:
             }
             if fallback_error:
                 fallback_payload["error"] = fallback_error
+            _add_event_diagnostics(fallback_payload, final_event_payload)
             self.store.append("forced_final_summary_fallback", fallback_payload)
 
         emitted_text = self._emit_final_assistant_text(
@@ -1005,18 +1249,22 @@ class AgentSession:
             language=language,
             script=script,
             explicit_language_override=explicit_language_override,
+            # Thread the turn's last-shown answer so the change-dedup can suppress a
+            # forced summary that merely repeats it (otherwise prior_visible_text
+            # defaults to "" and on_assistant_message_done always re-fires).
+            prior_visible_text=latest_assistant_text,
+            final_event_payload=final_event_payload,
         )
         if fallback_reason is None:
-            self.store.append(
-                "forced_final_summary_completed",
-                {
-                    "reason": reason,
-                    "termination_cause": termination_cause,
-                    "termination_kind": normalized_termination_kind,
-                    "max_steps": max_steps,
-                    "content_length": len(emitted_text),
-                },
-            )
+            completed_payload = {
+                "reason": reason,
+                "termination_cause": termination_cause,
+                "termination_kind": normalized_termination_kind,
+                "max_steps": max_steps,
+                "content_length": len(emitted_text),
+            }
+            _add_event_diagnostics(completed_payload, final_event_payload)
+            self.store.append("forced_final_summary_completed", completed_payload)
         return emitted_text
 
     def run_turn(
@@ -1029,15 +1277,61 @@ class AgentSession:
         ephemeral_user_messages: list[str] | tuple[str, ...] | None = None,
         cancellation_token: Any | None = None,
     ) -> int:
-        return _run_turn(
-            self,
-            instruction,
-            image_paths=image_paths,
-            routing_mode_override=routing_mode_override,
-            ephemeral_system_messages=ephemeral_system_messages,
-            ephemeral_user_messages=ephemeral_user_messages,
-            cancellation_token=cancellation_token,
-        )
+        try:
+            if self.agentbox_telemetry is None:
+                return _run_turn(
+                    self,
+                    instruction,
+                    image_paths=image_paths,
+                    routing_mode_override=routing_mode_override,
+                    ephemeral_system_messages=ephemeral_system_messages,
+                    ephemeral_user_messages=ephemeral_user_messages,
+                    cancellation_token=cancellation_token,
+                )
+            self.agentbox_telemetry.task(instruction)
+            with self.agentbox_telemetry.turn():
+                return _run_turn(
+                    self,
+                    instruction,
+                    image_paths=image_paths,
+                    routing_mode_override=routing_mode_override,
+                    ephemeral_system_messages=ephemeral_system_messages,
+                    ephemeral_user_messages=ephemeral_user_messages,
+                    cancellation_token=cancellation_token,
+                )
+        except Exception as exc:
+            # Single authoritative terminal-failure boundary: every caller (one-shot
+            # run, interactive chat, Forge workers, subagents) routes turns through
+            # here, so one durable, redacted record makes a crashed build
+            # reconstructable from artifacts alone. Re-raise unchanged afterwards.
+            self._emit_terminal_error(exc)
+            raise
+
+    def _emit_terminal_error(
+        self,
+        error: BaseException,
+        *,
+        operation: str = "run_turn",
+    ) -> None:
+        """Record one redacted, joinable terminal-failure record for ``error``.
+
+        Written to the per-run store (default-on; suppressed only by ``--no-log``) and,
+        when the opt-in crash-diagnostic log is enabled, as the durable ``terminal_error``
+        event. Never raises — a diagnostic failure here must not mask the user's error.
+        """
+        try:
+            fields = build_error_event_fields(error, operation=operation)
+        except Exception:  # noqa: BLE001 - diagnostics must never mask the real failure
+            fields = {"error_type": type(error).__name__, "operation": operation}
+        try:
+            self.store.append("terminal_error", dict(fields))
+        except Exception:  # noqa: BLE001 - best-effort durable record
+            pass
+        if self.crash_diagnostics is not None:
+            try:
+                self.crash_diagnostics.event("terminal_error", dict(fields), durable=True)
+            except Exception:  # noqa: BLE001 - best-effort diagnostic event
+                pass
 
 
 def create_session(
@@ -1046,7 +1340,7 @@ def create_session(
     root: Path,
     mode: str,
     yes: bool,
-    max_steps: int,
+    max_steps: int | None,
     no_log: bool,
     api_key_override: str | None = None,
     console: Any | None = None,
@@ -1123,6 +1417,7 @@ def create_session(
     binding_created_path = prompt_context.binding_created_path
     authoritative_verify_commands = prompt_context.authoritative_verify_commands
     session_cfg = prompt_context.session_cfg
+    session_cfg.step_budget_policy = normalize_step_budget_policy(session_cfg.step_budget_policy)
     session_cfg, native_streaming_warning_message = _disable_unsupported_native_streaming(
         cfg=session_cfg
     )
@@ -1151,14 +1446,19 @@ def create_session(
     if not initial_active_workdir.is_dir():
         raise SessionWorkdirError(f"Path is not a directory: {initial_active_workdir}")
 
+    active_profile = get_active_profile(session_cfg)
     if api_key_override is None:
-        api_key_resolution = resolve_api_key(session_cfg)
-        if api_key_resolution.key is None:
-            api_key = get_api_key(session_cfg)
-            api_key_source = "missing"
+        if active_profile.auth_provider:
+            api_key = ""
+            api_key_source = f"provider-auth:{active_profile.auth_provider}"
         else:
-            api_key = api_key_resolution.key
-            api_key_source = api_key_resolution.source
+            api_key_resolution = resolve_api_key(session_cfg)
+            if api_key_resolution.key is None:
+                api_key = get_api_key(session_cfg)
+                api_key_source = "missing"
+            else:
+                api_key = api_key_resolution.key
+                api_key_source = api_key_resolution.source
     else:
         api_key = api_key_override.strip()
         if not api_key:
@@ -1173,6 +1473,19 @@ def create_session(
     llm_timeout_s = resolve_llm_timeout_s(session_cfg)
     llm_enable_thinking = resolve_llm_enable_thinking(session_cfg)
     llm_reasoning_effort = resolve_llm_reasoning_effort(session_cfg)
+    active_profile_name = active_profile.name
+    active_profile_base_url = resolve_effective_base_url(
+        cfg=session_cfg,
+        profile=active_profile,
+    )
+
+    def _prompt_cache_namespace(role: str) -> str | None:
+        return build_prompt_cache_namespace(
+            workspace_root=workspace_context.workspace_root,
+            role=role,
+            profile_name=active_profile_name,
+        )
+
     registry = ModelRegistry(cfg=session_cfg, api_key=api_key)
     routing_mode = _resolve_routing_mode(session_cfg)
     resolved_subagents_enabled = prompt_context.resolved_subagents_enabled
@@ -1261,8 +1574,10 @@ def create_session(
         temperature=coding_temperature,
         prompt_cache_key=resolve_prompt_cache_key(session_cfg),
         prompt_cache_retention=resolve_prompt_cache_retention(session_cfg),
+        prompt_cache_namespace=_prompt_cache_namespace(ROLE_CODING),
         enable_thinking=llm_enable_thinking,
         reasoning_effort=llm_reasoning_effort,
+        session_id=session_id,
     )
     router_client: Any | None = None
     if routing_mode == _ROUTING_MODE_AUTO:
@@ -1284,8 +1599,10 @@ def create_session(
             temperature=0.0,
             prompt_cache_key=resolve_prompt_cache_key(session_cfg),
             prompt_cache_retention=resolve_prompt_cache_retention(session_cfg),
+            prompt_cache_namespace=_prompt_cache_namespace(ROLE_ROUTER),
             enable_thinking=False,
             reasoning_effort="",
+            session_id=session_id,
         )
     sessions_dir = (
         session_log_dir_override
@@ -1350,11 +1667,13 @@ def create_session(
 
     tool_output_offloader: ToolOutputOffloader | None = None
     if tool_output_offload_enabled:
+        workspace_artifacts_enabled = resolved_runtime_kind != RuntimeKind.SWARM_WORKER
         tool_output_offloader = ToolOutputOffloader(
             artifact_layout=store.session_artifact_layout,
             workspace_root=root,
             threshold_chars=compaction_settings.tool_output_offload_threshold_chars,
             preview_chars=compaction_settings.tool_output_preview_chars,
+            workspace_artifacts_enabled=workspace_artifacts_enabled,
         )
     system_prompt = prompt_context.system_prompt
     system_prompt_sha256 = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
@@ -1428,7 +1747,12 @@ def create_session(
             "subagent_max_steps": session_cfg.subagent_max_steps,
             "model": session_cfg.model,
             "router_model": router_model_name,
-            "base_url": session_cfg.base_url,
+            "base_url_descriptor": endpoint_descriptor(session_cfg.base_url),
+            "profile_name": active_profile.name,
+            "protocol": active_profile.protocol,
+            "provider_base_url_descriptor": endpoint_descriptor(active_profile_base_url),
+            "auth_provider": active_profile.auth_provider,
+            "reasoning_trace_adapter": active_profile.reasoning_trace_adapter,
             "api_key_source": api_key_source,
             "temperature": session_cfg.temperature,
             "coding_temperature": coding_temperature,
@@ -1857,8 +2181,10 @@ def create_session(
                 temperature=compactor_temperature,
                 prompt_cache_key=resolve_prompt_cache_key(session_cfg),
                 prompt_cache_retention=resolve_prompt_cache_retention(session_cfg),
+                prompt_cache_namespace=_prompt_cache_namespace(ROLE_COMPACTOR),
                 enable_thinking=llm_enable_thinking,
                 reasoning_effort=llm_reasoning_effort,
+                session_id=session_id,
             )
             conversation_compactor = ConversationCompactor(
                 root=root,
@@ -1871,6 +2197,18 @@ def create_session(
                 usage_role=usage_role,
                 pinned_prefix_len=pinned_prefix_len,
                 profile=("execution" if compaction_profile == "execution" else "chat"),
+                input_token_counter=(
+                    lambda count_messages, count_tools: count_input_tokens_if_supported(
+                        client=client,
+                        messages=count_messages,
+                        tools=effective_tools_for_client(client, count_tools),
+                    )
+                ),
+                calibration_filters=usage_context_from_client_response(
+                    client=client,
+                    response=None,
+                    operation="main_llm",
+                ),
             )
 
         if _surface_needs_startup_git_status(surface):
@@ -1884,7 +2222,7 @@ def create_session(
 
         startup_context_baseline_tokens = estimate_request_token_breakdown(
             messages=messages,
-            tool_list=tool_list,
+            tool_list=effective_tools_for_client(client, tool_list),
             pinned_prefix_len=pinned_prefix_len,
         ).total_tokens
 
@@ -1993,7 +2331,19 @@ def create_session(
             execution_deadline=execution_deadline,
             crash_diagnostics=crash_diagnostics,
             crash_diagnostic_log_path=resolved_crash_diagnostic_log_path,
+            agentbox_telemetry=AgentBoxTelemetry.from_env(
+                root=root,
+                runtime_version=f"sylliptor-{__version__}",
+            ),
         )
+        if subagent_depth == 0 and store.enabled:
+            # Persist the process's provider/web-search telemetry to the run's artifact
+            # dir so retry/throttle/latency history survives exit. Only the top-level
+            # session registers the sink; nested subagent/candidate calls in the same
+            # process flow into it. Released on close().
+            set_provider_telemetry_sink(
+                store.runtime_artifact_path("diagnostics", "provider_telemetry.jsonl")
+            )
         active_workdir_state["session"] = session
         return session
     except Exception:

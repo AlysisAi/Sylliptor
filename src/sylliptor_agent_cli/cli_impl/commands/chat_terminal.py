@@ -518,15 +518,18 @@ def _resolve_startup_workspace_binding(
     source: str = "explicit_path",
     action: str = WorkspaceAction.CHAT,
 ) -> WorkspaceBinding:
+    default_select_action = _select_guarded_workspace_action_interactive
+    default_select_candidate = _select_workspace_candidate_interactive
+    default_prompt = _guarded_workspace_prompt_text
     select_action = _patchable(
         "_select_guarded_workspace_action_interactive",
-        _select_guarded_workspace_action_interactive,
+        default_select_action,
     )
     select_candidate = _patchable(
         "_select_workspace_candidate_interactive",
-        _select_workspace_candidate_interactive,
+        default_select_candidate,
     )
-    prompt = _patchable("_guarded_workspace_prompt_text", _guarded_workspace_prompt_text)
+    prompt = _patchable("_guarded_workspace_prompt_text", default_prompt)
     # When the full-screen TUI is active, render the guarded-workspace steps with
     # the TUI's own picker/prompt chrome instead of the classic inline ones, so the
     # startup screen matches the rest of the experience. The binding *logic* is
@@ -543,9 +546,12 @@ def _resolve_startup_workspace_binding(
                     workspace_guard_prompt_text as _tui_prompt,
                 )
 
-                select_action = _tui_select_action
-                select_candidate = _tui_select_candidate
-                prompt = _tui_prompt
+                if select_action is default_select_action:
+                    select_action = _tui_select_action
+                if select_candidate is default_select_candidate:
+                    select_candidate = _tui_select_candidate
+                if prompt is default_prompt:
+                    prompt = _tui_prompt
         except Exception:
             pass
     return _resolve_startup_workspace_binding_impl(
@@ -565,7 +571,11 @@ def _resolve_startup_workspace_binding(
 def _chat_mode_rows() -> list[tuple[str, str, str]]:
     return [
         ("review", "1) safe (review)", "Asks before file writes and shell commands."),
-        ("auto", "2) fast (auto)", "Runs faster with fewer prompts."),
+        (
+            "auto",
+            "2) fast (auto)",
+            "Auto-runs normal operations; approval-gated sensitive actions still ask.",
+        ),
         (
             "readonly",
             "3) read (readonly)",
@@ -636,9 +646,17 @@ def _chat_mode_panel(
 
 def _chat_trace_rows() -> list[tuple[str, str, str]]:
     return [
-        ("off", "1) off", "No reasoning trace in chat output."),
-        ("compact", "2) compact", "Short reasoning trace (recommended)."),
-        ("full", "3) full", "Detailed reasoning trace."),
+        ("off", "1) off", "Hide reasoning summaries and routine activity."),
+        (
+            "compact",
+            "2) compact",
+            "Collapsed provider summaries and key activity (recommended).",
+        ),
+        (
+            "full",
+            "3) full",
+            "Expanded provider summaries and detailed tool activity; never raw thinking.",
+        ),
     ]
 
 

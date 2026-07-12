@@ -5,8 +5,10 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -18,7 +20,6 @@ from .config import (
     is_generic_configured_verify_preset,
     is_generic_verify_command_fallback,
     normalize_verify_command_list,
-    normalize_verify_module_invocation,
     split_verify_command_parts,
     strip_verify_runner_prefix,
 )
@@ -31,6 +32,14 @@ from .file_classification import SOURCE_EXTENSIONS_BY_LANGUAGE
 from .repo_scan import RepoScanResult, scan_workspace
 from .sandbox_runner import HostShellRunner, build_shell_runner_from_settings
 from .sandbox_settings import resolve_shell_sandbox_settings
+from .verification_command_analysis import (
+    VerificationCommandEvidentiaryCapability,
+    VerificationCommandStatus,
+    analyze_verification_command,
+    command_status_from_execution,
+    path_has_known_verification_surface,
+    verification_commands_apply_to_paths,
+)
 from .verification_contract import (
     VerificationCommandExecutionMode,
     VerificationCommandSpec,
@@ -38,6 +47,7 @@ from .verification_contract import (
     build_verification_command_specs,
     command_specs_payload,
 )
+from .verification_failure_summary import summarize_verification_failure
 from .workspace_context import WorkspaceContext, WorkspaceContextError, resolve_workspace_context
 
 VERIFY_MODES = {"off", "warn", "strict"}
@@ -149,6 +159,10 @@ _PYTEST_NO_TESTS_RE = re.compile(
 _UNITTEST_NO_TESTS_RE = re.compile(r"\bRan\s+0\s+tests\b", re.IGNORECASE)
 _JUNIT_ZERO_TESTS_RE = re.compile(r"\bTests\s+run:\s*0\b", re.IGNORECASE)
 _NODE_ZERO_TESTS_RE = re.compile(r"^\s*#\s+tests\s+0\s*$", re.IGNORECASE | re.MULTILINE)
+_NOTHING_TO_DO_RE = re.compile(
+    r"\b(?:nothing to be done|nothing to do|no work to do)\b",
+    re.IGNORECASE,
+)
 _VERIFICATION_FAILURE_PRIORITY_MARKERS = (
     "ImportError",
     "ModuleNotFoundError",
@@ -171,6 +185,13 @@ _TOOLCHAIN_UNAVAILABLE_RE = re.compile(
 _LANGUAGE_VERSION_MISMATCH_RE = re.compile(
     r"\b(?:go|elixir|erlang|otp|node|npm|java|jdk|gradle|maven|ruby|python|swift)"
     r"\b.*\b(?:version|v\d+)\b.*\b(?:required|requires|unsupported|not supported)",
+    re.IGNORECASE,
+)
+_LEGACY_PYTHON_RUNTIME_INCOMPATIBILITY_RE = re.compile(
+    r"(?:attributeerror:\s*module\s+['\"]collections['\"]\s+has\s+no\s+attribute\s+"
+    r"['\"](?:mapping|mutablemapping|sequence|iterable|callable)['\"]|"
+    r"importerror:\s*cannot\s+import\s+name\s+['\"]"
+    r"(?:mapping|mutablemapping|sequence|iterable|callable)['\"]\s+from\s+['\"]collections['\"])",
     re.IGNORECASE,
 )
 _DOCS_ONLY_TEXT_RE = re.compile(
@@ -271,6 +292,16 @@ _MIXED_NODE_PYTHON_REPO_CLASSIFICATION_ALLOWED_PACKAGE_HINTS = (
 )
 _REPO_CLASSIFICATION_NEUTRAL_NAMES = {"codeowners"}
 _NODE_VERIFY_SCRIPT_PRIORITY = ("test", "build", "lint", "typecheck", "check")
+_VALIDATION_COMMAND_PATH_MARKERS = {
+    "accept",
+    "acceptance",
+    "check",
+    "smoke",
+    "test",
+    "validate",
+    "validation",
+    "verify",
+}
 
 
 class VerifyError(RuntimeError):
@@ -297,8 +328,19 @@ class VerifyCommandResult:
     non_execution_reason: str | None = None
 
     @property
+    def status(self) -> VerificationCommandStatus:
+        return command_status_from_execution(
+            exit_code=self.exit_code,
+            real_execution=self.real_execution,
+            non_execution_reason=self.non_execution_reason,
+        )
+
+    @property
     def ok(self) -> bool:
-        return self.exit_code == 0 and self.real_execution is not False
+        return self.status in {
+            VerificationCommandStatus.PASSED,
+            VerificationCommandStatus.SKIPPED,
+        }
 
 
 @dataclass(frozen=True)
@@ -331,7 +373,16 @@ class VerifyRunResult:
             return "verification skipped: no commands"
         passed = len([item for item in self.command_results if item.ok])
         total = len(self.command_results)
+        skipped = [
+            item.command
+            for item in self.command_results
+            if item.status == VerificationCommandStatus.SKIPPED
+        ]
         if self.all_passed:
+            if skipped and len(skipped) == total:
+                return f"verification skipped: nothing to verify ({passed}/{total})"
+            if skipped:
+                return f"verification passed ({passed}/{total}); skipped: {', '.join(skipped)}"
             return f"verification passed ({passed}/{total})"
         return f"verification failed ({passed}/{total}); failed: {', '.join(self.failed_commands)}"
 
@@ -579,6 +630,8 @@ def _looks_like_docs_only_target(path: str) -> bool:
     if not normalized:
         return False
     pure = PurePosixPath(normalized)
+    if path_has_known_verification_surface(normalized):
+        return False
     parts = [part.casefold() for part in pure.parts]
     name = pure.name.casefold()
     stem = pure.stem.casefold()
@@ -1138,6 +1191,7 @@ def refine_generic_fallback_verify_command_selection(
 ) -> ResolvedVerifyCommands:
     if not is_generic_fallback_verify_command_selection(selection):
         return selection
+    suppressible_generic_fallback = is_generic_fallback_verify_command_selection(selection)
 
     scan = repo_scan
     if scan is None and root is not None:
@@ -1147,6 +1201,12 @@ def refine_generic_fallback_verify_command_selection(
             scan = None
 
     task_paths = _task_signal_paths(task)
+    generic_commands_apply_to_task_paths = bool(
+        task_paths
+    ) and verification_commands_apply_to_paths(
+        set(task_paths),
+        selection.commands,
+    )
     task_texts = _task_signal_texts(task, plan_requirements=plan_requirements)
     repo_grounded_no_authoritative = _repo_grounded_no_authoritative_selection(scan)
     task_has_python_signals = any(_looks_like_python_verify_target(path) for path in task_paths)
@@ -1229,6 +1289,8 @@ def refine_generic_fallback_verify_command_selection(
             contract_type="task_inferred",
         )
     if task_has_docs_only_signals or (not task_paths and _texts_look_docs_only(task_texts)):
+        if not suppressible_generic_fallback:
+            return selection
         return _resolved_verify_commands(
             commands=(),
             source="task_refinement.no_authoritative_commands",
@@ -1236,6 +1298,8 @@ def refine_generic_fallback_verify_command_selection(
             contract_type="unavailable",
         )
     if task_has_static_web_signals or (not task_paths and _texts_look_static_web_task(task_texts)):
+        if not suppressible_generic_fallback:
+            return selection
         return _resolved_verify_commands(
             commands=(),
             source="task_refinement.no_authoritative_commands",
@@ -1243,6 +1307,8 @@ def refine_generic_fallback_verify_command_selection(
             contract_type="unavailable",
         )
     if task_has_ci_only_signals or (not task_paths and _texts_look_ci_only(task_texts)):
+        if not suppressible_generic_fallback:
+            return selection
         return _resolved_verify_commands(
             commands=(),
             source="task_refinement.no_authoritative_commands",
@@ -1255,6 +1321,8 @@ def refine_generic_fallback_verify_command_selection(
         or (not task_paths and _texts_look_terraform_or_compose(task_texts))
         or task_has_pathless_compose_shorthand
     ):
+        if not suppressible_generic_fallback:
+            return selection
         return _resolved_verify_commands(
             commands=(),
             source="task_refinement.no_authoritative_commands",
@@ -1265,7 +1333,11 @@ def refine_generic_fallback_verify_command_selection(
         not task_paths and repo_python_hints and _texts_look_python_code_task(task_texts)
     )
     if task_has_python_signals or task_has_pathless_python_code_signals:
-        if scan is not None and not repo_has_authoritative_commands:
+        if (
+            scan is not None
+            and not repo_has_authoritative_commands
+            and suppressible_generic_fallback
+        ):
             return _resolved_verify_commands(
                 commands=(),
                 source="task_refinement.no_authoritative_commands",
@@ -1303,6 +1375,8 @@ def refine_generic_fallback_verify_command_selection(
         or task_has_js_targets
         or task_has_pathless_js_frontend_signals
     ):
+        if not suppressible_generic_fallback:
+            return selection
         return _resolved_verify_commands(
             commands=(),
             source="task_refinement.no_authoritative_commands",
@@ -1310,17 +1384,26 @@ def refine_generic_fallback_verify_command_selection(
             contract_type="unavailable",
         )
 
-    if repo_grounded_no_authoritative is not None:
+    if repo_grounded_no_authoritative is not None and suppressible_generic_fallback:
         return repo_grounded_no_authoritative
+
+    if task_paths and suppressible_generic_fallback and not generic_commands_apply_to_task_paths:
+        return _resolved_verify_commands(
+            commands=(),
+            source="task_refinement.no_authoritative_commands",
+            reason=("configured generic verification commands do not apply to the task paths"),
+            contract_type="unavailable",
+        )
 
     if (
         scan is not None
-        and selection.source == CONFIG_VERIFY_COMMANDS_FALLBACK_SOURCE
+        and suppressible_generic_fallback
         and not repo_has_authoritative_commands
         and not repo_python_hints
         and not task_has_python_signals
         and not task_has_pathless_python_code_signals
         and not explicit_pytest_commands
+        and not generic_commands_apply_to_task_paths
     ):
         return _resolved_verify_commands(
             commands=(),
@@ -1717,95 +1800,20 @@ def _strip_execution_runner_prefix(parts: list[str]) -> list[str] | None:
 
 
 def _normalize_execution_semantics_parts(command: str) -> list[str] | None:
-    normalized = _normalize_shell_command(command)
-    if not normalized:
-        return None
-
-    while True:
-        wrapped = _unwrap_shell_wrapper_command(normalized)
-        if not wrapped or wrapped == normalized:
-            break
-        normalized = wrapped
-
-    parts = _split_shell_command_parts(normalized)
-    if not parts:
-        return None
-
-    while True:
-        changed = False
-        stripped_env = _strip_execution_env_prefix(parts)
-        if stripped_env is None:
-            return None
-        if stripped_env != parts:
-            parts = stripped_env
-            changed = True
-
-        stripped_runner = _strip_execution_runner_prefix(parts)
-        if stripped_runner is None:
-            return None
-        if stripped_runner != parts:
-            parts = stripped_runner
-            changed = True
-
-        if not changed:
-            break
-
-    parts = normalize_verify_module_invocation(parts)
-    return parts or None
+    analysis = analyze_verification_command(command, trusted=True)
+    return list(analysis.parts) if analysis.parts else None
 
 
 def _verification_family_for_result(command: str) -> str | None:
-    parts = _normalize_execution_semantics_parts(command)
-    if not parts:
-        return None
-
-    head = Path(parts[0]).name.lower()
-    tail = [part.lower() for part in parts[1:]]
-    if head in {"pytest", "py.test"}:
-        return "pytest"
-    if head == "unittest":
-        return "unittest"
-    if head == "mypy":
-        return "mypy"
-    if head == "go" and tail and tail[0] == "test":
-        return "go:test"
-    if head == "cargo" and tail and tail[0] in {"test", "check"}:
-        return f"cargo:{tail[0]}"
-    if head in {"mvn", "mvnw", "./mvnw"} and tail and tail[0] in {"test", "verify"}:
-        return f"maven:{tail[0]}"
-    if head in {"gradle", "gradlew", "./gradlew"} and tail and tail[0] == "test":
-        return "gradle:test"
-    if head == "dotnet" and tail and tail[0] == "test":
-        return "dotnet:test"
-    if head == "mix" and tail and tail[0] == "test":
-        return "mix:test"
-    if head in {"npm", "pnpm", "yarn"} and tail and tail[0] == "test":
-        return f"{head}:test"
-    if head in {"make", "just"} and tail and tail[0] in {"test", "check", "verify"}:
-        return f"{head}:{tail[0]}"
-    if head == "ruff" and tail and tail[0] == "check":
-        return "ruff:check"
-    return None
+    return analyze_verification_command(command, trusted=True).command_family
 
 
 def _has_shell_control_flow(command: str) -> bool:
-    raw = str(command or "")
-    if "\n" in raw or "\r" in raw:
-        return True
-
-    normalized = _normalize_command_for_control_flow_detection(raw)
-    if not normalized:
-        return False
-
-    try:
-        lexer = shlex.shlex(normalized, posix=True, punctuation_chars="|&;")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = list(lexer)
-    except ValueError:
-        return False
-
-    return any(token in _VERIFY_SHELL_CONTROL_FLOW_TOKENS for token in tokens)
+    analysis = analyze_verification_command(command, trusted=True)
+    return analysis.shell_control_flow in {"unsafe", "pipeline"} or analysis.rejection_reason in {
+        "disallowed_shell_control_flow",
+        "unsafe_pipeline",
+    }
 
 
 def assess_verification_command_execution(
@@ -1814,13 +1822,21 @@ def assess_verification_command_execution(
     exit_code: int,
     output: str,
 ) -> VerificationExecutionAssessment:
-    family = _verification_family_for_result(command)
+    analysis = analyze_verification_command(command, trusted=True)
+    family = analysis.command_family
     if _is_execution_layer_failure(exit_code=exit_code, output=output):
         return VerificationExecutionAssessment(
             real_execution=False,
             non_execution_reason="execution_layer_failure",
         )
-    if family == "pytest" and _PYTEST_NO_TESTS_RE.search(str(output or "")):
+    if analysis.rejection_reason:
+        if exit_code == 0:
+            return VerificationExecutionAssessment(
+                real_execution=False,
+                non_execution_reason=analysis.rejection_reason,
+            )
+        return VerificationExecutionAssessment(real_execution=None)
+    if family == "pytest" and (exit_code == 5 or _PYTEST_NO_TESTS_RE.search(str(output or ""))):
         return VerificationExecutionAssessment(
             real_execution=False,
             non_execution_reason="pytest_no_tests_collected",
@@ -1843,14 +1859,32 @@ def assess_verification_command_execution(
             real_execution=False,
             non_execution_reason=f"{family.replace(':', '_')}_zero_tests",
         )
+    if (
+        family
+        in {
+            "make:test",
+            "make:check",
+            "make:verify",
+            "just:test",
+            "just:check",
+            "just:verify",
+        }
+        and exit_code == 0
+        and _NOTHING_TO_DO_RE.search(str(output or ""))
+    ):
+        return VerificationExecutionAssessment(
+            real_execution=False,
+            non_execution_reason="verification_nothing_to_do",
+        )
 
     if exit_code != 0:
         return VerificationExecutionAssessment(real_execution=None)
 
-    if _has_shell_control_flow(command):
-        # Managed workflow verification still allows shell chaining. When a compound command exits 0,
-        # do not let family-specific zero-work heuristics downgrade the whole verification result.
-        return VerificationExecutionAssessment(real_execution=None)
+    if analysis.evidentiary_capability == VerificationCommandEvidentiaryCapability.NON_ASSERTIVE:
+        return VerificationExecutionAssessment(
+            real_execution=False,
+            non_execution_reason=analysis.capability_reason or "non_assertive_verifier",
+        )
 
     if family == "go:test":
         saw_zero_work = False
@@ -1879,7 +1913,12 @@ def assess_verification_command_execution(
                 non_execution_reason=zero_work_reason or "go_test_no_tests_to_run",
             )
     if family is None:
-        return VerificationExecutionAssessment(real_execution=None)
+        return VerificationExecutionAssessment(
+            real_execution=None,
+            non_execution_reason=analysis.inconclusive_reason
+            or analysis.capability_reason
+            or "unknown_verification_capability",
+        )
     return VerificationExecutionAssessment(real_execution=True)
 
 
@@ -1984,6 +2023,8 @@ def _is_toolchain_unavailable_failure(*, output: str) -> bool:
         return True
     if _LANGUAGE_VERSION_MISMATCH_RE.search(lowered):
         return True
+    if _LEGACY_PYTHON_RUNTIME_INCOMPATIBILITY_RE.search(lowered):
+        return True
     return any(
         marker in lowered
         for marker in (
@@ -2055,16 +2096,29 @@ def verify_run_result_to_payload(
 
     command_results: list[dict[str, object]] = []
     fallback_details: list[dict[str, object]] = []
+    primary_failure_summary: dict[str, Any] | None = None
     for item in result.command_results:
         preview, was_truncated = _truncate_verify_output(
             item.output,
             max_chars=max(1, int(output_preview_chars)),
         )
         effective_command = item.effective_command or item.command
+        failure_summary = None
+        if not item.ok:
+            failure_summary = summarize_verification_failure(
+                root=root,
+                command=item.command,
+                effective_command=effective_command,
+                output=item.output,
+                output_truncated=was_truncated,
+            )
+            if failure_summary is not None and primary_failure_summary is None:
+                primary_failure_summary = failure_summary
         command_payload = {
             "command": item.command,
             "effective_command": effective_command,
             "exit_code": item.exit_code,
+            "status": item.status.value,
             "ok": item.ok,
             "real_execution": item.real_execution,
             "output_preview": preview,
@@ -2072,6 +2126,8 @@ def verify_run_result_to_payload(
             "output_truncated": was_truncated,
             "fallback_used": item.fallback_used,
         }
+        if failure_summary is not None:
+            command_payload["failure_summary"] = failure_summary
         if item.fallback_reason:
             command_payload["fallback_reason"] = item.fallback_reason
         if item.non_execution_reason:
@@ -2083,6 +2139,7 @@ def verify_run_result_to_payload(
                     "command": item.command,
                     "effective_command": effective_command,
                     "exit_code": item.exit_code,
+                    "status": item.status.value,
                     "ok": item.ok,
                     "reason": item.fallback_reason or "pytest_entrypoint_unavailable",
                 }
@@ -2105,6 +2162,8 @@ def verify_run_result_to_payload(
     }
     if primary_failure is not None:
         payload["primary_failure"] = primary_failure
+    if primary_failure_summary is not None:
+        payload["failure_summary"] = primary_failure_summary
     return payload
 
 
@@ -2147,6 +2206,11 @@ def compact_verification_payload(
                 compact_item["fallback_reason"] = str(item.get("fallback_reason") or "")
             if item.get("non_execution_reason") is not None:
                 compact_item["non_execution_reason"] = str(item.get("non_execution_reason") or "")
+            raw_failure_summary = item.get("failure_summary")
+            if isinstance(raw_failure_summary, dict):
+                compact_summary = _compact_failure_summary(raw_failure_summary)
+                if compact_summary:
+                    compact_item["failure_summary"] = compact_summary
             if preview_truncated or bool(item.get("output_truncated")):
                 compact_item["output_truncated"] = True
             compact_results.append(compact_item)
@@ -2194,7 +2258,40 @@ def compact_verification_payload(
         compact_payload["artifact_saved"] = bool(payload.get("artifact_saved"))
     if payload.get("artifact_location") is not None:
         compact_payload["artifact_location"] = str(payload.get("artifact_location") or "")
+    raw_failure_summary = payload.get("failure_summary")
+    if isinstance(raw_failure_summary, dict):
+        compact_summary = _compact_failure_summary(raw_failure_summary)
+        if compact_summary:
+            compact_payload["failure_summary"] = compact_summary
     return compact_payload
+
+
+def _compact_failure_summary(summary: dict[str, Any]) -> dict[str, object]:
+    compact: dict[str, object] = {}
+    framework = str(summary.get("framework") or "").strip()
+    primary_error = str(summary.get("primary_error") or "").strip()
+    if framework:
+        compact["framework"] = framework
+    if primary_error:
+        compact["primary_error"] = _clip_verification_failure_snippet(
+            primary_error,
+            max_chars=VERIFICATION_FAILURE_SNIPPET_MAX_CHARS,
+        )
+    for key, limit in (
+        ("failing_tests", 4),
+        ("stack_frames", 6),
+        ("likely_next_files", 8),
+    ):
+        value = summary.get(key)
+        if isinstance(value, list) and value:
+            compact[key] = value[:limit]
+    if summary.get("output_truncated") is not None:
+        compact["output_truncated"] = bool(summary.get("output_truncated"))
+    if summary.get("heuristic") is not None:
+        compact["heuristic"] = bool(summary.get("heuristic"))
+    if summary.get("confidence") is not None:
+        compact["confidence"] = summary.get("confidence")
+    return compact
 
 
 def resolve_verify_artifact_payload(*, root: Path, artifact_path: Path) -> VerifyArtifactPayload:
@@ -2249,7 +2346,10 @@ def resolve_verify_command_selection(
 
     commands = normalize_verify_command_list(cfg.verify_commands)
     if not commands:
-        if not allow_empty_config:
+        managed_host_verifier_unavailable = bool(
+            (cfg.extra_fields or {}).get("managed_host_verifier_unavailable")
+        )
+        if not allow_empty_config and not managed_host_verifier_unavailable:
             raise VerifyError("Configured verify_commands is empty.")
         inferred = _resolve_repo_inferred_verify_commands(root=root, repo_scan=repo_scan)
         if inferred:
@@ -2257,16 +2357,30 @@ def resolve_verify_command_selection(
                 commands=inferred,
                 source="repo_scan.likely_test_commands",
                 reason=(
-                    "configured verify_commands is empty, but repo scan discovered "
+                    "managed host verifier is unavailable, but repo scan discovered "
                     "authoritative repo-native verification commands"
+                    if managed_host_verifier_unavailable
+                    else (
+                        "configured verify_commands is empty, but repo scan discovered "
+                        "authoritative repo-native verification commands"
+                    )
                 ),
             )
         return _resolved_verify_commands(
             commands=(),
-            source=REPO_SCAN_NO_AUTHORITATIVE_SOURCE,
+            source=(
+                "environment.managed_host_verifier_unavailable"
+                if managed_host_verifier_unavailable
+                else REPO_SCAN_NO_AUTHORITATIVE_SOURCE
+            ),
             reason=(
-                "configured verify_commands is empty and no repo-native verification "
+                "managed host verifier is unavailable and no repo-native verification "
                 "commands were discovered"
+                if managed_host_verifier_unavailable
+                else (
+                    "configured verify_commands is empty and no repo-native verification "
+                    "commands were discovered"
+                )
             ),
             contract_type="unavailable",
         )
@@ -2304,33 +2418,40 @@ def resolve_verify_commands(
     )
 
 
+def _repo_scan_describes_root(scan: RepoScanResult, root: Path) -> bool:
+    raw_scan_root = str(getattr(scan, "workspace_root", "") or "").strip()
+    if not raw_scan_root:
+        return False
+    try:
+        scan_root = Path(raw_scan_root).expanduser().resolve()
+        target_root = root.resolve()
+    except OSError:
+        return False
+    return os.path.normcase(str(scan_root)) == os.path.normcase(str(target_root))
+
+
 def _resolve_repo_inferred_verify_commands(
     *,
     root: Path | None,
     repo_scan: RepoScanResult | None,
 ) -> tuple[str, ...]:
+    # A scan of the requested root is authoritative as-is: files created after it
+    # was captured must not retroactively establish a verification contract. A scan
+    # of a different root (e.g. the base workspace while verifying a merge-candidate
+    # copy) is stale for command inference, so rescan the candidate root while
+    # preserving the original scan's focus.
     scan = repo_scan
-    if root is not None and (scan is None or not _repo_scan_matches_root(scan, root)):
+    if root is not None and (scan is None or not _repo_scan_describes_root(scan, root)):
         try:
             scan = scan_workspace(context=_resolve_verify_workspace_context(root, repo_scan))
         except (WorkspaceContextError, OSError):
-            scan = None
+            scan = repo_scan
     if scan is None:
         return ()
     likely_commands = normalize_verify_command_list(scan.likely_test_commands)
     if likely_commands:
         return likely_commands
     return ()
-
-
-def _repo_scan_matches_root(scan: RepoScanResult, root: Path) -> bool:
-    raw_root = str(getattr(scan, "workspace_root", "") or "").strip()
-    if not raw_root:
-        return False
-    try:
-        return Path(raw_root).expanduser().resolve() == root.resolve()
-    except OSError:
-        return False
 
 
 def _infer_node_project_script_verify_commands(
@@ -2559,6 +2680,42 @@ def resolve_verify_sandbox_mode(cfg: AppConfig) -> str:
     return mode
 
 
+@dataclass(frozen=True)
+class _PathSnapshot:
+    existed: bool
+    temp_dir: tempfile.TemporaryDirectory[str] | None = None
+    snapshot_path: Path | None = None
+
+
+def _snapshot_path(path: Path) -> _PathSnapshot:
+    if not path.exists():
+        return _PathSnapshot(existed=False)
+    temp_dir = tempfile.TemporaryDirectory(prefix="sylliptor-verify-snapshot-")
+    snapshot_path = Path(temp_dir.name) / path.name
+    if path.is_dir():
+        shutil.copytree(path, snapshot_path)
+    else:
+        shutil.copy2(path, snapshot_path)
+    return _PathSnapshot(existed=True, temp_dir=temp_dir, snapshot_path=snapshot_path)
+
+
+def _restore_path_snapshot(path: Path, snapshot: _PathSnapshot) -> None:
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink()
+        if snapshot.existed and snapshot.snapshot_path is not None:
+            if snapshot.snapshot_path.is_dir():
+                shutil.copytree(snapshot.snapshot_path, path)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(snapshot.snapshot_path, path)
+    finally:
+        if snapshot.temp_dir is not None:
+            snapshot.temp_dir.cleanup()
+
+
 def run_task_verification(
     *,
     root: Path,
@@ -2579,121 +2736,129 @@ def run_task_verification(
     runner = HostShellRunner() if verify_sandbox_mode == "off" else None
     runner_build_error: str | None = None
     failure_category: FailureCategory | None = None
-    if verify_sandbox_mode != "off":
-        try:
-            base_settings = resolve_shell_sandbox_settings(effective_cfg)
-            verify_settings = replace(base_settings, mode=verify_sandbox_mode)
-            runner = build_shell_runner_from_settings(verify_settings, root, warning_callback=None)
-        except (ConfigError, VerifyError) as e:
-            runner_build_error = str(e)
-            failure_category = FailureCategory.INFRA_UNAVAILABLE
-
-    for idx, command in enumerate(commands, start=1):
-        effective_command = _expand_verification_command_globs(command, root=root)
-        initial_execution = _run_verify_command_once(
-            command=effective_command,
-            root=root,
-            runner=runner,
-            runner_build_error=runner_build_error,
-            timeout_s=timeout_s,
-        )
-        exit_code = initial_execution.exit_code
-        stdout = initial_execution.stdout
-        stderr = initial_execution.stderr
-        output = initial_execution.output
-        fallback_used = False
-        fallback_reason: str | None = None
-
-        fallback_command = _build_pytest_module_fallback_command(command)
-        if (
-            runner_build_error is None
-            and fallback_command
-            and (
-                _is_execution_layer_failure(
-                    exit_code=initial_execution.exit_code,
-                    output=output,
+    pytest_cache_path = root / ".pytest_cache"
+    pytest_cache_snapshot = _snapshot_path(pytest_cache_path)
+    try:
+        if verify_sandbox_mode != "off":
+            try:
+                base_settings = resolve_shell_sandbox_settings(effective_cfg)
+                verify_settings = replace(base_settings, mode=verify_sandbox_mode)
+                runner = build_shell_runner_from_settings(
+                    verify_settings, root, warning_callback=None
                 )
-                or _is_pytest_entrypoint_import_failure(command=command, output=output)
-            )
-        ):
-            fallback_used = True
-            fallback_reason = "pytest_entrypoint_unavailable"
-            effective_command = fallback_command
-            fallback_execution = _run_verify_command_once(
-                command=fallback_command,
+            except (ConfigError, VerifyError) as e:
+                runner_build_error = str(e)
+                failure_category = FailureCategory.INFRA_UNAVAILABLE
+
+        for idx, command in enumerate(commands, start=1):
+            effective_command = _expand_verification_command_globs(command, root=root)
+            initial_execution = _run_verify_command_once(
+                command=effective_command,
                 root=root,
                 runner=runner,
                 runner_build_error=runner_build_error,
                 timeout_s=timeout_s,
             )
-            exit_code = fallback_execution.exit_code
-            stdout = fallback_execution.stdout
-            stderr = fallback_execution.stderr
-            output = fallback_execution.output
+            exit_code = initial_execution.exit_code
+            stdout = initial_execution.stdout
+            stderr = initial_execution.stderr
+            output = initial_execution.output
+            fallback_used = False
+            fallback_reason: str | None = None
 
-        execution_assessment = assess_verification_command_execution(
-            command=effective_command,
-            exit_code=exit_code,
-            output=output,
-        )
-        result = VerifyCommandResult(
-            command=command,
-            effective_command=effective_command,
-            exit_code=exit_code,
-            output=output,
-            stdout=stdout,
-            stderr=stderr,
-            fallback_used=fallback_used,
-            fallback_reason=fallback_reason,
-            real_execution=execution_assessment.real_execution,
-            non_execution_reason=execution_assessment.non_execution_reason,
-        )
-        results.append(result)
-        if failure_category is None and (
-            result.non_execution_reason == "execution_layer_failure"
-            or is_infra_unavailable_error(result.output)
-            or _is_toolchain_unavailable_failure(output=result.output)
-        ):
-            failure_category = FailureCategory.INFRA_UNAVAILABLE
+            fallback_command = _build_pytest_module_fallback_command(command)
+            if (
+                runner_build_error is None
+                and fallback_command
+                and (
+                    _is_execution_layer_failure(
+                        exit_code=initial_execution.exit_code,
+                        output=output,
+                    )
+                    or _is_pytest_entrypoint_import_failure(command=command, output=output)
+                )
+            ):
+                fallback_used = True
+                fallback_reason = "pytest_entrypoint_unavailable"
+                effective_command = fallback_command
+                fallback_execution = _run_verify_command_once(
+                    command=fallback_command,
+                    root=root,
+                    runner=runner,
+                    runner_build_error=runner_build_error,
+                    timeout_s=timeout_s,
+                )
+                exit_code = fallback_execution.exit_code
+                stdout = fallback_execution.stdout
+                stderr = fallback_execution.stderr
+                output = fallback_execution.output
 
-        lines.extend(
-            [
-                f"## Command {idx}",
-                f"requested_command: {command}",
-                f"effective_command: {effective_command}",
-                f"fallback_used: {str(fallback_used).lower()}",
-            ]
-        )
-        if fallback_reason:
-            lines.append(f"fallback_reason: {fallback_reason}")
+            execution_assessment = assess_verification_command_execution(
+                command=effective_command,
+                exit_code=exit_code,
+                output=output,
+            )
+            result = VerifyCommandResult(
+                command=command,
+                effective_command=effective_command,
+                exit_code=exit_code,
+                output=output,
+                stdout=stdout,
+                stderr=stderr,
+                fallback_used=fallback_used,
+                fallback_reason=fallback_reason,
+                real_execution=execution_assessment.real_execution,
+                non_execution_reason=execution_assessment.non_execution_reason,
+            )
+            results.append(result)
+            if failure_category is None and (
+                result.non_execution_reason == "execution_layer_failure"
+                or is_infra_unavailable_error(result.output)
+                or _is_toolchain_unavailable_failure(output=result.output)
+            ):
+                failure_category = FailureCategory.INFRA_UNAVAILABLE
+
             lines.extend(
                 [
-                    "----- initial output -----",
-                    initial_execution.output.rstrip() or "(no output)",
+                    f"## Command {idx}",
+                    f"requested_command: {command}",
+                    f"effective_command: {effective_command}",
+                    f"fallback_used: {str(fallback_used).lower()}",
                 ]
             )
-        if result.non_execution_reason:
-            lines.append(f"non_execution_reason: {result.non_execution_reason}")
-        lines.extend(
-            [
-                f"exit_code: {exit_code}",
-                f"real_execution: {str(result.real_execution).lower() if result.real_execution is not None else 'unknown'}",
-                "----- output -----",
-                output.rstrip() or "(no output)",
-                "",
-            ]
-        )
+            if fallback_reason:
+                lines.append(f"fallback_reason: {fallback_reason}")
+                lines.extend(
+                    [
+                        "----- initial output -----",
+                        initial_execution.output.rstrip() or "(no output)",
+                    ]
+                )
+            if result.non_execution_reason:
+                lines.append(f"non_execution_reason: {result.non_execution_reason}")
+            lines.extend(
+                [
+                    f"exit_code: {exit_code}",
+                    f"status: {result.status.value}",
+                    f"real_execution: {str(result.real_execution).lower() if result.real_execution is not None else 'unknown'}",
+                    "----- output -----",
+                    output.rstrip() or "(no output)",
+                    "",
+                ]
+            )
 
-    run_result = VerifyRunResult(
-        commands=commands,
-        command_results=results,
-        artifact_path=artifact_path,
-        failure_category=(
-            failure_category
-            if failure_category is not None or all(item.ok for item in results)
-            else FailureCategory.VERIFICATION_FAILED
-        ),
-    )
-    lines.extend(["Summary:", run_result.summary, ""])
-    artifact_path.write_text("\n".join(lines), encoding="utf-8")
-    return run_result
+        run_result = VerifyRunResult(
+            commands=commands,
+            command_results=results,
+            artifact_path=artifact_path,
+            failure_category=(
+                failure_category
+                if failure_category is not None or all(item.ok for item in results)
+                else FailureCategory.VERIFICATION_FAILED
+            ),
+        )
+        lines.extend(["Summary:", run_result.summary, ""])
+        artifact_path.write_text("\n".join(lines), encoding="utf-8")
+        return run_result
+    finally:
+        _restore_path_snapshot(pytest_cache_path, pytest_cache_snapshot)

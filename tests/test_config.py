@@ -20,6 +20,8 @@ from sylliptor_agent_cli.config import (
     load_config,
     load_persisted_api_key,
     normalize_verify_command_list,
+    resolve_anthropic_prompt_cache_enabled,
+    resolve_anthropic_prompt_cache_ttl,
     resolve_api_key,
     resolve_crash_diagnostic_log_path,
     resolve_feedback_github_enabled,
@@ -30,6 +32,7 @@ from sylliptor_agent_cli.config import (
     resolve_llm_timeout_s,
     resolve_model_metadata_policy,
     resolve_prompt_cache_key,
+    resolve_prompt_cache_mode,
     resolve_prompt_cache_retention,
     resolve_run_deadline,
     resolve_run_deadline_seconds,
@@ -37,6 +40,7 @@ from sylliptor_agent_cli.config import (
     resolve_web_search_base_url,
     resolve_web_search_mode,
     resolve_web_search_model,
+    resolve_web_search_policy,
     resolve_web_search_timeout_s,
     save_config,
     save_persisted_api_key,
@@ -542,7 +546,7 @@ def test_config_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert cfg2.llm_reasoning_effort == "high"
     assert cfg2.temperature == 0.2
     assert cfg2.stream is True
-    assert cfg2.step_budget_policy == "fixed"
+    assert cfg2.step_budget_policy == "limited"
     assert cfg2.task_max_steps == 144
     assert cfg2.subagent_max_steps == 12
     assert cfg2.web_search_mode == "auto"
@@ -569,9 +573,14 @@ def test_config_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
 def test_app_config_uses_shared_step_budget_defaults() -> None:
     cfg = AppConfig()
 
+    assert cfg.step_budget_policy == "autonomous"
     assert cfg.max_steps == DEFAULT_CHAT_MAX_STEPS
     assert cfg.task_max_steps == DEFAULT_TASK_MAX_STEPS
     assert cfg.subagent_max_steps == DEFAULT_SUBAGENT_MAX_STEPS
+
+
+def test_stream_defaults_on() -> None:
+    assert AppConfig().stream is True
 
 
 def test_set_stream_value_validation() -> None:
@@ -611,9 +620,13 @@ def test_set_routing_mode_validation() -> None:
 def test_set_step_budget_policy_validation() -> None:
     cfg = AppConfig()
     cfg = set_config_value(cfg, "step_budget_policy", "fixed")
-    assert cfg.step_budget_policy == "fixed"
+    assert cfg.step_budget_policy == "limited"
     cfg = set_config_value(cfg, "step_budget_policy", "adaptive")
-    assert cfg.step_budget_policy == "adaptive"
+    assert cfg.step_budget_policy == "autonomous"
+    cfg = set_config_value(cfg, "step_budget_policy", "limited")
+    assert cfg.step_budget_policy == "limited"
+    cfg = set_config_value(cfg, "step_budget_policy", "autonomous")
+    assert cfg.step_budget_policy == "autonomous"
     with pytest.raises(ConfigError):
         set_config_value(cfg, "step_budget_policy", "maybe")
 
@@ -733,8 +746,29 @@ def test_set_assets_config_validation() -> None:
 def test_default_web_search_mode_is_auto() -> None:
     assert AppConfig().web_search_mode == "auto"
     assert resolve_web_search_mode(AppConfig()) == "auto"
+    assert AppConfig().web_search_policy == "auto"
+    assert resolve_web_search_policy(AppConfig()) == "auto"
     assert AppConfig().web_search_adapter == "auto"
     assert resolve_web_search_adapter(AppConfig()) == "auto"
+
+
+def test_set_and_resolve_web_search_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_POLICY", raising=False)
+    cfg = AppConfig()
+
+    cfg = set_config_value(cfg, "web_search_policy", "always")
+    assert cfg.web_search_policy == "auto"
+    assert resolve_web_search_policy(cfg) == "auto"
+
+    cfg = set_config_value(cfg, "web_search_policy", "off")
+    assert cfg.web_search_policy == "off"
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_POLICY", "auto")
+    assert resolve_web_search_policy(cfg) == "auto"
+
+    with pytest.raises(ConfigError, match="web_search_policy"):
+        set_config_value(cfg, "web_search_policy", "sometimes")
 
 
 def test_default_web_search_timeout_allows_slower_search_backends(
@@ -804,16 +838,40 @@ def test_set_web_search_model_and_base_url_supports_round_trip() -> None:
 
 def test_set_prompt_cache_knobs_support_round_trip_and_clear() -> None:
     cfg = AppConfig()
+    cfg = set_config_value(cfg, "prompt_cache_mode", "auto")
     cfg = set_config_value(cfg, "prompt_cache_key", "repo-main")
     cfg = set_config_value(cfg, "prompt_cache_retention", "24h")
 
+    assert cfg.prompt_cache_mode == "auto"
     assert cfg.prompt_cache_key == "repo-main"
     assert cfg.prompt_cache_retention == "24h"
 
+    cfg = set_config_value(cfg, "prompt_cache_mode", "")
     cfg = set_config_value(cfg, "prompt_cache_key", "")
     cfg = set_config_value(cfg, "prompt_cache_retention", "")
+    assert cfg.prompt_cache_mode == "manual"
     assert cfg.prompt_cache_key is None
     assert cfg.prompt_cache_retention is None
+
+    with pytest.raises(ConfigError, match="prompt_cache_mode"):
+        set_config_value(cfg, "prompt_cache_mode", "always")
+
+
+def test_set_anthropic_prompt_cache_knobs_validate_and_round_trip() -> None:
+    cfg = AppConfig()
+    cfg = set_config_value(cfg, "anthropic_prompt_cache_enabled", "true")
+    cfg = set_config_value(cfg, "anthropic_prompt_cache_ttl", "1h")
+
+    assert cfg.anthropic_prompt_cache_enabled is True
+    assert cfg.anthropic_prompt_cache_ttl == "1h"
+
+    cfg = set_config_value(cfg, "anthropic_prompt_cache_enabled", "false")
+    cfg = set_config_value(cfg, "anthropic_prompt_cache_ttl", "")
+    assert cfg.anthropic_prompt_cache_enabled is False
+    assert cfg.anthropic_prompt_cache_ttl == "5m"
+
+    with pytest.raises(ConfigError, match="anthropic_prompt_cache_ttl"):
+        set_config_value(cfg, "anthropic_prompt_cache_ttl", "24h")
 
 
 def test_set_verify_commands_validation() -> None:
@@ -1564,21 +1622,59 @@ def test_resolve_web_search_base_url_can_come_from_active_profile_without_copied
 
 
 def test_resolve_prompt_cache_knobs_default_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SYLLIPTOR_PROMPT_CACHE_MODE", raising=False)
     monkeypatch.delenv("SYLLIPTOR_PROMPT_CACHE_KEY", raising=False)
     monkeypatch.delenv("SYLLIPTOR_PROMPT_CACHE_RETENTION", raising=False)
 
     cfg = AppConfig()
+    assert resolve_prompt_cache_mode(cfg) == "manual"
     assert resolve_prompt_cache_key(cfg) is None
     assert resolve_prompt_cache_retention(cfg) is None
 
 
 def test_resolve_prompt_cache_knobs_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SYLLIPTOR_PROMPT_CACHE_MODE", "auto")
     monkeypatch.setenv("SYLLIPTOR_PROMPT_CACHE_KEY", "env-cache-key")
     monkeypatch.setenv("SYLLIPTOR_PROMPT_CACHE_RETENTION", "8h")
 
-    cfg = AppConfig(prompt_cache_key="cfg-cache-key", prompt_cache_retention="1h")
+    cfg = AppConfig(
+        prompt_cache_mode="manual",
+        prompt_cache_key="cfg-cache-key",
+        prompt_cache_retention="1h",
+    )
+    assert resolve_prompt_cache_mode(cfg) == "auto"
     assert resolve_prompt_cache_key(cfg) == "env-cache-key"
     assert resolve_prompt_cache_retention(cfg) == "8h"
+
+
+def test_resolve_prompt_cache_mode_rejects_invalid_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_PROMPT_CACHE_MODE", "always")
+
+    with pytest.raises(ConfigError, match="SYLLIPTOR_PROMPT_CACHE_MODE"):
+        resolve_prompt_cache_mode(AppConfig())
+
+
+def test_resolve_anthropic_prompt_cache_knobs_env_override_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_ANTHROPIC_PROMPT_CACHE_ENABLED", "true")
+    monkeypatch.setenv("SYLLIPTOR_ANTHROPIC_PROMPT_CACHE_TTL", "1h")
+
+    cfg = AppConfig(anthropic_prompt_cache_enabled=False, anthropic_prompt_cache_ttl="5m")
+
+    assert resolve_anthropic_prompt_cache_enabled(cfg) is True
+    assert resolve_anthropic_prompt_cache_ttl(cfg) == "1h"
+
+
+def test_resolve_anthropic_prompt_cache_ttl_rejects_invalid_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_ANTHROPIC_PROMPT_CACHE_TTL", "24h")
+
+    with pytest.raises(ConfigError, match="SYLLIPTOR_ANTHROPIC_PROMPT_CACHE_TTL"):
+        resolve_anthropic_prompt_cache_ttl(AppConfig())
 
 
 def test_resolve_web_search_mode_rejects_invalid_values() -> None:

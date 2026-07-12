@@ -123,6 +123,8 @@ def assets_add(
 ) -> None:
     clean_title = _resolve_title(title)
     surface = _load_surface_or_exit(path)
+    if wait:
+        _require_subscription_comprehension(surface.cfg)
     try:
         result = surface.add_asset(
             file,
@@ -190,6 +192,8 @@ def assets_edit(
     if title is None and description is None and pinned is None and not refresh:
         _asset_error("Nothing to edit. Use --title, --description, --pin, --unpin, or --refresh.")
     surface = _load_surface_or_exit(path)
+    if refresh:
+        _require_subscription_comprehension(surface.cfg)
     try:
         detail = surface.edit_asset(
             asset_id,
@@ -222,6 +226,7 @@ def assets_refresh(
         _asset_error(
             "CLI refresh requires --wait. Use /assets for live background refresh in chat."
         )
+    _require_subscription_comprehension(surface.cfg)
     try:
         handle = surface.refresh_comprehension(asset_id, mode="sync")
     except AssetError as exc:
@@ -373,6 +378,41 @@ def _load_surface_or_exit(path: Path) -> AssetSurface:
 
 def build_surface(*, cfg: AppConfig, run_paths: RunPaths) -> AssetSurface:
     return build_asset_surface(cfg=cfg, run_paths=run_paths)
+
+
+def _require_subscription_comprehension(cfg: AppConfig) -> None:
+    from ..profiles import active_subscription_selection_ready, get_active_profile
+
+    try:
+        profile = get_active_profile(cfg)
+    except Exception:
+        return
+    provider_id = str(profile.auth_provider or "").strip()
+    if not provider_id:
+        return
+    if not active_subscription_selection_ready(cfg):
+        _asset_error(
+            "Choose the subscription model and reasoning effort in "
+            "/config → Default Model before running asset comprehension."
+        )
+    try:
+        from ..provider_auth import create_provider_auth
+
+        adapter = create_provider_auth(provider_id)
+        compatible = profile.protocol == adapter.protocol and profile.base_url.rstrip(
+            "/"
+        ) == adapter.base_url.rstrip("/")
+        status = adapter.account_status()
+    except Exception as exc:  # noqa: BLE001
+        _asset_error(f"Subscription status check failed: {exc}")
+    if not compatible:
+        _asset_error("The subscription profile is incompatible; reconnect it through setup.")
+    if not status.connected:
+        detail = f" ({status.detail})" if status.detail else ""
+        _asset_error(
+            f"The selected AI subscription is not connected{detail}. "
+            f"Run `sylliptor auth login {provider_id}`."
+        )
 
 
 def _bind_asset_to_current_plan(*, surface: AssetSurface, record: Any) -> list[str]:

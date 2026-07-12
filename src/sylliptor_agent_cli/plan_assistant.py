@@ -25,9 +25,9 @@ from .branding import env_get
 from .config import (
     AppConfig,
     ConfigError,
-    get_api_key,
     resolve_llm_enable_thinking,
     resolve_llm_timeout_s,
+    resolve_model_access_api_key,
     resolve_prompt_cache_key,
     resolve_prompt_cache_retention,
 )
@@ -93,6 +93,7 @@ from .task_readiness import (
     task_requires_runnable_file_scope as _task_requires_runnable_file_scope,
 )
 from .task_scope import extract_repo_path_hints
+from .usage_tracker import build_usage_record
 
 PLANNER_SYSTEM_PROMPT = """You are PLANNER - a senior engineering lead responsible for producing actionable forge plan updates.
 
@@ -107,6 +108,10 @@ Hard constraints
 
 How to structure tasks (high quality)
 - Keep the plan tight (often 3-7 tasks; fewer if the change is small).
+- For a bug or API change, re-read the request before planning. Capture each distinct requirement and any exact names, values, types, messages, or formats.
+- When public API changes, use the request's terminology and sibling naming conventions; preserve neighboring runtime types and formats.
+- Plan the fix at the definition whose behavior is wrong, not only the exposing caller; a direct call to that definition should work after the change.
+- Make final acceptance re-check every requirement against the implementation. Tests written for the change validate the interpretation rather than define the requirement.
 - Each task should be independently executable and reviewable.
 - Titles: verb-first, specific (e.g., "Fix X in Y", "Add regression test for Z").
 - Descriptions: include the intended approach, key files/modules, and any important constraints.
@@ -297,6 +302,7 @@ class PlannerTurnResult:
     planner_invoked: bool = True
     planner_router_event: dict[str, Any] | None = None
     schema_failures: list[dict[str, Any]] = field(default_factory=list)
+    usage_events: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -647,6 +653,58 @@ def _planner_router_chat(
             retry_kwargs.pop("temperature", None)
             return chat(messages=messages, **retry_kwargs)
         raise
+
+
+def _planner_response_tool_calls(response: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for tool_call in list(getattr(response, "tool_calls", []) or []):
+        out.append(
+            {
+                "id": str(getattr(tool_call, "id", "") or ""),
+                "name": str(getattr(tool_call, "name", "") or ""),
+                "arguments": getattr(tool_call, "arguments", {}) or {},
+            }
+        )
+    return out
+
+
+def _planner_usage_event_payload(
+    *,
+    role: str,
+    requested_model: str,
+    request_messages: list[dict[str, Any]],
+    response: Any,
+    registry: ModelRegistry,
+) -> dict[str, Any] | None:
+    try:
+        usage = getattr(response, "usage", None)
+        usage_record = build_usage_record(
+            role=role,
+            requested_model=requested_model,
+            response_model=getattr(response, "response_model", None),
+            messages=request_messages,
+            response_content=str(getattr(response, "content", "") or ""),
+            response_tool_calls=_planner_response_tool_calls(response),
+            api_prompt_tokens=(
+                getattr(usage, "prompt_tokens", None) if usage is not None else None
+            ),
+            api_cached_prompt_tokens=(
+                getattr(usage, "cached_prompt_tokens", None) if usage is not None else None
+            ),
+            api_completion_tokens=(
+                getattr(usage, "completion_tokens", None) if usage is not None else None
+            ),
+            api_total_tokens=(getattr(usage, "total_tokens", None) if usage is not None else None),
+            # Pass the full usage object so build_usage_record can back-fill the
+            # cache-creation and reasoning fields; without it, Anthropic
+            # cache-creation tokens are lost and folded into uncached input
+            # (billed at 1.0x instead of the cache-write rate).
+            api_usage=usage,
+            registry=registry,
+        )
+    except Exception:
+        return None
+    return usage_record.to_payload()
 
 
 def _run_planner_intent_router(
@@ -2701,6 +2759,7 @@ def _planner_error(
     planner_invoked: bool = True,
     planner_router_event: dict[str, Any] | None = None,
     schema_failures: list[dict[str, Any]] | None = None,
+    usage_events: list[dict[str, Any]] | None = None,
 ) -> PlannerTurnResult:
     result_route = route or intent_route
     return PlannerTurnResult(
@@ -2722,6 +2781,7 @@ def _planner_error(
         planner_invoked=planner_invoked,
         planner_router_event=planner_router_event,
         schema_failures=list(schema_failures or []),
+        usage_events=list(usage_events or []),
     )
 
 
@@ -3316,19 +3376,15 @@ def run_planner_turn(
             router_fallback_reason = "planner_router_model_unavailable: empty model"
 
     try:
-        if api_key_override is None:
-            api_key = get_api_key()
-        else:
-            api_key = api_key_override.strip()
-            if not api_key:
-                raise ConfigError("API key is empty.")
+        api_key = resolve_model_access_api_key(cfg, override=api_key_override)
     except ConfigError as e:
         return _planner_error(
-            "Planner assistant is unavailable because no API key is configured.",
+            "Planner assistant is unavailable because model access is not configured.",
             error=str(e),
         )
 
     registry = ModelRegistry(cfg=cfg, api_key=api_key)
+    usage_events: list[dict[str, Any]] = []
     try:
         planner_metadata_policy_result = evaluate_active_model_metadata_policy(
             cfg=cfg,
@@ -3506,6 +3562,7 @@ def run_planner_turn(
             planner_invoked=True,
             planner_router_event=planner_router_event,
             schema_failures=schema_failures,
+            usage_events=usage_events,
         )
 
     client = _make_planner_llm_client(
@@ -3578,11 +3635,31 @@ def run_planner_turn(
             )
 
         try:
-            return _call_chat(temperature_value=requested_temperature), delta_emitted, None
+            response = _call_chat(temperature_value=requested_temperature)
+            usage_payload = _planner_usage_event_payload(
+                role="forge_planner",
+                requested_model=planner_model,
+                request_messages=request_messages,
+                response=response,
+                registry=registry,
+            )
+            if usage_payload is not None:
+                usage_events.append(usage_payload)
+            return response, delta_emitted, None
         except LLMError as e:
             if _is_unsupported_temperature_error(e) and requested_temperature != 1.0:
                 try:
-                    return _call_chat(temperature_value=1.0), delta_emitted, None
+                    response = _call_chat(temperature_value=1.0)
+                    usage_payload = _planner_usage_event_payload(
+                        role="forge_planner",
+                        requested_model=planner_model,
+                        request_messages=request_messages,
+                        response=response,
+                        registry=registry,
+                    )
+                    if usage_payload is not None:
+                        usage_events.append(usage_payload)
+                    return response, delta_emitted, None
                 except LLMError as fallback_error:
                     return None, delta_emitted, fallback_error
             return None, delta_emitted, e
@@ -3795,6 +3872,7 @@ def run_planner_turn(
         planner_invoked=True,
         planner_router_event=planner_router_event,
         schema_failures=schema_failures,
+        usage_events=usage_events,
     )
 
 

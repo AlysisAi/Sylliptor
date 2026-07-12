@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -153,6 +155,7 @@ def _build_tools(
     non_interactive: bool = True,
     surface: object | None = None,
     cfg: AppConfig | None = None,
+    yes: bool = True,
 ) -> dict[str, object]:
     _fake_git_repo(tmp_path)
     return build_tools(
@@ -161,7 +164,7 @@ def _build_tools(
         surface=surface,
         store=_store(tmp_path, enabled=True),
         mode=mode,
-        yes=True,
+        yes=yes,
         cfg=cfg
         or AppConfig(
             model="test-model",
@@ -213,6 +216,7 @@ def test_build_tools_readonly_keeps_expected_read_safe_inspection_tools(tmp_path
         "fs_list",
         "search_rg",
         "symbol_search",
+        "repo_map",
         "history_search",
         "web_fetch",
         "web_search",
@@ -267,6 +271,28 @@ def test_build_tools_write_capable_modes_keep_expected_builtin_and_mcp_surface(
         "mcp__alpha__echo",
     ):
         assert name in tools
+
+
+def test_auto_mode_fs_delete_requires_approval_when_not_yes(tmp_path: Path) -> None:
+    target = tmp_path / "old.txt"
+    target.write_text("old\n", encoding="utf-8")
+    surface = _RecordingSurface(allow=True)
+
+    tools = _build_tools(
+        tmp_path,
+        mode="auto",
+        non_interactive=False,
+        surface=surface,
+        yes=False,
+    )
+
+    result = tools["fs_delete"].run({"path": "old.txt"})
+
+    assert result["deleted"] is True
+    assert target.exists() is False
+    assert [request.kind for request in surface.requests] == ["fs_delete"]
+    assert "file deletion" in surface.requests[0].reason
+    assert surface.requests[0].files == ["old.txt"]
 
 
 def test_mcp_tool_binding_rejects_readonly_session_mode_before_server_call() -> None:
@@ -368,6 +394,138 @@ def test_build_tools_exposes_custom_tool_capability_metadata(
     assert event_metadata["tool_type"] == "custom_tool"
     assert event_metadata["custom_tool"]["capabilities"]["read_only"] is True
     assert "output_schema" not in event_metadata["custom_tool"]
+
+
+def test_model_facing_custom_and_mcp_tool_schemas_strip_descriptive_bloat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_dir = tmp_path / "config"
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", str(cfg_dir))
+    _write_project_custom_tool(
+        tmp_path,
+        extra_manifest_lines=[
+            '"input_schema": {',
+            '    "type": "object",',
+            '    "description": "CUSTOM_ROOT_DESCRIPTION",',
+            '    "properties": {',
+            '        "mode": {',
+            '            "type": "string",',
+            '            "description": "CUSTOM_MODE_DESCRIPTION",',
+            '            "markdownDescription": "CUSTOM_MARKDOWN_DESCRIPTION",',
+            '            "title": "CUSTOM_TITLE",',
+            '            "examples": ["CUSTOM_EXAMPLE"],',
+            '            "default": "CUSTOM_DEFAULT",',
+            '            "enum": ["fast", "safe"],',
+            "        },",
+            "    },",
+            '    "required": ["mode"],',
+            "},",
+        ],
+    )
+    _trust_project_custom_tool(tmp_path)
+    binding, _client = _make_mcp_binding()
+    binding = McpToolBinding(
+        server_id=binding.server_id,
+        tool_name=binding.tool_name,
+        tool_alias=binding.tool_alias,
+        description="MCP echo " + ("detail " * 500),
+        parameters={
+            "type": "object",
+            "description": "MCP_ROOT_DESCRIPTION",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "MCP_TEXT_DESCRIPTION",
+                    "default": "MCP_DEFAULT",
+                }
+            },
+            "required": ["text"],
+        },
+        client=_client,
+    )
+
+    tools = _build_tools(
+        tmp_path,
+        mode="auto",
+        runtime_kind=RuntimeKind.INTERACTIVE_CHAT,
+        mcp_manager=_DummyMcpManager(binding),
+    )
+
+    custom_tool = tools["project_echo"]
+    custom_payload = custom_tool.as_openai_tool()  # type: ignore[attr-defined]
+    custom_schema = custom_payload["function"]["parameters"]
+    custom_serialized = json.dumps(custom_schema, ensure_ascii=True, sort_keys=True)
+    assert "CUSTOM_ROOT_DESCRIPTION" not in custom_serialized
+    assert "CUSTOM_MODE_DESCRIPTION" not in custom_serialized
+    assert "CUSTOM_MARKDOWN_DESCRIPTION" not in custom_serialized
+    assert "CUSTOM_TITLE" not in custom_serialized
+    assert "CUSTOM_EXAMPLE" not in custom_serialized
+    assert "CUSTOM_DEFAULT" not in custom_serialized
+    assert custom_schema["properties"]["mode"]["enum"] == ["fast", "safe"]
+    assert "CUSTOM_MODE_DESCRIPTION" in json.dumps(
+        custom_tool.parameters,
+        ensure_ascii=True,
+        sort_keys=True,  # type: ignore[attr-defined]
+    )
+    assert custom_payload["function"]["description"] == "Project custom tool"
+
+    mcp_tool = tools["mcp__alpha__echo"]
+    mcp_payload = mcp_tool.as_openai_tool()  # type: ignore[attr-defined]
+    mcp_schema = mcp_payload["function"]["parameters"]
+    mcp_serialized = json.dumps(mcp_schema, ensure_ascii=True, sort_keys=True)
+    assert "MCP_ROOT_DESCRIPTION" not in mcp_serialized
+    assert "MCP_TEXT_DESCRIPTION" not in mcp_serialized
+    assert "MCP_DEFAULT" not in mcp_serialized
+    assert "MCP_TEXT_DESCRIPTION" in json.dumps(
+        mcp_tool.parameters,
+        ensure_ascii=True,
+        sort_keys=True,  # type: ignore[attr-defined]
+    )
+    assert 800 < len(mcp_payload["function"]["description"]) <= 1000
+    assert _tool_event_metadata(mcp_tool)["tool_type"] == "mcp"  # type: ignore[arg-type]
+
+
+def test_model_facing_descriptions_honor_declared_family_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_dir = tmp_path / "config"
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", str(cfg_dir))
+    _write_project_custom_tool(tmp_path)
+    _trust_project_custom_tool(tmp_path)
+    binding, _client = _make_mcp_binding()
+    binding = McpToolBinding(
+        server_id=binding.server_id,
+        tool_name=binding.tool_name,
+        tool_alias=binding.tool_alias,
+        description="MCP echo " + ("detail " * 500),
+        parameters=binding.parameters,
+        client=_client,
+    )
+
+    tools = _build_tools(
+        tmp_path,
+        mode="auto",
+        runtime_kind=RuntimeKind.INTERACTIVE_CHAT,
+        mcp_manager=_DummyMcpManager(binding),
+    )
+
+    custom_tool = tools["project_echo"]
+    assert custom_tool.metadata["model_description_max_chars"] == 1200  # type: ignore[attr-defined]
+    # Manifest validation caps TOOL.description below 1200, so exercise the
+    # declared limit on the built tool with a longer description swapped in.
+    long_custom_tool = replace(
+        custom_tool,  # type: ignore[type-var]
+        description="Custom echo " + ("detail " * 500),
+    )
+    custom_payload = long_custom_tool.as_openai_tool()  # type: ignore[attr-defined]
+    assert 1000 < len(custom_payload["function"]["description"]) <= 1200
+
+    mcp_tool = tools["mcp__alpha__echo"]
+    assert mcp_tool.metadata["model_description_max_chars"] == 1000  # type: ignore[attr-defined]
+    mcp_payload = mcp_tool.as_openai_tool()  # type: ignore[attr-defined]
+    assert 800 < len(mcp_payload["function"]["description"]) <= 1000
 
 
 def test_build_tools_scope_restricted_session_excludes_custom_tools(

@@ -10,8 +10,20 @@ from .config import (
     AppConfig,
     resolve_api_key,
     resolve_profile_api_key,
+    resolve_prompt_cache_key,
+    resolve_prompt_cache_retention,
     resolve_web_search_adapter,
     resolve_web_search_mode,
+    resolve_web_search_policy,
+)
+from .llm.cache_capabilities import (
+    EffectiveCacheCapability,
+    resolve_effective_cache_capability,
+)
+from .llm.cache_policy import (
+    ResolvedPromptCachePolicy,
+    prompt_cache_policy_diagnostic_rows,
+    resolve_prompt_cache_policy,
 )
 from .llm.gemini_interactions import (
     gemini_interactions_disabled_message,
@@ -59,6 +71,7 @@ class ProviderDiagnostics:
     model: str
     api_key_source: str
     api_key_present: bool
+    web_search_policy: str
     web_search_mode: str
     web_search_configured_adapter: str
     web_search_runtime_adapter: str
@@ -67,6 +80,8 @@ class ProviderDiagnostics:
     streaming_supported: bool
     stream_enabled: bool
     unsupported_parameters: tuple[str, ...]
+    cache_capability: EffectiveCacheCapability
+    cache_policy: ResolvedPromptCachePolicy
     quirks: tuple[str, ...]
     notes: tuple[str, ...]
     issues: tuple[str, ...]
@@ -81,6 +96,7 @@ class ProviderDiagnostics:
             ("model", self.model or "(missing)"),
             ("api_key_source", self.api_key_source),
             ("api_key_present", "yes" if self.api_key_present else "no"),
+            ("web_search_policy", self.web_search_policy),
             ("web_search_mode", self.web_search_mode),
             ("web_search_configured_adapter", self.web_search_configured_adapter),
             ("web_search_runtime_adapter", self.web_search_runtime_adapter or "(none)"),
@@ -95,6 +111,7 @@ class ProviderDiagnostics:
                 "unsupported_parameters",
                 ", ".join(self.unsupported_parameters) if self.unsupported_parameters else "none",
             ),
+            *prompt_cache_policy_diagnostic_rows(self.cache_policy),
             ("known_quirks", "; ".join(self.quirks) if self.quirks else "none"),
             ("notes", "; ".join(self.notes) if self.notes else "none"),
             ("issues", "; ".join(self.issues) if self.issues else "none"),
@@ -144,20 +161,43 @@ def build_provider_diagnostics(cfg: AppConfig) -> ProviderDiagnostics:
         provider_key=provider_key,
         protocol=protocol,
     )
-    streaming_supported = (
-        capabilities.supports_streaming
-        if capabilities is not None
-        else protocol == OPENAI_COMPAT_PROTOCOL
+    preset = find_preset_for_profile(profile)
+    cache_capability = resolve_effective_cache_capability(
+        provider_key=provider_key,
+        protocol=protocol,
+        model=model,
+        base_url=base_url,
+        transport_capabilities=capabilities,
+        preset_cache_capability=(preset.cache_capability if preset is not None else None),
+        profile_cache_capability=profile.cache_capability,
     )
+    cache_policy = resolve_prompt_cache_policy(
+        cfg=cfg,
+        capabilities=capabilities,
+        provider_key=provider_key,
+        protocol=protocol,
+        model=model,
+        prompt_cache_key=resolve_prompt_cache_key(cfg),
+        prompt_cache_retention=resolve_prompt_cache_retention(cfg),
+        prompt_cache_namespace=None,
+        cache_capability=cache_capability,
+    )
+    # Mirrors _disable_unsupported_native_streaming: unknown provider capabilities
+    # assume streaming works; only a known supports_streaming=False entry disables it.
+    streaming_supported = capabilities.supports_streaming if capabilities is not None else True
     protocol_kind = "native" if protocol in NATIVE_PROFILE_PROTOCOLS else "compatibility"
 
+    policy = resolve_web_search_policy(cfg)
     mode = resolve_web_search_mode(cfg)
     configured_adapter = resolve_web_search_adapter(cfg)
     search_status = resolve_web_search_runtime_status(cfg=cfg, api_key=api_key.key)
     runtime_adapter = search_status.provider or ""
     backend_kind = _web_search_backend_kind(runtime_adapter, configured_adapter)
+    effective_search_ready = search_status.registration_ready and policy != "off"
 
     notes = [_redact_url_text(note) for note in search_status.notes]
+    if policy == "off":
+        notes.append("web_search_policy=off prevents web_search tool registration.")
     if capabilities is None:
         notes.append(
             "No bundled capability record for this provider/protocol; treating it as a custom profile."
@@ -195,14 +235,17 @@ def build_provider_diagnostics(cfg: AppConfig) -> ProviderDiagnostics:
         model=model,
         api_key_source=_redacted_api_key_source(api_key),
         api_key_present=bool(api_key.key),
+        web_search_policy=policy,
         web_search_mode=mode,
         web_search_configured_adapter=configured_adapter,
         web_search_runtime_adapter=runtime_adapter,
-        web_search_registration_ready=search_status.registration_ready,
+        web_search_registration_ready=effective_search_ready,
         web_search_backend_kind=backend_kind,
         streaming_supported=streaming_supported,
         stream_enabled=bool(getattr(cfg, "stream", False)),
         unsupported_parameters=unsupported,
+        cache_capability=cache_capability,
+        cache_policy=cache_policy,
         quirks=quirks,
         notes=tuple(_dedupe(notes)),
         issues=tuple(_dedupe([_redact_url_text(issue) for issue in issues])),
@@ -250,7 +293,7 @@ def validate_active_provider_live(
             message="Active profile has no model configured. Set a model before live validation.",
         )
     api_key = _resolve_active_profile_api_key(cfg, profile.name)
-    if not api_key.key:
+    if not api_key.key and not profile.auth_provider:
         return ProviderLiveValidation(
             profile_name=profile.name,
             provider_key=str(provider_key or ""),
@@ -269,14 +312,27 @@ def validate_active_provider_live(
             client_factory = make_llm_client
         client = client_factory(
             cfg=cfg,
-            api_key=api_key.key,
+            api_key=api_key.key or "",
             model=model,
             timeout_s=timeout_s,
             temperature=0.0,
             profile=profile,
         )
+        if getattr(client, "supports_tool_calling", True) is False:
+            return ProviderLiveValidation(
+                profile_name=profile.name,
+                provider_key=str(provider_key or ""),
+                protocol=protocol,
+                model=model,
+                status="failed",
+                message=(
+                    "Active profile chat client does not support tool calling; choose a "
+                    "tool-capable profile before using coding-agent modes."
+                ),
+            )
         response = client.chat(
             messages=[{"role": "user", "content": "Reply with only: ok"}],
+            tools=_live_validation_tool_schema(),
             max_tokens=20,
         )
     except Exception as exc:  # pragma: no cover - exercised with fake clients in tests.
@@ -288,6 +344,20 @@ def validate_active_provider_live(
             status="failed",
             message=_classify_live_validation_error(str(exc), model=model),
         )
+    if getattr(
+        client, "supports_tool_calling", True
+    ) is False or _response_reports_tool_calling_disabled(response):
+        return ProviderLiveValidation(
+            profile_name=profile.name,
+            provider_key=str(provider_key or ""),
+            protocol=protocol,
+            model=model,
+            status="failed",
+            message=(
+                "Provider accepted chat but rejected tool calling; choose a tool-capable "
+                "model/profile before using coding-agent modes."
+            ),
+        )
     if str(getattr(response, "content", "") or "").strip() or getattr(response, "tool_calls", None):
         return ProviderLiveValidation(
             profile_name=profile.name,
@@ -295,7 +365,7 @@ def validate_active_provider_live(
             protocol=protocol,
             model=model,
             status="passed",
-            message="Minimal text request completed successfully.",
+            message="Minimal tool-capability request completed successfully.",
         )
     return ProviderLiveValidation(
         profile_name=profile.name,
@@ -305,6 +375,38 @@ def validate_active_provider_live(
         status="failed",
         message="Provider returned an empty response to the live validation prompt.",
     )
+
+
+def _live_validation_tool_schema() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "diagnostic_echo",
+                "description": "Return a short diagnostic acknowledgement.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
+def _response_reports_tool_calling_disabled(response: Any) -> bool:
+    metadata = getattr(response, "provider_metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    transport = metadata.get("transport")
+    if not isinstance(transport, dict):
+        return False
+    if transport.get("tools_retry_used") is True:
+        return True
+    return str(transport.get("tools_omit_reason") or "") in {
+        "provider_rejected_tool_calling",
+        "cached_provider_rejection",
+    }
 
 
 def _provider_diagnostic_issues(
@@ -383,8 +485,10 @@ def _provider_diagnostic_issues(
         )
     ):
         issues.append(
-            "external web_search requires TAVILY_API_KEY for the Tavily adapter. Suggested fix: "
-            "export TAVILY_API_KEY or run `sylliptor config set web_search_mode auto`."
+            "external web_search needs SYLLIPTOR_WEB_SEARCH_API_KEY or TAVILY_API_KEY for "
+            "the Tavily adapter, or the 'ddgs' package for the keyless backend. Suggested "
+            "fix: export one search key, `pip install ddgs`, or run "
+            "`sylliptor config set web_search_mode auto`."
         )
 
     is_custom_openai_compat = protocol == OPENAI_COMPAT_PROTOCOL and provider_key not in {
@@ -524,7 +628,11 @@ def _provider_protocol_mismatch_issues(
             "profile such as `gemini-compat`."
         )
 
-    if protocol == OPENAI_RESPONSES_PROTOCOL and host != "api.openai.com":
+    if (
+        protocol == OPENAI_RESPONSES_PROTOCOL
+        and host != "api.openai.com"
+        and not profile.auth_provider
+    ):
         issues.append(
             "protocol=openai_responses is intended for the OpenAI Responses API at "
             "api.openai.com. Suggested fix: "
@@ -658,6 +766,8 @@ def _missing_api_key_issue(
     base_url: str,
     api_key: ApiKeyResolution,
 ) -> str | None:
+    if profile.auth_provider:
+        return None
     if api_key.key:
         return None
     if not _profile_requires_api_key(profile=profile, provider_key=provider_key, base_url=base_url):

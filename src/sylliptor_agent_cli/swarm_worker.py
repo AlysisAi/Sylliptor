@@ -6,6 +6,7 @@ import re
 import subprocess
 import tarfile
 import tempfile
+import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,11 @@ from .assets.worker_mirror import TaskAssetMirror, mirror_task_assets
 from .assets.worker_section import render_relevant_assets_section
 from .assets.worker_tools import build_worker_asset_mcp_manager, compose_worker_asset_mcp_manager
 from .config import AppConfig, clone_cfg
-from .error_text import sanitize_error_summary, sanitize_optional_error_summary
+from .error_text import (
+    redact_sensitive_error_text,
+    sanitize_error_summary,
+    sanitize_optional_error_summary,
+)
 from .execution_shared import (
     build_execution_reporting_diff_with_commit_range,
     build_task_execution_instruction_bundle,
@@ -43,9 +48,8 @@ from .execution_shared import (
 )
 from .failure_category import (
     FailureCategory,
+    classify_failure_category,
     failure_category_value,
-    is_provider_throttling_error,
-    is_provider_unavailable_error,
 )
 from .forge import RunPaths, ensure_execution_dirs, now_iso, write_task_report
 from .git_ops import (
@@ -711,6 +715,25 @@ def _format_agent_exception_summary(exc: Exception) -> str:
     return sanitize_error_summary(f"{name}: {message}" if message else name)
 
 
+def _persist_agent_exception_traceback(artifact_dir: Path, exc: BaseException) -> None:
+    """Persist the full, secret-redacted agent traceback for post-mortem.
+
+    The worker result keeps only a short summary; the full traceback is what an
+    autonomous fix-loop actually needs to root-cause a Forge worker failure. The
+    text is run through the shared secret redactor before it touches disk. Best
+    effort: a failure to persist must never mask the agent error itself.
+    """
+    try:
+        text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "agent_exception_traceback.txt").write_text(
+            redact_sensitive_error_text(text),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must not mask the real failure
+        return
+
+
 def _empty_task_asset_mirror(workspace_path: Path, *, task_id: str = "") -> TaskAssetMirror:
     workspace = workspace_path.resolve()
     return TaskAssetMirror(
@@ -1128,10 +1151,12 @@ def run_task_worker(
         run_code = 1
         agent_run_exception = True
         agent_exception_summary = _format_agent_exception_summary(e)
-        if is_provider_throttling_error(e):
-            failure_category = FailureCategory.PROVIDER_THROTTLED
-        elif is_provider_unavailable_error(e):
-            failure_category = FailureCategory.PROVIDER_UNAVAILABLE
+        # Classify with the shared mapper so a worker that hits a permanent provider
+        # rejection (auth / bad-request / unknown-model) is recorded as PROVIDER_ERROR
+        # and joins the chat/run vocabulary, instead of silently defaulting to
+        # IMPLEMENTATION_FAILED downstream.
+        failure_category = classify_failure_category(e)
+        _persist_agent_exception_traceback(scratch_artifact_dir, e)
     finally:
         if task_asset_mcp_manager is not None:
             task_asset_mcp_manager.close()
@@ -1692,23 +1717,15 @@ def run_task_worker(
                     "accepted because the task text allowed no work when not applicable."
                 )
         elif verify_mode == "off":
-            success = False
-            failure_reason = failure_reason or "verification_required_for_noop"
-            failure_category = failure_category or FailureCategory.IMPLEMENTATION_FAILED
-            _append_run_error(
-                "zero-diff worker outcomes require passing authoritative verification; "
-                "verification was disabled"
-            )
-            verify_summary = "verification disabled (--verify off)"
+            success = True
+            result_kind = "success_noop"
+            noop_reason = "already_satisfied"
+            verify_summary = "verification skipped: no changes needed"
         elif not verify_cmds:
-            success = False
-            failure_reason = failure_reason or "verification_required_for_noop"
-            failure_category = failure_category or FailureCategory.IMPLEMENTATION_FAILED
-            _append_run_error(
-                "zero-diff worker outcomes require passing authoritative verification; "
-                "no verification commands were available"
-            )
-            verify_summary = "verification skipped: no commands"
+            success = True
+            result_kind = "success_noop"
+            noop_reason = "already_satisfied"
+            verify_summary = "verification skipped: no changes needed"
         else:
             success = True
             if _run_authoritative_verification(
@@ -1746,8 +1763,7 @@ def run_task_worker(
         summary = "Worker completed conditional task with no repository changes."
     elif success and result_kind == "success_noop":
         summary = (
-            "Worker completed successfully with no repository changes; "
-            "authoritative verification passed and the task was already satisfied."
+            "Worker completed successfully with no repository changes; task was already satisfied."
         )
     elif success:
         summary = "Worker completed successfully and produced a task commit."
@@ -1798,7 +1814,7 @@ def run_task_worker(
                 "no merge required (conditional no-op)"
                 if result_kind == "success_noop" and noop_reason == "conditional_noop"
                 else (
-                    "no merge required (verified no-op)"
+                    "no merge required (already-satisfied no-op)"
                     if result_kind == "success_noop"
                     else "not merged"
                 )

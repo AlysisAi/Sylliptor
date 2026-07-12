@@ -1,0 +1,421 @@
+from __future__ import annotations
+
+import json
+import threading
+import time
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import urlparse
+
+
+def _response(content: str, *, model: str = "qa-mock-model") -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-qa",
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+    }
+
+
+def _tool_response(
+    name: str, arguments: dict[str, Any], *, model: str = "qa-mock-model"
+) -> dict[str, Any]:
+    return _tool_response_many(((name, arguments),), model=model)
+
+
+def _tool_response_many(
+    calls: tuple[tuple[str, dict[str, Any]], ...],
+    *,
+    model: str = "qa-mock-model",
+) -> dict[str, Any]:
+    return {
+        "id": "chatcmpl-qa-tool",
+        "object": "chat.completion",
+        "created": 1_700_000_000,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": f"call_qa_{index}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(arguments)},
+                        }
+                        for index, (name, arguments) in enumerate(calls, start=1)
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 18, "completion_tokens": 6, "total_tokens": 24},
+    }
+
+
+def _last_user_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts: list[str] = []
+                for item in content:
+                    if isinstance(item, dict) and isinstance(item.get("text"), str):
+                        parts.append(item["text"])
+                return "\n".join(parts)
+    return ""
+
+
+def _has_tool_result(messages: list[dict[str, Any]]) -> bool:
+    return any(message.get("role") == "tool" for message in messages)
+
+
+def _has_tool_call(messages: list[dict[str, Any]], tool_name: str) -> bool:
+    for message in messages:
+        for tool_call in message.get("tool_calls") or ():
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if isinstance(function, dict) and function.get("name") == tool_name:
+                return True
+    return False
+
+
+def _has_completion_gate_nudge(messages: list[dict[str, Any]], marker: str) -> bool:
+    normalized_marker = marker.casefold()
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        normalized = content.casefold()
+        if "completion gate:" in normalized and normalized_marker in normalized:
+            return True
+    return False
+
+
+def _all_message_text(messages: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+        for tool_call in message.get("tool_calls") or ():
+            if isinstance(tool_call, dict):
+                function = tool_call.get("function")
+                if isinstance(function, dict):
+                    parts.append(str(function.get("name") or ""))
+                    parts.append(str(function.get("arguments") or ""))
+    return "\n".join(parts)
+
+
+def _raw_agent_proxy_response(
+    *,
+    messages: list[dict[str, Any]],
+    text: str,
+) -> dict[str, Any] | None:
+    lowered = text.lower()
+    if "raw_proxy_force_verify" in lowered:
+        if _has_tool_call(messages, "verify_run"):
+            return _response("Done. Forced verification was completed.")
+        if _has_tool_call(messages, "fs_edit") or _has_tool_call(messages, "fs_write"):
+            if _has_completion_gate_nudge(messages, "verify_run"):
+                return _tool_response("verify_run", {})
+            return _response("Implemented the marker. Ready to finish.")
+        return _tool_response(
+            "fs_edit",
+            {
+                "path": "src/calc.py",
+                "edits": [
+                    {
+                        "op": "append",
+                        "content": "\n# forced verify marker\n",
+                    }
+                ],
+            },
+        )
+    if "raw_proxy_force_diff" in lowered:
+        if _has_tool_call(messages, "git_diff"):
+            return _response("Done. Verification passed and diff was reviewed.")
+        if _has_tool_call(messages, "verify_run"):
+            if _has_completion_gate_nudge(messages, "git_diff"):
+                return _tool_response("git_diff", {})
+            return _response("Verification passed. Ready to finish.")
+        if _has_tool_call(messages, "fs_edit") or _has_tool_call(messages, "fs_write"):
+            return _tool_response("verify_run", {})
+        return _tool_response(
+            "fs_edit",
+            {
+                "path": "README.md",
+                "edits": [
+                    {
+                        "op": "append",
+                        "content": "\nforced diff marker\n",
+                    }
+                ],
+            },
+        )
+    if "write file" not in lowered or "run the configured verification" not in lowered:
+        return None
+    if _has_tool_call(messages, "verify_run"):
+        return _response("Done. Verified raw proxy write.")
+    if _has_tool_call(messages, "fs_write"):
+        return _tool_response("verify_run", {})
+    return None
+
+
+def _router_response(text: str) -> dict[str, Any] | None:
+    if "You classify one user message for a coding assistant." not in text:
+        return None
+    return {
+        "route": "repo",
+        "execution_posture": "execute",
+        "confidence": 0.95,
+        "reply": "",
+        "language": "English",
+        "script": "Latin",
+        "explicit_language_override": False,
+        "tool_family": "none",
+        "tool_candidates": [],
+    }
+
+
+def _write_call(path: str, content: str) -> tuple[str, dict[str, Any]]:
+    return ("fs_write", {"path": path, "content": content})
+
+
+def _shell_call(cmd: str) -> tuple[str, dict[str, Any]]:
+    return ("shell_run", {"cmd": cmd})
+
+
+def _real_fix_calls(
+    *,
+    public_surface: bool,
+    docs: bool,
+) -> tuple[tuple[str, dict[str, Any]], ...]:
+    calls: list[tuple[str, dict[str, Any]]] = [
+        _write_call("src/hard.py", "def hard_fix(value=True):\n    return bool(value)\n"),
+        _write_call(
+            "tests/test_hard.py",
+            "from src.hard import hard_fix\n\n\ndef test_hard_fix():\n    assert hard_fix()\n",
+        ),
+    ]
+    if public_surface:
+        calls.append(
+            _write_call("src/api.py", "from src.hard import hard_fix\n\n__all__ = ['hard_fix']\n")
+        )
+    if docs:
+        calls.append(
+            _write_call("docs/api.md", "# API\n\n`hard_fix` is the supported entrypoint.\n")
+        )
+    return tuple(calls)
+
+
+def _probe_fixture_calls(*, edge_correct: bool) -> tuple[tuple[str, dict[str, Any]], ...]:
+    implementation = (
+        "def hard_fix(value=True):\n"
+        "    if value == 'bad':\n"
+        "        return False\n"
+        "    return bool(value)\n"
+        if edge_correct
+        else "def hard_fix(value=True):\n    return bool(value)\n"
+    )
+    return (
+        _write_call("src/hard.py", implementation),
+        _write_call(
+            "tests/test_hard.py",
+            "from src.hard import hard_fix\n\n\n"
+            "def test_visible_hard_fix():\n"
+            "    assert hard_fix(True) is True\n"
+            "    assert hard_fix(False) is False\n",
+        ),
+    )
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server: _Server
+
+    def log_message(self, _format: str, *_args: Any) -> None:
+        return
+
+    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if urlparse(self.path).path == "/v1/models":
+            auth = self.headers.get("Authorization", "")
+            if "bad" in auth:
+                self._send_json(401, {"error": {"message": "invalid mock key"}})
+                return
+            self._send_json(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {"id": "gpt-4o-mini"},
+                        {"id": "qa-mock-model"},
+                        {"id": "claude-sonnet-4-6"},
+                    ],
+                },
+            )
+            return
+        self._send_json(404, {"error": {"message": "not found"}})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if urlparse(self.path).path != "/v1/chat/completions":
+            self._send_json(404, {"error": {"message": "not found"}})
+            return
+        auth = self.headers.get("Authorization", "")
+        if "bad" in auth:
+            self._send_json(401, {"error": {"message": "invalid mock key"}})
+            return
+        length = int(self.headers.get("Content-Length") or "0")
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self._send_json(400, {"error": {"message": "bad json"}})
+            return
+        self.server.requests.append(payload)
+        messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+        user_text = _last_user_text(messages).lower()
+        all_text = _all_message_text(messages)
+        if "qa_429" in user_text:
+            self._send_json(429, {"error": {"message": "rate limit exceeded"}})
+            return
+        if "qa_500" in user_text:
+            self._send_json(500, {"error": {"message": "mock upstream failed"}})
+            return
+        if "qa_reject_tool_choice" in user_text and "tool_choice" in payload:
+            self._send_json(
+                400,
+                {
+                    "error": {
+                        "message": "Thinking mode does not support this tool_choice",
+                        "param": "tool_choice",
+                    }
+                },
+            )
+            return
+        if "qa_reject_tools" in user_text and payload.get("tools"):
+            self._send_json(
+                400,
+                {
+                    "error": {
+                        "message": (
+                            "The requested tools are not supported for this model's "
+                            "function calling request."
+                        ),
+                        "param": "tools",
+                    }
+                },
+            )
+            return
+        router_payload = _router_response(all_text)
+        if router_payload is not None:
+            self._send_json(200, _response(json.dumps(router_payload, sort_keys=True)))
+            return
+        raw_agent_payload = _raw_agent_proxy_response(messages=messages, text=all_text)
+        if raw_agent_payload is not None:
+            self._send_json(200, raw_agent_payload)
+            return
+        if _has_tool_result(messages):
+            self._send_json(200, _response("Done. Tool completed and result was inspected."))
+            return
+
+        if "non-existent" in user_text or "missing file" in user_text:
+            self._send_json(200, _tool_response("fs_read", {"path": "missing.txt"}))
+            return
+        if "long file" in user_text or "100kb" in user_text:
+            self._send_json(200, _tool_response("fs_read", {"path": "long.txt", "max_bytes": 1200}))
+            return
+        if "read existing" in user_text or "readme" in user_text or "list files" in user_text:
+            self._send_json(200, _tool_response("fs_read", {"path": "README.md"}))
+            return
+        if "write file" in user_text:
+            self._send_json(
+                200, _tool_response("fs_write", {"path": "qa_written.txt", "content": "qa write\n"})
+            )
+            return
+        if "failing command" in user_text:
+            self._send_json(
+                200, _tool_response("shell_run", {"cmd": "sh -lc 'echo qa-fail >&2; exit 7'"})
+            )
+            return
+        if "echo" in user_text or "shell" in user_text:
+            self._send_json(200, _tool_response("shell_run", {"cmd": "echo qa-smoke"}))
+            return
+        if "subagent" in user_text or "explorer" in user_text:
+            self._send_json(
+                200,
+                _tool_response(
+                    "subagent_run", {"name": "explorer", "task": "Map the repository briefly."}
+                ),
+            )
+            return
+        self._send_json(
+            200, _response("Done. This is a concise mock assistant response for QA visual review.")
+        )
+
+
+class _Server(ThreadingHTTPServer):
+    requests: list[dict[str, Any]]
+
+
+@dataclass
+class MockLLMServer:
+    host: str = "127.0.0.1"
+    port: int = 0
+
+    def __post_init__(self) -> None:
+        self._server = _Server((self.host, self.port), _Handler)
+        self._server.requests = []
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}/v1"
+
+    @property
+    def requests(self) -> list[dict[str, Any]]:
+        return self._server.requests
+
+    def start(self) -> MockLLMServer:
+        self._thread.start()
+        # Give the server a tiny deterministic startup window before subprocesses connect.
+        time.sleep(0.02)
+        return self
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
+
+    def __enter__(self) -> MockLLMServer:
+        return self.start()
+
+    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+        self.stop()

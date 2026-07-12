@@ -13,6 +13,7 @@ import pytest
 
 from sylliptor_agent_cli.agent_loop import AgentRuntimeError, create_session
 from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.execution_deadline import ExecutionDeadline
 
 
 def _cfg() -> AppConfig:
@@ -38,7 +39,13 @@ def _assert_http_ready(port: int) -> None:
         assert response.status == 200
 
 
-def _create_service_session(root: Path, sessions_dir: Path, *, mode: str = "auto") -> Any:
+def _create_service_session(
+    root: Path,
+    sessions_dir: Path,
+    *,
+    mode: str = "auto",
+    execution_deadline: ExecutionDeadline | None = None,
+) -> Any:
     return create_session(
         cfg=_cfg(),
         root=root,
@@ -49,6 +56,7 @@ def _create_service_session(root: Path, sessions_dir: Path, *, mode: str = "auto
         api_key_override="override-key",
         non_interactive=True,
         session_log_dir_override=sessions_dir,
+        execution_deadline=execution_deadline,
     )
 
 
@@ -98,6 +106,7 @@ def test_shell_service_survives_close_and_can_stop_from_fresh_session(
         service_id = str(started["service_id"])
 
         assert started["ownership"] == "DURABLE_SERVICE"
+        assert started["lifetime"] == "durable"
         assert started["status"] == "running"
         assert started["readiness"]["status"] == "ready"
         assert Path(str(started["log_paths"]["stdout"])).exists()
@@ -131,6 +140,117 @@ def test_shell_service_survives_close_and_can_stop_from_fresh_session(
             session.close()
 
 
+def test_shell_service_start_deadline_denial_is_warning_not_refusal(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    sessions_dir = tmp_path / "sessions"
+    root.mkdir()
+    deadline = ExecutionDeadline.from_absolute(
+        started_at_monotonic=0.0,
+        deadline_monotonic=4.0,
+        configured_duration_seconds=4.0,
+        clock=lambda: 3.5,
+    )
+    session = _create_service_session(root, sessions_dir, execution_deadline=deadline)
+    service_id = ""
+    try:
+        started = session.tools["shell_service_start"].run(
+            {
+                "cmd": _shell_join([sys.executable, "-c", "import time; time.sleep(30)"]),
+            }
+        )
+        service_id = str(started["service_id"])
+
+        assert started["lifetime"] == "durable"
+        assert started["status"] == "running"
+        assert started["deadline_prevented_launch"] is False
+        assert "error" not in started
+        assert "deadline_warning" in started
+        assert started["deadline_start_decision"]["allowed"] is False
+        assert started["deadline_start_decision"]["reason"] == "finalization_disallows_operation"
+    finally:
+        if service_id and session.durable_service_manager is not None:
+            session.durable_service_manager.stop(service_id)
+        session.close()
+
+
+def test_workspace_preview_tool_works_with_strict_unavailable_docker_image(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    sessions_dir = tmp_path / "sessions"
+    root.mkdir()
+    (root / "index.html").write_text("preview-tool-ok\n", encoding="utf-8")
+    cfg = AppConfig(model="test-model")
+    cfg.extra_fields = {
+        "shell_sandbox": {
+            "mode": "strict",
+            "backend": "docker",
+            "network": "off",
+            "docker_image": "private.invalid/sylliptor-sandbox:dev",
+        }
+    }
+    session = create_session(
+        cfg=cfg,
+        root=root,
+        mode="auto",
+        yes=True,
+        max_steps=1,
+        no_log=True,
+        api_key_override="override-key",
+        non_interactive=True,
+        session_log_dir_override=sessions_dir,
+    )
+    service_id = ""
+    try:
+        started = session.tools["workspace_preview_start"].run({"access": "auto"})
+        service_id = str(started["service_id"])
+
+        assert started["backend"] == "host-preview"
+        assert started["status"] == "running"
+        assert started["preview_access"] == "local"
+        assert started["preview_port"] > 0
+        with urllib.request.urlopen(started["access_url"], timeout=2) as response:
+            assert response.read() == b"preview-tool-ok\n"
+    finally:
+        if service_id and session.durable_service_manager is not None:
+            session.durable_service_manager.stop(service_id)
+        session.close()
+
+
+def test_workspace_preview_lan_access_requires_approval_in_noninteractive_mode(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    sessions_dir = tmp_path / "sessions"
+    root.mkdir()
+    cfg = _cfg()
+    cfg.extra_fields["shell_sandbox"]["preview_access"] = "lan"
+    session = create_session(
+        cfg=cfg,
+        root=root,
+        mode="auto",
+        yes=False,
+        max_steps=1,
+        no_log=True,
+        api_key_override="override-key",
+        non_interactive=True,
+        session_log_dir_override=sessions_dir,
+    )
+    service_id = ""
+    try:
+        with pytest.raises(AgentRuntimeError, match="LAN preview exposure requires"):
+            session.tools["workspace_preview_start"].run({"access": "auto"})
+        started = session.tools["workspace_preview_start"].run({"access": "local"})
+        service_id = str(started["service_id"])
+        assert started["preview_access"] == "local"
+    finally:
+        if service_id and session.durable_service_manager is not None:
+            session.durable_service_manager.stop(service_id)
+        session.close()
+
+
 def test_shell_service_tools_hidden_in_readonly_mode(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     sessions_dir = tmp_path / "sessions"
@@ -138,6 +258,7 @@ def test_shell_service_tools_hidden_in_readonly_mode(tmp_path: Path) -> None:
     session = _create_service_session(root, sessions_dir, mode="readonly")
     try:
         assert "shell_service_start" not in session.tools
+        assert "workspace_preview_start" not in session.tools
         assert "shell_service_status" not in session.tools
         assert "shell_service_stop" not in session.tools
     finally:

@@ -19,19 +19,26 @@ from collections.abc import Callable
 Entry = tuple[str, str]
 
 
+def _normalize_visible(text: str) -> str:
+    """Whitespace-collapsed comparison key for assistant text, so a re-emitted
+    reply that differs only in incidental spacing still reads as a duplicate."""
+    return " ".join(str(text or "").split())
+
+
 class TuiTranscript:
     def __init__(self, *, invalidate: Callable[[], None] | None = None) -> None:
         self.entries: list[Entry] = []
         self._lock = threading.RLock()
         self._status: str | None = None
         self._assistant_index: int | None = None
-        # Live model reasoning ("thinking") block: index of the open reasoning
-        # entry, when it started, and the elapsed seconds of each closed block
-        # (keyed by entry index) so the renderer can collapse it to "thought for
-        # Ns" once the answer (or a tool) follows.
+        # Live provider-generated reasoning-summary block: index of the open
+        # entry, when it started, and elapsed seconds for each closed block.
         self._reasoning_index: int | None = None
         self._reasoning_start: float | None = None
+        self._reasoning_block_id: str | None = None
+        self._reasoning_block_ids: dict[int, str] = {}
         self._reasoning_secs: dict[int, int] = {}
+        self._trace_level = "compact"
         # Live Forge execution view: a task table + phase/spinner rendered at the
         # bottom of the transcript while ``/execute plan`` runs the swarm on a
         # worker thread. ``None`` when no run is active. Shape:
@@ -43,16 +50,30 @@ class TuiTranscript:
     def set_invalidate(self, fn: Callable[[], None]) -> None:
         self._invalidate = fn
 
+    @property
+    def trace_level(self) -> str:
+        with self._lock:
+            return self._trace_level
+
+    def set_trace_level(self, level: str) -> str:
+        normalized = str(level or "").strip().lower()
+        with self._lock:
+            if normalized not in {"off", "compact", "full"}:
+                normalized = self._trace_level
+            self._trace_level = normalized
+        self._touch()
+        return normalized
+
     def _touch(self) -> None:
         try:
             self._invalidate()
         except Exception:
             pass
 
-    # ---- reasoning ("thinking") block ----
+    # ---- safe provider reasoning-summary block ----
     def _close_reasoning_locked(self) -> None:
         """Close the open reasoning block, recording its elapsed seconds. Caller
-        holds the lock. Any content/tool/turn boundary collapses thinking."""
+        holds the lock. Any content/tool/turn boundary collapses the summary."""
         if self._reasoning_index is not None:
             if self._reasoning_start is not None:
                 self._reasoning_secs[self._reasoning_index] = max(
@@ -60,11 +81,38 @@ class TuiTranscript:
                 )
             self._reasoning_index = None
             self._reasoning_start = None
+            self._reasoning_block_id = None
 
-    def end_reasoning(self) -> None:
-        """Collapse the open reasoning block (e.g. when a tool starts) without
+    def begin_reasoning(self, block_id: str) -> None:
+        """Open a safe-summary block with a stable provider-call identifier.
+
+        Reusing the active identifier is idempotent. A different identifier
+        closes the previous block first so retries and later agent steps can
+        never merge their summaries merely because no visible tool line landed
+        between the two provider calls.
+        """
+
+        normalized = str(block_id or "").strip()
+        if not normalized:
+            return
+        with self._lock:
+            if self._reasoning_index is not None and self._reasoning_block_id == normalized:
+                return
+            self._close_reasoning_locked()
+            self.entries.append(("reasoning", ""))
+            self._reasoning_index = len(self.entries) - 1
+            self._reasoning_start = time.monotonic()
+            self._reasoning_block_id = normalized
+            self._reasoning_block_ids[self._reasoning_index] = normalized
+        self._touch()
+
+    def end_reasoning(self, block_id: str | None = None) -> None:
+        """Collapse the open summary block (e.g. when a tool starts) without
         appending anything — records its elapsed seconds for the summary."""
         with self._lock:
+            normalized = str(block_id or "").strip()
+            if normalized and normalized != self._reasoning_block_id:
+                return
             self._close_reasoning_locked()
         self._touch()
 
@@ -76,6 +124,8 @@ class TuiTranscript:
                 self.entries.append(("reasoning", ""))
                 self._reasoning_index = len(self.entries) - 1
                 self._reasoning_start = time.monotonic()
+                self._reasoning_block_id = f"legacy-{self._reasoning_index}"
+                self._reasoning_block_ids[self._reasoning_index] = self._reasoning_block_id
             role, current = self.entries[self._reasoning_index]
             self.entries[self._reasoning_index] = (role, current + delta)
         self._touch()
@@ -147,10 +197,28 @@ class TuiTranscript:
                 if not current and text:
                     self.entries[self._assistant_index] = (role, text)
             elif text.strip():
-                self.entries.append(("assistant", text))
+                # A multi-step turn can re-emit the same answer after its live
+                # block was already closed by an intervening tool/trace line (which
+                # reset _assistant_index). Only append a fresh block when it is NOT
+                # a verbatim repeat of the turn's most recent assistant block —
+                # otherwise the same reply stacks up 2-3 times. Content-based and
+                # provider-agnostic (see also the render-layer collapse in app.py).
+                last = self._last_turn_assistant_text_locked()
+                if last is None or _normalize_visible(last) != _normalize_visible(text):
+                    self.entries.append(("assistant", text))
             self._assistant_index = None
             self._status = None
         self._touch()
+
+    def _last_turn_assistant_text_locked(self) -> str | None:
+        """Text of the most recent assistant entry within the current turn, or
+        ``None`` if none precedes a ``user`` boundary. Caller holds the lock."""
+        for role, text in reversed(self.entries):
+            if role == "user":
+                return None
+            if role == "assistant":
+                return text
+        return None
 
     # ---- transient status (working line) ----
     def set_status(self, status: str | None) -> None:
@@ -281,6 +349,8 @@ class TuiTranscript:
             self._assistant_index = None
             self._reasoning_index = None
             self._reasoning_start = None
+            self._reasoning_block_id = None
+            self._reasoning_block_ids.clear()
             self._reasoning_secs.clear()
             self._status = None
             self._forge = None
@@ -302,6 +372,8 @@ class TuiTranscript:
             self._assistant_index = None
             self._reasoning_index = None
             self._reasoning_start = None
+            self._reasoning_block_id = None
+            self._reasoning_block_ids.clear()
             self._reasoning_secs.clear()
             self._status = None
             self._forge = None
@@ -329,6 +401,12 @@ class TuiTranscript:
         """
         with self._lock:
             return self._reasoning_index, dict(self._reasoning_secs)
+
+    def reasoning_block_ids(self) -> dict[int, str]:
+        """Return stable identifiers for safe-summary transcript entries."""
+
+        with self._lock:
+            return dict(self._reasoning_block_ids)
 
     def snapshot(self) -> tuple[list[Entry], str | None, int | None]:
         """Return ``(entries, status, streaming_index)`` under the lock.

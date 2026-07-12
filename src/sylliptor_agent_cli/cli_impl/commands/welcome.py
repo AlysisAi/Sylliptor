@@ -702,6 +702,7 @@ def _chat_command_sections(*, ui_mode: str = "chat") -> list[tuple[str, list[tup
             (
                 "Tools & Config",
                 [
+                    ("/login", "choose Sylliptor or an AI subscription connection"),
                     (
                         "/subagent [name] [task]",
                         "no args opens picker; /subagent on|off|status toggles delegation",
@@ -736,7 +737,7 @@ def _chat_command_sections(*, ui_mode: str = "chat") -> list[tuple[str, list[tup
                 ("/mode", "change execution mode"),
                 (
                     "/plan <task>",
-                    "default planning path: draft, review, approve, then execute; bare /plan prompts for the task",
+                    "default planning path: draft, review, approve, then execute; bare /plan shows usage",
                 ),
                 (
                     "/plan mode",
@@ -782,6 +783,7 @@ def _chat_command_sections(*, ui_mode: str = "chat") -> list[tuple[str, list[tup
         (
             "Configuration",
             [
+                ("/login", "choose Sylliptor or an AI subscription connection"),
                 ("/config", "inline config menu; /config show|set|clear for model metadata"),
                 ("/toolbar", "customize toolbar items"),
                 ("/exit", "quit"),

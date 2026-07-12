@@ -3,9 +3,9 @@
 The classic first-run wizard (:mod:`cli_impl.setup_wizard`) is a Rich-print +
 prompt_toolkit-prompt flow. When ``SYLLIPTOR_TUI`` is on we want the *onboarding*
 to match the alt-screen launch experience too, so this module re-expresses the
-exact same flow — provider → API key → model → workspace → commit → sandbox →
-(optional) login — as a step machine that holds state and renders a small
-:class:`Screen` description. The prompt_toolkit application in
+same branched flow — connection method, then either API-provider and model setup
+or an AI subscription selection, followed by workspace and commit — as a step machine
+that renders a :class:`Screen` description. The prompt_toolkit application in
 :mod:`cli_impl.tui.setup_app` reads that description and routes key events back
 into the flow; nothing here imports prompt_toolkit, so the whole thing is unit
 testable by driving the public methods synchronously.
@@ -37,6 +37,8 @@ from ...workspace_binding import WorkspaceBindingError, resolve_workspace_bindin
 from .. import setup_wizard as _wiz
 
 # Reuse the wizard's result dataclasses so the persisted shapes stay identical.
+_ExecutionStepResult = _wiz._ExecutionStepResult
+_DelegatedAuthResult = _wiz._DelegatedAuthResult
 _ProfileStepResult = _wiz._ProfileStepResult
 _ApiKeyStepResult = _wiz._ApiKeyStepResult
 _ModelStepResult = _wiz._ModelStepResult
@@ -48,17 +50,77 @@ Mode = Literal["list", "input", "busy", "confirm", "message", "done"]
 Tone = Literal["ok", "warn", "err", "dim", "plain"]
 
 # Stages that count toward the "Step N of M" progress label (the visible
-# decisions the user makes); the trailing commit/sandbox/login work shares the
-# final "Finishing" slot so the bar does not jitter.
-_PROGRESS_STAGES = ("welcome", "provider", "api_key", "model", "workspace")
+# decisions the user makes).
+_PROGRESS_STAGES = (
+    "welcome",
+    "execution",
+    "provider",
+    "api_key",
+    "model",
+    "router_model",
+    "workspace",
+    "sandbox_choice",
+)
+_SUBSCRIPTION_PROGRESS_STAGES = ("welcome", "execution", "runtime", "workspace")
 _PROGRESS_LABELS = {
     "welcome": "Welcome",
+    "execution": "Connection",
+    "runtime": "Subscription",
     "provider": "Provider",
     "api_key": "API key",
     "model": "Model",
+    "router_model": "Router model",
     "workspace": "Workspace",
+    "sandbox_choice": "Sandbox",
+}
+_PROGRESS_ALIASES = {
+    "provider_advanced": ("provider", "Provider (advanced)"),
+    "custom_name": ("provider", "Provider (custom)"),
+    "custom_url": ("provider", "Provider (custom)"),
+    "custom_headers": ("provider", "Provider (custom)"),
+    "validating_key": ("api_key", "API key"),
+    "custom_model": ("model", "Model"),
+    "validating_model": ("model", "Model"),
+    "model_not_found_confirm": ("model", "Model"),
+    "custom_router_model": ("router_model", "Router model"),
+    "validating_router_model": ("router_model", "Router model"),
+    "router_model_not_found_confirm": ("router_model", "Router model"),
+    "workspace_create_confirm": ("workspace", "Workspace"),
+    "checking_runtime_auth": ("workspace", "Subscription"),
+    "runtime_login_confirm": ("workspace", "Subscription"),
+    "runtime_logging_in": ("workspace", "Subscription"),
+    "diagnosing_sandbox": ("sandbox_choice", "Sandbox"),
+    "installing_sandbox": ("sandbox_choice", "Sandbox"),
+    "pulling_sandbox": ("sandbox_choice", "Sandbox"),
+    "disabling_sandbox": ("sandbox_choice", "Sandbox"),
+    "sandbox_pull_confirm": ("sandbox_choice", "Sandbox"),
 }
 _MAX_KEY_ATTEMPTS = _wiz._MAX_API_KEY_VALIDATION_ATTEMPTS
+_POST_COMMIT_STAGES = frozenset(
+    {
+        "checking_runtime_auth",
+        "runtime_login_confirm",
+        "runtime_logging_in",
+        "diagnosing_sandbox",
+        "sandbox_choice",
+        "sandbox_pull_confirm",
+        "installing_sandbox",
+        "pulling_sandbox",
+        "disabling_sandbox",
+        "login_confirm",
+        "logging_in",
+    }
+)
+
+
+def _merge_validation_messages(*messages: str | None) -> str:
+    merged: list[str] = []
+    for message in messages:
+        normalized = str(message or "").strip()
+        if normalized and normalized not in merged:
+            merged.append(normalized)
+    return " ".join(merged)
+
 
 # Cheap stage → interaction-mode lookup so the application's key-binding filters
 # don't have to build a full :class:`Screen` (and its row list) on every repaint.
@@ -66,18 +128,27 @@ _STAGE_MODE: dict[str, Mode] = {
     "welcome": "message",
     "complete": "message",
     "fatal": "message",
+    "execution": "list",
+    "runtime": "list",
     "provider": "list",
+    "provider_advanced": "list",
     "model": "list",
+    "router_model": "list",
     "sandbox_choice": "list",
     "custom_name": "input",
     "custom_url": "input",
     "custom_headers": "input",
     "api_key": "input",
     "custom_model": "input",
+    "custom_router_model": "input",
     "workspace": "input",
+    "workspace_create_confirm": "confirm",
     "validating_key": "busy",
     "validating_model": "busy",
+    "validating_router_model": "busy",
     "committing": "busy",
+    "checking_runtime_auth": "busy",
+    "runtime_logging_in": "busy",
     "diagnosing_sandbox": "busy",
     "installing_sandbox": "busy",
     "pulling_sandbox": "busy",
@@ -85,7 +156,9 @@ _STAGE_MODE: dict[str, Mode] = {
     "logging_in": "busy",
     "sandbox_pull_confirm": "confirm",
     "model_not_found_confirm": "confirm",
+    "router_model_not_found_confirm": "confirm",
     "login_confirm": "confirm",
+    "runtime_login_confirm": "confirm",
     "cancel_confirm": "confirm",
     "done": "done",
 }
@@ -149,14 +222,18 @@ class SetupFlow:
         self.status = ""
         self.status_tone: Tone = "dim"
         # Collected results.
+        self.execution_result: _ExecutionStepResult | None = None
         self.profile_result: _ProfileStepResult | None = None
         self.api_key_result: _ApiKeyStepResult | None = None
         self.model_result: _ModelStepResult | None = None
+        self.router_model_result: _RouterModelStepResult | None = None
         self.workspace_result: _WorkspaceStepResult | None = None
         self.sandbox_result: _SandboxStepResult | None = None
         self.cfg: AppConfig | None = None
         self.login_summary: str = ""
         self.login_ok: bool = False
+        self.runtime_auth_summary: str = ""
+        self.runtime_auth_connected: bool | None = None
         self.diagnostic_lines: list[str] = []
         self.fatal_error: str = ""
         self.success: bool | None = None
@@ -166,11 +243,13 @@ class SetupFlow:
         self._custom_url = ""
         self._custom_headers: dict[str, str] = {}
         self._last_model_not_found = ""
+        self._last_router_model_not_found = ""
         self._sandbox_diag: Any = None
         self._sandbox_plan: Any = None
         self._resume_stage = ""  # stage to return to after a cancel prompt
         self._pending_profile: ProfileSpec | None = None
         self._pending_key = ""
+        self._pending_workspace_path: Path | None = None
 
     # ---------------------------------------------------------------- helpers
 
@@ -181,7 +260,11 @@ class SetupFlow:
         return _STAGE_MODE.get(self.stage, "message")
 
     def busy_kind(self) -> str:
-        return "terminal" if self.stage in {"installing_sandbox", "pulling_sandbox"} else "thread"
+        return (
+            "terminal"
+            if self.stage in {"installing_sandbox", "pulling_sandbox", "runtime_logging_in"}
+            else "thread"
+        )
 
     def _hosted_mimo(self) -> bool:
         preset = self.profile_result.preset if self.profile_result else None
@@ -194,10 +277,19 @@ class SetupFlow:
         return preset.key == PROFILE_KEY
 
     def _progress(self, stage: str) -> str:
-        if stage in _PROGRESS_STAGES:
-            number = _PROGRESS_STAGES.index(stage) + 1
+        uses_subscription = self.stage == "runtime" or (
+            self.execution_result is not None and self.execution_result.backend == "delegated"
+        )
+        progress_stages = _SUBSCRIPTION_PROGRESS_STAGES if uses_subscription else _PROGRESS_STAGES
+        if stage in _PROGRESS_ALIASES:
+            base_stage, label = _PROGRESS_ALIASES[stage]
+            if base_stage in progress_stages:
+                number = progress_stages.index(base_stage) + 1
+                return f"Step {number} of {len(progress_stages)} · {label}"
+        if stage in progress_stages:
+            number = progress_stages.index(stage) + 1
             label = _PROGRESS_LABELS.get(stage, stage.title())
-            return f"Step {number} of {len(_PROGRESS_STAGES)} · {label}"
+            return f"Step {number} of {len(progress_stages)} · {label}"
         return f"Finishing · {stage.replace('_', ' ')}"
 
     def _set_status(self, text: str, tone: Tone = "dim") -> None:
@@ -231,14 +323,45 @@ class SetupFlow:
             title="Welcome to Sylliptor",
             subtitle="A coding agent that runs in your terminal.",
             lines=[
-                ("To get started we need four things:", "plain"),
+                ("First choose how Sylliptor should connect to AI models.", "plain"),
                 ("", "plain"),
-                ("1. A provider profile   (OpenAI, Anthropic, Gemini, local, or custom)", "dim"),
-                ("2. An API key           (from your provider's dashboard)", "dim"),
-                ("3. A default model      (picked from the provider's presets)", "dim"),
-                ("4. A workspace folder   (the project you want to work on)", "dim"),
+                ("Use an API key to connect directly to a supported model provider.", "dim"),
+                (
+                    "Use an AI subscription to sign in through a supported provider's "
+                    "official client.",
+                    "dim",
+                ),
+                ("Both paths ask for the workspace folder you want to work on.", "dim"),
             ],
             hint="▶  Press Enter to begin",
+        )
+
+    def _screen_execution(self) -> Screen:
+        rows = [
+            Row(label=label, description=description, value=value)
+            for value, label, description in _wiz._connection_method_picker_rows()
+        ]
+        return Screen(
+            stage="execution",
+            mode="list",
+            title="Connection Method",
+            subtitle="How would you like to connect Sylliptor to AI models?",
+            rows=rows,
+            hint="↑↓ move · Enter select · Esc back",
+        )
+
+    def _screen_runtime(self) -> Screen:
+        rows = [
+            Row(label=label, description=description, value=value)
+            for value, label, description in _wiz._subscription_picker_rows()
+        ]
+        return Screen(
+            stage="runtime",
+            mode="list",
+            title="AI Subscription",
+            subtitle="Choose the subscription you want to connect.",
+            rows=rows,
+            hint="↑↓ move · Enter select · Esc back",
         )
 
     def _screen_provider(self) -> Screen:
@@ -249,11 +372,31 @@ class SetupFlow:
             Row(label=_wiz.preset_selection_label(preset), value=preset.key)
             for preset in _wiz._setup_presets()
         ]
+        rows.append(
+            Row(
+                label="Advanced / local / compatibility providers",
+                value=_wiz._ADVANCED_PROVIDER_PRESETS_VALUE,
+            )
+        )
         return Screen(
             stage="provider",
             mode="list",
             title="Provider Profile",
             subtitle="Pick the provider you want Sylliptor to use.",
+            rows=rows,
+            hint="↑↓ move · Enter select · Esc back",
+        )
+
+    def _screen_provider_advanced(self) -> Screen:
+        rows = [
+            Row(label=_wiz.preset_selection_label(preset), value=preset.key)
+            for preset in _wiz._advanced_setup_presets()
+        ]
+        return Screen(
+            stage="provider_advanced",
+            mode="list",
+            title="Advanced Provider Profile",
+            subtitle="Local endpoints (Ollama, LM Studio, vLLM), custom URLs, and legacy OpenAI-compatible presets.",
             rows=rows,
             hint="↑↓ move · Enter select · Esc back",
         )
@@ -339,6 +482,41 @@ class SetupFlow:
             hint="Enter next · Esc back",
         )
 
+    def _screen_router_model(self) -> Screen:
+        rows = [
+            Row(label=label, description=description, value=value)
+            for value, label, description in _wiz._router_model_picker_rows(
+                self.profile_result,  # type: ignore[arg-type]
+                default_model_result=self.model_result,  # type: ignore[arg-type]
+                previous=self.router_model_result,
+            )
+        ]
+        return Screen(
+            stage="router_model",
+            mode="list",
+            title="Router Model",
+            subtitle=(
+                "By default the router stays synchronized with the main model. "
+                "Choose an override only if you want a different routing model."
+            ),
+            rows=rows,
+            hint="↑↓ move · 1-9 pick · Enter select · Esc back",
+        )
+
+    def _screen_custom_router_model(self) -> Screen:
+        previous = ""
+        if self.router_model_result is not None and not self.router_model_result.inherited:
+            previous = self.router_model_result.model
+        return Screen(
+            stage="custom_router_model",
+            mode="input",
+            title="Router Model",
+            subtitle="Type any model id supported by this provider.",
+            input_label="Router model",
+            input_default=self._last_router_model_not_found or previous,
+            hint="Enter next · Esc back",
+        )
+
     def _screen_workspace(self) -> Screen:
         default = _wiz._suggest_workspace_default()
         prev = self.workspace_result.workspace if self.workspace_result else os.fspath(default)
@@ -350,6 +528,18 @@ class SetupFlow:
             input_label="Workspace folder",
             input_default=prev,
             hint="Enter confirm · Esc back",
+        )
+
+    def _screen_workspace_create_confirm(self) -> Screen:
+        pending = os.fspath(self._pending_workspace_path or "")
+        return Screen(
+            stage="workspace_create_confirm",
+            mode="confirm",
+            title="Workspace",
+            subtitle="That folder does not exist yet.",
+            lines=[(f"Create it now? {pending}", "plain")],
+            hint="Y create · N choose another · Esc back",
+            confirm_default=True,
         )
 
     # ----- busy screens (the app runs run_busy(), they transition themselves)
@@ -367,8 +557,33 @@ class SetupFlow:
             busy_label="Validating model…",
         )
 
+    def _screen_validating_router_model(self) -> Screen:
+        return Screen(
+            stage="validating_router_model",
+            mode="busy",
+            title="Router Model",
+            busy_label="Validating router model…",
+        )
+
     def _screen_committing(self) -> Screen:
         return Screen(stage="committing", mode="busy", title="Saving", busy_label="Saving setup…")
+
+    def _screen_checking_runtime_auth(self) -> Screen:
+        return Screen(
+            stage="checking_runtime_auth",
+            mode="busy",
+            title="AI subscription",
+            busy_label="Checking subscription connection…",
+        )
+
+    def _screen_runtime_logging_in(self) -> Screen:
+        return Screen(
+            stage="runtime_logging_in",
+            mode="busy",
+            busy_kind="terminal",
+            title="AI subscription",
+            busy_label="Opening provider sign-in…",
+        )
 
     def _screen_diagnosing_sandbox(self) -> Screen:
         return Screen(
@@ -462,6 +677,21 @@ class SetupFlow:
             hint="Y use it · N pick again · Esc back",
         )
 
+    def _screen_router_model_not_found_confirm(self) -> Screen:
+        return Screen(
+            stage="router_model_not_found_confirm",
+            mode="confirm",
+            title="Router Model",
+            subtitle="The provider reported this model is missing.",
+            lines=[
+                (
+                    f"Use custom router model '{self._last_router_model_not_found}' anyway?",
+                    "warn",
+                )
+            ],
+            hint="Y use it · N pick again · Esc back",
+        )
+
     def _screen_login_confirm(self) -> Screen:
         return Screen(
             stage="login_confirm",
@@ -473,23 +703,72 @@ class SetupFlow:
             confirm_default=True,
         )
 
+    def _screen_runtime_login_confirm(self) -> Screen:
+        runtime_label = (
+            self.execution_result.label if self.execution_result is not None else "AI subscription"
+        )
+        return Screen(
+            stage="runtime_login_confirm",
+            mode="confirm",
+            title="Connect subscription",
+            subtitle=f"{runtime_label} is not connected.",
+            lines=[
+                ("Connect now using the provider's browser login?", "plain"),
+                (
+                    "Provider login is an immediate external side effect. Cancelling or "
+                    "leaving setup later does not undo it.",
+                    "warn",
+                ),
+            ],
+            hint="Y connect · N later · Esc skip",
+            confirm_default=True,
+        )
+
     def _screen_cancel_confirm(self) -> Screen:
+        settings_saved = self._resume_stage in _POST_COMMIT_STAGES
         return Screen(
             stage="cancel_confirm",
             mode="confirm",
             title="Cancel setup",
-            lines=[("Cancel setup? No changes will be saved.", "warn")],
+            lines=(
+                [
+                    ("Leave setup? Your model access settings are already saved.", "warn"),
+                    ("Leaving does not undo provider sign-in or sign-out actions.", "dim"),
+                ]
+                if settings_saved
+                else [("Cancel setup? No changes will be saved.", "warn")]
+            ),
             hint="Y cancel · N keep going",
         )
 
     def _screen_complete(self) -> Screen:
         lines = self._summary_lines()
+        delegated = self.cfg is not None and self.cfg.execution.backend == "delegated"
+        subscription_selection_required = False
+        if self.cfg is not None and not delegated:
+            try:
+                from ...profiles import active_subscription_selection_ready, get_active_profile
+
+                subscription_selection_required = bool(
+                    get_active_profile(self.cfg).auth_provider
+                    and not active_subscription_selection_ready(self.cfg)
+                )
+            except Exception:
+                subscription_selection_required = False
         return Screen(
             stage="complete",
             mode="message",
             title="Setup complete",
             lines=lines,
-            hint="▶  Press Enter to start chatting",
+            hint=(
+                "▶  Press Enter to finish setup"
+                if delegated
+                else (
+                    "▶  Press Enter to choose model and reasoning in /config"
+                    if subscription_selection_required
+                    else "▶  Press Enter to start chatting"
+                )
+            ),
         )
 
     def _screen_fatal(self) -> Screen:
@@ -505,12 +784,48 @@ class SetupFlow:
 
     def _summary_lines(self) -> list[tuple[str, Tone]]:
         out: list[tuple[str, Tone]] = []
+        delegated = (
+            self.execution_result is not None and self.execution_result.backend == "delegated"
+        )
+        if delegated and self.execution_result is not None:
+            out.append(("Connection  AI subscription", "ok"))
+            out.append((f"Provider    {self.execution_result.label}", "plain"))
+            auth_summary = self.runtime_auth_summary or "not connected"
+            out.append(
+                (
+                    f"Sign-in     {auth_summary}",
+                    "ok" if self.runtime_auth_connected else "warn",
+                )
+            )
         if self.profile_result is not None:
             out.append((f"Profile    {self.profile_result.label} (active)", "ok"))
         if self.api_key_result is not None:
             out.append((f"API key    {self._api_key_summary()}", self._api_key_tone()))
         if self.model_result is not None:
             out.append((f"Model      {self.model_result.model}", "plain"))
+        elif self.cfg is not None and self.cfg.execution.backend == "native":
+            try:
+                from ...profiles import active_subscription_selection_ready, get_active_profile
+
+                active = get_active_profile(self.cfg)
+                selection_ready = active_subscription_selection_ready(self.cfg)
+            except Exception:
+                active = None
+                selection_ready = True
+            if active is not None and active.auth_provider and not selection_ready:
+                out.append(("Model      choose in /config → Default Model", "warn"))
+                out.append(("Reasoning  choose with the model in /config", "warn"))
+            else:
+                out.append((f"Model      {self.cfg.model}", "plain"))
+                if active is not None and active.reasoning_effort is not None:
+                    out.append((f"Reasoning  {active.reasoning_effort}", "plain"))
+        if self.router_model_result is not None:
+            router_model = (
+                "inherits default"
+                if self.router_model_result.inherited
+                else self.router_model_result.model
+            )
+            out.append((f"Router     {router_model}", "plain"))
         if self.workspace_result is not None:
             out.append((f"Workspace  {self.workspace_result.workspace}", "plain"))
         if self.sandbox_result is not None:
@@ -520,7 +835,27 @@ class SetupFlow:
         for issue in self.diagnostic_lines:
             out.append((f"Diagnostic: {issue}", "warn"))
         out.append(("", "plain"))
-        out.append(("Type your first message to start chatting.", "dim"))
+        if delegated and self.execution_result is not None:
+            runtime_id = str(self.execution_result.runtime or "").strip()
+            if self.runtime_auth_connected:
+                out.append(("Your AI subscription is connected.", "dim"))
+                out.append(
+                    (
+                        "Provider sign-in is immediate; leaving setup does not sign you out.",
+                        "dim",
+                    )
+                )
+            else:
+                out.append(
+                    (
+                        f"Next: run `sylliptor auth login {runtime_id}` before using this subscription.",
+                        "warn",
+                    )
+                )
+                if self.execution_result.auth_hint:
+                    out.append((self.execution_result.auth_hint, "dim"))
+        else:
+            out.append(("Type your first message to start chatting.", "dim"))
         return out
 
     def _api_key_summary(self) -> str:
@@ -591,10 +926,18 @@ class SetupFlow:
         self.choose(scr.rows[self.index].value)
 
     def choose(self, value: str) -> None:
-        if self.stage == "provider":
+        if self.stage == "execution":
+            self._choose_execution(value)
+        elif self.stage == "runtime":
+            self._choose_runtime(value)
+        elif self.stage == "provider":
+            self._choose_provider(value)
+        elif self.stage == "provider_advanced":
             self._choose_provider(value)
         elif self.stage == "model":
             self._choose_model(value)
+        elif self.stage == "router_model":
+            self._choose_router_model(value)
         elif self.stage == "sandbox_choice":
             self._choose_sandbox(value)
 
@@ -610,6 +953,8 @@ class SetupFlow:
             self._submit_api_key(text)
         elif self.stage == "custom_model":
             self._submit_custom_model(text)
+        elif self.stage == "custom_router_model":
+            self._submit_custom_router_model(text)
         elif self.stage == "workspace":
             self._submit_workspace(text)
 
@@ -629,17 +974,40 @@ class SetupFlow:
                 self._accept_unconfirmed_model()
             else:
                 self._goto("model")
+        elif self.stage == "router_model_not_found_confirm":
+            if yes:
+                self._accept_unconfirmed_router_model()
+            else:
+                self._goto("router_model")
+        elif self.stage == "workspace_create_confirm":
+            if yes:
+                self._accept_workspace_path(
+                    self._pending_workspace_path,
+                    create_if_missing=True,
+                )
+            else:
+                self._pending_workspace_path = None
+                self._goto("workspace")
+                self._set_status(
+                    "Type an existing folder, or enter a new folder and choose Create.",
+                    "warn",
+                )
         elif self.stage == "login_confirm":
             if yes:
                 self._goto("logging_in")
             else:
                 self.login_summary = ""
                 self._goto("complete")
+        elif self.stage == "runtime_login_confirm":
+            if yes:
+                self._goto("runtime_logging_in")
+            else:
+                self._skip_runtime_login()
 
     def advance_message(self) -> None:
         """Enter on a ``message`` screen."""
         if self.stage == "welcome":
-            self._goto("provider")
+            self._goto("execution")
         elif self.stage == "complete":
             self._finish(True)
         elif self.stage == "fatal":
@@ -648,14 +1016,25 @@ class SetupFlow:
     def back(self) -> None:
         custom_profile = self.profile_result is not None and self.profile_result.preset is None
         prev = {
-            "provider": "welcome",
+            "execution": "welcome",
+            "runtime": "execution",
+            "provider": "execution",
+            "provider_advanced": "provider",
             "custom_name": "provider",
             "custom_url": "custom_name",
             "custom_headers": "custom_url",
             "api_key": "custom_headers" if custom_profile else "provider",
             "model": "api_key",
             "custom_model": "model",
-            "workspace": "model",
+            "router_model": "model",
+            "custom_router_model": "router_model",
+            "workspace": (
+                "runtime"
+                if self.execution_result is not None
+                and self.execution_result.backend == "delegated"
+                else "router_model"
+            ),
+            "workspace_create_confirm": "workspace",
         }.get(self.stage)
         if self.stage == "welcome":
             self.request_cancel()
@@ -669,8 +1048,14 @@ class SetupFlow:
                 self.login_summary = ""
                 self._goto("complete")
                 return
+            if self.stage == "runtime_login_confirm":
+                self._skip_runtime_login()
+                return
             if self.stage == "model_not_found_confirm":
                 self._goto("model")
+                return
+            if self.stage == "router_model_not_found_confirm":
+                self._goto("router_model")
                 return
             return
         self._set_status("", "dim")
@@ -688,9 +1073,29 @@ class SetupFlow:
     def _goto(self, stage: str, *, reset_index: bool = True, keep_status: bool = False) -> None:
         self.stage = stage
         if reset_index:
-            self.index = 0
+            self.index = self._router_model_index() if stage == "router_model" else 0
         if not keep_status:
             self._set_status("", "dim")
+
+    def _router_model_index(self) -> int:
+        if (
+            self.router_model_result is None
+            or self.profile_result is None
+            or self.model_result is None
+        ):
+            return 0
+        rows = _wiz._router_model_picker_rows(
+            self.profile_result,
+            default_model_result=self.model_result,
+            previous=self.router_model_result,
+        )
+        values = [value for value, _label, _description in rows]
+        selected = (
+            _wiz._INHERIT_DEFAULT_MODEL_VALUE
+            if self.router_model_result.inherited
+            else self.router_model_result.model
+        )
+        return values.index(selected) if selected in values else 0
 
     def _finish(self, success: bool) -> None:
         self.success = success
@@ -698,7 +1103,47 @@ class SetupFlow:
 
     # --------------------------------------------------------- provider step
 
+    def _choose_execution(self, value: str) -> None:
+        if value == _wiz._SUBSCRIPTION_EXECUTION_VALUE:
+            self._goto("runtime")
+            return
+        try:
+            selected = _wiz._execution_result_from_value(value)
+        except ConfigError as exc:
+            self._set_status(str(exc), "err")
+            return
+        if self.execution_result is not None and selected != self.execution_result:
+            self.profile_result = None
+            self.api_key_result = None
+            self.model_result = None
+            self.router_model_result = None
+        self.execution_result = selected
+        if selected.backend == "delegated":
+            self._goto("workspace")
+        else:
+            self._goto("provider")
+
+    def _choose_runtime(self, value: str) -> None:
+        try:
+            selected = _wiz._execution_result_from_value(value)
+        except ConfigError as exc:
+            self._set_status(str(exc), "err")
+            return
+        if selected.backend != "delegated":
+            self._set_status("Choose an available AI subscription.", "err")
+            return
+        if self.execution_result is not None and selected != self.execution_result:
+            self.profile_result = None
+            self.api_key_result = None
+            self.model_result = None
+            self.router_model_result = None
+        self.execution_result = selected
+        self._goto("workspace")
+
     def _choose_provider(self, key: str) -> None:
+        if key == _wiz._ADVANCED_PROVIDER_PRESETS_VALUE:
+            self._goto("provider_advanced")
+            return
         preset = _wiz._preset_by_key(key)
         if preset is None:
             self._set_status(f"Unknown provider preset: {key}", "err")
@@ -712,6 +1157,7 @@ class SetupFlow:
         if self.profile_result is not None and new != self.profile_result:
             self.api_key_result = None
             self.model_result = None
+            self.router_model_result = None
         self.profile_result = new
         warning = (preset.setup_warning or "").strip()
         self._goto("api_key")
@@ -748,6 +1194,7 @@ class SetupFlow:
         if self.profile_result is not None and new != self.profile_result:
             self.api_key_result = None
             self.model_result = None
+            self.router_model_result = None
         self.profile_result = new
         self._goto("api_key")
 
@@ -877,7 +1324,7 @@ class SetupFlow:
         key = self.api_key_result
         if key is None or not key.api_key or key.validation_status == "failed":
             # Nothing to validate against; accept the model and move on.
-            self._goto("workspace")
+            self._goto("router_model")
             return
         self._report("Validating model…")
         validation = _wiz._validate_api_key(
@@ -898,14 +1345,14 @@ class SetupFlow:
                 self._set_status(validation.message or "Model not found at this provider.", "err")
             return
         if validation.status == "validated":
-            self._goto("workspace")
+            self._goto("router_model")
             self._set_status("Model validated.", "ok")
             return
         if validation.status == "failed":
-            self._goto("workspace")
+            self._goto("router_model")
             self._set_status(validation.message or "Provider rejected the key.", "err")
             return
-        self._goto("workspace")
+        self._goto("router_model")
         if validation.message:
             self._set_status(validation.message, "warn")
 
@@ -918,6 +1365,119 @@ class SetupFlow:
             self.api_key_result = replace(
                 self.api_key_result, validation_status="inconclusive", validation_message=warning
             )
+        self._goto("router_model")
+        self._set_status(warning, "warn")
+
+    # ---------------------------------------------------- router model step
+
+    def _choose_router_model(self, value: str) -> None:
+        if value == _wiz._INHERIT_DEFAULT_MODEL_VALUE:
+            self.router_model_result = _RouterModelStepResult()
+            self._goto("workspace")
+            return
+        if value == _wiz._CUSTOM_MODEL_VALUE:
+            self._goto("custom_router_model")
+            return
+        self._set_router_model(value, custom=False)
+
+    def _submit_custom_router_model(self, text: str) -> None:
+        model = text.strip()
+        if not model:
+            self._set_status(
+                "Router model is required when not inheriting the default model.",
+                "err",
+            )
+            return
+        self._set_router_model(model, custom=True)
+
+    def _set_router_model(self, model: str, *, custom: bool) -> None:
+        preset = self.profile_result.preset if self.profile_result else None
+        if preset is not None:
+            model = canonical_model_alias_for_preset(preset, model)
+        model = model.strip()
+        if not model:
+            self._set_status(
+                "Router model is required when not inheriting the default model.",
+                "err",
+            )
+            return
+        self.router_model_result = _RouterModelStepResult(
+            model=model,
+            custom=custom,
+            inherited=False,
+        )
+        self._goto("validating_router_model")
+
+    def _run_validating_router_model(self) -> None:
+        key = self.api_key_result
+        if key is None or not key.api_key or key.validation_status == "failed":
+            self._goto("workspace")
+            return
+        self._report("Validating router model…")
+        validation = _wiz._validate_api_key(
+            profile=self.profile_result.profile,  # type: ignore[union-attr]
+            api_key=key.api_key,
+            model=self.router_model_result.model,  # type: ignore[union-attr]
+            suggested_models=_wiz._suggested_models(self.profile_result),  # type: ignore[arg-type]
+        )
+        if validation.status == "model_not_found":
+            self._last_router_model_not_found = self.router_model_result.model  # type: ignore[union-attr]
+            if self.router_model_result is not None and self.router_model_result.custom:
+                self._goto("router_model_not_found_confirm")
+            else:
+                self._goto("router_model")
+                self._set_status(
+                    validation.message or "Router model not found at this provider.",
+                    "err",
+                )
+            return
+        preserve_prior_warning = key.validation_status == "inconclusive" and validation.status in {
+            "validated",
+            "inconclusive",
+        }
+        self.api_key_result = replace(
+            key,
+            validation_status=("inconclusive" if preserve_prior_warning else validation.status),
+            validation_message=(
+                _merge_validation_messages(key.validation_message, validation.message)
+                if preserve_prior_warning
+                else validation.message
+            ),
+        )
+        if validation.status == "validated":
+            self._goto("workspace")
+            if preserve_prior_warning:
+                self._set_status(
+                    "Router model validated; the default-model warning still applies.",
+                    "warn",
+                )
+            else:
+                self._set_status("Router model validated.", "ok")
+            return
+        if validation.status == "failed":
+            self._goto("workspace")
+            self._set_status(validation.message or "Provider rejected the key.", "err")
+            return
+        self._goto("workspace")
+        if validation.message:
+            self._set_status(validation.message, "warn")
+
+    def _accept_unconfirmed_router_model(self) -> None:
+        warning = (
+            f"Router model '{self._last_router_model_not_found}' was not confirmed; "
+            "provider reported it missing and you chose to use it anyway."
+        )
+        if self.api_key_result is not None:
+            prior_warning = (
+                self.api_key_result.validation_message
+                if self.api_key_result.validation_status == "inconclusive"
+                else ""
+            )
+            self.api_key_result = replace(
+                self.api_key_result,
+                validation_status="inconclusive",
+                validation_message=_merge_validation_messages(prior_warning, warning),
+            )
         self._goto("workspace")
         self._set_status(warning, "warn")
 
@@ -926,16 +1486,46 @@ class SetupFlow:
     def _submit_workspace(self, text: str) -> None:
         default = _wiz._suggest_workspace_default()
         raw = text.strip() or os.fspath(default)
-        selected = Path(raw).expanduser().resolve()
+        selected = Path(raw).expanduser().resolve(strict=False)
+        if not selected.exists():
+            self._pending_workspace_path = selected
+            self._goto("workspace_create_confirm")
+            return
+        self._accept_workspace_path(selected, create_if_missing=False)
+
+    def _accept_workspace_path(
+        self,
+        selected: Path | None,
+        *,
+        create_if_missing: bool,
+    ) -> None:
+        if selected is None:
+            self._goto("workspace")
+            self._set_status("Choose a workspace folder.", "err")
+            return
         try:
             binding = resolve_workspace_binding(
-                selected, allow_broad_workspace=True, source="setup_wizard"
+                selected,
+                create_if_missing=create_if_missing,
+                allow_broad_workspace=True,
+                source="setup_wizard",
             )
         except WorkspaceBindingError as exc:
-            self._set_status(str(exc), "err")
+            self._goto("workspace")
+            self._set_status(self._workspace_error_message(selected, exc), "err")
             return
         self.workspace_result = _WorkspaceStepResult(workspace=os.fspath(binding.requested_path))
+        self._pending_workspace_path = None
         self._goto("committing")
+
+    @staticmethod
+    def _workspace_error_message(selected: Path, exc: WorkspaceBindingError) -> str:
+        message = str(exc)
+        if "create_if_missing=True" in message:
+            return f"Folder does not exist: {selected}. Type an existing folder or choose Create."
+        if "not a directory" in message:
+            return f"That path is not a folder: {selected}"
+        return message
 
     # ---------------------------------------------------------- commit step
 
@@ -943,19 +1533,31 @@ class SetupFlow:
         self._report("Saving setup…")
         sink = _RichConsole(file=io.StringIO(), force_terminal=False, no_color=True)
         try:
-            cfg = _wiz._commit_setup(
-                profile_result=self.profile_result,  # type: ignore[arg-type]
-                api_key_result=self.api_key_result,  # type: ignore[arg-type]
-                model_result=self.model_result,  # type: ignore[arg-type]
-                router_model_result=_RouterModelStepResult(),
-                workspace_result=self.workspace_result,  # type: ignore[arg-type]
-                console=sink,
-            )
+            if self.execution_result is not None and self.execution_result.backend == "delegated":
+                cfg = _wiz._commit_delegated_setup(
+                    execution_result=self.execution_result,
+                    workspace_result=self.workspace_result,  # type: ignore[arg-type]
+                    console=sink,
+                )
+            else:
+                cfg = _wiz._commit_setup(
+                    profile_result=self.profile_result,  # type: ignore[arg-type]
+                    api_key_result=self.api_key_result,  # type: ignore[arg-type]
+                    model_result=self.model_result,  # type: ignore[arg-type]
+                    router_model_result=self.router_model_result,  # type: ignore[arg-type]
+                    workspace_result=self.workspace_result,  # type: ignore[arg-type]
+                    console=sink,
+                )
         except (ConfigError, OSError) as exc:
             self.fatal_error = f"Failed to save setup: {exc}"
             self._goto("fatal")
             return
         self.cfg = cfg
+        if self.execution_result is not None and self.execution_result.backend == "delegated":
+            self.diagnostic_lines = []
+            self.sandbox_result = None
+            self._goto("checking_runtime_auth")
+            return
         self.diagnostic_lines = self._collect_diagnostics(cfg)
         self._goto("diagnosing_sandbox")
 
@@ -966,6 +1568,51 @@ class SetupFlow:
             return list(provider_diagnostic_warning_lines(cfg))
         except Exception:
             return []
+
+    # ------------------------------------------------ runtime account step
+
+    def _run_checking_runtime_auth(self) -> None:
+        self._report("Checking subscription connection…")
+        result: _DelegatedAuthResult = _wiz._check_delegated_runtime_connection(
+            self.cfg,  # type: ignore[arg-type]
+            self.execution_result,  # type: ignore[arg-type]
+        )
+        self.runtime_auth_connected = result.connected
+        self.runtime_auth_summary = result.summary
+        if result.connected and self.cfg is not None and self.cfg.execution.backend == "native":
+            try:
+                _wiz._sync_direct_subscription_model(
+                    self.cfg,
+                    str(self.execution_result.runtime or ""),  # type: ignore[union-attr]
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._goto("runtime_login_confirm")
+                self._set_status(f"Connected, but model discovery failed: {exc}", "err")
+                return
+            self.diagnostic_lines = self._collect_diagnostics(self.cfg)
+            self._goto("diagnosing_sandbox")
+            return
+        self._goto("complete" if result.connected else "runtime_login_confirm")
+
+    def _skip_runtime_login(self) -> None:
+        self.runtime_auth_connected = False
+        if not self.runtime_auth_summary:
+            self.runtime_auth_summary = "not connected"
+        self._goto("complete")
+
+    def _run_runtime_logging_in(self) -> None:
+        self._report("Opening provider sign-in…")
+        result: _DelegatedAuthResult = _wiz._login_delegated_runtime(
+            self.cfg,  # type: ignore[arg-type]
+            self.execution_result,  # type: ignore[arg-type]
+        )
+        self.runtime_auth_connected = result.connected
+        self.runtime_auth_summary = result.summary
+        if result.connected and self.cfg is not None and self.cfg.execution.backend == "native":
+            self.diagnostic_lines = self._collect_diagnostics(self.cfg)
+            self._goto("diagnosing_sandbox")
+        else:
+            self._goto("complete")
 
     # --------------------------------------------------------- sandbox step
 

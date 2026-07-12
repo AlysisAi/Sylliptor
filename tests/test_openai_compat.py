@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import json
+import logging
+import ssl
 
 import httpx
 import pytest
 
+from sylliptor_agent_cli.llm import openai_compat as openai_compat_mod
 from sylliptor_agent_cli.llm import types as shared_types
+from sylliptor_agent_cli.llm.base import effective_tools_for_client
+from sylliptor_agent_cli.llm.cache_capabilities import (
+    CACHE_CONTROL_FIELD,
+    OPENROUTER_SESSION_ID_FIELD,
+    XAI_CONVERSATION_ID_HEADER_FIELD,
+)
+from sylliptor_agent_cli.llm.metadata import (
+    endpoint_descriptor,
+    endpoint_label,
+    stamp_provider_metadata_for_route,
+)
 from sylliptor_agent_cli.llm.openai_compat import (
     PROVIDER_METADATA_KEY,
     LLMError,
@@ -13,11 +27,20 @@ from sylliptor_agent_cli.llm.openai_compat import (
     LLMUsage,
     OpenAICompatClient,
     ToolCall,
+    _httpx_request_timeout,
     _provider_key_from_base_url,
     attach_provider_metadata_to_assistant_message,
     sylliptor_trial_error_message,
 )
 from sylliptor_agent_cli.llm.provider_limits import ProviderRetrySettings
+from sylliptor_agent_cli.provider_telemetry import (
+    last_provider_call_summary,
+    reset_provider_telemetry_for_tests,
+)
+from sylliptor_agent_cli.request_estimation import estimate_provider_payload_tokens
+from sylliptor_agent_cli.session_store import SessionStore
+
+_SYLLIPTOR_TRIAL_BASE_URL = "https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1"
 
 _SYLLIPTOR_TRIAL_BASE_URL = "https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1"
 
@@ -27,6 +50,73 @@ def test_openai_compat_reexports_shared_llm_types() -> None:
     assert ToolCall is shared_types.ToolCall
     assert LLMUsage is shared_types.LLMUsage
     assert LLMResponse is shared_types.LLMResponse
+
+
+def test_malformed_response_error_never_echoes_raw_reasoning_payload() -> None:
+    sentinel = "PRIVATE_RAW_REASONING_SENTINEL"
+    response = httpx.Response(
+        200,
+        json={
+            "choices": [],
+            "reasoning_content": sentinel,
+            "reasoning_details": [{"type": "reasoning.text", "text": sentinel}],
+        },
+    )
+
+    with pytest.raises(LLMError) as exc_info:
+        OpenAICompatClient._parse_non_stream_response(
+            response,
+            provider_key="deepseek",
+        )
+
+    assert "missing choices[0]" in str(exc_info.value)
+    assert sentinel not in str(exc_info.value)
+
+
+def test_count_input_tokens_measures_provider_shaped_multilingual_payload() -> None:
+    client = OpenAICompatClient(
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        api_key="test",
+        model="qwen3.7-plus",
+        provider_key="qwen",
+        prompt_cache_request_field_values={CACHE_CONTROL_FIELD: "ephemeral"},
+        prompt_cache_policy_metadata={
+            "strategy": "qwen_cache_control_blocks",
+            "enabled": True,
+            "status": "enabled",
+        },
+    )
+    measured = client.count_input_tokens(
+        messages=[
+            {"role": "system", "content": "Απάντησε με ακρίβεια."},
+            {"role": "user", "content": "中文 العربية 👩🏽‍💻"},
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    )
+
+    assert measured.input_tokens > 0
+    assert measured.source.value == "local_estimate"
+    assert measured.confidence.value == "estimated"
+    assert measured.raw_provider_usage == {
+        "estimator": "cl100k_base",
+        "estimate_basis": "provider_prompt_payload",
+        "provider_key": "qwen",
+        "protocol": "openai_compat",
+        "model": "qwen3.7-plus",
+        "message_count": 2,
+        "tool_count": 1,
+    }
 
 
 def test_sylliptor_trial_error_message_maps_known_codes() -> None:
@@ -158,6 +248,195 @@ def test_sends_extra_headers() -> None:
     assert resp.content == "ok"
 
 
+def test_request_timeout_uses_short_connect_timeout() -> None:
+    timeout = _httpx_request_timeout(60.0)
+    assert timeout.connect == 2.0
+    assert timeout.read == 60.0
+    assert timeout.write == 60.0
+    assert timeout.pool == 60.0
+
+    tiny_timeout = _httpx_request_timeout(0.5)
+    assert tiny_timeout.connect == 0.5
+    assert tiny_timeout.read == 0.5
+
+
+def test_connect_errors_retry_same_request_with_provider_backoff_and_telemetry() -> None:
+    reset_provider_telemetry_for_tests()
+    attempts = 0
+    sleeps: list[float] = []
+    request_bodies: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        request_bodies.append(request.content)
+        if attempts <= 2:
+            cause = ssl.SSLError("_ssl.c:1015: The handshake operation timed out")
+            raise httpx.ConnectError("_ssl.c:1015: The handshake operation timed out") from cause
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://example.com/v1",
+        api_key="test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(max_retries=2),
+        provider_sleep_fn=sleeps.append,
+        provider_random_fn=lambda: 0.5,
+    )
+
+    resp = client.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert resp.content == "ok"
+    assert attempts == 3
+    assert request_bodies == [request_bodies[0]] * 3
+    assert sleeps == [10.0, 20.0]
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["retry_count"] == 2
+    assert summary["retry_reasons"] == ["provider_unavailable"]
+
+
+def test_read_timeout_retries_instead_of_ending_the_agent_step() -> None:
+    attempts = 0
+    request_bodies: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        request_bodies.append(request.content)
+        if attempts == 1:
+            raise httpx.ReadTimeout("The read operation timed out", request=request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://example.com/v1",
+        api_key="test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(
+            max_retries=1,
+            base_delay_seconds=1.0,
+            max_delay_seconds=30.0,
+        ),
+        provider_sleep_fn=lambda _seconds: None,
+        provider_random_fn=lambda: 0.5,
+    )
+
+    response = client.chat(messages=[{"role": "user", "content": "keep this step"}])
+
+    assert response.content == "ok"
+    assert attempts == 2
+    assert request_bodies == [request_bodies[0], request_bodies[0]]
+
+
+def test_auth_errors_still_do_not_retry_provider_backoff() -> None:
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(401, text="invalid api key")
+
+    client = OpenAICompatClient(
+        base_url="https://example.com/v1",
+        api_key="test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(max_retries=5),
+        provider_sleep_fn=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("auth errors must not retry")
+        ),
+    )
+
+    with pytest.raises(LLMError, match="LLM error 401"):
+        client.chat(messages=[{"role": "user", "content": "hi"}])
+
+    assert attempts == 1
+
+
+def test_connect_errors_exhaust_retries_with_same_final_llm_error() -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        cause = ssl.SSLError("_ssl.c:1015: The handshake operation timed out")
+        raise httpx.ConnectError("_ssl.c:1015: The handshake operation timed out") from cause
+
+    client = OpenAICompatClient(
+        base_url="https://example.com/v1",
+        api_key="test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(
+            max_retries=2,
+            base_delay_seconds=1.0,
+            max_delay_seconds=30.0,
+        ),
+        provider_sleep_fn=sleeps.append,
+        provider_random_fn=lambda: 0.5,
+    )
+    with pytest.raises(LLMError) as excinfo:
+        client.chat(messages=[{"role": "user", "content": "hi"}])
+
+    error_text = str(excinfo.value)
+    assert error_text.startswith("LLM request failed for example.com (endpoint ")
+    assert error_text.endswith(": _ssl.c:1015: The handshake operation timed out")
+    assert isinstance(excinfo.value.__cause__, httpx.ConnectError)
+    assert attempts == 3
+    assert sleeps == [1.0, 2.0]
+
+
+def test_network_error_and_persisted_event_never_include_secret_endpoint(
+    tmp_path,
+) -> None:
+    sentinel = "PRIVATE_ENDPOINT_SENTINEL"
+    secret_base_url = (
+        f"https://route-user:route-password@example.com/private/{sentinel}?token={sentinel}"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            f"connection failed for {secret_base_url}",
+            request=request,
+        )
+
+    client = OpenAICompatClient(
+        base_url=secret_base_url,
+        api_key="test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(max_retries=0),
+    )
+
+    with pytest.raises(LLMError) as exc_info:
+        client.chat(messages=[{"role": "user", "content": "hi"}])
+
+    error_text = str(exc_info.value)
+    assert endpoint_label(secret_base_url) in error_text
+    assert sentinel not in error_text
+    assert "route-user" not in error_text
+    assert "route-password" not in error_text
+
+    store = SessionStore(
+        enabled=True,
+        sessions_dir=tmp_path,
+        session_id="safe-network-error",
+        cwd=str(tmp_path),
+        repo_root=str(tmp_path),
+    )
+    try:
+        store.append("error", {"error": error_text})
+    finally:
+        store.close()
+    persisted = (tmp_path / "safe-network-error.jsonl").read_text(encoding="utf-8")
+    assert sentinel not in persisted
+    assert "route-user" not in persisted
+    assert "route-password" not in persisted
+
+
 def test_chat_decompression_error_is_explicit() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -239,22 +518,22 @@ def test_retries_with_default_temperature_when_provider_accepts_only_default() -
     assert requests[0]["temperature"] == 0.0
     assert requests[1]["temperature"] == 1.0
     assert requests[2]["temperature"] == 1.0
-    assert first.provider_metadata == {
-        "transport": {
-            "temperature_adjusted": True,
-            "temperature_adjustment": "default_temperature",
-            "temperature_adjustment_reason": "provider_rejected_parameter",
-            "temperature_retry_used": True,
-            "temperature_retry_count": 1,
-        }
+    assert first.provider_metadata is not None
+    assert first.provider_metadata["transport"] == {
+        "temperature_adjusted": True,
+        "temperature_adjustment": "default_temperature",
+        "temperature_adjustment_reason": "provider_rejected_parameter",
+        "temperature_retry_used": True,
+        "temperature_retry_count": 1,
     }
-    assert second.provider_metadata == {
-        "transport": {
-            "temperature_adjusted": True,
-            "temperature_adjustment": "default_temperature",
-            "temperature_adjustment_reason": "cached_provider_rejection",
-        }
+    assert first.provider_metadata["openai_compat"]["request_plan"]["input_mode"] == "full"
+    assert second.provider_metadata is not None
+    assert second.provider_metadata["transport"] == {
+        "temperature_adjusted": True,
+        "temperature_adjustment": "default_temperature",
+        "temperature_adjustment_reason": "cached_provider_rejection",
     }
+    assert second.provider_metadata["openai_compat"]["request_plan"]["input_mode"] == "full"
 
 
 def test_omits_temperature_when_default_temperature_is_also_rejected() -> None:
@@ -296,26 +575,26 @@ def test_omits_temperature_when_default_temperature_is_also_rejected() -> None:
     assert requests[1]["temperature"] == 1.0
     assert "temperature" not in requests[2]
     assert "temperature" not in requests[3]
-    assert first.provider_metadata == {
-        "transport": {
-            "temperature_adjusted": True,
-            "temperature_adjustment": "omit_temperature",
-            "temperature_adjustment_reason": "provider_rejected_parameter",
-            "temperature_retry_used": True,
-            "temperature_retry_count": 2,
-            "temperature_omitted": True,
-            "temperature_omit_reason": "provider_rejected_parameter",
-        }
+    assert first.provider_metadata is not None
+    assert first.provider_metadata["transport"] == {
+        "temperature_adjusted": True,
+        "temperature_adjustment": "omit_temperature",
+        "temperature_adjustment_reason": "provider_rejected_parameter",
+        "temperature_retry_used": True,
+        "temperature_retry_count": 2,
+        "temperature_omitted": True,
+        "temperature_omit_reason": "provider_rejected_parameter",
     }
-    assert second.provider_metadata == {
-        "transport": {
-            "temperature_adjusted": True,
-            "temperature_adjustment": "omit_temperature",
-            "temperature_adjustment_reason": "cached_provider_rejection",
-            "temperature_omitted": True,
-            "temperature_omit_reason": "cached_provider_rejection",
-        }
+    assert first.provider_metadata["openai_compat"]["request_plan"]["input_mode"] == "full"
+    assert second.provider_metadata is not None
+    assert second.provider_metadata["transport"] == {
+        "temperature_adjusted": True,
+        "temperature_adjustment": "omit_temperature",
+        "temperature_adjustment_reason": "cached_provider_rejection",
+        "temperature_omitted": True,
+        "temperature_omit_reason": "cached_provider_rejection",
     }
+    assert second.provider_metadata["openai_compat"]["request_plan"]["input_mode"] == "full"
 
 
 def test_retries_with_default_temperature_for_plain_text_temperature_error() -> None:
@@ -435,7 +714,7 @@ def test_retries_without_temperature_for_deprecated_temperature_error_without_pa
     client = OpenAICompatClient(
         base_url="https://api.anthropic.com/v1",
         api_key="test",
-        model="claude-opus-4-7",
+        model="claude-future-model",
         temperature=0.2,
         transport=httpx.MockTransport(handler),
     )
@@ -625,6 +904,300 @@ def test_chat_sends_tool_choice_and_response_format() -> None:
     assert resp.content == "{}"
 
 
+def test_tools_omit_default_tool_choice_auto() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "fs_read", "parameters": {"type": "object", "properties": {}}},
+        }
+    ]
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://example.com/v1",
+        api_key="test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+    )
+    resp = client.chat(messages=[{"role": "user", "content": "hi"}], tools=tools)
+
+    assert captured["tools"] == tools
+    assert "tool_choice" not in captured
+    assert resp.content == "ok"
+
+
+def test_retries_without_tool_choice_when_provider_rejects_param() -> None:
+    forced = {"type": "function", "function": {"name": "fs_read"}}
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "fs_read", "parameters": {"type": "object", "properties": {}}},
+        }
+    ]
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            assert body["tool_choice"] == forced
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "Thinking mode does not support this tool_choice",
+                        "param": "tool_choice",
+                    }
+                },
+            )
+        assert "tool_choice" not in body
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.deepseek.com/v1",
+        api_key="test",
+        model="deepseek-v4-pro",
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        tool_choice=forced,
+    )
+    second = client.chat(
+        messages=[{"role": "user", "content": "hi again"}],
+        tools=tools,
+        tool_choice=forced,
+    )
+
+    assert first.content == "ok"
+    assert second.content == "ok"
+    assert len(requests) == 3
+    assert requests[0]["tool_choice"] == forced
+    assert "tool_choice" not in requests[1]
+    assert "tool_choice" not in requests[2]
+    assert first.provider_metadata is not None
+    assert set(first.provider_metadata) <= {"transport", "openai_compat", "_route_identity"}
+    assert first.provider_metadata["transport"] == {
+        "temperature_adjusted": True,
+        "temperature_adjustment": "omit_temperature",
+        "temperature_adjustment_reason": "documented_model_policy",
+        "temperature_omitted": True,
+        "temperature_omit_reason": "deepseek_thinking_temperature_unsupported",
+        "tool_choice_omitted": True,
+        "tool_choice_omit_reason": "provider_rejected_parameter",
+        "tool_choice_retry_used": True,
+    }
+    assert second.provider_metadata is not None
+    assert set(second.provider_metadata) <= {"transport", "openai_compat", "_route_identity"}
+    assert second.provider_metadata["transport"] == {
+        "temperature_adjusted": True,
+        "temperature_adjustment": "omit_temperature",
+        "temperature_adjustment_reason": "documented_model_policy",
+        "temperature_omitted": True,
+        "temperature_omit_reason": "deepseek_thinking_temperature_unsupported",
+        "tool_choice_omitted": True,
+        "tool_choice_omit_reason": "cached_provider_rejection",
+    }
+
+
+def test_retries_without_tools_when_full_error_body_rejects_tool_calling(caplog) -> None:
+    reset_provider_telemetry_for_tests()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "diagnostic_echo",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": (
+                            ("x" * 1100)
+                            + " tools are not supported by this model for function calling"
+                        )
+                    }
+                },
+            )
+        assert "tools" not in body
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    secret_base_url = "https://route-user:route-password@example.com/private/route-token"
+    client = OpenAICompatClient(
+        base_url=secret_base_url,
+        api_key="test",
+        model="test-model",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with caplog.at_level(logging.INFO, logger=openai_compat_mod.__name__):
+        response = client.chat(messages=[{"role": "user", "content": "hi"}], tools=tools)
+
+    assert response.content == "ok"
+    assert len(requests) == 2
+    assert "tools" in requests[0]
+    assert "tools" not in requests[1]
+    assert response.provider_metadata is not None
+    assert set(response.provider_metadata) <= {
+        "transport",
+        "openai_compat",
+        "_route_identity",
+    }
+    assert response.provider_metadata["transport"] == {
+        "tools_omitted": True,
+        "tools_omit_reason": "provider_rejected_tool_calling",
+        "tools_retry_used": True,
+    }
+    request_plan = response.provider_metadata["openai_compat"]["request_plan"]
+    assert request_plan["input_mode"] == "tool_calling_fallback"
+    assert request_plan["tool_count"] == 0
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["request_shape"]["input_mode"] == "tool_calling_fallback"
+    assert summary["request_shape"]["tool_count"] == 0
+    assert summary["token_reconciliation"]["input_mode"] == "tool_calling_fallback"
+    assert (
+        summary["token_reconciliation"]["input_estimate_tokens"]
+        == summary["token_reconciliation"]["sent_input_estimate_tokens"]
+    )
+    assert effective_tools_for_client(client, tools) is None
+    retry_record = next(
+        record
+        for record in caplog.records
+        if record.message == "llm_tool_calling_rejected_retrying_without_tools"
+    )
+    assert retry_record.base_url_descriptor == endpoint_descriptor(secret_base_url)
+    serialized_record = json.dumps(retry_record.__dict__, default=str, sort_keys=True)
+    assert "route-user" not in serialized_record
+    assert "route-password" not in serialized_record
+    assert "private/route-token" not in serialized_record
+    measured = client.count_input_tokens(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+    )
+    assert measured.raw_provider_usage is not None
+    assert measured.raw_provider_usage["tool_count"] == 0
+
+
+def test_forced_tool_choice_omitted_in_openrouter_thinking_mode() -> None:
+    # Regression: a reasoning model (Xiaomi MiMo via the OpenRouter shape) returns
+    # 400 "Thinking mode does not support this tool_choice" when the agent forces a
+    # specific tool (recovery / completion gate) while thinking is on. The client
+    # must omit the parameter so the turn keeps moving instead of crashing the
+    # whole run.
+    forced = {"type": "function", "function": {"name": "fs_read"}}
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "fs_read", "parameters": {"type": "object", "properties": {}}},
+        }
+    ]
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="test",
+        model="xiaomi/mimo",
+        enable_thinking=True,
+        transport=httpx.MockTransport(handler),
+    )
+    resp = client.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        tool_choice=forced,
+    )
+
+    assert captured["reasoning"] == {"enabled": True}  # thinking is on
+    assert "tool_choice" not in captured
+    assert captured["tools"] == tools  # tools still offered
+    assert resp.content == "ok"
+
+
+def test_forced_tool_choice_preserved_when_thinking_disabled() -> None:
+    # The downgrade is scoped to thinking mode: with reasoning off, the same
+    # provider must still forward a forced tool_choice unchanged.
+    forced = {"type": "function", "function": {"name": "fs_read"}}
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "fs_read", "parameters": {"type": "object", "properties": {}}},
+        }
+    ]
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="test",
+        model="xiaomi/mimo",
+        enable_thinking=False,
+        transport=httpx.MockTransport(handler),
+    )
+    client.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        tool_choice=forced,
+    )
+
+    assert captured["tool_choice"] == forced
+
+
+def test_required_tool_choice_omitted_in_deepseek_thinking_mode() -> None:
+    # The string forms ("required"/"any") force a call too, and omission also
+    # covers the DeepSeek "thinking" payload branch.
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.deepseek.com",
+        api_key="test",
+        model="deepseek-v4-pro",
+        enable_thinking=True,
+        transport=httpx.MockTransport(handler),
+    )
+    client.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "fs_read",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        tool_choice="required",
+    )
+
+    assert captured["thinking"] == {"type": "enabled"}
+    assert "tool_choice" not in captured
+
+
 def test_tool_call_arguments_non_json() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         data = {
@@ -732,6 +1305,7 @@ def test_non_stream_content_array_keeps_tool_calls() -> None:
 
 def test_deepseek_reasoning_content_round_trips_for_tool_calls() -> None:
     calls: list[dict[str, object]] = []
+    reasoning_deltas: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
@@ -777,9 +1351,16 @@ def test_deepseek_reasoning_content_round_trips_for_tool_calls() -> None:
         transport=transport,
     )
 
-    first = client.chat(messages=[{"role": "user", "content": "read"}], tools=[])
+    first = client.chat(
+        messages=[{"role": "user", "content": "read"}],
+        tools=[],
+        on_reasoning_delta=reasoning_deltas.append,
+    )
     assert first.content == ""
-    assert first.provider_metadata == {"deepseek": {"reasoning_content": "hidden reasoning state"}}
+    assert reasoning_deltas == []
+    assert first.provider_metadata is not None
+    assert first.provider_metadata["deepseek"] == {"reasoning_content": "hidden reasoning state"}
+    assert first.provider_metadata["openai_compat"]["request_plan"]["input_mode"] == "full"
     assistant_message = attach_provider_metadata_to_assistant_message(
         {
             "role": "assistant",
@@ -804,6 +1385,92 @@ def test_deepseek_reasoning_content_round_trips_for_tool_calls() -> None:
             {"role": "user", "content": "read"},
             assistant_message,
             {"role": "tool", "tool_call_id": "call_1", "content": '{"content":"x"}'},
+        ],
+        tools=[],
+    )
+    assert second.content == "ok"
+
+
+def test_qwen_streamed_reasoning_round_trips_opaquely_for_tool_calls() -> None:
+    calls: list[dict[str, object]] = []
+    reasoning_deltas: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if len(calls) == 1:
+            events = [
+                {"choices": [{"delta": {"reasoning_content": "private "}}]},
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning_content": "qwen state",
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "fs_read",
+                                            "arguments": '{"path":"README.md"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+            ]
+            body_sse = "".join(f"data: {json.dumps(event)}\n" for event in events)
+            return httpx.Response(200, text=body_sse + "data: [DONE]\n")
+
+        assistant_message = body["messages"][1]
+        assert PROVIDER_METADATA_KEY not in assistant_message
+        assert assistant_message["reasoning_content"] == "private qwen state"
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        api_key="test",
+        model="qwen3.7-plus",
+        enable_thinking=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(
+        messages=[{"role": "user", "content": "read"}],
+        tools=[],
+        stream=True,
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+    assert first.content == ""
+    assert reasoning_deltas == []
+    assert first.provider_metadata is not None
+    assert first.provider_metadata["qwen"] == {"reasoning_content": "private qwen state"}
+    assistant_message = attach_provider_metadata_to_assistant_message(
+        {
+            "role": "assistant",
+            "content": first.content,
+            "tool_calls": [
+                {
+                    "id": first.tool_calls[0].id,
+                    "type": "function",
+                    "function": {
+                        "name": first.tool_calls[0].name,
+                        "arguments": json.dumps(first.tool_calls[0].arguments),
+                    },
+                }
+            ],
+        },
+        first,
+    )
+
+    second = client.chat(
+        messages=[
+            {"role": "user", "content": "read"},
+            assistant_message,
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
         ],
         tools=[],
     )
@@ -837,7 +1504,20 @@ def test_provider_metadata_is_stripped_for_non_deepseek_transports() -> None:
                 "reasoning_content": "must not leak",
                 "reasoning": "must not leak",
                 "reasoning_details": [{"type": "reasoning.encrypted", "data": "must not leak"}],
-                PROVIDER_METADATA_KEY: {"deepseek": {"reasoning_content": "must not leak"}},
+                PROVIDER_METADATA_KEY: {
+                    "deepseek": {"reasoning_content": "must not leak"},
+                    "qwen": {"reasoning_content": "must not leak"},
+                    "mistral": {
+                        "content_chunks": [
+                            {
+                                "type": "thinking",
+                                "thinking": [{"type": "text", "text": "must not leak"}],
+                                "signature": "must not leak",
+                            },
+                            {"type": "text", "text": "safe answer"},
+                        ]
+                    },
+                },
             }
         ],
         tools=[],
@@ -1004,6 +1684,166 @@ def test_reasoning_effort_is_sent_for_supported_openai_style_providers(
     assert resp.content == "ok"
 
 
+def test_mistral_thinking_chunks_round_trip_opaquely_on_text_turns() -> None:
+    calls: list[dict[str, object]] = []
+    reasoning_deltas: list[str] = []
+    content_chunks = [
+        {
+            "type": "thinking",
+            "thinking": [{"type": "text", "text": "private mistral reasoning"}],
+            "signature": "opaque-mistral-signature",
+            "closed": True,
+        },
+        {"type": "text", "text": "Public answer."},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": content_chunks}}]},
+            )
+
+        assistant_message = body["messages"][1]
+        assert PROVIDER_METADATA_KEY not in assistant_message
+        assert assistant_message["content"] == content_chunks
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "Continued answer."}}]},
+        )
+
+    client = OpenAICompatClient(
+        base_url="https://api.mistral.ai/v1",
+        api_key="test",
+        model="mistral-medium-3-5",
+        reasoning_effort="high",
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(
+        messages=[{"role": "user", "content": "reason"}],
+        tools=[],
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+    assert first.content == "Public answer."
+    assert reasoning_deltas == []
+    assert first.reasoning == ()
+    assert first.provider_metadata is not None
+    assert first.provider_metadata["mistral"] == {"content_chunks": content_chunks}
+
+    assistant_message = attach_provider_metadata_to_assistant_message(
+        {"role": "assistant", "content": first.content},
+        first,
+    )
+    assert assistant_message["content"] == "Public answer."
+    assert PROVIDER_METADATA_KEY in assistant_message
+
+    second = client.chat(
+        messages=[
+            {"role": "user", "content": "reason"},
+            assistant_message,
+            {"role": "user", "content": "continue"},
+        ],
+        tools=[],
+    )
+    assert second.content == "Continued answer."
+
+
+def test_mistral_stream_reconstructs_signed_thinking_chunks_for_opaque_replay() -> None:
+    calls: list[dict[str, object]] = []
+    reasoning_deltas: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if len(calls) == 1:
+            events = [
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "content": [
+                                    {
+                                        "type": "thinking",
+                                        "thinking": [{"type": "text", "text": "private "}],
+                                        "closed": False,
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "content": [
+                                    {
+                                        "type": "thinking",
+                                        "thinking": [{"type": "text", "text": "state"}],
+                                        "signature": "opaque-stream-signature",
+                                        "closed": True,
+                                    },
+                                    {"type": "text", "text": "Public "},
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"delta": {"content": "answer."}}]},
+            ]
+            body_sse = "".join(f"data: {json.dumps(event)}\n" for event in events)
+            return httpx.Response(200, text=body_sse + "data: [DONE]\n")
+
+        assistant_message = body["messages"][1]
+        assert assistant_message["content"] == [
+            {
+                "type": "thinking",
+                "thinking": [
+                    {"type": "text", "text": "private "},
+                    {"type": "text", "text": "state"},
+                ],
+                "closed": True,
+                "signature": "opaque-stream-signature",
+            },
+            {"type": "text", "text": "Public answer."},
+        ]
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.mistral.ai/v1",
+        api_key="test",
+        model="mistral-medium-3-5",
+        reasoning_effort="high",
+        transport=httpx.MockTransport(handler),
+    )
+    first = client.chat(
+        messages=[{"role": "user", "content": "reason"}],
+        tools=[],
+        stream=True,
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+    assert first.content == "Public answer."
+    assert reasoning_deltas == []
+    assert first.provider_metadata is not None
+    assistant_message = attach_provider_metadata_to_assistant_message(
+        {"role": "assistant", "content": first.content},
+        first,
+    )
+
+    second = client.chat(
+        messages=[
+            {"role": "user", "content": "reason"},
+            assistant_message,
+            {"role": "user", "content": "continue"},
+        ],
+        tools=[],
+    )
+    assert second.content == "ok"
+
+
 @pytest.mark.parametrize(
     ("model", "effort", "expected"),
     [
@@ -1079,8 +1919,254 @@ def test_reasoning_effort_is_omitted_for_unsupported_transports(
     assert resp.content == "ok"
 
 
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        "deepseek_reasoning",
+        "dashscope_thinking",
+        "openrouter_reasoning",
+        "mistral_thinking",
+    ],
+)
+def test_explicit_custom_reasoning_adapter_controls_stream_parse_replay_and_route_gate(
+    adapter: str,
+) -> None:
+    sentinel = f"PRIVATE_{adapter.upper()}_STATE"
+    reasoning_deltas: list[str] = []
+    calls: list[dict[str, object]] = []
+    tool_call = {
+        "index": 0,
+        "id": "call_1",
+        "type": "function",
+        "function": {
+            "name": "fs_read",
+            "arguments": json.dumps({"path": "README.md"}),
+        },
+    }
+    if adapter == "mistral_thinking":
+        mistral_content = [
+            {
+                "type": "thinking",
+                "thinking": [{"type": "text", "text": sentinel}],
+                "signature": f"opaque-{adapter}-signature",
+                "closed": True,
+            },
+            {"type": "text", "text": "Public answer."},
+        ]
+        delta: dict[str, object] = {
+            "content": mistral_content,
+            "tool_calls": [tool_call],
+        }
+        metadata_namespace = "mistral"
+    elif adapter == "openrouter_reasoning":
+        reasoning_details = [{"type": "reasoning.encrypted", "data": sentinel}]
+        delta = {
+            "content": "Public answer.",
+            "reasoning": sentinel,
+            "reasoning_details": reasoning_details,
+            "tool_calls": [tool_call],
+        }
+        metadata_namespace = "openrouter"
+    else:
+        delta = {
+            "content": "Public answer.",
+            "reasoning_content": sentinel,
+            "tool_calls": [tool_call],
+        }
+        metadata_namespace = "deepseek" if adapter == "deepseek_reasoning" else "qwen"
+
+    stream_body = "data: " + json.dumps({"choices": [{"delta": delta}]}) + "\n\ndata: [DONE]\n\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if len(calls) == 1:
+            reasoning_fields = {
+                key
+                for key in ("enable_thinking", "thinking", "reasoning", "reasoning_effort")
+                if key in body
+            }
+            expected_fields = {
+                "deepseek_reasoning": {"thinking"},
+                "dashscope_thinking": {"enable_thinking"},
+                "openrouter_reasoning": {"reasoning"},
+                "mistral_thinking": {"reasoning_effort"},
+            }
+            expected_payloads = {
+                "deepseek_reasoning": {"thinking": {"type": "enabled"}},
+                "dashscope_thinking": {"enable_thinking": True},
+                "openrouter_reasoning": {"reasoning": {"effort": "high"}},
+                "mistral_thinking": {"reasoning_effort": "high"},
+            }
+            assert reasoning_fields == expected_fields[adapter]
+            assert all(body[key] == value for key, value in expected_payloads[adapter].items())
+            return httpx.Response(
+                200,
+                text=stream_body,
+                headers={"content-type": "text/event-stream"},
+            )
+
+        assistant_wire = body["messages"][1]
+        assert PROVIDER_METADATA_KEY not in assistant_wire
+        assert sentinel in json.dumps(assistant_wire, sort_keys=True)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://custom.example.test/v1",
+        api_key="same-route-secret",
+        model="custom-reasoning-model",
+        provider_key="custom-provider",
+        reasoning_trace_adapter=adapter,
+        enable_thinking=True,
+        reasoning_effort="high",
+        transport=httpx.MockTransport(handler),
+    )
+    first = client.chat(
+        messages=[{"role": "user", "content": "reason"}],
+        tools=[],
+        stream=True,
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+
+    assert first.content == "Public answer."
+    assert first.provider_metadata is not None
+    assert metadata_namespace in first.provider_metadata
+    assert sentinel in json.dumps(first.provider_metadata[metadata_namespace], sort_keys=True)
+    assert first.reasoning == ()
+    assert reasoning_deltas == []
+    assistant_message = attach_provider_metadata_to_assistant_message(
+        {
+            "role": "assistant",
+            "content": first.content,
+            "tool_calls": [
+                {
+                    "id": first.tool_calls[0].id,
+                    "type": "function",
+                    "function": {
+                        "name": first.tool_calls[0].name,
+                        "arguments": json.dumps(first.tool_calls[0].arguments),
+                    },
+                }
+            ],
+        },
+        first,
+    )
+    continuation = [
+        {"role": "user", "content": "reason"},
+        assistant_message,
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+
+    second = client.chat(messages=continuation, tools=[])
+    assert second.content == "ok"
+
+    mismatched_calls: list[dict[str, object]] = []
+
+    def mismatched_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        mismatched_calls.append(body)
+        assert sentinel not in json.dumps(body, sort_keys=True)
+        assert PROVIDER_METADATA_KEY not in body["messages"][1]
+        return httpx.Response(200, json={"choices": [{"message": {"content": "safe"}}]})
+
+    mismatched_client = OpenAICompatClient(
+        base_url="https://custom.example.test/v1",
+        api_key="different-route-secret",
+        model="custom-reasoning-model",
+        provider_key="custom-provider",
+        reasoning_trace_adapter=adapter,
+        enable_thinking=True,
+        reasoning_effort="high",
+        transport=httpx.MockTransport(mismatched_handler),
+    )
+    assert mismatched_client.route_identity.fingerprint != client.route_identity.fingerprint
+    mismatched = mismatched_client.chat(messages=continuation, tools=[])
+    assert mismatched.content == "safe"
+    assert len(mismatched_calls) == 1
+
+
+def test_auto_custom_reasoning_route_is_passive_and_does_not_guess_wire_fields() -> None:
+    sentinel = "PRIVATE_UNKNOWN_PROVIDER_REASONING"
+    calls: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        assert not {
+            "enable_thinking",
+            "thinking",
+            "reasoning",
+            "reasoning_effort",
+        }.intersection(body)
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "Public answer.",
+                                "reasoning_content": sentinel,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "fs_read",
+                                            "arguments": '{"path":"README.md"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+        assert sentinel not in json.dumps(body, sort_keys=True)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://custom.example.test/v1",
+        api_key="test",
+        model="custom-reasoning-model",
+        provider_key="custom-provider",
+        enable_thinking=True,
+        transport=httpx.MockTransport(handler),
+    )
+    first = client.chat(messages=[{"role": "user", "content": "reason"}], tools=[])
+    assert first.provider_metadata is not None
+    assert sentinel not in json.dumps(first.provider_metadata, sort_keys=True)
+    assistant_message = attach_provider_metadata_to_assistant_message(
+        {
+            "role": "assistant",
+            "content": first.content,
+            "tool_calls": [
+                {
+                    "id": first.tool_calls[0].id,
+                    "type": "function",
+                    "function": {
+                        "name": first.tool_calls[0].name,
+                        "arguments": json.dumps(first.tool_calls[0].arguments),
+                    },
+                }
+            ],
+        },
+        first,
+    )
+    second = client.chat(
+        messages=[
+            {"role": "user", "content": "reason"},
+            assistant_message,
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ],
+        tools=[],
+    )
+    assert second.content == "ok"
+
+
 def test_openrouter_reasoning_round_trips_for_tool_calls() -> None:
     calls: list[dict[str, object]] = []
+    reasoning_deltas: list[str] = []
     reasoning_details = [{"type": "reasoning.encrypted", "data": "encrypted-state"}]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1129,13 +2215,18 @@ def test_openrouter_reasoning_round_trips_for_tool_calls() -> None:
         transport=httpx.MockTransport(handler),
     )
 
-    first = client.chat(messages=[{"role": "user", "content": "read"}], tools=[])
-    assert first.provider_metadata == {
-        "openrouter": {
-            "reasoning": "hidden openrouter reasoning",
-            "reasoning_details": reasoning_details,
-        }
+    first = client.chat(
+        messages=[{"role": "user", "content": "read"}],
+        tools=[],
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+    assert reasoning_deltas == []
+    assert first.provider_metadata is not None
+    assert first.provider_metadata["openrouter"] == {
+        "reasoning": "hidden openrouter reasoning",
+        "reasoning_details": reasoning_details,
     }
+    assert first.provider_metadata["openai_compat"]["request_plan"]["input_mode"] == "full"
     assistant_message = attach_provider_metadata_to_assistant_message(
         {
             "role": "assistant",
@@ -1241,6 +2332,8 @@ def test_parses_cached_prompt_tokens_from_usage_details() -> None:
     resp = client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
     assert resp.usage is not None
     assert resp.usage.cached_prompt_tokens == 14
+    assert resp.usage.cache_read_input_tokens == 14
+    assert resp.usage.input_tokens_uncached == 6
 
 
 def test_omits_prompt_cache_fields_by_default() -> None:
@@ -1264,6 +2357,8 @@ def test_omits_prompt_cache_fields_by_default() -> None:
 
 
 def test_includes_prompt_cache_fields_when_configured() -> None:
+    reset_provider_telemetry_for_tests()
+
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
         assert body["prompt_cache_key"] == "repo-main"
@@ -1277,11 +2372,547 @@ def test_includes_prompt_cache_fields_when_configured() -> None:
         model="test-model",
         prompt_cache_key="repo-main",
         prompt_cache_retention="24h",
+        prompt_cache_policy_metadata={
+            "status": "enabled",
+            "strategy": "openai_prompt_cache",
+            "mode": "manual",
+            "enabled": True,
+            "capability_source": "profile",
+            "source": "profile",
+            "allowed_fields": ["prompt_cache_key", "prompt_cache_retention"],
+            "emitted_fields": ["prompt_cache_key", "prompt_cache_retention"],
+            "trusted_usage_fields": ["cache_read_input_tokens"],
+            "usage_schema": "openai",
+        },
         transport=transport,
     )
 
     resp = client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
     assert resp.content == "ok"
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["cache_policy"] == {
+        "status": "enabled",
+        "strategy": "openai_prompt_cache",
+        "mode": "automatic",
+        "retention": "24h",
+        "enabled": True,
+        "capability_source": "profile",
+        "source": "profile",
+        "allowed_fields": ["prompt_cache_key", "prompt_cache_retention"],
+        "emitted_fields": ["prompt_cache_key", "prompt_cache_retention"],
+        "trusted_usage_fields": ["cache_read_input_tokens"],
+        "usage_schema": "openai",
+    }
+    assert summary["token_reconciliation"]["input_estimate_tokens"] > 0
+    assert summary["token_reconciliation"]["sent_input_estimate_tokens"] > 0
+    assert summary["token_reconciliation"]["reported_prompt_tokens"] is None
+    assert "repo-main" not in json.dumps(summary, sort_keys=True)
+
+
+def test_includes_openrouter_session_id_when_configured() -> None:
+    reset_provider_telemetry_for_tests()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert body[OPENROUTER_SESSION_ID_FIELD] == "or-session"
+        assert "prompt_cache_key" not in body
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="test",
+        model="qwen/qwen3.7-plus",
+        prompt_cache_request_field_values={OPENROUTER_SESSION_ID_FIELD: "or-session"},
+        prompt_cache_policy_metadata={
+            "status": "enabled",
+            "strategy": "openrouter_sticky_session",
+            "mode": "automatic",
+            "enabled": True,
+            "allowed_fields": [OPENROUTER_SESSION_ID_FIELD],
+            "emitted_fields": [OPENROUTER_SESSION_ID_FIELD],
+            "trusted_usage_fields": ["cache_read_input_tokens", "cache_creation_input_tokens"],
+            "usage_schema": "provider",
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    resp = client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert resp.content == "ok"
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["cache_policy"]["strategy"] == "openrouter_sticky_session"
+    assert summary["cache_policy"]["emitted_fields"] == [OPENROUTER_SESSION_ID_FIELD]
+    assert "or-session" not in json.dumps(summary, sort_keys=True)
+
+
+def test_includes_xai_conversation_id_header_when_configured() -> None:
+    reset_provider_telemetry_for_tests()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert XAI_CONVERSATION_ID_HEADER_FIELD not in body
+        assert request.headers[XAI_CONVERSATION_ID_HEADER_FIELD] == "conv-abc"
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.x.ai/v1",
+        api_key="test",
+        model="grok-4.3",
+        prompt_cache_request_field_values={XAI_CONVERSATION_ID_HEADER_FIELD: "conv-abc"},
+        prompt_cache_policy_metadata={
+            "status": "enabled",
+            "strategy": "xai_conversation_header",
+            "mode": "automatic",
+            "enabled": True,
+            "allowed_fields": [XAI_CONVERSATION_ID_HEADER_FIELD],
+            "emitted_fields": [XAI_CONVERSATION_ID_HEADER_FIELD],
+            "trusted_usage_fields": ["cache_read_input_tokens"],
+            "usage_schema": "provider",
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    resp = client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert resp.content == "ok"
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["cache_policy"]["strategy"] == "xai_conversation_header"
+    assert summary["cache_policy"]["emitted_fields"] == [XAI_CONVERSATION_ID_HEADER_FIELD]
+    assert "conv-abc" not in json.dumps(summary, sort_keys=True)
+
+
+def test_includes_cache_control_block_when_profile_capability_emits_field() -> None:
+    reset_provider_telemetry_for_tests()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        content = body["messages"][0]["content"]
+        assert isinstance(content, list)
+        assert content[0]["cache_control"] == {"type": "ephemeral"}
+        assert body["messages"][1]["content"] == "current request"
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        api_key="test",
+        model="qwen3-coder-plus",
+        prompt_cache_request_field_values={CACHE_CONTROL_FIELD: "ephemeral"},
+        prompt_cache_policy_metadata={
+            "status": "enabled",
+            "strategy": "qwen_cache_control_blocks",
+            "mode": "automatic",
+            "enabled": True,
+            "allowed_fields": [CACHE_CONTROL_FIELD],
+            "emitted_fields": [CACHE_CONTROL_FIELD],
+            "trusted_usage_fields": ["cache_read_input_tokens"],
+            "usage_schema": "provider",
+            "min_tokens": 1,
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    resp = client.chat(
+        messages=[
+            {"role": "system", "content": "stable prefix"},
+            {"role": "user", "content": "current request"},
+        ],
+        tools=[],
+    )
+
+    assert resp.content == "ok"
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["cache_policy"]["used"] is True
+    assert summary["cache_policy"]["cacheable_prefix_estimated_tokens"] > 0
+    assert summary["request_shape"]["cache_control_block_count"] == 1
+    assert summary["request_shape"]["cache_eligible"] is True
+    rendered = json.dumps(summary, sort_keys=True)
+    assert "stable prefix" not in rendered
+    assert "current request" not in rendered
+
+
+def test_cache_param_rejection_circuit_disables_cache_control_blocks() -> None:
+    reset_provider_telemetry_for_tests()
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            content = body["messages"][0]["content"]
+            assert isinstance(content, list)
+            assert content[0]["cache_control"] == {"type": "ephemeral"}
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "param": "messages.0.content.0.cache_control",
+                        "message": "cache_control is not supported by this route",
+                    }
+                },
+            )
+        rendered = json.dumps(body, sort_keys=True)
+        assert "cache_control" not in rendered
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        api_key="test",
+        model="qwen3-coder-plus",
+        prompt_cache_request_field_values={CACHE_CONTROL_FIELD: "ephemeral"},
+        prompt_cache_policy_metadata={
+            "status": "enabled",
+            "strategy": "qwen_cache_control_blocks",
+            "mode": "automatic",
+            "enabled": True,
+            "allowed_fields": [CACHE_CONTROL_FIELD],
+            "emitted_fields": [CACHE_CONTROL_FIELD],
+            "trusted_usage_fields": ["cache_read_input_tokens"],
+            "usage_schema": "provider",
+            "min_tokens": 1,
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(
+        messages=[
+            {"role": "system", "content": "stable prefix"},
+            {"role": "user", "content": "current request"},
+        ],
+        tools=[],
+    )
+    first_summary = last_provider_call_summary()
+    second = client.chat(
+        messages=[
+            {"role": "system", "content": "stable prefix"},
+            {"role": "user", "content": "next request"},
+        ],
+        tools=[],
+    )
+
+    assert first.content == "ok"
+    assert second.content == "ok"
+    assert len(requests) == 3
+    assert "cache_control" not in json.dumps(requests[1], sort_keys=True)
+    assert "cache_control" not in json.dumps(requests[2], sort_keys=True)
+    assert first_summary is not None
+    assert first_summary["request_shape"]["input_mode"] == "cache_param_fallback"
+    assert first_summary["request_shape"]["cache_control_block_count"] == 0
+    expected_estimate = estimate_provider_payload_tokens({"messages": requests[1]["messages"]})
+    assert first_summary["token_reconciliation"]["input_mode"] == "cache_param_fallback"
+    assert first_summary["token_reconciliation"]["input_estimate_tokens"] == expected_estimate
+    assert first_summary["token_reconciliation"]["sent_input_estimate_tokens"] == expected_estimate
+
+
+def test_cache_param_rejection_circuit_disables_openrouter_session_id() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            assert body[OPENROUTER_SESSION_ID_FIELD] == "or-session"
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "param": OPENROUTER_SESSION_ID_FIELD,
+                        "message": "session_id is not supported by this route",
+                    }
+                },
+            )
+        assert OPENROUTER_SESSION_ID_FIELD not in body
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="test",
+        model="qwen/qwen3.7-plus",
+        prompt_cache_request_field_values={OPENROUTER_SESSION_ID_FIELD: "or-session"},
+        prompt_cache_policy_metadata={
+            "status": "enabled",
+            "strategy": "openrouter_sticky_session",
+            "mode": "automatic",
+            "enabled": True,
+            "allowed_fields": [OPENROUTER_SESSION_ID_FIELD],
+            "emitted_fields": [OPENROUTER_SESSION_ID_FIELD],
+            "trusted_usage_fields": ["cache_read_input_tokens"],
+            "usage_schema": "provider",
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+    second = client.chat(messages=[{"role": "user", "content": "again"}], tools=[])
+
+    assert first.content == "ok"
+    assert second.content == "ok"
+    assert len(requests) == 3
+    assert OPENROUTER_SESSION_ID_FIELD not in requests[1]
+    assert OPENROUTER_SESSION_ID_FIELD not in requests[2]
+
+
+def test_cache_param_rejection_circuit_handles_fastapi_detail_list_body() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            assert body[OPENROUTER_SESSION_ID_FIELD] == "or-session"
+            return httpx.Response(
+                422,
+                json={
+                    "detail": [
+                        {
+                            "loc": ["body", "session_id"],
+                            "msg": "extra fields not permitted",
+                            "type": "value_error.extra",
+                        }
+                    ]
+                },
+            )
+        assert OPENROUTER_SESSION_ID_FIELD not in body
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="test",
+        model="qwen/qwen3.7-plus",
+        prompt_cache_request_field_values={OPENROUTER_SESSION_ID_FIELD: "or-session"},
+        prompt_cache_policy_metadata={
+            "status": "enabled",
+            "strategy": "openrouter_sticky_session",
+            "mode": "automatic",
+            "enabled": True,
+            "allowed_fields": [OPENROUTER_SESSION_ID_FIELD],
+            "emitted_fields": [OPENROUTER_SESSION_ID_FIELD],
+            "trusted_usage_fields": ["cache_read_input_tokens"],
+            "usage_schema": "provider",
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+    second = client.chat(messages=[{"role": "user", "content": "again"}], tools=[])
+
+    assert first.content == "ok"
+    assert second.content == "ok"
+    assert len(requests) == 3
+    assert OPENROUTER_SESSION_ID_FIELD not in requests[1]
+    assert OPENROUTER_SESSION_ID_FIELD not in requests[2]
+
+
+def test_cache_param_rejection_circuit_handles_string_error_body() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            assert body["prompt_cache_key"] == "repo-main"
+            return httpx.Response(
+                400,
+                json={"error": "Unsupported parameter: prompt_cache_key"},
+            )
+        assert "prompt_cache_key" not in body
+        assert "prompt_cache_retention" not in body
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://example.com/v1",
+        api_key="test",
+        model="test-model",
+        prompt_cache_key="repo-main",
+        prompt_cache_retention="24h",
+        prompt_cache_policy_metadata={
+            "status": "enabled",
+            "strategy": "openai_prompt_cache",
+            "mode": "manual",
+            "enabled": True,
+            "allowed_fields": ["prompt_cache_key", "prompt_cache_retention"],
+            "emitted_fields": ["prompt_cache_key", "prompt_cache_retention"],
+            "trusted_usage_fields": ["cache_read_input_tokens"],
+            "usage_schema": "openai",
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+    second = client.chat(messages=[{"role": "user", "content": "again"}], tools=[])
+
+    assert first.content == "ok"
+    assert second.content == "ok"
+    assert len(requests) == 3
+    assert "prompt_cache_key" not in requests[1]
+    assert "prompt_cache_key" not in requests[2]
+
+
+def test_cache_param_rejection_circuit_disables_xai_header() -> None:
+    seen_headers: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers.append(request.headers.get(XAI_CONVERSATION_ID_HEADER_FIELD))
+        if len(seen_headers) == 1:
+            assert seen_headers[-1] == "conv-abc"
+            return httpx.Response(
+                422,
+                json={
+                    "error": {
+                        "message": "x-grok-conv-id is not supported by this endpoint",
+                    }
+                },
+            )
+        assert seen_headers[-1] is None
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.x.ai/v1",
+        api_key="test",
+        model="grok-4.3",
+        prompt_cache_request_field_values={XAI_CONVERSATION_ID_HEADER_FIELD: "conv-abc"},
+        prompt_cache_policy_metadata={
+            "status": "enabled",
+            "strategy": "xai_conversation_header",
+            "mode": "automatic",
+            "enabled": True,
+            "allowed_fields": [XAI_CONVERSATION_ID_HEADER_FIELD],
+            "emitted_fields": [XAI_CONVERSATION_ID_HEADER_FIELD],
+            "trusted_usage_fields": ["cache_read_input_tokens"],
+            "usage_schema": "provider",
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+    second = client.chat(messages=[{"role": "user", "content": "again"}], tools=[])
+
+    assert first.content == "ok"
+    assert second.content == "ok"
+    assert seen_headers == ["conv-abc", None, None]
+
+
+def test_retries_without_rejected_prompt_cache_retention_only() -> None:
+    reset_provider_telemetry_for_tests()
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            assert body["prompt_cache_key"] == "repo-main"
+            assert body["prompt_cache_retention"] == "24h"
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "param": "prompt_cache_retention",
+                        "message": "Unsupported parameter: prompt_cache_retention",
+                    }
+                },
+            )
+        assert body["prompt_cache_key"] == "repo-main"
+        assert "prompt_cache_retention" not in body
+        return httpx.Response(
+            200,
+            json={
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 3,
+                    "total_tokens": 15,
+                    "prompt_tokens_details": {"cached_tokens": 5},
+                },
+                "choices": [{"message": {"content": "ok"}}],
+            },
+        )
+
+    client = OpenAICompatClient(
+        base_url="https://example.com/v1",
+        api_key="test",
+        model="test-model",
+        prompt_cache_key="repo-main",
+        prompt_cache_retention="24h",
+        prompt_cache_policy_metadata={
+            "status": "enabled",
+            "strategy": "openai_prompt_cache",
+            "mode": "manual",
+            "enabled": True,
+            "allowed_fields": ["prompt_cache_key", "prompt_cache_retention"],
+            "emitted_fields": ["prompt_cache_key", "prompt_cache_retention"],
+            "trusted_usage_fields": ["cache_read_input_tokens"],
+            "usage_schema": "openai",
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    resp = client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert resp.content == "ok"
+    assert len(requests) == 2
+    assert resp.usage is not None
+    assert resp.usage.cache_read_input_tokens == 5
+    summary = last_provider_call_summary()
+    assert summary is not None
+    assert summary["cache_policy"]["fallback"] == "stripped_rejected_cache_fields"
+    assert summary["cache_policy"]["disabled_fields"] == ["prompt_cache_retention"]
+    assert summary["cache_policy"]["emitted_fields"] == ["prompt_cache_key"]
+    assert "repo-main" not in json.dumps(summary, sort_keys=True)
+
+
+def test_cache_param_rejection_circuit_disables_key_and_retention_for_later_calls() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if len(requests) == 1:
+            assert body["prompt_cache_key"] == "repo-main"
+            assert body["prompt_cache_retention"] == "24h"
+            return httpx.Response(
+                422,
+                json={
+                    "error": {
+                        "param": "prompt_cache_key",
+                        "message": "prompt_cache_key is not supported by this provider",
+                    }
+                },
+            )
+        assert "prompt_cache_key" not in body
+        assert "prompt_cache_retention" not in body
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://example.com/v1",
+        api_key="test",
+        model="test-model",
+        prompt_cache_key="repo-main",
+        prompt_cache_retention="24h",
+        prompt_cache_policy_metadata={
+            "status": "enabled",
+            "strategy": "openai_prompt_cache",
+            "mode": "manual",
+            "enabled": True,
+            "allowed_fields": ["prompt_cache_key", "prompt_cache_retention"],
+            "emitted_fields": ["prompt_cache_key", "prompt_cache_retention"],
+            "trusted_usage_fields": ["cache_read_input_tokens"],
+            "usage_schema": "openai",
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+    second = client.chat(messages=[{"role": "user", "content": "again"}], tools=[])
+
+    assert first.content == "ok"
+    assert second.content == "ok"
+    assert len(requests) == 3
+    assert "prompt_cache_key" not in requests[1]
+    assert "prompt_cache_retention" not in requests[1]
+    assert "prompt_cache_key" not in requests[2]
+    assert "prompt_cache_retention" not in requests[2]
 
 
 def test_includes_enable_thinking_when_configured() -> None:
@@ -1919,7 +3550,7 @@ class _TruncatedSseStream(httpx.SyncByteStream):
         )
 
 
-def test_stream_transport_truncation_retries_without_partial_tool_batch() -> None:
+def test_stream_transport_truncation_does_not_replay_after_public_output() -> None:
     attempts = 0
     chunks: list[str] = []
 
@@ -1941,18 +3572,16 @@ def test_stream_transport_truncation_retries_without_partial_tool_batch() -> Non
         provider_random_fn=lambda: 0.5,
     )
 
-    resp = client.chat(
-        messages=[{"role": "user", "content": "hi"}],
-        tools=[],
-        stream=True,
-        on_text_delta=chunks.append,
-    )
+    with pytest.raises(LLMError, match="stream interrupted after partial output"):
+        client.chat(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            stream=True,
+            on_text_delta=chunks.append,
+        )
 
-    assert attempts == 2
-    assert resp.content == "ok"
-    assert resp.tool_calls == []
-    assert chunks == ["ok"]
-    assert resp.raw["stream_restart_count"] == 1
+    assert attempts == 1
+    assert chunks == ["partial"]
 
 
 def test_stream_parses_cached_prompt_tokens() -> None:
@@ -1997,23 +3626,21 @@ def _trial_client(handler) -> OpenAICompatClient:  # type: ignore[no-untyped-def
         base_url=_SYLLIPTOR_TRIAL_BASE_URL,
         api_key="test",
         model="mimo-v2.5-pro",
+        provider_key="sylliptor",
         transport=httpx.MockTransport(handler),
     )
 
 
-def test_non_stream_folds_reasoning_into_empty_content() -> None:
-    # MiMo reasoning models can answer entirely in the reasoning channel with an
-    # empty `content`. The fold surfaces that text so the turn does not degrade
-    # to the generic clarification fallback.
+def test_non_stream_never_folds_raw_reasoning_into_empty_content() -> None:
     handler = _content_handler({"content": "", "reasoning": "Hi! How can I help?"})
     resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}])
-    assert resp.content == "Hi! How can I help?"
+    assert resp.content == ""
 
 
-def test_non_stream_folds_reasoning_content_into_whitespace_content() -> None:
+def test_non_stream_never_folds_raw_reasoning_content_into_whitespace_content() -> None:
     handler = _content_handler({"content": "   ", "reasoning_content": "Hello there."})
     resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}])
-    assert resp.content == "Hello there."
+    assert resp.content == "   "
 
 
 def test_non_stream_keeps_empty_when_no_reasoning() -> None:
@@ -2050,7 +3677,7 @@ def test_non_stream_empty_content_with_tool_calls_is_not_folded() -> None:
     assert len(resp.tool_calls) == 1
 
 
-def test_stream_folds_reasoning_into_empty_content() -> None:
+def test_stream_never_folds_raw_reasoning_into_empty_content() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         events = [
             {"choices": [{"delta": {"reasoning": "Hi! "}}]},
@@ -2060,7 +3687,7 @@ def test_stream_folds_reasoning_into_empty_content() -> None:
         return httpx.Response(200, text=body_sse)
 
     resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}], stream=True)
-    assert resp.content == "Hi! How can I help?"
+    assert resp.content == ""
 
 
 def test_stream_keeps_content_over_reasoning() -> None:
@@ -2089,4 +3716,203 @@ def test_trial_proxy_captures_reasoning_into_provider_metadata() -> None:
     handler = _content_handler({"content": "ok", "reasoning": "hidden reasoning"})
     resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}])
     assert resp.content == "ok"
-    assert resp.provider_metadata == {"openrouter": {"reasoning": "hidden reasoning"}}
+    assert resp.provider_metadata is not None
+    assert resp.provider_metadata["openrouter"] == {"reasoning": "hidden reasoning"}
+    assert resp.provider_metadata["openai_compat"]["request_plan"]["input_mode"] == "full"
+
+
+@pytest.mark.parametrize(
+    ("provider_key", "base_url", "provider_state"),
+    [
+        (
+            "deepseek",
+            "https://api.deepseek.com/v1",
+            {"deepseek": {"reasoning_content": "private-deepseek-state"}},
+        ),
+        (
+            "qwen",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            {"qwen": {"reasoning_content": "private-qwen-state"}},
+        ),
+        (
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            {
+                "openrouter": {
+                    "reasoning": "private-openrouter-state",
+                    "reasoning_details": [
+                        {"type": "reasoning.encrypted", "data": "opaque-openrouter-state"}
+                    ],
+                }
+            },
+        ),
+        (
+            "mistral",
+            "https://api.mistral.ai/v1",
+            {
+                "mistral": {
+                    "content_chunks": [
+                        {
+                            "type": "thinking",
+                            "thinking": "private-mistral-state",
+                            "signature": "opaque-mistral-signature",
+                        },
+                        {"type": "text", "text": "public answer"},
+                    ]
+                }
+            },
+        ),
+    ],
+)
+def test_openai_compat_never_replays_state_from_a_different_credential_route(
+    provider_key: str,
+    base_url: str,
+    provider_state: dict[str, object],
+) -> None:
+    sent: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content.decode()))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    producer = OpenAICompatClient(
+        base_url=base_url,
+        api_key="credential-a",
+        model="route-model",
+        provider_key=provider_key,
+    )
+    consumer = OpenAICompatClient(
+        base_url=base_url,
+        api_key="credential-b",
+        model="route-model",
+        provider_key=provider_key,
+        transport=httpx.MockTransport(handler),
+    )
+    assistant = {
+        "role": "assistant",
+        "content": "public answer",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "fs_read", "arguments": "{}"},
+            }
+        ],
+        PROVIDER_METADATA_KEY: stamp_provider_metadata_for_route(
+            provider_state,
+            producer.route_identity,
+        ),
+    }
+
+    consumer.chat(
+        messages=[
+            {"role": "user", "content": "read"},
+            assistant,
+            {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+        ]
+    )
+
+    serialized = json.dumps(sent[0]["messages"])
+    assert "private-" not in serialized
+    assert "opaque-" not in serialized
+    assert sent[0]["messages"][1]["content"] == "public answer"
+
+
+def test_openai_compat_count_gates_foreign_route_before_transport_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    producer = OpenAICompatClient(
+        base_url="https://api.deepseek.com/v1",
+        api_key="credential-a",
+        model="route-model",
+        provider_key="deepseek",
+    )
+    consumer = OpenAICompatClient(
+        base_url="https://api.deepseek.com/v1",
+        api_key="credential-b",
+        model="route-model",
+        provider_key="deepseek",
+    )
+    projected_inputs: list[list[dict[str, object]]] = []
+    original = openai_compat_mod._messages_for_transport
+
+    def capture_projection(
+        messages: list[dict[str, object]],
+        *,
+        provider_key: str | None,
+        reasoning_provider_key: str | None = None,
+    ) -> list[dict[str, object]]:
+        projected_inputs.append(messages)
+        return original(
+            messages,
+            provider_key=provider_key,
+            reasoning_provider_key=reasoning_provider_key,
+        )
+
+    monkeypatch.setattr(openai_compat_mod, "_messages_for_transport", capture_projection)
+    consumer.count_input_tokens(
+        messages=[
+            {
+                "role": "assistant",
+                "content": "public answer",
+                PROVIDER_METADATA_KEY: stamp_provider_metadata_for_route(
+                    {"deepseek": {"reasoning_content": "private-count-state"}},
+                    producer.route_identity,
+                ),
+            }
+        ]
+    )
+
+    assert projected_inputs == [[{"role": "assistant", "content": "public answer"}]]
+
+
+def test_openai_compat_extra_headers_use_same_canonical_form_on_wire_and_route() -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(request.headers))
+        assert request.headers.get_list("authorization") == ["Bearer override"]
+        assert request.headers.get_list("content-type") == ["application/custom+json"]
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://gateway.example/v1",
+        api_key="credential",
+        model="route-model",
+        extra_headers={
+            " X-Tenant-ID ": "  tenant-a  ",
+            "Authorization": "Bearer override",
+            "Content-Type": "application/custom+json",
+        },
+        transport=httpx.MockTransport(handler),
+    )
+    canonical = OpenAICompatClient(
+        base_url="https://gateway.example/v1",
+        api_key="credential",
+        model="route-model",
+        extra_headers={
+            "x-tenant-id": "tenant-a",
+            "authorization": "Bearer override",
+            "content-type": "application/custom+json",
+        },
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert client.extra_headers == {
+        "x-tenant-id": "tenant-a",
+        "authorization": "Bearer override",
+        "content-type": "application/custom+json",
+    }
+    assert captured["x-tenant-id"] == "tenant-a"
+    assert captured["authorization"] == "Bearer override"
+    assert captured["content-type"] == "application/custom+json"
+    assert client.route_identity.fingerprint == canonical.route_identity.fingerprint
+
+    with pytest.raises(ValueError, match="Duplicate extra header name"):
+        OpenAICompatClient(
+            base_url="https://gateway.example/v1",
+            api_key="credential",
+            model="route-model",
+            extra_headers={"X-Tenant-ID": "tenant-a", "x-tenant-id": "tenant-b"},
+        )

@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import AppConfig, ConfigError, resolve_model_metadata_policy
-from .model_registry import ModelRegistry
+from .model_registry import (
+    DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS,
+    DEFAULT_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS,
+    ModelRegistry,
+)
 
 _CAPACITY_FIELDS: tuple[str, ...] = ("context_window_tokens", "max_output_tokens")
 
@@ -151,15 +155,14 @@ def _format_warning_message(
     fallback_capacity_fields: tuple[str, ...],
     last_registry_error: str | None,
 ) -> str:
-    roles_text = ", ".join(roles)
-    fields_text = ", ".join(fallback_capacity_fields)
-    message = (
-        f"Model metadata warning for {model_name} (roles: {roles_text}): "
-        f"fallback capacity metadata in {fields_text}. {_format_fix_hint()}"
+    _ = roles, fallback_capacity_fields, last_registry_error
+    return (
+        f"Unknown model {model_name}: using default context limits "
+        f"({DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS:,} context, "
+        f"{DEFAULT_UNKNOWN_MODEL_MAX_OUTPUT_TOKENS:,} output). "
+        f"Tune in chat with /config set {model_name} <context> <max_output>, "
+        "or set SYLLIPTOR_CONTEXT_WINDOW."
     )
-    if last_registry_error:
-        message += f" Registry detail: {last_registry_error}."
-    return message
 
 
 def _format_strict_error(

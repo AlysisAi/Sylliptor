@@ -395,6 +395,26 @@ def _start_forge_test_watchdog(
 
 
 @pytest.fixture(autouse=True)
+def block_live_ddgs_network(monkeypatch: pytest.MonkeyPatch):
+    """Structural guard: the keyless ddgs web-search backend is ready by default,
+    so any test that reaches it without stubbing would hit the live DuckDuckGo
+    engines. Fail loudly instead; tests stub ddgs_search or pass text_search_fn."""
+
+    def _blocked(query: str, *, max_results: int, timeout_s: float):
+        raise RuntimeError(
+            "live ddgs network call attempted in tests: stub "
+            "sylliptor_agent_cli.tools.web_search.ddgs_search, pass text_search_fn, "
+            "or set SYLLIPTOR_WEB_SEARCH_KEYLESS=0"
+        )
+
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.tools.web_search_ddgs._default_text_search",
+        _blocked,
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def forge_execution_test_timeout(request: pytest.FixtureRequest):
     path = getattr(request, "path", None)
     if path is None or path.name not in _FORGE_EXECUTION_TEST_FILES:

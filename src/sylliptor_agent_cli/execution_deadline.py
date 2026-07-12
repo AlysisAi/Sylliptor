@@ -608,11 +608,6 @@ def temporarily_clamp_client_timeout(
         return
     original = client.timeout_s
     original_retry_deadline = getattr(client, "_provider_retry_deadline_allows", _MISSING)
-    original_finalization_retry_used = getattr(
-        client,
-        "_provider_finalization_retry_used",
-        _MISSING,
-    )
     timeout = deadline_timeout_or_raise(
         deadline,
         float(original) if original is not None else None,
@@ -627,27 +622,19 @@ def temporarily_clamp_client_timeout(
             float(minimum_timeout_seconds),
         )
         in_finalization = deadline.phase() == DeadlinePhase.FINALIZATION_WINDOW
-        finalization_retry_available = in_finalization and not bool(
-            getattr(client, "_provider_finalization_retry_used", False)
-        )
         decision = deadline.start_decision(
             DeadlineOperation.PROVIDER_RETRY_SLEEP,
             minimum_remaining_seconds=retry_window_seconds,
             estimated_duration_seconds=retry_window_seconds,
-            allow_during_finalization=finalization_retry_available,
+            allow_during_finalization=in_finalization,
         )
-        if not decision.allowed:
-            return False
-        if finalization_retry_available:
-            client._provider_finalization_retry_used = True
-        return True
+        return decision.allowed
 
     client.timeout_s = timeout
     client._provider_retry_deadline_allows = _provider_retry_deadline_allows
     try:
         yield
     finally:
-        finalization_retry_used = bool(getattr(client, "_provider_finalization_retry_used", False))
         client.timeout_s = original
         if original_retry_deadline is _MISSING:
             try:
@@ -656,15 +643,3 @@ def temporarily_clamp_client_timeout(
                 pass
         else:
             client._provider_retry_deadline_allows = original_retry_deadline
-        if original_finalization_retry_used is _MISSING:
-            if finalization_retry_used:
-                client._provider_finalization_retry_used = True
-            else:
-                try:
-                    delattr(client, "_provider_finalization_retry_used")
-                except AttributeError:
-                    pass
-        else:
-            client._provider_finalization_retry_used = (
-                bool(original_finalization_retry_used) or finalization_retry_used
-            )

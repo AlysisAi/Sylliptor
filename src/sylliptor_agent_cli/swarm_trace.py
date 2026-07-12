@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import warnings
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,7 +19,6 @@ from .surface.rich_surface import (
     _summarize_tool_output,
     _tool_display_name,
     _tool_input_preview,
-    _tool_reasoning_hints,
     _truncate_inline,
 )
 from .surface.types import (
@@ -155,6 +155,7 @@ class SerializedSwarmTraceSink:
         self._queue: queue.Queue[SwarmTraceEvent | object] = queue.Queue()
         self._closed = False
         self._close_lock = threading.Lock()
+        self.write_failures = 0
         self.artifact_path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = self.artifact_path.open("a", encoding="utf-8")
         self._thread = threading.Thread(target=self._consume, daemon=True)
@@ -193,8 +194,18 @@ class SerializedSwarmTraceSink:
         try:
             self._fh.write(json.dumps(event.to_json(), ensure_ascii=False) + "\n")
             self._fh.flush()
-        except Exception:
-            return
+        except Exception as exc:  # noqa: BLE001 - a trace write must not kill the run
+            # Non-silent: a broken swarm-trace artifact must be observable, not a
+            # silently-truncated trace an autonomous harness would misread as complete.
+            self.write_failures += 1
+            if self.write_failures == 1:
+                warnings.warn(
+                    f"swarm trace write to {self.artifact_path} failed "
+                    f"({type(exc).__name__}: {exc}); subsequent failures are counted but "
+                    "not re-warned.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     def _render_live(self, event: SwarmTraceEvent) -> None:
         if self.trace_level == "off":
@@ -372,15 +383,11 @@ class SwarmWorkerTraceSurface:
         self._emit("worker.tool", f"Step {event.step}: {display}")
         if self.trace_level != "full":
             return
-        why, expect, fallback = _tool_reasoning_hints(event.name)
-        self._emit("worker.tool", f"Goal: {why}", verbosity="full")
-        self._emit("worker.tool", f"Action: {expect}", verbosity="full")
         self._emit(
             "worker.tool",
             f"Input: {_tool_input_preview(event.name, event.args)}",
             verbosity="full",
         )
-        self._emit("worker.tool", f"Fallback: {fallback}", verbosity="full")
 
     def on_tool_output(self, event: ToolOutputEvent) -> None:
         summary = _summarize_tool_output(event.name, event.chunk).strip()
@@ -398,20 +405,8 @@ class SwarmWorkerTraceSurface:
         if event.status == "done":
             message = f"{display}: {summary} ({elapsed})" if summary else f"{display} ({elapsed})"
             self._emit("worker.tool", message)
-            if self.trace_level == "full":
-                self._emit(
-                    "worker.tool",
-                    "Decision: Accepted tool output and continued to the next step.",
-                    verbosity="full",
-                )
             return
         self._emit("worker.tool", f"{display} failed ({elapsed}){detail}")
-        if self.trace_level == "full":
-            self._emit(
-                "worker.tool",
-                "Decision: Tool failed; switching to a fallback or narrower action.",
-                verbosity="full",
-            )
 
     def on_patch_generated(self, event: PatchEvent) -> None:
         if self.trace_level != "full":

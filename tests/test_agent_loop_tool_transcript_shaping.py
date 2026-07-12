@@ -55,15 +55,15 @@ def _cfg() -> AppConfig:
         "compaction": {
             "enabled": True,
             "offload_tool_outputs": True,
-            "tool_output_offload_threshold_chars": 2500,
-            "tool_output_preview_chars": 400,
+            "tool_output_offload_threshold_chars": 6000,
+            "tool_output_preview_chars": 2000,
             "summarize_conversation": False,
         },
     }
     return cfg
 
 
-def test_run_turn_shapes_medium_tool_output_but_keeps_tool_transcript_valid(
+def test_run_turn_keeps_medium_tool_output_full_and_tool_transcript_valid(
     tmp_path: Path,
 ) -> None:
     sample = tmp_path / "sample.txt"
@@ -124,24 +124,17 @@ def test_run_turn_shapes_medium_tool_output_but_keeps_tool_transcript_valid(
     assert tool_message["tool_call_id"] == "tc-read"
     assert assistant_call["tool_calls"][0]["id"] == "tc-read"
 
-    shaped = json.loads(str(tool_message.get("content") or "{}"))
-    assert shaped["transcript_shaped"] is True
-    assert shaped["tool"] == "fs_read"
-    assert shaped["tool_call_id"] == "tc-read"
-    assert shaped["summary"] == 'Loaded "sample.txt" (1800 chars).'
-    assert shaped["preview_chars"] == 400
-    assert shaped["original_chars"] > 1800
-    assert shaped["content_truncated"] is True
-    assert len(shaped["preview"]) <= 400 + len("...(truncated)")
-    assert "A" * 800 not in str(tool_message.get("content") or "")
+    content = json.loads(str(tool_message.get("content") or "{}"))
+    assert content["path"] == "sample.txt"
+    assert len(str(content["content"])) == 1800
+    assert "transcript_shaped" not in content
+    assert "A" * 800 in str(tool_message.get("content") or "")
 
     persisted_tool_message = next(
         message for message in reversed(persisted_messages) if str(message.get("role")) == "tool"
     )
     assert persisted_tool_message["tool_call_id"] == "tc-read"
-    assert (
-        json.loads(str(persisted_tool_message.get("content") or "{}"))["tool_call_id"] == "tc-read"
-    )
+    assert json.loads(str(persisted_tool_message.get("content") or "{}"))["path"] == "sample.txt"
 
     tool_result_events = [
         dict(event.get("payload") or {})
@@ -152,9 +145,9 @@ def test_run_turn_shapes_medium_tool_output_but_keeps_tool_transcript_valid(
     assert tool_result_events[-1]["name"] == "fs_read"
     assert len(str((tool_result_events[-1]["result"] or {}).get("content") or "")) == 1800
     logged_content = json.loads(str(tool_result_events[-1].get("content") or "{}"))
-    assert logged_content["transcript_shaped"] is True
-    assert logged_content["tool_call_id"] == "tc-read"
-    assert "A" * 800 not in str(tool_result_events[-1].get("content") or "")
+    assert logged_content["path"] == "sample.txt"
+    assert "transcript_shaped" not in logged_content
+    assert "A" * 800 in str(tool_result_events[-1].get("content") or "")
 
 
 def test_run_turn_preserves_deepseek_reasoning_metadata_for_tool_followup(

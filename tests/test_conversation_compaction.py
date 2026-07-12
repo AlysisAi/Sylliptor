@@ -15,6 +15,8 @@ from sylliptor_agent_cli.agent_loop import (
 from sylliptor_agent_cli.compaction.conversation_compactor import MEMORY_MARKER, PINS_MARKER
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse
+from sylliptor_agent_cli.llm.types import InputTokenCount, UsageConfidence, UsageSource
+from sylliptor_agent_cli.session_store import read_session_events
 
 
 def _summary(*, decisions: list[str]) -> dict[str, Any]:
@@ -463,6 +465,449 @@ def test_maybe_compact_does_not_compact_below_trigger_threshold(tmp_path: Path) 
         assert changed is False
         assert compacted == session.messages
         assert not list((_compaction_session_dir(session) / "history").glob("chunk_*.jsonl"))
+    finally:
+        session.close()
+
+
+def test_compactor_refreshes_calibration_route_after_client_reconfiguration(
+    tmp_path: Path,
+) -> None:
+    session = create_session(
+        cfg=_make_cfg(),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=True,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-route-refresh",
+    )
+    try:
+        assert session.conversation_compactor is not None
+        session.client.provider_key = "provider-b"
+        session.client.base_url = "https://api.provider-b.example/v1"
+
+        session.refresh_compactor_calibration_filters()
+
+        assert session.conversation_compactor._calibration_filters["provider_key"] == ("provider-b")
+        assert session.conversation_compactor._calibration_filters["base_url_host"] == (
+            "api.provider-b.example"
+        )
+    finally:
+        session.close()
+
+
+def test_maybe_compact_prefers_exact_provider_count_near_trigger(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-exact-count",
+    )
+    event_path = session.store.path
+    exact_count_calls = 0
+    try:
+        assert session.conversation_compactor is not None
+        fake_compactor = _FakeCompactorClient([_summary(decisions=["unused"])])
+        session.conversation_compactor.compactor_client = fake_compactor  # type: ignore[assignment]
+        _append_turns(session, count=120, prefix="large-estimate")
+
+        def exact_counter(
+            _messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]] | None,
+        ) -> InputTokenCount:
+            nonlocal exact_count_calls
+            exact_count_calls += 1
+            return InputTokenCount(input_tokens=100)
+
+        session.conversation_compactor._input_token_counter = exact_counter
+        compacted, changed = session.conversation_compactor.maybe_compact(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            focus="exact-count",
+        )
+
+        assert changed is False
+        assert compacted == session.messages
+        assert exact_count_calls == 1
+        assert fake_compactor.calls == 0
+    finally:
+        session.close()
+
+    checks = [
+        event
+        for event in read_session_events(event_path)
+        if event.get("type") == "compaction_check"
+    ]
+    assert checks
+    payload = checks[-1]["payload"]
+    assert payload["comparison_tokens"] == 100
+    assert payload["token_count_source"] == "provider_count"
+    assert payload["token_count_confidence"] == "authoritative"
+
+
+def test_estimated_or_reported_preflight_cannot_lower_calibrated_baseline() -> None:
+    for measurement in (
+        InputTokenCount(
+            input_tokens=100,
+            source=UsageSource.LOCAL_ESTIMATE,
+            confidence=UsageConfidence.ESTIMATED,
+        ),
+        InputTokenCount(
+            input_tokens=200,
+            source=UsageSource.PROVIDER_COUNT,
+            confidence=UsageConfidence.REPORTED,
+        ),
+    ):
+        used, source, confidence = compactor_mod._conservative_input_measurement(
+            baseline_tokens=1000,
+            measurement=measurement,
+        )
+        assert used == 1000
+        assert source == "mixed"
+        assert confidence == "estimated"
+
+    authoritative, source, confidence = compactor_mod._conservative_input_measurement(
+        baseline_tokens=1000,
+        measurement=InputTokenCount(input_tokens=100),
+    )
+    assert authoritative == 100
+    assert source == "provider_count"
+    assert confidence == "authoritative"
+
+    calibrated, source, confidence = compactor_mod._conservative_input_measurement(
+        baseline_tokens=500,
+        measurement=InputTokenCount(
+            input_tokens=600,
+            source=UsageSource.LOCAL_ESTIMATE,
+            confidence=UsageConfidence.ESTIMATED,
+        ),
+        estimate_multiplier=1.6,
+    )
+    assert calibrated == 960
+    assert source == "mixed"
+    assert confidence == "estimated"
+
+
+def test_overflow_fit_check_keeps_calibration_above_estimated_preflight(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    session = create_session(
+        cfg=_make_cfg(),
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "session-artifacts",
+        session_id_override="compaction-calibrated-fit-check",
+    )
+    event_path = session.store.path
+    try:
+        assert session.conversation_compactor is not None
+        monkeypatch.setattr(compactor_mod, "estimate_request_tokens", lambda *_args: 300)
+        monkeypatch.setattr(compactor_mod, "compute_input_budget", lambda *_args, **_kwargs: 500)
+        monkeypatch.setattr(
+            session.usage_summary,
+            "recent_calibration_snapshot",
+            lambda **_kwargs: {"prompt_estimate_error_ratio_p90": 2.0},
+        )
+        session.conversation_compactor._input_token_counter = lambda _messages, _tools: (
+            InputTokenCount(
+                input_tokens=400,
+                source=UsageSource.LOCAL_ESTIMATE,
+                confidence=UsageConfidence.ESTIMATED,
+            )
+        )
+
+        fits = session.conversation_compactor.request_fits_input_budget(
+            messages=[{"role": "user", "content": "small"}],
+            tool_list=None,
+            main_model=session.client.model,
+        )
+
+        assert fits is False
+    finally:
+        session.close()
+
+    verification = [
+        event
+        for event in read_session_events(event_path)
+        if event.get("type") == "compaction_budget_verification"
+    ][-1]["payload"]
+    assert verification["local_used_tokens"] == 300
+    assert verification["calibrated_used_tokens"] == 600
+    assert verification["used_tokens"] == 800
+    assert verification["token_count_source"] == "mixed"
+    assert verification["token_count_confidence"] == "estimated"
+
+
+def test_compaction_counts_provider_bound_ephemeral_messages(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["model_metadata_overrides"] = {
+        "models": {
+            "gpt-5-nano": {
+                "context_window_tokens": 8192,
+                "max_output_tokens": 1024,
+            }
+        }
+    }
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "logs",
+        session_id_override="compaction-provider-bound-count",
+    )
+    captured: list[list[dict[str, Any]]] = []
+    try:
+        assert session.conversation_compactor is not None
+        session.messages.append({"role": "user", "content": "small persistent request"})
+
+        def request_builder(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                *messages,
+                {"role": "system", "content": "EPHEMERAL " + ("x" * 30000)},
+            ]
+
+        def exact_counter(
+            messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]] | None,
+        ) -> InputTokenCount:
+            captured.append(messages)
+            return InputTokenCount(input_tokens=100)
+
+        session.conversation_compactor._input_token_counter = exact_counter
+        compacted, changed = session.conversation_compactor.maybe_compact(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+            request_messages_builder=request_builder,
+        )
+
+        assert changed is False
+        assert compacted == session.messages
+        assert captured
+        assert any("EPHEMERAL" in str(message.get("content") or "") for message in captured[-1])
+    finally:
+        session.close()
+
+
+def test_multimodal_request_uses_provider_count_below_estimate_threshold(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "logs",
+        session_id_override="compaction-media-count",
+    )
+    exact_calls = 0
+    try:
+        assert session.conversation_compactor is not None
+        session.messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            }
+        )
+
+        def exact_counter(
+            _messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]] | None,
+        ) -> InputTokenCount:
+            nonlocal exact_calls
+            exact_calls += 1
+            return InputTokenCount(input_tokens=100)
+
+        session.conversation_compactor._input_token_counter = exact_counter
+        compacted, changed = session.conversation_compactor.maybe_compact(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+        )
+
+        assert changed is False
+        assert compacted == session.messages
+        assert exact_calls == 1
+    finally:
+        session.close()
+
+
+def test_multimodal_compat_estimate_reserves_target_ratio(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"].update(  # type: ignore[index]
+        {
+            "trigger_ratio": 0.90,
+            "target_ratio": 0.70,
+            "recent_user_turns_to_keep": 1,
+        }
+    )
+    cfg.extra_fields["model_metadata_overrides"] = {
+        "models": {
+            "gpt-5-nano": {
+                "context_window_tokens": 12000,
+                "max_output_tokens": 1000,
+            }
+        }
+    }
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "logs",
+        session_id_override="compaction-media-uncertainty",
+    )
+    event_path = session.store.path
+    try:
+        assert session.conversation_compactor is not None
+        compactor = session.conversation_compactor
+        compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [_summary(decisions=["preserve media request"])]
+        )
+        media_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "inspect"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AAAA"},
+                },
+            ],
+        }
+        session.messages.append(media_message)
+        budget = compactor_mod.compute_input_budget(
+            session.model_registry.get(session.client.model),
+            safety_margin=compactor._settings.safety_margin_tokens,
+        )
+        target_tokens = int(budget * compactor._settings.target_ratio)
+        trigger_tokens = int(budget * compactor._settings.trigger_ratio)
+        turn = 0
+        while compactor_mod.estimate_request_tokens(session.messages, None) <= (
+            target_tokens + 100
+        ):
+            text = " ".join(f"segment_{turn}_{idx}" for idx in range(100))
+            session.messages[-1:-1] = [
+                {"role": "user", "content": text},
+                {"role": "assistant", "content": text},
+            ]
+            turn += 1
+            assert turn < 60
+        estimated = compactor_mod.estimate_request_tokens(
+            session.messages,
+            None,
+        )
+        assert target_tokens < estimated < trigger_tokens
+
+        compactor._input_token_counter = lambda messages, tools: InputTokenCount(
+            input_tokens=compactor_mod.estimate_request_tokens(messages, tools),
+            source=UsageSource.LOCAL_ESTIMATE,
+            confidence=UsageConfidence.ESTIMATED,
+        )
+        _messages, changed = compactor.maybe_compact(
+            messages=session.messages,
+            tool_list=None,
+            main_model=session.client.model,
+        )
+
+        assert changed is True
+    finally:
+        session.close()
+
+    checks = [
+        event["payload"]
+        for event in read_session_events(event_path)
+        if event.get("type") == "compaction_check"
+    ]
+    uncertain = next(payload for payload in checks if payload["media_input_uncertain"] is True)
+    assert uncertain["comparison_tokens"] < uncertain["trigger_tokens"]
+    assert uncertain["effective_trigger_tokens"] == uncertain["target_tokens"]
+
+
+def test_overflow_compaction_relaxes_recent_window_but_preserves_latest_turn(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["recent_user_turns_to_keep"] = 8  # type: ignore[index]
+    cfg.extra_fields["compaction"]["importance_enabled"] = False  # type: ignore[index]
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=tmp_path / "logs",
+        session_id_override="compaction-hard-pressure",
+    )
+    counted_requests: list[str] = []
+    try:
+        assert session.conversation_compactor is not None
+
+        def exact_counter(
+            messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]] | None,
+        ) -> InputTokenCount:
+            counted_requests.append(json.dumps(messages, ensure_ascii=False))
+            return InputTokenCount(input_tokens=100)
+
+        session.conversation_compactor._input_token_counter = exact_counter
+        session.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [_summary(decisions=["preserved"])]
+        )
+        oldest = "oldest overflow turn " + ("o" * 3000)
+        latest = "latest active turn " + ("l" * 1000)
+        session.messages.extend(
+            [
+                {"role": "user", "content": oldest},
+                {"role": "assistant", "content": "old response"},
+                {"role": "user", "content": latest},
+                {"role": "assistant", "content": "latest response"},
+            ]
+        )
+
+        compacted, changed = session.conversation_compactor.compact_for_overflow(
+            messages=session.messages,
+            tool_list=session.tool_list,
+            main_model=session.client.model,
+        )
+
+        serialized = json.dumps(compacted, ensure_ascii=False)
+        assert changed is True
+        assert oldest not in serialized
+        assert latest in serialized
+        assert len(counted_requests) >= 2
+        assert oldest in counted_requests[0]
+        assert oldest not in counted_requests[-1]
     finally:
         session.close()
 
@@ -1329,7 +1774,7 @@ def test_summary_normalization_unions_previous_items(tmp_path: Path) -> None:
         session.close()
 
 
-def test_compactor_failure_can_drop_chunk_after_history_write(tmp_path: Path) -> None:
+def test_compactor_failure_preserves_chunk_and_writes_no_partial_artifacts(tmp_path: Path) -> None:
     cfg = _make_cfg()
     cfg.extra_fields["compaction"]["recent_user_turns_to_keep"] = 1  # type: ignore[index]
     cfg.extra_fields["compaction"]["importance_enabled"] = False  # type: ignore[index]
@@ -1374,26 +1819,75 @@ def test_compactor_failure_can_drop_chunk_after_history_write(tmp_path: Path) ->
             main_model=session.client.model,
             focus="faildrop",
         )
-        assert changed is True
+        assert changed is False
         assert failing.calls >= 2
 
         history_dir = _compaction_session_dir(session) / "history"
         history_files = list(history_dir.glob("chunk_*.jsonl"))
-        assert history_files
-        first_chunk = history_files[0].read_text(encoding="utf-8")
-        assert high_signal in first_chunk
+        assert history_files == []
 
         serialized = json.dumps(compacted, ensure_ascii=False)
-        assert high_signal not in serialized
-        assert any(
-            str(msg.get("content") or "").startswith(MEMORY_MARKER)
+        assert high_signal in serialized
+        assert not any(
+            str(msg.get("content") or "").startswith((MEMORY_MARKER, PINS_MARKER))
             for msg in compacted
-            if str(msg.get("role") or "") == "user"
-        )
-        assert any(
-            str(msg.get("content") or "").startswith(PINS_MARKER)
-            for msg in compacted
-            if str(msg.get("role") or "") == "user"
         )
     finally:
         session.close()
+
+
+def test_compactor_restores_summary_pins_and_history_index_for_resume(tmp_path: Path) -> None:
+    cfg = _make_cfg()
+    cfg.extra_fields["compaction"]["recent_user_turns_to_keep"] = 1  # type: ignore[index]
+    sessions_dir = tmp_path / "logs"
+    session_id = "compaction-state-restore"
+    first = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    try:
+        assert first.conversation_compactor is not None
+        first.conversation_compactor.compactor_client = _FakeCompactorClient(  # type: ignore[assignment]
+            [_summary(decisions=["restore this decision"])]
+        )
+        _append_turns(first, count=4, prefix="restore")
+        compacted, changed = first.conversation_compactor.compact_now(
+            messages=first.messages,
+            tool_list=first.tool_list,
+            main_model=first.client.model,
+        )
+        first.messages = compacted
+        assert changed is True
+        expected_index = first.conversation_compactor.state.history_chunk_index
+        expected_summary = first.conversation_compactor.state.summary
+        expected_pins = first.conversation_compactor.state.pins
+        assert expected_index > 0
+    finally:
+        first.close()
+
+    resumed = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+        session_source="resume",
+    )
+    try:
+        assert resumed.conversation_compactor is not None
+        assert resumed.conversation_compactor.state.history_chunk_index == expected_index
+        assert resumed.conversation_compactor.state.summary == expected_summary
+        assert resumed.conversation_compactor.state.pins == expected_pins
+    finally:
+        resumed.close()

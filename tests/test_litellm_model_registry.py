@@ -13,6 +13,7 @@ from sylliptor_agent_cli.litellm_static_provider import (
 )
 from sylliptor_agent_cli.model_registry import ModelRegistry
 from sylliptor_agent_cli.token_budget import compute_input_budget
+from sylliptor_agent_cli.usage_tracker import compute_context_left
 
 
 def _bundled_meta(
@@ -50,6 +51,46 @@ def test_litellm_static_provider_handles_missing_bundled_catalog(monkeypatch) ->
     assert result.error == "bundled model catalog missing"
     assert result.context_window_tokens is None
     assert result.max_output_tokens is None
+
+
+def test_provider_scoped_catalog_lookup_never_borrows_another_host_route() -> None:
+    cases = [
+        ("MiniMax-M2.7", "https://api.minimax.io/v1", "minimax", None),
+        ("yi-large", "https://api.lingyiwanwu.com/v1", "01ai", None),
+        ("llama3.3-70b", "https://api.cerebras.ai/v1", "cerebras", None),
+        (
+            "sonar-pro",
+            "https://api.perplexity.ai",
+            "perplexity",
+            "perplexity/sonar-pro",
+        ),
+        ("zai-org/GLM-5.1", "https://api.together.ai/v1", "together", None),
+        (
+            "accounts/fireworks/models/deepseek-v4-pro",
+            "https://api.fireworks.ai/inference/v1",
+            "fireworks",
+            "fireworks_ai/deepseek-v4-pro",
+        ),
+        (
+            "gpt-4o",
+            "https://api.groq.com/openai/v1",
+            "groq",
+            None,
+        ),
+    ]
+
+    for model, base_url, provider_hint, expected_key in cases:
+        result = resolve_litellm_static_metadata(
+            model,
+            base_url=base_url,
+            provider_hint=provider_hint,
+        )
+        assert result.model_key == expected_key
+        if expected_key is None:
+            assert result.error == "model not found in bundled model catalog"
+        else:
+            assert result.error is None
+            assert result.raw_metadata["catalog_provider_hint"] == provider_hint
 
 
 def test_litellm_static_provider_handles_invalid_bundled_catalog(monkeypatch) -> None:
@@ -130,6 +171,10 @@ def test_litellm_static_provider_uses_model_variants(monkeypatch) -> None:
                 "max_output_tokens": 8192,
                 "input_cost_per_token": 0.000001,
                 "output_cost_per_token": 0.000002,
+                "cache_read_input_token_cost": 0.0000001,
+                "cache_creation_input_token_cost": 0.00000125,
+                "cache_creation_input_token_cost_above_1hr": 0.000002,
+                "output_cost_per_reasoning_token": 0.000003,
             },
             "ignored_string": "not-a-model",
         },
@@ -141,6 +186,55 @@ def test_litellm_static_provider_uses_model_variants(monkeypatch) -> None:
     assert result.max_output_tokens == 8192
     assert result.input_cost_per_token == 0.000001
     assert result.output_cost_per_token == 0.000002
+    assert result.cache_read_input_cost_per_token == 0.0000001
+    assert result.cache_creation_input_cost_per_token == 0.00000125
+    assert result.cache_creation_1h_input_cost_per_token == 0.000002
+    assert result.reasoning_output_cost_per_token == 0.000003
+
+
+def test_bundled_snapshot_resolves_1h_cache_write_rate() -> None:
+    provider_mod._load_bundled_model_catalog.cache_clear()
+    catalog = provider_mod._load_bundled_model_catalog()
+
+    result = resolve_litellm_static_metadata("claude-opus-4-1")
+    assert result.error is None
+    raw = catalog[result.model_key]
+    assert result.cache_creation_1h_input_cost_per_token is not None
+    assert (
+        result.cache_creation_1h_input_cost_per_token
+        == raw["cache_creation_input_token_cost_above_1hr"]
+    )
+    assert result.cache_creation_input_cost_per_token == raw["cache_creation_input_token_cost"]
+    assert (
+        result.cache_creation_1h_input_cost_per_token > result.cache_creation_input_cost_per_token
+    )
+
+
+def test_bundled_snapshot_resolves_reasoning_output_rate() -> None:
+    provider_mod._load_bundled_model_catalog.cache_clear()
+    catalog = provider_mod._load_bundled_model_catalog()
+
+    candidates = [
+        (key, entry)
+        for key, entry in catalog.items()
+        if isinstance(entry, dict)
+        and isinstance(entry.get("output_cost_per_reasoning_token"), (int, float))
+        and entry.get("output_cost_per_reasoning_token") != entry.get("output_cost_per_token")
+    ]
+    assert candidates
+
+    # Variant matching may resolve a dated key to its undated sibling, so only
+    # keep candidates that round-trip to their own catalog entry.
+    for key, entry in candidates:
+        result = resolve_litellm_static_metadata(key)
+        if result.model_key != key:
+            continue
+        assert result.error is None
+        assert result.reasoning_output_cost_per_token is not None
+        assert result.reasoning_output_cost_per_token == entry["output_cost_per_reasoning_token"]
+        assert result.reasoning_output_cost_per_token != result.output_cost_per_token
+        return
+    raise AssertionError("no reasoning-rate catalog entry resolved to itself")
 
 
 def test_litellm_static_provider_ignores_sample_spec_entry(monkeypatch) -> None:
@@ -274,7 +368,7 @@ def test_env_overrides_beat_user_and_bundled_catalog(monkeypatch) -> None:
     monkeypatch.setattr(
         model_registry_mod,
         "resolve_litellm_static_metadata",
-        lambda _model, *, base_url=None: _bundled_meta(
+        lambda _model, *, base_url=None, provider_hint=None: _bundled_meta(
             context_window_tokens=128000,
             max_output_tokens=4096,
             supports_vision=True,
@@ -316,7 +410,7 @@ def test_user_overrides_beat_bundled_catalog(monkeypatch) -> None:
     monkeypatch.setattr(
         model_registry_mod,
         "resolve_litellm_static_metadata",
-        lambda _model, *, base_url=None: _bundled_meta(
+        lambda _model, *, base_url=None, provider_hint=None: _bundled_meta(
             context_window_tokens=128000,
             max_output_tokens=4096,
             supports_vision=True,
@@ -331,6 +425,9 @@ def test_user_overrides_beat_bundled_catalog(monkeypatch) -> None:
                 "gpt-5-nano": {
                     "context_window_tokens": 99999,
                     "max_output_tokens": 4444,
+                    "cache_read_input_cost_per_token": 0.0000001,
+                    "cache_creation_input_cost_per_token": 0.0000002,
+                    "cache_creation_1h_input_cost_per_token": 0.0000003,
                 }
             }
         }
@@ -340,16 +437,49 @@ def test_user_overrides_beat_bundled_catalog(monkeypatch) -> None:
     assert meta.max_output_tokens == 4444
     assert meta.input_cost_per_token == 0.000001
     assert meta.output_cost_per_token == 0.000002
+    assert meta.cache_read_input_cost_per_token == 0.0000001
+    assert meta.cache_creation_input_cost_per_token == 0.0000002
+    assert meta.cache_creation_1h_input_cost_per_token == 0.0000003
     assert meta.field_sources["context_window_tokens"] == "user:models['gpt-5-nano']"
     assert meta.field_sources["max_output_tokens"] == "user:models['gpt-5-nano']"
+    assert meta.field_sources["cache_read_input_cost_per_token"] == "user:models['gpt-5-nano']"
     assert meta.field_sources["input_cost_per_token"] == BUNDLED_MODEL_CATALOG_SOURCE
+
+
+def test_reasoning_support_uses_catalog_and_model_override_precedence(monkeypatch) -> None:
+    monkeypatch.setattr(
+        model_registry_mod,
+        "resolve_litellm_static_metadata",
+        lambda _model, *, base_url=None, provider_hint=None: LiteLLMStaticMetadata(
+            model_key="openai/gpt-test",
+            context_window_tokens=128000,
+            max_output_tokens=4096,
+            supports_vision=False,
+            input_cost_per_token=None,
+            output_cost_per_token=None,
+            raw_metadata={"supports_reasoning": True},
+            error=None,
+        ),
+    )
+    cfg = AppConfig(base_url="https://api.openai.com/v1", model="gpt-test")
+
+    catalog_meta = ModelRegistry(cfg=cfg).get("gpt-test")
+    assert catalog_meta.supports_reasoning is True
+    assert catalog_meta.field_sources["supports_reasoning"] == BUNDLED_MODEL_CATALOG_SOURCE
+
+    cfg.extra_fields = {
+        "model_metadata_overrides": {"models": {"gpt-test": {"supports_reasoning": False}}}
+    }
+    overridden_meta = ModelRegistry(cfg=cfg).get("gpt-test")
+    assert overridden_meta.supports_reasoning is False
+    assert overridden_meta.field_sources["supports_reasoning"] == "user:models['gpt-test']"
 
 
 def test_bundled_catalog_beats_fallback_when_available(monkeypatch) -> None:
     monkeypatch.setattr(
         model_registry_mod,
         "resolve_litellm_static_metadata",
-        lambda _model, *, base_url=None: _bundled_meta(
+        lambda _model, *, base_url=None, provider_hint=None: _bundled_meta(
             context_window_tokens=200000,
             max_output_tokens=8192,
             supports_vision=True,
@@ -375,7 +505,7 @@ def test_built_in_deepseek_v4_metadata_beats_fallback_when_bundled_catalog_lags(
     monkeypatch.setattr(
         model_registry_mod,
         "resolve_litellm_static_metadata",
-        lambda _model, *, base_url=None: _bundled_meta(
+        lambda _model, *, base_url=None, provider_hint=None: _bundled_meta(
             context_window_tokens=None,
             max_output_tokens=None,
             error="model not found in bundled model catalog",
@@ -402,7 +532,7 @@ def test_per_field_mixing_sets_source_to_mixed(monkeypatch) -> None:
     monkeypatch.setattr(
         model_registry_mod,
         "resolve_litellm_static_metadata",
-        lambda _model, *, base_url=None: _bundled_meta(
+        lambda _model, *, base_url=None, provider_hint=None: _bundled_meta(
             context_window_tokens=128000,
             max_output_tokens=4096,
             supports_vision=True,
@@ -421,7 +551,7 @@ def test_model_registry_uses_bundled_total_context_for_budget(monkeypatch) -> No
     monkeypatch.setattr(
         model_registry_mod,
         "resolve_litellm_static_metadata",
-        lambda _model, *, base_url=None: LiteLLMStaticMetadata(
+        lambda _model, *, base_url=None, provider_hint=None: LiteLLMStaticMetadata(
             model_key="dashscope/qwen3.5-plus",
             context_window_tokens=1057344,
             max_output_tokens=65536,
@@ -446,7 +576,7 @@ def test_endpoint_scoped_overrides_take_precedence(monkeypatch) -> None:
     monkeypatch.setattr(
         model_registry_mod,
         "resolve_litellm_static_metadata",
-        lambda _model, *, base_url=None: _bundled_meta(
+        lambda _model, *, base_url=None, provider_hint=None: _bundled_meta(
             context_window_tokens=128000,
             max_output_tokens=4096,
         ),
@@ -475,7 +605,7 @@ def test_override_alias_matching_supports_provider_and_version_variants(monkeypa
     monkeypatch.setattr(
         model_registry_mod,
         "resolve_litellm_static_metadata",
-        lambda _model, *, base_url=None: _bundled_meta(
+        lambda _model, *, base_url=None, provider_hint=None: _bundled_meta(
             context_window_tokens=None,
             max_output_tokens=None,
         ),
@@ -505,7 +635,7 @@ def test_registry_records_bundled_catalog_error_and_fallback_warning(monkeypatch
     monkeypatch.setattr(
         model_registry_mod,
         "resolve_litellm_static_metadata",
-        lambda _model, *, base_url=None: _bundled_meta(
+        lambda _model, *, base_url=None, provider_hint=None: _bundled_meta(
             context_window_tokens=None,
             max_output_tokens=None,
             error="bundled model catalog missing",
@@ -514,7 +644,33 @@ def test_registry_records_bundled_catalog_error_and_fallback_warning(monkeypatch
     cfg = AppConfig(model="gpt-5-nano")
     registry = ModelRegistry(cfg=cfg)
     meta = registry.get("gpt-5-nano")
-    assert meta.context_window_tokens == 8192
-    assert meta.max_output_tokens == 2048
+    assert meta.context_window_tokens == 128000
+    assert meta.max_output_tokens == 8192
     assert registry.last_error == "bundled model catalog missing"
     assert any("fallback context/max_output" in warning for warning in meta.warnings)
+
+
+def test_unknown_model_fallback_window_keeps_startup_context_gauge_healthy(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        model_registry_mod,
+        "resolve_litellm_static_metadata",
+        lambda _model, *, base_url=None, provider_hint=None: _bundled_meta(
+            context_window_tokens=None,
+            max_output_tokens=None,
+            error="model not found in bundled model catalog",
+        ),
+    )
+    cfg = AppConfig(model="custom-live-model")
+    registry = ModelRegistry(cfg=cfg)
+
+    ctx = compute_context_left(
+        messages=[{"role": "system", "content": "startup context " * 20_000}],
+        model_name="custom-live-model",
+        registry=registry,
+    )
+
+    assert ctx.context_window_tokens == 128000
+    assert ctx.context_window_percent_left is not None
+    assert ctx.context_window_percent_left > 60.0

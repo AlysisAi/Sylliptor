@@ -156,7 +156,7 @@ def test_temporarily_clamp_client_timeout_restores_original_value() -> None:
     assert client.timeout_s == 60.0
 
 
-def test_finalization_provider_retry_marker_persists_across_clamped_calls() -> None:
+def test_finalization_provider_retries_continue_while_hard_deadline_allows() -> None:
     clock = _FakeClock(now=0.0)
     deadline = ExecutionDeadline.from_absolute(
         started_at_monotonic=0.0,
@@ -164,11 +164,7 @@ def test_finalization_provider_retry_marker_persists_across_clamped_calls() -> N
         configured_duration_seconds=10.0,
         clock=clock,
     )
-    client = type(
-        "Client",
-        (),
-        {"timeout_s": 60.0, "_provider_finalization_retry_used": False},
-    )()
+    client = type("Client", (), {"timeout_s": 60.0})()
 
     assert deadline.phase() == DeadlinePhase.FINALIZATION_WINDOW
 
@@ -180,12 +176,19 @@ def test_finalization_provider_retry_marker_persists_across_clamped_calls() -> N
     ):
         assert client._provider_retry_deadline_allows(0.1) is True
 
-    assert client._provider_finalization_retry_used is True
-
     with temporarily_clamp_client_timeout(
         client,
         deadline,
         reserve_seconds=0.1,
+        minimum_timeout_seconds=0.05,
+    ):
+        assert client._provider_retry_deadline_allows(0.1) is True
+
+    clock.advance(0.7)
+    with temporarily_clamp_client_timeout(
+        client,
+        deadline,
+        reserve_seconds=0.01,
         minimum_timeout_seconds=0.05,
     ):
         assert client._provider_retry_deadline_allows(0.1) is False

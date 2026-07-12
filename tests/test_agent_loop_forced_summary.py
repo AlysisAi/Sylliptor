@@ -135,7 +135,8 @@ def _assert_forced_summary_artifacts(
     surface: _ForcedSummarySurface,
 ) -> str:
     assert _event_payloads(log_path, "forced_final_summary_requested")
-    assert _event_payloads(log_path, "forced_final_summary_completed")
+    completed_events = _event_payloads(log_path, "forced_final_summary_completed")
+    assert completed_events
     assistant_events = _event_payloads(log_path, "assistant_message")
     final_events = _event_payloads(log_path, "final")
     assert assistant_events
@@ -143,6 +144,12 @@ def _assert_forced_summary_artifacts(
     summary = surface.final_messages[-1]
     assert assistant_events[-1]["content"] == summary
     assert final_events[-1]["content"] == summary
+    assert completed_events[-1]["controller_interventions_total"] >= 1
+    assert (
+        final_events[-1]["controller_interventions_total"]
+        == completed_events[-1]["controller_interventions_total"]
+    )
+    assert "controller_interventions" in final_events[-1]
     return summary
 
 
@@ -364,6 +371,12 @@ def test_forced_final_summary_uses_fallback_when_needed(
     final_events = _event_payloads(log_path, "final")
     assert assistant_events[-1]["content"] == surface.final_messages[-1]
     assert final_events[-1]["content"] == surface.final_messages[-1]
+    assert fallback_events[-1]["controller_interventions_total"] >= 1
+    assert (
+        final_events[-1]["controller_interventions_total"]
+        == fallback_events[-1]["controller_interventions_total"]
+    )
+    assert "controller_interventions" in final_events[-1]
 
 
 def test_forced_final_summary_uses_local_fallback_when_deadline_is_too_close(
@@ -413,7 +426,7 @@ def test_forced_final_summary_uses_local_fallback_when_deadline_is_too_close(
     assert fallback_events[-1]["fallback_reason"] == "local_summary_due_to_deadline"
 
 
-def test_exploration_retry_exhausted_fallback_summary_uses_truthful_termination_wording(
+def test_max_steps_fallback_summary_uses_truthful_termination_wording_with_stagnation(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "repeat.txt").write_text("x\n", encoding="utf-8")
@@ -429,7 +442,7 @@ def test_exploration_retry_exhausted_fallback_summary_uses_truthful_termination_
         api_key_override="override-key",
         one_shot_execution=True,
         session_log_dir_override=sessions_dir,
-        session_id_override="forced-summary-exploration-retry-exhausted-fallback",
+        session_id_override="forced-summary-exploration-max-steps-fallback",
         surface=surface,
     )
     client = _ScriptedClient(
@@ -442,7 +455,7 @@ def test_exploration_retry_exhausted_fallback_summary_uses_truthful_termination_
                     ],
                     raw={},
                 )
-                for idx in range(1, 6)
+                for idx in range(1, 11)
             ],
         ],
         finalization_response=LLMResponse(content="   ", tool_calls=[], raw={}),
@@ -458,19 +471,26 @@ def test_exploration_retry_exhausted_fallback_summary_uses_truthful_termination_
     assert exit_code == 1
     fallback_events = _event_payloads(log_path, "forced_final_summary_fallback")
     assert fallback_events
-    assert fallback_events[-1]["reason"] == "exploration_retry_exhausted"
-    assert fallback_events[-1]["termination_cause"] == "exploration retries are exhausted"
+    assert fallback_events[-1]["reason"] == "max_steps_exceeded"
+    assert fallback_events[-1]["termination_cause"] == "the overall step budget is exhausted"
     assert surface.final_messages
-    assert "exploration retries are exhausted" in surface.final_messages[-1]
+    assert "overall step budget is exhausted" in surface.final_messages[-1]
     assert "before the turn terminated" in surface.final_messages[-1]
-    assert "budget ran out" not in surface.final_messages[-1]
     assistant_events = _event_payloads(log_path, "assistant_message")
     final_events = _event_payloads(log_path, "final")
     assert assistant_events[-1]["content"] == surface.final_messages[-1]
     assert final_events[-1]["content"] == surface.final_messages[-1]
+    assert fallback_events[-1]["controller_interventions_total"] >= 1
+    assert (
+        final_events[-1]["controller_interventions_total"]
+        == fallback_events[-1]["controller_interventions_total"]
+    )
+    assert "controller_interventions" in final_events[-1]
 
 
-def test_post_explore_retry_exhausted_emits_forced_final_summary(tmp_path: Path) -> None:
+def test_post_explore_stagnation_budget_end_emits_generic_forced_summary(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "src" / "mini_notes").mkdir(parents=True, exist_ok=True)
     (tmp_path / "src" / "mini_notes" / "cli.py").write_text("print('x')\n", encoding="utf-8")
     sessions_dir = tmp_path / "sessions"
@@ -486,7 +506,7 @@ def test_post_explore_retry_exhausted_emits_forced_final_summary(tmp_path: Path)
         one_shot_execution=True,
         subagents_enabled=True,
         session_log_dir_override=sessions_dir,
-        session_id_override="forced-summary-post-explore-retry-exhausted",
+        session_id_override="forced-summary-post-explore-max-steps",
         surface=surface,
     )
     _install_stub_subagent_run(
@@ -518,14 +538,14 @@ def test_post_explore_retry_exhausted_emits_forced_final_summary(tmp_path: Path)
                     ],
                     raw={},
                 )
-                for idx in range(2, 9)
+                for idx in range(2, 13)
             ],
         ],
         finalization_response=LLMResponse(
             content=(
                 "Completed work: inspected `src/mini_notes/cli.py` and mapped likely targets.\n"
                 "Remaining work: implementation has not started.\n"
-                "Known issues or risks: post-explore retries were exhausted before edits began."
+                "Known issues or risks: the step budget ended before edits began."
             ),
             tool_calls=[],
             raw={},
@@ -541,17 +561,22 @@ def test_post_explore_retry_exhausted_emits_forced_final_summary(tmp_path: Path)
 
     assert exit_code == 1
     assert surface.errors
-    assert len([call for call in client.calls if call["tools"] is not None]) < session.max_steps
+    assert len([call for call in client.calls if call["tools"] is not None]) == session.max_steps
     assert client.calls[-1]["tools"] is None
-    assert _event_payloads(log_path, "one_shot_post_explore_incomplete_after_retries")
+    assert _event_payloads(log_path, "one_shot_post_explore_stagnation_detected")
+    assert _event_payloads(log_path, "one_shot_post_explore_incomplete_after_retries") == []
     requested = _event_payloads(log_path, "forced_final_summary_requested")
-    assert requested[-1]["reason"] == "post_explore_retry_exhausted"
-    assert requested[-1]["termination_cause"] == "post-explore bootstrap retries are exhausted"
+    assert requested[-1]["reason"] == "max_steps_exceeded"
+    assert requested[-1]["termination_cause"] == "the overall step budget is exhausted"
+    errors = _event_payloads(log_path, "error")
+    assert "post_explore" in errors[-1]["stagnation_state"]
     summary = _assert_forced_summary_artifacts(log_path=log_path, surface=surface)
-    assert "Known issues or risks: post-explore retries were exhausted" in summary
+    assert "Known issues or risks: the step budget ended" in summary
 
 
-def test_exploration_retry_exhausted_emits_forced_final_summary(tmp_path: Path) -> None:
+def test_exploration_stagnation_budget_end_emits_generic_forced_summary(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "repeat.txt").write_text("x\n", encoding="utf-8")
     sessions_dir = tmp_path / "sessions"
     surface = _ForcedSummarySurface()
@@ -565,7 +590,7 @@ def test_exploration_retry_exhausted_emits_forced_final_summary(tmp_path: Path) 
         api_key_override="override-key",
         one_shot_execution=True,
         session_log_dir_override=sessions_dir,
-        session_id_override="forced-summary-exploration-retry-exhausted",
+        session_id_override="forced-summary-exploration-max-steps",
         surface=surface,
     )
     client = _ScriptedClient(
@@ -578,14 +603,14 @@ def test_exploration_retry_exhausted_emits_forced_final_summary(tmp_path: Path) 
                     ],
                     raw={},
                 )
-                for idx in range(1, 6)
+                for idx in range(1, 11)
             ],
         ],
         finalization_response=LLMResponse(
             content=(
                 "Completed work: repeated exploration confirmed the same file state.\n"
                 "Remaining work: implementation and verification are still pending.\n"
-                "Known issues or risks: exploration retries were exhausted before progress."
+                "Known issues or risks: the step budget ended before progress."
             ),
             tool_calls=[],
             raw={},
@@ -601,17 +626,20 @@ def test_exploration_retry_exhausted_emits_forced_final_summary(tmp_path: Path) 
 
     assert exit_code == 1
     assert surface.errors
-    assert len([call for call in client.calls if call["tools"] is not None]) == 5
+    assert len([call for call in client.calls if call["tools"] is not None]) == session.max_steps
     assert client.calls[-1]["tools"] is None
-    assert _event_payloads(log_path, "one_shot_exploration_incomplete_after_retries")
+    assert _event_payloads(log_path, "one_shot_exploration_stagnation_detected")
+    assert _event_payloads(log_path, "one_shot_exploration_incomplete_after_retries") == []
     requested = _event_payloads(log_path, "forced_final_summary_requested")
-    assert requested[-1]["reason"] == "exploration_retry_exhausted"
-    assert requested[-1]["termination_cause"] == "exploration retries are exhausted"
+    assert requested[-1]["reason"] == "max_steps_exceeded"
+    assert requested[-1]["termination_cause"] == "the overall step budget is exhausted"
+    errors = _event_payloads(log_path, "error")
+    assert "exploration" in errors[-1]["stagnation_state"]
     summary = _assert_forced_summary_artifacts(log_path=log_path, surface=surface)
-    assert "Known issues or risks: exploration retries were exhausted" in summary
+    assert "Known issues or risks: the step budget ended" in summary
 
 
-def test_edit_retry_exhausted_emits_forced_final_summary(tmp_path: Path) -> None:
+def test_edit_stagnation_budget_end_emits_generic_forced_summary(tmp_path: Path) -> None:
     (tmp_path / "target.txt").write_text("alpha\nbeta\n", encoding="utf-8")
     sessions_dir = tmp_path / "sessions"
     surface = _ForcedSummarySurface()
@@ -625,7 +653,7 @@ def test_edit_retry_exhausted_emits_forced_final_summary(tmp_path: Path) -> None
         api_key_override="override-key",
         one_shot_execution=True,
         session_log_dir_override=sessions_dir,
-        session_id_override="forced-summary-edit-retry-exhausted",
+        session_id_override="forced-summary-edit-max-steps",
         surface=surface,
     )
     client = _ScriptedClient(
@@ -658,7 +686,7 @@ def test_edit_retry_exhausted_emits_forced_final_summary(tmp_path: Path) -> None
             content=(
                 "Completed work: attempted localized edits on `target.txt`.\n"
                 "Remaining work: the requested change is still unfinished.\n"
-                "Known issues or risks: failed edit retries were exhausted before a successful write."
+                "Known issues or risks: the step budget ended before a successful write."
             ),
             tool_calls=[],
             raw={},
@@ -674,17 +702,20 @@ def test_edit_retry_exhausted_emits_forced_final_summary(tmp_path: Path) -> None
 
     assert exit_code == 1
     assert surface.errors
-    assert len([call for call in client.calls if call["tools"] is not None]) < session.max_steps
+    assert len([call for call in client.calls if call["tools"] is not None]) == session.max_steps
     assert client.calls[-1]["tools"] is None
-    assert _event_payloads(log_path, "one_shot_edit_incomplete_after_retries")
+    assert _event_payloads(log_path, "one_shot_edit_stagnation_detected")
+    assert _event_payloads(log_path, "one_shot_edit_incomplete_after_retries") == []
     requested = _event_payloads(log_path, "forced_final_summary_requested")
-    assert requested[-1]["reason"] == "edit_retry_exhausted"
-    assert requested[-1]["termination_cause"] == "failed edit retries are exhausted"
+    assert requested[-1]["reason"] == "max_steps_exceeded"
+    assert requested[-1]["termination_cause"] == "the overall step budget is exhausted"
+    errors = _event_payloads(log_path, "error")
+    assert "failed_edit" in errors[-1]["stagnation_state"]
     summary = _assert_forced_summary_artifacts(log_path=log_path, surface=surface)
-    assert "Known issues or risks: failed edit retries were exhausted" in summary
+    assert "Known issues or risks: the step budget ended" in summary
 
 
-def test_repeated_non_final_progress_termination_emits_forced_final_summary(
+def test_repeated_non_final_progress_accepts_after_single_nudge(
     tmp_path: Path,
 ) -> None:
     sessions_dir = tmp_path / "sessions"
@@ -709,15 +740,6 @@ def test_repeated_non_final_progress_termination_emits_forced_final_summary(
             LLMResponse(content=repeated_progress_text, tool_calls=[], raw={}),
             LLMResponse(content=repeated_progress_text, tool_calls=[], raw={}),
         ],
-        finalization_response=LLMResponse(
-            content=(
-                "Completed work: inspected the task and identified the next implementation step.\n"
-                "Remaining work: implementation is still incomplete.\n"
-                "Known issues or risks: repeated non-final progress stopped the run."
-            ),
-            tool_calls=[],
-            raw={},
-        ),
     )
     session.client = client  # type: ignore[assignment]
 
@@ -727,26 +749,18 @@ def test_repeated_non_final_progress_termination_emits_forced_final_summary(
     finally:
         session.close()
 
-    assert exit_code == 1
-    assert len(client.calls) == 4
-    incomplete_events = _event_payloads(log_path, "one_shot_incomplete_after_retries")
-    assert incomplete_events
-    assert incomplete_events[-1]["reason"] == "stagnant_progress"
-    requested = _event_payloads(log_path, "forced_final_summary_requested")
-    assert requested[-1]["reason"] == "non_final_progress_retry_exhausted"
-    expected_cause = "non-final progress stagnated without implementation or verification progress"
-    assert requested[-1]["termination_cause"] == expected_cause
-    assert requested[-1]["termination_kind"] == "completion_gate_stagnation"
-    _assert_last_forced_summary_request(
-        client,
-        latest_assistant_text=repeated_progress_text,
-        termination_cause=expected_cause,
-    )
-    summary = _assert_forced_summary_artifacts(log_path=log_path, surface=surface)
-    assert "Known issues or risks: repeated non-final progress stopped the run." in summary
+    assert exit_code == 0
+    assert len(client.calls) == 2
+    assert not surface.errors
+    assert surface.final_messages[-1] == repeated_progress_text
+    assert len(_event_payloads(log_path, "continuation_nudge")) == 1
+    assert _event_payloads(log_path, "completion_gate_accepted_with_open_problems")
+    assert _event_payloads(log_path, "one_shot_incomplete_after_retries") == []
+    assert _event_payloads(log_path, "forced_final_summary_requested") == []
+    assert _event_payloads(log_path, "forced_final_summary_completed") == []
 
 
-def test_non_final_progress_continuation_cap_emits_forced_final_summary(
+def test_non_final_progress_continuation_cap_accepts_second_final(
     tmp_path: Path,
 ) -> None:
     sessions_dir = tmp_path / "sessions"
@@ -771,15 +785,6 @@ def test_non_final_progress_continuation_cap_emits_forced_final_summary(
             LLMResponse(content=final_progress_text, tool_calls=[], raw={}),
             LLMResponse(content=final_progress_text, tool_calls=[], raw={}),
         ],
-        finalization_response=LLMResponse(
-            content=(
-                "Completed work: gathered partial implementation progress signals.\n"
-                "Remaining work: the requested change is still unfinished.\n"
-                "Known issues or risks: non-final progress stagnated."
-            ),
-            tool_calls=[],
-            raw={},
-        ),
     )
     session.client = client  # type: ignore[assignment]
 
@@ -789,36 +794,24 @@ def test_non_final_progress_continuation_cap_emits_forced_final_summary(
     finally:
         session.close()
 
-    assert exit_code == 1
-    assert len(client.calls) == 4
-    incomplete_events = _event_payloads(log_path, "one_shot_incomplete_after_retries")
-    assert incomplete_events
-    assert incomplete_events[-1]["reason"] == "stagnant_progress"
-    requested = _event_payloads(log_path, "forced_final_summary_requested")
-    assert requested[-1]["reason"] == "non_final_progress_retry_exhausted"
-    expected_cause = "non-final progress stagnated without implementation or verification progress"
-    assert requested[-1]["termination_cause"] == expected_cause
-    assert requested[-1]["termination_kind"] == "completion_gate_stagnation"
-    _assert_last_forced_summary_request(
-        client,
-        latest_assistant_text=final_progress_text,
-        termination_cause=expected_cause,
-    )
-    summary = _assert_forced_summary_artifacts(log_path=log_path, surface=surface)
-    assert "Known issues or risks: non-final progress stagnated." in summary
+    assert exit_code == 0
+    assert len(client.calls) == 2
+    assert not surface.errors
+    assert surface.final_messages[-1] == final_progress_text
+    assert len(_event_payloads(log_path, "continuation_nudge")) == 1
+    assert _event_payloads(log_path, "completion_gate_accepted_with_open_problems")
+    assert _event_payloads(log_path, "one_shot_incomplete_after_retries") == []
+    assert _event_payloads(log_path, "forced_final_summary_requested") == []
+    assert _event_payloads(log_path, "forced_final_summary_completed") == []
 
 
-def test_completion_gate_terminal_failure_emits_forced_final_summary(
+def test_completion_gate_open_problems_accepts_second_final(
     tmp_path: Path,
 ) -> None:
     sessions_dir = tmp_path / "sessions"
     surface = _ForcedSummarySurface()
     session = create_session(
-        cfg=AppConfig(
-            model=SMOKE_MODEL,
-            routing_mode="code_only",
-            verify_commands=["pytest -q"],
-        ),
+        cfg=AppConfig(model=SMOKE_MODEL, routing_mode="code_only"),
         root=tmp_path,
         mode="auto",
         yes=True,
@@ -833,30 +826,9 @@ def test_completion_gate_terminal_failure_emits_forced_final_summary(
     latest_final_text = "Implemented the requested code change."
     client = _ScriptedClient(
         [
-            LLMResponse(
-                content="",
-                tool_calls=[
-                    ToolCall(
-                        id="tc1",
-                        name="fs_write",
-                        arguments={"path": "main.py", "content": "print('done')\n"},
-                    )
-                ],
-                raw={},
-            ),
-            LLMResponse(content=latest_final_text, tool_calls=[], raw={}),
             LLMResponse(content=latest_final_text, tool_calls=[], raw={}),
             LLMResponse(content=latest_final_text, tool_calls=[], raw={}),
         ],
-        finalization_response=LLMResponse(
-            content=(
-                "Completed work: updated `main.py`.\n"
-                "Remaining work: verification still needs to run.\n"
-                "Known issues or risks: completion-gate repair attempts were exhausted."
-            ),
-            tool_calls=[],
-            raw={},
-        ),
     )
     session.client = client  # type: ignore[assignment]
 
@@ -866,25 +838,14 @@ def test_completion_gate_terminal_failure_emits_forced_final_summary(
     finally:
         session.close()
 
-    assert exit_code == 1
-    assert len(client.calls) == 5
-    incomplete_events = _event_payloads(
-        log_path, "one_shot_completion_gate_incomplete_after_retries"
-    )
-    assert incomplete_events
-    assert incomplete_events[-1]["stage"] == "verification_not_attempted"
-    requested = _event_payloads(log_path, "forced_final_summary_requested")
-    assert requested[-1]["reason"] == "completion_gate_terminal_failure"
-    expected_cause = (
-        "completion-gate stagnation after repeated invalid finalization attempts "
-        "without new implementation or verification progress"
-    )
-    assert requested[-1]["termination_cause"] == expected_cause
-    assert requested[-1]["termination_kind"] == "completion_gate_stagnation"
-    _assert_last_forced_summary_request(
-        client,
-        latest_assistant_text=latest_final_text,
-        termination_cause=expected_cause,
-    )
-    summary = _assert_forced_summary_artifacts(log_path=log_path, surface=surface)
-    assert "Known issues or risks: completion-gate repair attempts were exhausted." in summary
+    assert exit_code == 0
+    assert len(client.calls) == 2
+    assert not surface.errors
+    assert surface.final_messages[-1] == latest_final_text
+    assert len(_event_payloads(log_path, "completion_gate_nudge")) == 1
+    accepted_events = _event_payloads(log_path, "completion_gate_accepted_with_open_problems")
+    assert accepted_events
+    assert accepted_events[-1]["stage"] == "no_material_edits"
+    assert _event_payloads(log_path, "one_shot_completion_gate_incomplete_after_retries") == []
+    assert _event_payloads(log_path, "forced_final_summary_requested") == []
+    assert _event_payloads(log_path, "forced_final_summary_completed") == []

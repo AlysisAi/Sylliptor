@@ -79,6 +79,44 @@ class _FinalReplyClient:
         return LLMResponse(content=self.reply, tool_calls=[], raw={})
 
 
+class _CompletesAfterToolCallsClient:
+    model = "test-model"
+    temperature = 0.2
+
+    def __init__(self, *, complete_after: int) -> None:
+        self.complete_after = complete_after
+        self.calls = 0
+        self.tool_enabled_calls = 0
+
+    def chat(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = False,
+        on_text_delta=None,  # type: ignore[no-untyped-def]
+        temperature: float | None = None,
+    ) -> LLMResponse:
+        _ = messages, stream, on_text_delta, temperature
+        self.calls += 1
+        if tools is None:
+            return LLMResponse(content="Inspection complete.", tool_calls=[], raw={})
+        if self.tool_enabled_calls >= self.complete_after:
+            return LLMResponse(content="Inspection complete.", tool_calls=[], raw={})
+        self.tool_enabled_calls += 1
+        return LLMResponse(
+            content="Continuing the inspection.",
+            tool_calls=[
+                ToolCall(
+                    id=f"call-{self.tool_enabled_calls}",
+                    name="fs_list",
+                    arguments={"path": "."},
+                )
+            ],
+            raw={},
+        )
+
+
 def _route_decision(route: str) -> SimpleNamespace:
     return SimpleNamespace(
         route=route,
@@ -97,7 +135,7 @@ def _event_payloads(path: Path, event_type: str) -> list[dict[str, Any]]:
     ]
 
 
-def test_repo_turn_emits_resolution_event_and_uses_resolved_ceiling(
+def test_autonomous_repo_turn_runs_past_legacy_cap_until_model_completes(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr(agent_loop_mod, "_route_turn", lambda **_kwargs: _route_decision("repo"))
@@ -107,18 +145,18 @@ def test_repo_turn_emits_resolution_event_and_uses_resolved_ceiling(
         root=tmp_path,
         mode="review",
         yes=True,
-        max_steps=32,
+        max_steps=5,
         no_log=False,
         api_key_override="override-key",
         session_log_dir_override=tmp_path / "sessions",
         enable_chat_turn_step_budget=True,
         verification_enabled=False,
     )
-    client = _LoopingToolClient()
+    client = _CompletesAfterToolCallsClient(complete_after=8)
     session.client = client  # type: ignore[assignment]
 
     try:
-        exit_code = session.run_turn("Keep working on the repo change.")
+        exit_code = session.run_turn("Inspect this repository and report your findings.")
         active_turn_budget = session.step_budget_runtime.active_turn_budget
         last_resolution = session.step_budget_runtime.last_resolution
         log_path = session.store.path
@@ -127,20 +165,20 @@ def test_repo_turn_emits_resolution_event_and_uses_resolved_ceiling(
 
     assert exit_code == 0
     assert last_resolution is not None
-    assert last_resolution.resolved_max_steps < session.max_steps
-    assert client.tool_enabled_calls == last_resolution.resolved_max_steps
-    assert client.calls == last_resolution.resolved_max_steps + 1
-    assert client.call_tools[-1] is None
-    assert active_turn_budget == last_resolution.resolved_max_steps
-    assert last_resolution is not None
-    assert last_resolution.reason == "adaptive_chat_turn"
+    assert last_resolution.resolved_max_steps is None
+    assert last_resolution.unlimited is True
+    assert client.tool_enabled_calls == 8
+    assert client.calls == 9
+    assert client.tool_enabled_calls > session.max_steps
+    assert active_turn_budget is None
+    assert last_resolution.reason == "autonomous_unbounded"
     resolution_events = _event_payloads(log_path, "turn_step_budget_resolved")
     assert len(resolution_events) == 1
-    assert resolution_events[0]["resolved_max_steps"] == last_resolution.resolved_max_steps
+    assert resolution_events[0]["resolved_max_steps"] is None
+    assert resolution_events[0]["unlimited"] is True
     assert _event_payloads(log_path, "error") == []
-    handoff_events = _event_payloads(log_path, "interactive_step_budget_handoff")
-    assert handoff_events[-1]["max_steps"] == last_resolution.resolved_max_steps
-    assert _event_payloads(log_path, "forced_final_summary_requested")
+    assert _event_payloads(log_path, "interactive_step_budget_handoff") == []
+    assert _event_payloads(log_path, "forced_final_summary_requested") == []
 
 
 def test_simple_agent_fixed_override_uses_fixed_turn_ceiling(tmp_path: Path, monkeypatch) -> None:
@@ -174,13 +212,15 @@ def test_simple_agent_fixed_override_uses_fixed_turn_ceiling(tmp_path: Path, mon
     resolution_events = _event_payloads(log_path, "turn_step_budget_resolved")
     assert len(resolution_events) == 1
     assert resolution_events[0]["resolved_max_steps"] == 4
-    assert resolution_events[0]["reason"] == "fixed_override"
+    assert resolution_events[0]["reason"] == "explicit_limit"
     assert resolution_events[0]["override_applied"] is True
     assert _event_payloads(log_path, "error") == []
     assert _event_payloads(log_path, "interactive_step_budget_handoff")
 
 
-def test_disabled_session_keeps_fixed_runtime_behavior(tmp_path: Path, monkeypatch) -> None:
+def test_low_level_session_can_still_use_an_explicit_finite_loop(
+    tmp_path: Path, monkeypatch
+) -> None:
     monkeypatch.setattr(agent_loop_mod, "_route_turn", lambda **_kwargs: _route_decision("repo"))
     cfg = AppConfig(model="test-model", routing_mode="auto", step_budget_policy="adaptive")
     session = create_session(
@@ -275,7 +315,7 @@ def test_non_repo_fast_path_clears_active_turn_budget_without_new_resolution_eve
         root=tmp_path,
         mode="review",
         yes=True,
-        max_steps=32,
+        max_steps=64,
         no_log=False,
         api_key_override="override-key",
         session_log_dir_override=tmp_path / "sessions",
@@ -292,7 +332,7 @@ def test_non_repo_fast_path_clears_active_turn_budget_without_new_resolution_eve
             session.step_budget_runtime.active_turn_budget
             == session.step_budget_runtime.last_resolution.resolved_max_steps
         )
-        assert session.step_budget_runtime.active_turn_budget < session.max_steps
+        assert session.step_budget_runtime.active_turn_budget is None
         second_exit_code = session.run_turn("How are you?")
         active_turn_budget = session.step_budget_runtime.active_turn_budget
         log_path = session.store.path
@@ -310,9 +350,16 @@ def test_run_agent_defaults_chat_turn_budget_off(tmp_path: Path, monkeypatch) ->
     captured: dict[str, Any] = {}
 
     class _DummySession:
-        def run_turn(self, instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self,
+            instruction: str,
+            *,
+            image_paths: list[str] | None = None,
+            cancellation_token: Any | None = None,
+        ) -> int:
             captured["instruction"] = instruction
             captured["image_paths"] = image_paths
+            captured["cancellation_token"] = cancellation_token
             return 0
 
         def close(self) -> None:

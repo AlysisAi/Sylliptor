@@ -43,14 +43,14 @@ def _events(sessions_dir: Path, session_id: str) -> list[dict[str, Any]]:
 def _latest_completion_gate_payload(
     sessions_dir: Path,
     session_id: str,
+    *,
+    event_type: str = "completion_gate_accepted_with_open_problems",
 ) -> dict[str, Any]:
-    incomplete_events = [
-        event
-        for event in _events(sessions_dir, session_id)
-        if event.get("type") == "one_shot_completion_gate_incomplete_after_retries"
+    matching_events = [
+        event for event in _events(sessions_dir, session_id) if event.get("type") == event_type
     ]
-    assert incomplete_events
-    return dict(incomplete_events[-1].get("payload") or {})
+    assert matching_events
+    return dict(matching_events[-1].get("payload") or {})
 
 
 def test_one_shot_static_task_suppresses_generic_pytest(tmp_path: Path) -> None:
@@ -262,7 +262,7 @@ def test_exact_black_box_command_satisfies_one_shot_acceptance(
     assert payload.get("acceptance_problems") == []
 
 
-def test_missing_required_output_blocks_one_shot_finalization(tmp_path: Path) -> None:
+def test_missing_required_output_surfaces_advisory_open_problems(tmp_path: Path) -> None:
     cfg = AppConfig(model="test-model", routing_mode="code_only")
     sessions_dir = tmp_path / "sessions"
     session_id = "acceptance-missing-output"
@@ -292,6 +292,15 @@ def test_missing_required_output_blocks_one_shot_finalization(tmp_path: Path) ->
     finally:
         session.close()
 
-    assert exit_code == 1
-    payload = _latest_completion_gate_payload(sessions_dir, session_id)
-    assert "acceptance_criteria_unverified" in set(payload.get("problems") or [])
+    # The completion gate is advisory-only: the turn completes (exit 0), but the
+    # unmet acceptance criterion is surfaced as a gate problem, first as a
+    # failed-gate advisory and then in the accepted-with-open-problems record.
+    assert exit_code == 0
+    failed_payload = _latest_completion_gate_payload(
+        sessions_dir,
+        session_id,
+        event_type="one_shot_completion_gate_failed",
+    )
+    assert "acceptance_criteria_unverified" in set(failed_payload.get("problems") or [])
+    accepted_payload = _latest_completion_gate_payload(sessions_dir, session_id)
+    assert "acceptance_criteria_unverified" in set(accepted_payload.get("problems") or [])

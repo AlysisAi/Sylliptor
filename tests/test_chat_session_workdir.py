@@ -210,9 +210,9 @@ def test_natural_language_navigation_changes_active_workdir_and_tool_defaults(
         return {"root_path": root_path, "entries": []}
 
     def fake_search_rg(
-        *, root: Path, pattern: str, root_path: str, globs=None
+        *, root: Path, pattern: str, root_path: str, globs=None, **kwargs: object
     ) -> dict[str, object]:
-        _ = root, pattern, globs
+        _ = root, pattern, globs, kwargs
         captured.append(("search_rg", root_path))
         return {"root_path": root_path, "matches": []}
 
@@ -225,8 +225,9 @@ def test_natural_language_navigation_changes_active_workdir_and_tool_defaults(
         globs=None,
         max_results=100,
         exact=False,
+        **kwargs: object,
     ) -> dict[str, object]:
-        _ = root, query, kind, globs, max_results, exact
+        _ = root, query, kind, globs, max_results, exact, kwargs
         captured.append(("symbol_search", root_path))
         return {"root_path": root_path, "matches": []}
 
@@ -436,9 +437,9 @@ def test_tool_roots_align_on_active_workdir_with_workspace_root_override(
         return {"root_path": root_path, "entries": []}
 
     def fake_search_rg(
-        *, root: Path, pattern: str, root_path: str, globs=None
+        *, root: Path, pattern: str, root_path: str, globs=None, **kwargs: object
     ) -> dict[str, object]:
-        _ = root, pattern, globs
+        _ = root, pattern, globs, kwargs
         captured.append(("search_rg", root_path))
         return {"root_path": root_path, "matches": []}
 
@@ -451,8 +452,9 @@ def test_tool_roots_align_on_active_workdir_with_workspace_root_override(
         globs=None,
         max_results=100,
         exact=False,
+        **kwargs: object,
     ) -> dict[str, object]:
-        _ = root, query, kind, globs, max_results, exact
+        _ = root, query, kind, globs, max_results, exact, kwargs
         captured.append(("symbol_search", root_path))
         return {"root_path": root_path, "matches": []}
 

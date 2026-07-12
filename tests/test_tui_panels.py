@@ -15,6 +15,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from sylliptor_agent_cli.cli_impl.commands import chat_tui_panels as panels
+from sylliptor_agent_cli.cli_impl.commands.chat_status import _chat_mode_status_label
 from sylliptor_agent_cli.cli_impl.tui import run_tui
 from sylliptor_agent_cli.cli_impl.tui.state import TuiState
 
@@ -99,6 +100,43 @@ def test_context_panel_tone_matches_displayed_window_percent_not_dynamic():
     assert left_pct == [("60.0%", "accent")]  # displays & colours the window %
 
 
+def test_context_panel_surfaces_effective_budget_separately_from_window_percent():
+    ctx = SimpleNamespace(
+        model_name="m",
+        source="catalog",
+        context_window_tokens=64000,
+        context_window_remaining_tokens=38000,
+        context_window_percent_left=60.0,
+        effective_input_budget=28000,
+        effective_remaining_tokens=1200,
+        effective_percent_left=4.285,
+        startup_baseline_tokens=24000,
+        dynamic_context_budget_tokens=4000,
+        dynamic_context_used_tokens=2800,
+        dynamic_context_remaining_tokens=1200,
+        dynamic_context_percent_left=30.0,
+        percent_left=60.0,
+        used_input_tokens=26000,
+    )
+    sess = SimpleNamespace(context_left=lambda: ctx, _hud_context_cache=None)
+
+    spec = panels._chat_context_panel_spec(session=sess)
+
+    assert [name for name, _rows in spec["sections"]] == [
+        "Context",
+        "Effective Input Budget",
+        "Conversation Context",
+    ]
+    rows = {
+        k: (v, tone) for _name, section_rows in spec["sections"] for (k, v, tone) in section_rows
+    }
+    assert rows["left %"] == ("60.0%", "accent")
+    assert rows["input budget"] == ("28000", "plain")
+    assert rows["budget left"] == ("1200", "plain")
+    assert rows["budget left %"] == ("4.3%", "err")
+    assert rows["conversation left %"] == ("30.0%", "accent")
+
+
 def test_usage_panel_unknown_cost_not_green():
     # An entirely-unknown total cost must not read as healthy green.
     class _Sum:
@@ -127,6 +165,41 @@ def test_usage_panel_unknown_cost_not_green():
     spec = panels._chat_usage_panel_spec(session=SimpleNamespace(usage_summary=_Sum()))
     cost = [(v, tone) for _name, rows in spec["sections"] for (k, v, tone) in rows if k == "cost"]
     assert cost and cost[0][1] != "accent"  # not painted healthy-green
+
+
+def test_usage_panel_warns_when_tool_schema_shadow_budget_is_exceeded():
+    class _Sum:
+        def by_model_rows(self):
+            return [
+                {
+                    "model": "m",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                    "known_cost_calls": 1,
+                    "unknown_cost_count": 0,
+                }
+            ]
+
+        def totals(self):
+            return {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+                "known_cost_calls": 1,
+                "unknown_cost_calls": 0,
+                "request_token_estimate": {
+                    "tool_schema_budget_exceeded_calls": 2,
+                    "tool_schema_budget_overage_tokens": 12000,
+                    "tool_schema_largest_tool_tokens": 9000,
+                },
+            }
+
+    spec = panels._chat_usage_panel_spec(session=SimpleNamespace(usage_summary=_Sum()))
+    blob = _values(spec)
+    assert "tool schema shadow budget" in blob
+    assert "12,000" in blob
+    assert "warn" in _tones(spec)
 
 
 def test_context_panel_spec_reads_cache_and_tones_low_percent():
@@ -187,6 +260,10 @@ def test_config_panel_spec_lists_tracked_models():
     blob = _values(spec)
     assert "deepseek-chat" in blob
     assert "/config set" in blob  # manage usage line present
+
+
+def test_status_mode_label_matches_tui_mode_label():
+    assert _chat_mode_status_label("auto") == "fast (auto)"
 
 
 def test_toolbar_panel_spec_active_available():
@@ -445,6 +522,47 @@ def test_trace_picker_digit_selects_and_applies():
     )
     assert picked["value"] == "full"
     assert ("system", "trace -> full") in transcript
+
+
+def test_stream_picker_defaults_on_and_can_select_off():
+    state = TuiState(model_name="m", username="t")
+    picked = {"value": None}
+
+    def on_select(value):
+        picked["value"] = value
+        return [("system", f"stream -> {value}")]
+
+    def stream_picker():
+        return {
+            "title": "Streaming",
+            "rows": [
+                {
+                    "label": "on",
+                    "description": "Render model output live.",
+                    "value": "on",
+                    "current": True,
+                },
+                {
+                    "label": "off",
+                    "description": "Buffer output until complete.",
+                    "value": "off",
+                    "current": False,
+                },
+            ],
+            "on_select": on_select,
+        }
+
+    _result, transcript = _run_headless(
+        state,
+        "/stream\r2/exit\r",
+        session_builder=_FakeSession,
+        command_runner=_runner([]),
+        picker_providers={"/stream": stream_picker},
+        background_turns=False,
+    )
+    assert picked["value"] == "off"
+    assert ("system", "stream -> off") in transcript
+    assert ("user", "/stream") not in transcript
 
 
 def test_subagent_picker_prefill_then_task_spawns_via_runner():

@@ -79,7 +79,7 @@ sylliptor config set model "your-model"
 sylliptor chat
 ```
 
-On a fresh install, running `sylliptor` opens a guided setup wizard for provider, API key, default model, optional router model, and workspace. Re-run anytime:
+On a fresh install, running `sylliptor` opens a guided setup wizard for connection, default model, optional router model, and workspace. Re-run anytime:
 
 ```bash
 sylliptor setup
@@ -191,6 +191,7 @@ sylliptor profile list
 ```
 
 See [Credentials](docs/credentials.md) for key resolution and storage details.
+See [Providers and models](docs/providers.md) for additional connection options.
 
 ## Workspace Behavior
 

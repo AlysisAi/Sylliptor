@@ -2,25 +2,49 @@ from __future__ import annotations
 
 import re
 
-_SENSITIVE_PATTERNS = [
-    re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
-    re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]{8,}", re.IGNORECASE),
-    re.compile(r"(Authorization\s*:\s*)(.+)", re.IGNORECASE),
-]
+from .llm.metadata import sanitize_urls_for_output
+
+_SENSITIVE_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"sk-[A-Za-z0-9_\-]{16,}"), "[REDACTED]"),
+    (
+        re.compile(r"(Bearer\s+)[^\s,;}\"']{8,}", re.IGNORECASE),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(r"(Authorization\s*:\s*)(.+)", re.IGNORECASE),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"((?:[\"']?(?:api_key|api-key|x-api-key|x-goog-api-key)[\"']?"
+            r"\s*[:=]\s*[\"']?))([^\"'\s,;&}]+)([\"']?)",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED]\3",
+    ),
+    (
+        re.compile(
+            r"((?:SYLLIPTOR_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|GEMINI_API_KEY)"
+            r"\s*[:=]\s*)([^\s,;&]+)",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED]",
+    ),
+)
 _DEFAULT_MAX_ERROR_SUMMARY_CHARS = 320
 
 
 def redact_sensitive_error_text(text: str) -> str:
     out = str(text or "")
-    for pattern in _SENSITIVE_PATTERNS:
-        if pattern.pattern.lower().startswith("(authorization"):
-            out = pattern.sub(r"\1[REDACTED]", out)
-            continue
-        if pattern.pattern.lower().startswith("(bearer"):
-            out = pattern.sub(r"\1[REDACTED]", out)
-            continue
-        out = pattern.sub("[REDACTED]", out)
+    for pattern, replacement in _SENSITIVE_REPLACEMENTS:
+        out = pattern.sub(replacement, out)
     return out
+
+
+def sanitize_error_text_for_output(text: object) -> str:
+    """Redact credentials and private URL route material from error text."""
+
+    return redact_sensitive_error_text(sanitize_urls_for_output(text))
 
 
 def sanitize_error_summary(
@@ -28,7 +52,7 @@ def sanitize_error_summary(
     *,
     max_chars: int = _DEFAULT_MAX_ERROR_SUMMARY_CHARS,
 ) -> str:
-    clean = redact_sensitive_error_text(" ".join(str(text or "").split())).strip()
+    clean = sanitize_error_text_for_output(" ".join(str(text or "").split())).strip()
     if not clean:
         return "No additional error details."
     if len(clean) <= max_chars:

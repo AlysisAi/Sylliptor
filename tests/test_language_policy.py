@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from sylliptor_agent_cli.agent.routing import _fallback_general_reply
 from sylliptor_agent_cli.agent_loop import (
     _build_turn_language_system_message,
     _detect_turn_language_and_script,
@@ -33,6 +34,23 @@ class _LanguageDecisionClient:
         if self.error is not None:
             raise self.error
         return LLMResponse(content=str(self.content or ""), tool_calls=[], raw={})
+
+
+def test_localized_fallback_reply_records_its_provider_call() -> None:
+    client = _LanguageDecisionClient("Μπορείς να διευκρινίσεις τι θέλεις να κάνω;")
+    usage_calls: list[dict[str, object]] = []
+
+    reply = _fallback_general_reply(
+        language="Greek",
+        script="Greek",
+        client=client,
+        record_usage=lambda **kwargs: usage_calls.append(kwargs),
+    )
+
+    assert reply.startswith("Μπορείς")
+    assert len(usage_calls) == 1
+    assert usage_calls[0]["operation"] == "localized_fallback_reply"
+    assert usage_calls[0]["messages"] == client.last_messages
 
 
 def test_normalizers_keep_model_selected_names_without_alias_mapping() -> None:

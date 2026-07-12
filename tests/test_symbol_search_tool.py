@@ -101,6 +101,61 @@ def test_symbol_search_finds_python_symbols(tmp_path: Path) -> None:
     ]
 
 
+def test_symbol_search_can_include_details_snippets_and_references(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "src" / "demo.py",
+        (
+            "class Parser:\n"
+            "    def run(self, payload: str) -> str:\n"
+            "        return payload\n"
+            "\n"
+            "def caller(parser: Parser) -> str:\n"
+            "    return parser.run('ok')\n"
+        ),
+    )
+
+    result = symbol_search(
+        root=tmp_path,
+        query="run",
+        kind="method",
+        exact=True,
+        include_details=True,
+        include_snippet=True,
+        include_references=True,
+    )
+
+    assert result["include_details"] is True
+    assert result["include_snippet"] is True
+    assert result["include_references"] is True
+    assert result["matches"] == [
+        {
+            "path": "src/demo.py",
+            "line": 2,
+            "kind": "method",
+            "name": "Parser.run",
+            "signature": "def Parser.run(self, payload: str) -> str",
+            "end_line": 3,
+            "parent": "Parser",
+            "snippet": {
+                "start_line": 2,
+                "end_line": 3,
+                "truncated": False,
+                "lines": [
+                    {"line": 2, "text": "def run(self, payload: str) -> str:"},
+                    {"line": 3, "text": "return payload"},
+                ],
+            },
+            "references": [
+                {
+                    "path": "src/demo.py",
+                    "line": 6,
+                    "text": "return parser.run('ok')",
+                }
+            ],
+        }
+    ]
+
+
 def test_symbol_search_finds_js_ts_symbols(tmp_path: Path) -> None:
     _write(
         tmp_path / "web" / "app.ts",
@@ -732,3 +787,6 @@ def test_build_tools_registers_symbol_search(tmp_path: Path) -> None:
     ]
     assert schema["properties"]["max_results"]["default"] == 100
     assert schema["properties"]["exact"]["default"] is False
+    assert schema["properties"]["include_details"]["default"] is False
+    assert schema["properties"]["include_snippet"]["default"] is False
+    assert schema["properties"]["include_references"]["default"] is False

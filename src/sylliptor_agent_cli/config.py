@@ -5,13 +5,13 @@ import math
 import os
 import re
 import shlex
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .branding import (
     canonical_user_config_dir,
@@ -25,11 +25,14 @@ from .llm.provider_limits import (
     DEFAULT_PROVIDER_RETRY_MAX_RETRIES,
 )
 from .step_budget import (
+    AUTONOMOUS_STEP_BUDGET_POLICY,
     DEFAULT_CHAT_MAX_STEPS,
     DEFAULT_SUBAGENT_MAX_STEPS,
     DEFAULT_TASK_MAX_STEPS,
+    normalize_step_budget_policy,
 )
 from .web_search_adapters import normalize_web_search_adapter
+from .web_search_policy import normalize_web_search_policy
 
 
 class ConfigError(RuntimeError):
@@ -69,7 +72,18 @@ VERIFY_PY_LAUNCHERS: frozenset[str] = frozenset({"py", "py.exe"})
 VERIFY_PYTHON_LAUNCHER_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?$")
 VERIFY_MODULE_NAMES: frozenset[str] = frozenset({"pytest", "ruff", "unittest"})
 _WEB_SEARCH_MODES: set[str] = {"off", "auto", "native", "external"}
-_REASONING_EFFORTS: set[str] = {"none", "minimal", "low", "medium", "high", "xhigh"}
+_REASONING_EFFORTS: set[str] = {
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+}
+_PROMPT_CACHE_MODES: set[str] = {"off", "manual", "auto"}
+_ANTHROPIC_PROMPT_CACHE_TTLS: set[str] = {"5m", "1h"}
 DEFAULT_FEEDBACK_GITHUB_REPO = "AlysisAi/Sylliptor"
 _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 
@@ -113,7 +127,143 @@ class AssetsConfig(BaseModel):
     worker: AssetsWorkerConfig = Field(default_factory=AssetsWorkerConfig)
 
 
+_RUNTIME_SECRET_FIELD_NAMES = frozenset(
+    {
+        "authorization",
+        "bearer",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
+        "id_token",
+        "oauth",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+    }
+)
+_RUNTIME_SECRET_FIELD_MARKERS = (
+    "access_token",
+    "api_key",
+    "auth_token",
+    "client_secret",
+    "private_key",
+    "refresh_token",
+)
+_RUNTIME_SECRET_FIELD_SUFFIXES = (
+    "_authorization",
+    "_credential",
+    "_credentials",
+    "_password",
+    "_passwd",
+    "_secret",
+    "_token",
+)
+_RUNTIME_SECRET_FIELD_SEGMENTS = frozenset(
+    {
+        "authorization",
+        "bearer",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
+        "oauth",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+    }
+)
+_RUNTIME_NON_SECRET_FIELD_ALLOWLIST = frozenset({"credential_store_backend"})
+
+
+def _runtime_secret_field(value: object) -> bool:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in _RUNTIME_NON_SECRET_FIELD_ALLOWLIST:
+        return False
+    segments = frozenset(segment for segment in normalized.split("_") if segment)
+    return (
+        normalized in _RUNTIME_SECRET_FIELD_NAMES
+        or any(marker in normalized for marker in _RUNTIME_SECRET_FIELD_MARKERS)
+        or normalized.endswith(_RUNTIME_SECRET_FIELD_SUFFIXES)
+        or bool(segments & _RUNTIME_SECRET_FIELD_SEGMENTS)
+    )
+
+
+def _find_runtime_secret_field(value: object, path: str = "") -> str | None:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            current = f"{path}.{key}" if path else str(key)
+            if _runtime_secret_field(key):
+                return current
+            found = _find_runtime_secret_field(nested, current)
+            if found:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            found = _find_runtime_secret_field(nested, f"{path}[{index}]")
+            if found:
+                return found
+    return None
+
+
+def _reject_runtime_secret_fields(value: object, *, label: str) -> None:
+    secret_path = _find_runtime_secret_field(value)
+    if secret_path:
+        raise ValueError(
+            f"{label} {secret_path!r} looks secret. "
+            "Provider credentials must remain owned by the provider runtime."
+        )
+
+
+class ExecutionConfig(BaseModel):
+    """Select the native loop or a provider-managed delegated runtime."""
+
+    model_config = ConfigDict(extra="allow")
+
+    backend: Literal["native", "delegated"] = "native"
+    runtime: str | None = None
+
+    @model_validator(mode="after")
+    def validate_backend_runtime_pair(self) -> Self:
+        _reject_runtime_secret_fields(
+            self.model_extra or {},
+            label="Execution setting",
+        )
+        runtime = str(self.runtime or "").strip() or None
+        self.runtime = runtime
+        if self.backend == "delegated" and runtime is None:
+            raise ValueError("Delegated execution requires a selected agent runtime.")
+        if self.backend == "native" and runtime is not None:
+            raise ValueError("Native execution cannot select a delegated agent runtime.")
+        return self
+
+
+class AgentRuntimeSettings(BaseModel):
+    """Provider-neutral settings for one delegated agent runtime."""
+
+    model_config = ConfigDict(extra="allow")
+
+    adapter: str
+    executable: str
+    provider_managed_auth: bool = True
+    model: str | None = None
+    reasoning_effort: str | None = None
+    timeout_seconds: float = Field(default=3600.0, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def reject_persisted_secrets(self) -> Self:
+        _reject_runtime_secret_fields(
+            self.model_extra or {},
+            label="Agent runtime setting",
+        )
+        return self
+
+
 class AppConfig(BaseModel):
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    agent_runtimes: dict[str, AgentRuntimeSettings] = Field(default_factory=dict)
     base_url: str = "https://api.openai.com/v1"
     model: str = ""
     llm_timeout_s: float = 60.0
@@ -136,9 +286,9 @@ class AppConfig(BaseModel):
     conflict_review_temperature: float = 0.0
     compactor_temperature: float = 0.2
     chat_temperature: float = 0.7
-    stream: bool = False
+    stream: bool = True
     routing_mode: str = "auto"  # auto|code_only
-    step_budget_policy: str = "adaptive"
+    step_budget_policy: str = AUTONOMOUS_STEP_BUDGET_POLICY
     task_max_steps: int = DEFAULT_TASK_MAX_STEPS
     subagent_max_steps: int = DEFAULT_SUBAGENT_MAX_STEPS
     subagents_enabled: bool = True
@@ -153,6 +303,7 @@ class AppConfig(BaseModel):
     experimental_gemini_interactions_enabled: bool = False
     custom_tools_enabled: bool = True
     web_search_mode: str = "auto"
+    web_search_policy: str = "auto"
     web_search_adapter: str = "auto"
     web_search_base_url: str | None = None
     web_search_model: str | None = None
@@ -160,13 +311,17 @@ class AppConfig(BaseModel):
     update_check_enabled: bool = True
     update_check_interval_hours: int = 24
     update_check_timeout_s: float = 3.0
+    update_prompt_enabled: bool = True
     feedback_github_enabled: bool = True
     feedback_github_repo: str = DEFAULT_FEEDBACK_GITHUB_REPO
     feedback_open_browser: bool = True
     session_log_dir: str | None = None
     crash_diagnostic_log_path: str | None = None
+    prompt_cache_mode: str = "manual"
     prompt_cache_key: str | None = None
     prompt_cache_retention: str | None = None
+    anthropic_prompt_cache_enabled: bool = False
+    anthropic_prompt_cache_ttl: str = "5m"
     verify_commands: list[str] = Field(
         default_factory=lambda: list(DEFAULT_VERIFY_COMMANDS),
     )
@@ -180,6 +335,16 @@ class AppConfig(BaseModel):
 
     # Internal: allow future keys without crashing older clients.
     extra_fields: dict[str, Any] = Field(default_factory=dict, exclude=True)
+
+    @model_validator(mode="after")
+    def validate_delegated_runtime_settings(self) -> Self:
+        self.step_budget_policy = normalize_step_budget_policy(self.step_budget_policy)
+        if self.execution.backend != "delegated":
+            return self
+        runtime_id = str(self.execution.runtime or "").strip()
+        if runtime_id not in self.agent_runtimes:
+            raise ValueError(f"Delegated runtime {runtime_id!r} has no agent_runtimes settings.")
+        return self
 
 
 _ROLE_TEMPERATURE_FIELDS: dict[str, str] = {
@@ -394,6 +559,55 @@ def default_chat_history_path() -> Path:
     return _data_dir() / "chat_history.txt"
 
 
+def _migrate_legacy_agent_runtime_config(
+    raw: dict[str, Any],
+    known: dict[str, Any],
+) -> set[str]:
+    """Translate the discarded ``acli`` prototype shape without writing it yet."""
+
+    if "execution" in raw:
+        return set()
+    raw_connection = raw.get("connection")
+    connection = raw_connection if isinstance(raw_connection, dict) else {}
+    connection_kind = str(connection.get("kind") or "").strip().lower()
+    connection_provider = str(connection.get("provider") or "").strip().lower()
+    legacy_backend = str(raw.get("llm_backend") or "").strip().lower()
+    delegated = (
+        connection_kind in {"subscription", "account", "subscription-account"}
+        and connection_provider in {"", "chatgpt", "chat-gpt", "codex"}
+    ) or legacy_backend in {"codex", "codex_cli", "codex-cli"}
+    if not delegated:
+        return set()
+
+    raw_subscription = raw.get("subscription")
+    subscription = raw_subscription if isinstance(raw_subscription, dict) else {}
+    raw_chatgpt = subscription.get("chatgpt")
+    chatgpt = raw_chatgpt if isinstance(raw_chatgpt, dict) else {}
+    raw_nested_codex = chatgpt.get("codex_cli")
+    nested_codex = raw_nested_codex if isinstance(raw_nested_codex, dict) else {}
+    raw_legacy_codex = raw.get("codex_cli")
+    legacy_codex = raw_legacy_codex if isinstance(raw_legacy_codex, dict) else {}
+    settings_source = {**legacy_codex, **nested_codex}
+    executable = str(settings_source.get("executable") or settings_source.get("path") or "codex")
+    settings: dict[str, Any] = {
+        "adapter": "codex-cli",
+        "executable": executable,
+        "provider_managed_auth": True,
+    }
+    model = str(settings_source.get("model") or "").strip()
+    if model:
+        settings["model"] = model
+    timeout = settings_source.get("timeout_seconds")
+    if timeout is not None and str(timeout).strip():
+        settings["timeout_seconds"] = timeout
+    known["execution"] = {"backend": "delegated", "runtime": "openai-codex"}
+    existing_runtimes = raw.get("agent_runtimes")
+    runtimes = dict(existing_runtimes) if isinstance(existing_runtimes, dict) else {}
+    runtimes.setdefault("openai-codex", settings)
+    known["agent_runtimes"] = runtimes
+    return {"connection", "subscription", "codex_cli", "llm_backend"}
+
+
 def load_config() -> AppConfig:
     path = config_path()
     if not path.exists():
@@ -416,6 +630,7 @@ def load_config() -> AppConfig:
     # web_search keys into the legacy auto/off values when older configs
     # are loaded.
     known = {k: v for k, v in raw.items() if k in AppConfig.model_fields}
+    migrated_runtime_keys = _migrate_legacy_agent_runtime_config(raw, known)
     if "web_search_mode" in raw:
         known["web_search_mode"] = _normalize_web_search_mode(
             raw.get("web_search_mode"),
@@ -425,6 +640,8 @@ def load_config() -> AppConfig:
         known["web_search_mode"] = _coerce_legacy_web_search_mode(raw.get("web_search_enabled"))
     if "web_search_adapter" in raw:
         known["web_search_adapter"] = _normalize_web_search_adapter(raw.get("web_search_adapter"))
+    if "web_search_policy" in raw:
+        known["web_search_policy"] = _normalize_web_search_policy(raw.get("web_search_policy"))
     if "temperature" in raw:
         legacy_temperature = raw.get("temperature")
         for field in _ROLE_TEMPERATURE_FIELDS.values():
@@ -433,23 +650,102 @@ def load_config() -> AppConfig:
     unknown = {
         k: v
         for k, v in raw.items()
-        if k not in AppConfig.model_fields and k != "web_search_enabled"
+        if k not in AppConfig.model_fields
+        and k != "web_search_enabled"
+        and k not in migrated_runtime_keys
     }
     cfg = AppConfig(**known)
     cfg.extra_fields = unknown
     from .profiles import migrate_legacy_to_profiles, sync_active_profile_to_config
 
     migrate_legacy_to_profiles(cfg)
+    _migrate_delegated_codex_subscription(
+        cfg,
+        had_non_default_profile=(
+            isinstance(raw.get("profiles"), dict)
+            and any(str(name) != "default" for name in raw["profiles"])
+        ),
+    )
     sync_active_profile_to_config(cfg)
     _canonicalize_active_profile_model(cfg)
     return cfg
+
+
+def _migrate_delegated_codex_subscription(
+    cfg: AppConfig,
+    *,
+    had_non_default_profile: bool,
+) -> bool:
+    """Move the original Codex subscription choice onto the native transport.
+
+    The first implementation used ``execution.backend=delegated`` and therefore
+    replaced the Sylliptor agent with ``codex exec``. Preserve those runtime
+    settings as an inactive fallback, but make the user-facing subscription
+    selection a native profile so existing installations receive the corrected
+    behavior without repeating setup.
+    """
+
+    _ = had_non_default_profile  # Retained for callers from the first migration draft.
+    if cfg.extra_fields.get("onboarded") is not True:
+        return False
+    if cfg.extra_fields.get("preserve_delegated_runtime") is True:
+        return False
+    if cfg.execution.backend != "delegated" or cfg.execution.runtime != "openai-codex":
+        return False
+    settings = cfg.agent_runtimes.get("openai-codex")
+    if settings is None or str(settings.adapter or "").strip() != "codex-cli":
+        return False
+    if str(settings.executable or "").strip() not in {"", "codex"}:
+        return False
+    from .profiles import (
+        SUBSCRIPTION_SELECTION_REQUIRED_KEY,
+        ProfileSpec,
+        add_profile,
+        set_active_profile,
+    )
+
+    model = str(settings.model or "").strip()
+    reasoning_effort = str(settings.reasoning_effort or "").strip() or None
+    profile = ProfileSpec(
+        name="chatgpt-codex",
+        protocol="openai_responses",
+        base_url="https://chatgpt.com/backend-api/codex",
+        auth_provider="openai-codex",
+        default_model=model,
+        reasoning_effort=reasoning_effort,
+        notes=(
+            "ChatGPT Codex subscription compatibility transport. "
+            "Migrated from the delegated Codex runtime."
+        ),
+    )
+    add_profile(cfg, profile, allow_auth_profile_update=True)
+    set_active_profile(cfg, profile.name)
+    cfg.execution.backend = "native"
+    cfg.execution.runtime = None
+    cfg.model = model
+    effective_effort = None if reasoning_effort in {None, "auto"} else reasoning_effort
+    cfg.llm_reasoning_effort = effective_effort
+    cfg.llm_enable_thinking = None if effective_effort is None else effective_effort != "none"
+    # The delegated CLI owned credentials, so native Sylliptor must explicitly
+    # connect its own encrypted provider vault before chat starts.
+    cfg.extra_fields["onboarded"] = False
+    cfg.extra_fields["subscription_reconnect_required"] = True
+    # Preserve any explicit legacy values only as a pre-filled suggestion. Migration
+    # itself is not a /config confirmation, so execution remains blocked until the
+    # user saves a model + effort from Default Model.
+    cfg.extra_fields[SUBSCRIPTION_SELECTION_REQUIRED_KEY] = "openai-codex"
+    return True
 
 
 def save_config(cfg: AppConfig) -> None:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    data = cfg.model_dump()
+    try:
+        validated = AppConfig.model_validate(cfg.model_dump())
+    except ValidationError as exc:
+        raise ConfigError(f"Invalid configuration: {exc.errors()[0]['msg']}") from exc
+    data = validated.model_dump()
     # Preserve unknown keys.
     if cfg.extra_fields:
         extra_fields = dict(cfg.extra_fields)
@@ -469,6 +765,8 @@ def _canonicalize_active_profile_model(cfg: AppConfig) -> None:
     from .profiles import get_profile, update_active_profile_defaults
 
     profile = get_profile(cfg, active_profile)
+    if profile is not None and profile.auth_provider:
+        return
     preset = find_preset_for_profile(profile) if profile is not None else None
     preset = preset or get_preset(active_profile)
     canonical = _canonicalize_model_for_config(cfg, model, active_preset=preset)
@@ -894,6 +1192,65 @@ def get_api_key(cfg: AppConfig | None = None) -> str:
     return resolved.key
 
 
+def resolve_model_access_api_key(
+    cfg: AppConfig,
+    *,
+    override: str | None = None,
+    legacy_resolver: Callable[[], str] | None = None,
+) -> str:
+    """Resolve a static key, or an empty placeholder for an auth-backed profile."""
+
+    if override is not None:
+        normalized = override.strip()
+        if normalized:
+            return normalized
+    try:
+        from .profiles import get_active_profile
+
+        if get_active_profile(cfg).auth_provider:
+            return ""
+    except ConfigError:
+        pass
+    if override is not None:
+        raise ConfigError("API key is empty.")
+    if legacy_resolver is not None:
+        return legacy_resolver()
+    try:
+        return get_api_key(cfg)
+    except ConfigError:
+        # ``SYLLIPTOR_API_KEY`` is an explicit key for the selected Sylliptor
+        # connection. Preserve its historical use for custom-base profiles
+        # without falling back to a possibly unrelated ``OPENAI_API_KEY``.
+        sylliptor_key = str(env_get("SYLLIPTOR_API_KEY") or "").strip()
+        if sylliptor_key:
+            return sylliptor_key
+        raise
+
+
+def ensure_subscription_menu_managed_key(cfg: AppConfig, key: str) -> None:
+    """Reject raw edits that would split an auth profile's model/effort selection."""
+
+    normalized = str(key or "").strip().lower()
+    if normalized not in {
+        "model",
+        "base_url",
+        "llm_reasoning_effort",
+        "llm_enable_thinking",
+    }:
+        return
+    try:
+        from .profiles import get_active_profile
+
+        auth_provider = get_active_profile(cfg).auth_provider
+    except ConfigError:
+        auth_provider = None
+    if auth_provider:
+        raise ConfigError(
+            "Subscription model, reasoning effort, and endpoint settings are managed in "
+            "/config → Default Model."
+        )
+
+
 def _missing_api_key_message(cfg: AppConfig) -> str:
     suggestions: list[str] = ["set SYLLIPTOR_API_KEY"]
     try:
@@ -921,6 +1278,8 @@ def _missing_api_key_message(cfg: AppConfig) -> str:
 
 
 _SETTABLE_KEYS: set[str] = {
+    "execution.backend",
+    "execution.runtime",
     "base_url",
     "model",
     "llm_timeout_s",
@@ -952,6 +1311,7 @@ _SETTABLE_KEYS: set[str] = {
     "task_max_steps",
     "subagent_max_steps",
     "web_search_mode",
+    "web_search_policy",
     "web_search_enabled",
     "web_search_adapter",
     "web_search_base_url",
@@ -960,13 +1320,17 @@ _SETTABLE_KEYS: set[str] = {
     "update_check_enabled",
     "update_check_interval_hours",
     "update_check_timeout_s",
+    "update_prompt_enabled",
     "feedback_github_enabled",
     "feedback_github_repo",
     "feedback_open_browser",
     "session_log_dir",
     "crash_diagnostic_log_path",
+    "prompt_cache_mode",
     "prompt_cache_key",
     "prompt_cache_retention",
+    "anthropic_prompt_cache_enabled",
+    "anthropic_prompt_cache_ttl",
     "verify_commands",
     "integration_verify_mode",
     "integration_verify_commands",
@@ -1011,6 +1375,14 @@ _ROLE_MODEL_NAMES: set[str] = {
     "router",
 }
 _ROLE_MODEL_CONFIG_PREFIXES: set[str] = {"role_models", "forge_role_models"}
+_AGENT_RUNTIME_CONFIG_FIELDS: set[str] = {
+    "adapter",
+    "executable",
+    "provider_managed_auth",
+    "model",
+    "reasoning_effort",
+    "timeout_seconds",
+}
 
 
 def _parse_command_list(value: str, *, key: str, allow_empty: bool) -> list[str]:
@@ -1219,6 +1591,13 @@ def _normalize_web_search_adapter(raw: Any) -> str:
         raise ConfigError(str(exc)) from exc
 
 
+def _normalize_web_search_policy(raw: Any) -> str:
+    try:
+        return normalize_web_search_policy(raw)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+
+
 def _coerce_legacy_web_search_mode(raw: Any) -> str:
     if isinstance(raw, bool):
         return "auto" if raw else "off"
@@ -1319,6 +1698,10 @@ def resolve_crash_diagnostic_log_path(
 
 
 def resolve_llm_enable_thinking(cfg: AppConfig | None) -> bool | None:
+    active_subscription, subscription_effort = _active_subscription_reasoning_effort(cfg)
+    if active_subscription:
+        return None if subscription_effort is None else subscription_effort != "none"
+
     env_value = env_get("SYLLIPTOR_LLM_ENABLE_THINKING")
     if env_value is not None:
         return _coerce_optional_bool(str(env_value), key="SYLLIPTOR_LLM_ENABLE_THINKING")
@@ -1351,6 +1734,10 @@ def _legacy_reasoning_effort_hint(cfg: AppConfig | None) -> str | None:
 
 
 def resolve_llm_reasoning_effort(cfg: AppConfig | None) -> str | None:
+    active_subscription, subscription_effort = _active_subscription_reasoning_effort(cfg)
+    if active_subscription:
+        return subscription_effort
+
     env_value = env_get("SYLLIPTOR_LLM_REASONING_EFFORT")
     if env_value is not None:
         return _coerce_reasoning_effort(env_value, key="SYLLIPTOR_LLM_REASONING_EFFORT")
@@ -1362,6 +1749,28 @@ def resolve_llm_reasoning_effort(cfg: AppConfig | None) -> str | None:
     return _legacy_reasoning_effort_hint(cfg)
 
 
+def _active_subscription_reasoning_effort(
+    cfg: AppConfig | None,
+) -> tuple[bool, str | None]:
+    if cfg is None:
+        return False, None
+    try:
+        from .profiles import get_active_profile
+
+        profile = get_active_profile(cfg)
+    except ConfigError:
+        return False, None
+    if not profile.auth_provider:
+        return False, None
+    return (
+        True,
+        _coerce_reasoning_effort(
+            profile.reasoning_effort,
+            key="subscription profile reasoning_effort",
+        ),
+    )
+
+
 def resolve_web_search_mode(cfg: AppConfig | None) -> str:
     if cfg is None:
         return "auto"
@@ -1369,6 +1778,15 @@ def resolve_web_search_mode(cfg: AppConfig | None) -> str:
         getattr(cfg, "web_search_mode", "auto"),
         allow_legacy_on=True,
     )
+
+
+def resolve_web_search_policy(cfg: AppConfig | None) -> str:
+    env_policy = str(env_get("SYLLIPTOR_WEB_SEARCH_POLICY") or "").strip()
+    if env_policy:
+        return _normalize_web_search_policy(env_policy)
+    if cfg is None:
+        return "auto"
+    return _normalize_web_search_policy(getattr(cfg, "web_search_policy", "auto"))
 
 
 def resolve_web_search_enabled(cfg: AppConfig | None) -> bool:
@@ -1542,6 +1960,24 @@ def resolve_model_metadata_policy(cfg: AppConfig | None) -> str:
     return cfg_policy
 
 
+def _normalize_prompt_cache_mode(value: str | None, *, key: str) -> str:
+    normalized = str(value or "").strip().lower() or "manual"
+    if normalized not in _PROMPT_CACHE_MODES:
+        allowed = ", ".join(sorted(_PROMPT_CACHE_MODES))
+        raise ConfigError(f"{key} must be one of: {allowed}")
+    return normalized
+
+
+def resolve_prompt_cache_mode(cfg: AppConfig | None) -> str:
+    env_mode = str(env_get("SYLLIPTOR_PROMPT_CACHE_MODE") or "").strip()
+    if env_mode:
+        return _normalize_prompt_cache_mode(env_mode, key="SYLLIPTOR_PROMPT_CACHE_MODE")
+    return _normalize_prompt_cache_mode(
+        str(getattr(cfg, "prompt_cache_mode", "manual") or "manual"),
+        key="prompt_cache_mode",
+    )
+
+
 def resolve_prompt_cache_key(cfg: AppConfig | None) -> str | None:
     env_key = str(env_get("SYLLIPTOR_PROMPT_CACHE_KEY") or "").strip()
     if env_key:
@@ -1556,6 +1992,34 @@ def resolve_prompt_cache_retention(cfg: AppConfig | None) -> str | None:
         return env_retention
     cfg_retention = str(getattr(cfg, "prompt_cache_retention", "") or "").strip()
     return cfg_retention or None
+
+
+def _normalize_anthropic_prompt_cache_ttl(value: str | None, *, key: str) -> str:
+    normalized = str(value or "").strip().lower() or "5m"
+    if normalized not in _ANTHROPIC_PROMPT_CACHE_TTLS:
+        allowed = ", ".join(sorted(_ANTHROPIC_PROMPT_CACHE_TTLS))
+        raise ConfigError(f"{key} must be one of: {allowed}")
+    return normalized
+
+
+def resolve_anthropic_prompt_cache_enabled(cfg: AppConfig | None) -> bool:
+    env_value = env_get("SYLLIPTOR_ANTHROPIC_PROMPT_CACHE_ENABLED")
+    if env_value is not None:
+        return _coerce_bool(str(env_value), key="SYLLIPTOR_ANTHROPIC_PROMPT_CACHE_ENABLED")
+    return bool(getattr(cfg, "anthropic_prompt_cache_enabled", False))
+
+
+def resolve_anthropic_prompt_cache_ttl(cfg: AppConfig | None) -> str:
+    env_ttl = str(env_get("SYLLIPTOR_ANTHROPIC_PROMPT_CACHE_TTL") or "").strip()
+    if env_ttl:
+        return _normalize_anthropic_prompt_cache_ttl(
+            env_ttl,
+            key="SYLLIPTOR_ANTHROPIC_PROMPT_CACHE_TTL",
+        )
+    return _normalize_anthropic_prompt_cache_ttl(
+        str(getattr(cfg, "anthropic_prompt_cache_ttl", "5m") or "5m"),
+        key="anthropic_prompt_cache_ttl",
+    )
 
 
 def resolve_role_temperature(cfg: AppConfig, *, role: str) -> float:
@@ -1620,7 +2084,78 @@ def _set_role_model_config_value(
     return cfg
 
 
-def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
+def _agent_runtime_key_parts(key: str) -> tuple[str, str] | None:
+    parts = str(key or "").split(".")
+    if not parts or parts[0] != "agent_runtimes":
+        return None
+    if len(parts) != 3 or not parts[1].strip():
+        raise ConfigError("Agent runtime keys must use agent_runtimes.<runtime-id>.<field> syntax.")
+    field = parts[2].strip()
+    if field not in _AGENT_RUNTIME_CONFIG_FIELDS:
+        allowed = ", ".join(sorted(_AGENT_RUNTIME_CONFIG_FIELDS))
+        raise ConfigError(f"Unsupported agent runtime field {field!r}. Supported fields: {allowed}")
+    return parts[1].strip(), field
+
+
+def _set_agent_runtime_config_value(
+    cfg: AppConfig,
+    *,
+    runtime_id: str,
+    field: str,
+    value: str,
+) -> AppConfig:
+    current = cfg.agent_runtimes.get(runtime_id)
+    values = (
+        current.model_dump() if current is not None else _default_agent_runtime_values(runtime_id)
+    )
+    normalized = str(value or "").strip()
+    if field in {"adapter", "executable"}:
+        if not normalized:
+            raise ConfigError(f"agent_runtimes.{runtime_id}.{field} cannot be empty")
+        values[field] = normalized
+    elif field in {"model", "reasoning_effort"}:
+        values[field] = normalized or None
+    elif field == "timeout_seconds":
+        values[field] = _coerce_positive_float(value, key=f"agent_runtimes.{runtime_id}.{field}")
+    elif field == "provider_managed_auth":
+        values[field] = _coerce_bool(value, key=f"agent_runtimes.{runtime_id}.{field}")
+    cfg.agent_runtimes[runtime_id] = AgentRuntimeSettings(**values)
+    return cfg
+
+
+def _default_agent_runtime_values(runtime_id: str) -> dict[str, object]:
+    # Local import avoids coupling the core config model to optional runtime
+    # discovery during module import, while still using registered defaults for
+    # direct `config set agent_runtimes.<id>...` operations.
+    from .agent_runtimes.builtins import runtime_setup_option
+
+    option = runtime_setup_option(runtime_id)
+    return {
+        "adapter": option.adapter if option is not None else runtime_id,
+        "executable": option.default_executable if option is not None else runtime_id,
+        "provider_managed_auth": True,
+        "model": None,
+        "reasoning_effort": None,
+        "timeout_seconds": 3600.0,
+    }
+
+
+def _ensure_selected_runtime_settings(cfg: AppConfig, runtime_id: str) -> None:
+    if runtime_id not in cfg.agent_runtimes:
+        cfg.agent_runtimes[runtime_id] = AgentRuntimeSettings(
+            **_default_agent_runtime_values(runtime_id)
+        )
+
+
+def set_config_value(
+    cfg: AppConfig,
+    key: str,
+    value: str,
+    *,
+    allow_subscription_selection: bool = False,
+) -> AppConfig:
+    if not allow_subscription_selection or str(key or "").strip().lower() == "base_url":
+        ensure_subscription_menu_managed_key(cfg, key)
     role_model_parts = _role_model_key_parts(key)
     if role_model_parts is not None:
         namespace, role = role_model_parts
@@ -1631,11 +2166,65 @@ def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
             value=value,
         )
 
+    agent_runtime_parts = _agent_runtime_key_parts(key)
+    if agent_runtime_parts is not None:
+        runtime_id, field = agent_runtime_parts
+        return _set_agent_runtime_config_value(
+            cfg,
+            runtime_id=runtime_id,
+            field=field,
+            value=value,
+        )
+
     if key not in _SETTABLE_KEYS:
         raise ConfigError(
             f"Unknown/unsupported key: {key}. Supported keys: "
-            f"{', '.join(sorted(_SETTABLE_KEYS))}, role_models.<role>, forge_role_models.<role>"
+            f"{', '.join(sorted(_SETTABLE_KEYS))}, role_models.<role>, "
+            "forge_role_models.<role>, agent_runtimes.<runtime-id>.<field>"
         )
+
+    if key == "execution.backend":
+        backend = str(value or "").strip().lower()
+        if backend not in {"native", "delegated"}:
+            raise ConfigError("execution.backend must be one of: native, delegated")
+        if backend == "native":
+            cfg.execution.backend = "native"
+            cfg.execution.runtime = None
+            return cfg
+        runtime_id = str(cfg.execution.runtime or "").strip()
+        if not runtime_id:
+            configured = tuple(sorted(cfg.agent_runtimes))
+            if len(configured) == 1:
+                runtime_id = configured[0]
+            elif len(configured) > 1:
+                raise ConfigError(
+                    "Multiple agent runtimes are configured. Set execution.runtime to choose one."
+                )
+            else:
+                from .agent_runtimes.builtins import runtime_setup_options
+
+                options = runtime_setup_options()
+                if len(options) != 1:
+                    raise ConfigError(
+                        "Choose an agent runtime with `sylliptor config set execution.runtime "
+                        "<runtime-id>`."
+                    )
+                runtime_id = options[0].id
+        _ensure_selected_runtime_settings(cfg, runtime_id)
+        cfg.execution.runtime = runtime_id
+        cfg.execution.backend = "delegated"
+        return cfg
+
+    if key == "execution.runtime":
+        runtime_id = str(value or "").strip()
+        if not runtime_id:
+            cfg.execution.backend = "native"
+            cfg.execution.runtime = None
+            return cfg
+        _ensure_selected_runtime_settings(cfg, runtime_id)
+        cfg.execution.runtime = runtime_id
+        cfg.execution.backend = "delegated"
+        return cfg
 
     if key == "base_url":
         from .profiles import update_active_profile_defaults, validate_base_url
@@ -1666,7 +2255,11 @@ def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
 
         normalized = _canonicalize_model_for_config(cfg, str(value or "").strip())
         cfg.model = normalized
-        update_active_profile_defaults(cfg, default_model=normalized)
+        update_active_profile_defaults(
+            cfg,
+            default_model=normalized,
+            allow_subscription_selection=allow_subscription_selection,
+        )
         return cfg
 
     if key == "llm_timeout_s":
@@ -1682,7 +2275,16 @@ def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
         return cfg
 
     if key == "llm_reasoning_effort":
-        cfg.llm_reasoning_effort = _coerce_reasoning_effort(value, key=key)
+        resolved_effort = _coerce_reasoning_effort(value, key=key)
+        cfg.llm_reasoning_effort = resolved_effort
+        from .profiles import update_active_profile_defaults
+
+        profile_effort = resolved_effort or "auto"
+        update_active_profile_defaults(
+            cfg,
+            reasoning_effort=profile_effort,
+            allow_subscription_selection=allow_subscription_selection,
+        )
         return cfg
 
     if key == "provider_concurrency_caps":
@@ -1744,9 +2346,12 @@ def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
 
     if key == "step_budget_policy":
         normalized = value.strip().lower()
-        if normalized not in {"adaptive", "fixed"}:
-            raise ConfigError("step_budget_policy must be one of: adaptive, fixed")
-        cfg.step_budget_policy = normalized
+        if normalized not in {"autonomous", "limited", "adaptive", "fixed"}:
+            raise ConfigError(
+                "step_budget_policy must be one of: autonomous, limited "
+                "(legacy aliases: adaptive, fixed)"
+            )
+        cfg.step_budget_policy = normalize_step_budget_policy(normalized)
         return cfg
 
     if key == "subagents_enabled":
@@ -1797,6 +2402,10 @@ def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
         cfg.web_search_mode = _normalize_web_search_mode(value)
         return cfg
 
+    if key == "web_search_policy":
+        cfg.web_search_policy = _normalize_web_search_policy(value)
+        return cfg
+
     if key == "web_search_enabled":
         cfg.web_search_mode = _coerce_legacy_web_search_mode(value)
         return cfg
@@ -1829,6 +2438,10 @@ def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
         cfg.update_check_timeout_s = _coerce_positive_float(value, key=key)
         return cfg
 
+    if key == "update_prompt_enabled":
+        cfg.update_prompt_enabled = _coerce_bool(value, key=key)
+        return cfg
+
     if key == "feedback_github_enabled":
         cfg.feedback_github_enabled = _coerce_bool(value, key=key)
         return cfg
@@ -1849,12 +2462,24 @@ def set_config_value(cfg: AppConfig, key: str, value: str) -> AppConfig:
         cfg.crash_diagnostic_log_path = value.strip() or None
         return cfg
 
+    if key == "prompt_cache_mode":
+        cfg.prompt_cache_mode = _normalize_prompt_cache_mode(value, key=key)
+        return cfg
+
     if key == "prompt_cache_key":
         cfg.prompt_cache_key = value.strip() or None
         return cfg
 
     if key == "prompt_cache_retention":
         cfg.prompt_cache_retention = value.strip() or None
+        return cfg
+
+    if key == "anthropic_prompt_cache_enabled":
+        cfg.anthropic_prompt_cache_enabled = _coerce_bool(value, key=key)
+        return cfg
+
+    if key == "anthropic_prompt_cache_ttl":
+        cfg.anthropic_prompt_cache_ttl = _normalize_anthropic_prompt_cache_ttl(value, key=key)
         return cfg
 
     if key == "verify_commands":

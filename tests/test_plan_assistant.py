@@ -117,6 +117,56 @@ def _strict_metadata_cfg(
     )
 
 
+def test_planner_usage_payload_backfills_cache_creation_from_api_usage() -> None:
+    from types import SimpleNamespace
+
+    from sylliptor_agent_cli.llm.types import LLMUsage
+    from sylliptor_agent_cli.model_registry import ModelMeta
+    from sylliptor_agent_cli.plan_assistant import _planner_usage_event_payload
+
+    class _Reg:
+        def get(self, model_name: str) -> ModelMeta:
+            return ModelMeta(
+                model_name=model_name,
+                context_window_tokens=200000,
+                max_output_tokens=8192,
+                input_cost_per_token=0.000003,
+                output_cost_per_token=0.000015,
+                cache_read_input_cost_per_token=0.0000003,
+                cache_creation_input_cost_per_token=0.00000375,
+                source="test",
+            )
+
+    response = SimpleNamespace(
+        content="plan text",
+        response_model="claude-sonnet-4-5",
+        tool_calls=[],
+        usage=LLMUsage(
+            prompt_tokens=26000,
+            completion_tokens=500,
+            total_tokens=26500,
+            cache_read_input_tokens=20000,
+            cache_creation_input_tokens=5000,
+            input_tokens_uncached=1000,
+        ),
+    )
+
+    payload = _planner_usage_event_payload(
+        role="forge_planner",
+        requested_model="claude-sonnet-4-5",
+        request_messages=[{"role": "user", "content": "plan this"}],
+        response=response,
+        registry=_Reg(),  # type: ignore[arg-type]
+    )
+
+    assert payload is not None
+    # api_usage back-fill preserves cache accounting (dropped before the fix).
+    assert payload["cache_creation_input_tokens"] == 5000
+    assert payload["cache_read_input_tokens"] == 20000
+    # Uncached input must not swallow the cache-creation tokens.
+    assert payload["input_tokens_uncached"] == 1000
+
+
 def test_assistant_tool_call_message_preserves_provider_metadata() -> None:
     response = LLMResponse(
         content="",

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG PYTHON_IMAGE=python:3.12-slim@sha256:d764629ce0ddd8c71fd371e9901efb324a95789d2315a47db7e4d27e78f1b0e9
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 ARG VARIANT=dev
 ARG SOURCE_URL=https://github.com/AlysisAi/Sylliptor
 ARG GIT_SHA=dev
@@ -64,11 +64,11 @@ USER root
 ARG NODE_MAJOR=24
 # Keep npm ahead of the NodeSource package's bundled npm when scanner-actionable
 # transitive npm dependencies receive security fixes.
-ARG NPM_VERSION=11.13.0
+ARG NPM_VERSION=11.18.0
 ARG TARGETARCH
-ARG GO_VERSION=1.26.4
-ARG GO_LINUX_AMD64_SHA256=1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f
-ARG GO_LINUX_ARM64_SHA256=ef758ae7c6cf9267c9c0ef080b8965f453d89ab2d25d9eb22de4405925238768
+ARG GO_VERSION=1.26.5
+ARG GO_LINUX_AMD64_SHA256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
+ARG GO_LINUX_ARM64_SHA256=fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49
 
 ENV RUSTUP_HOME=/home/sylliptor/.rustup \
     CARGO_HOME=/home/sylliptor/.cargo \

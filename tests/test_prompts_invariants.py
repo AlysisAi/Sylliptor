@@ -145,7 +145,7 @@ def test_sylliptor_one_shot_addendum_invariants() -> None:
         ],
     )
     assert (
-        "After a successful research subagent run (for example explorer or general-purpose), proceed to implementation/tests/docs"
+        "After a successful research subagent run (for example explorer or implementer), proceed to implementation/tests/docs"
         not in _SYSTEM_PROMPT_ONE_SHOT_SECTION
     )
 

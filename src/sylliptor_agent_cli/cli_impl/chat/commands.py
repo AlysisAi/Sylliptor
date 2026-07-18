@@ -13,6 +13,7 @@ from rich.text import Text
 
 from ...llm.base import effective_tools_for_client
 from ...plan_validation import PlannerFailedError, raise_for_execution_ready_plan
+from ...subagents import available_subagent_names, unavailable_builtin_subagents
 from ...surface.styles import (
     STYLE_CHROME,
     STYLE_EMPHASIS,
@@ -196,6 +197,8 @@ def _handle_chat_command(
     plan_mode_state: _ChatPlanModeState,
     plan_mode_escape_supported: bool = False,
     plan_mode_action_prompt: Any | None = None,
+    subagent_result_sink: Any | None = None,
+    subagent_notice_sink: Any | None = None,
 ) -> str | _ChatExecutionRequest:
     trimmed = input_text.strip()
     if not trimmed:
@@ -598,7 +601,30 @@ def _handle_chat_command(
             if action in {"on", "off", "status"}:
                 current_state = bool(getattr(session, "subagents_enabled", False))
                 if action == "status":
-                    console.print(f"Subagents: {'on' if current_state else 'off'}")
+                    cfg = getattr(session, "cfg", None)
+                    tools_obj = getattr(session, "tools", None)
+                    available_tool_names = set(tools_obj) if isinstance(tools_obj, dict) else None
+                    callable_names = available_subagent_names(
+                        registry=registry,
+                        cfg=cfg,
+                        available_tool_names=available_tool_names,
+                    )
+                    lines = [f"Subagents: {'on' if current_state else 'off'}"]
+                    lines.append(
+                        "Available now: "
+                        + (", ".join(callable_names) if callable_names else "none")
+                    )
+                    unavailable = unavailable_builtin_subagents(
+                        registry=registry,
+                        cfg=cfg,
+                        available_tool_names=available_tool_names,
+                    )
+                    for item in unavailable:
+                        detail = f"Unavailable: {item.name} — {item.reason}"
+                        if item.resolution:
+                            detail += f" {item.resolution}"
+                        lines.append(detail)
+                    console.print("\n".join(lines))
                     return "handled"
                 parsed = action == "on"
                 session.subagents_enabled = parsed
@@ -624,6 +650,8 @@ def _handle_chat_command(
                 console=console,
                 subagent_name=selected_name,
                 subagent_task=selected_task,
+                result_sink=subagent_result_sink,
+                notice_sink=subagent_notice_sink,
             )
         parts_subagent = raw_subagent.split(maxsplit=1)
         if len(parts_subagent) < 2:
@@ -639,6 +667,8 @@ def _handle_chat_command(
             console=console,
             subagent_name=subagent_name,
             subagent_task=subagent_task,
+            result_sink=subagent_result_sink,
+            notice_sink=subagent_notice_sink,
         )
     if cmd in {"/context", "/ctx"}:
         _print_chat_context(console=console, session=session)

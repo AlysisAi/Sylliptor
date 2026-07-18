@@ -456,13 +456,69 @@ def test_built_in_subagent_exposure_matches_catalog_policy() -> None:
     assert "shell_run" not in expected
     assert "verify_run" not in expected
     assert "git_apply_patch" not in expected
+    assert "image_generate" not in expected
     assert "subagent_run" not in expected
     assert "history_search" in expected
     assert "web_fetch" not in expected
     assert "web_search" not in expected
     assert registry["explorer"].allow_tools == expected
-    assert registry["reviewer"].allow_tools == expected
+    assert registry["code-reviewer"].allow_tools == expected
     assert registry["test-strategist"].allow_tools == expected
+    assert registry["debugger"].allow_tools == (*expected, "shell_run", "verify_run")
+    assert registry["implementer"].allow_tools == ()
+    assert registry["implementer"].deny_tools == ("image_generate",)
+    assert registry["frontend-engineer"].allow_tools == ()
+    assert registry["frontend-engineer"].deny_tools == ("image_generate",)
+    assert registry["visual-designer"].allow_tools == (*expected, "image_generate")
+
+
+def test_image_generate_metadata_is_billable_optional_write_tool() -> None:
+    metadata = get_builtin_tool_metadata("image_generate")
+
+    assert metadata is not None
+    assert metadata.optional is True
+    assert {"write", "image", "generation", "network"} <= set(metadata.categories)
+    assert metadata.parameters["required"] == ["prompt", "output_path"]
+    assert metadata.parameters["properties"]["count"]["maximum"] == 4
+    assert "never overwritten" in metadata.description
+
+
+def test_image_generate_tool_is_opt_in_and_respects_protected_paths(tmp_path: Path) -> None:
+    disabled = build_tools(
+        root=tmp_path,
+        console=Console(file=io.StringIO()),
+        store=_store(tmp_path),
+        mode="auto",
+        yes=True,
+        cfg=AppConfig(model="test-model"),
+    )
+    assert "image_generate" not in disabled
+
+    cfg = AppConfig(
+        model="test-model",
+        image_generation={
+            "enabled": True,
+            "model": "gpt-image-test",
+            "base_url": "https://images.example.test/v1",
+        },
+    )
+    enabled = build_tools(
+        root=tmp_path,
+        console=Console(file=io.StringIO()),
+        store=_store(tmp_path),
+        mode="auto",
+        yes=True,
+        cfg=cfg,
+        api_key="test-key",
+    )
+    assert "image_generate" in enabled
+    with pytest.raises(RuntimeError, match="protected path"):
+        enabled["image_generate"].run(
+            {
+                "prompt": "An asset that must never be written into Git metadata.",
+                "output_path": ".git/generated.png",
+            }
+        )
 
 
 def test_web_fetch_schema_sets_max_chars_bounds() -> None:

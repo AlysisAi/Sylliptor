@@ -54,6 +54,9 @@ class SubagentStartEvent:
     name: str
     mode: str
     subagent_session_id: str | None = None
+    # What the subagent is for (the definition's description). Surfaces may show a
+    # condensed form so the user knows what agent they just entered.
+    description: str = ""
 
 
 @dataclass(frozen=True, slots=True)

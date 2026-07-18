@@ -22,6 +22,7 @@ from ..approval_scope import (
     exact_file_set_scope,
     exact_verify_command_set_scope,
 )
+from ..capabilities import get_capability_definition
 from ..config import AppConfig, ConfigError, resolve_role_temperature, resolve_web_search_policy
 from ..context.tool_schema_budgeter import (
     CUSTOM_MCP_SCHEMA_FAMILIES,
@@ -47,6 +48,7 @@ from ..execution_deadline import (
     DeadlinePhase,
     ExecutionDeadline,
     deadline_timeout_or_raise,
+    derive_subagent_deadline,
 )
 from ..extensions.activation import ActivationDecision
 from ..extensions.models import normalize_extension_id
@@ -56,15 +58,18 @@ from ..model_registry import ModelRegistry
 from ..model_router import ROLE_CODING, resolve_model_for_role
 from ..policy import evaluate_shell_command
 from ..runtime_kind import RuntimeKind, normalize_runtime_kind
+from ..safety.subagent_report import sanitize_subagent_report, subagent_report_evidence_text
 from ..session_store import SessionStore
 from ..skills import SkillBundle, SkillReadError, read_skill_bundle_file, resolve_skill_by_name
 from ..step_budget import StepBudgetRequest, resolve_step_budget
 from ..subagents import (
     SubagentDefinition,
-    allowed_subagent_tool_names,
+    available_subagent_names,
     canonical_subagent_name,
     normalize_subagent_mode,
     resolve_subagent_model_role,
+    resolve_subagent_tool_scope,
+    subagent_unavailability,
 )
 from ..surface import (
     ApprovalRequest,
@@ -97,6 +102,11 @@ from ..tools.fs import (
 )
 from ..tools.git import git_apply_patch, git_diff, git_history, git_status
 from ..tools.history import history_search
+from ..tools.image_generation import (
+    ImageGenerationError,
+    generate_images,
+    plan_image_output_paths,
+)
 from ..tools.registry import (
     built_in_subagent_tool_names,
     copied_tool_parameters,
@@ -255,6 +265,12 @@ def _subagent_final_report_problem(*, text: str, source: str) -> str | None:
         return "missing_final_report"
     if source not in _AUTHORITATIVE_SUBAGENT_FINAL_TEXT_SOURCES:
         return "missing_final_report_signal"
+    evidence_text = subagent_report_evidence_text(text)
+    acknowledgement = re.sub(r"[\W_]+", "", evidence_text).casefold()
+    if not acknowledgement:
+        return "non_substantive_final_report"
+    if acknowledgement in {"complete", "completed", "done", "ok", "okay"}:
+        return "non_substantive_final_report"
     return None
 
 
@@ -476,6 +492,9 @@ class ToolDef:
         }
 
 
+_SUBAGENT_CANCELLATION_TOKEN_ARG = object()
+
+
 _MODEL_FACING_SCHEMA_PROSE_KEYS = frozenset(
     {
         "$comment",
@@ -632,6 +651,46 @@ def _subagent_exact_tool_catalog_message(
         lines.append(candidate)
     lines.append("</available_tool_catalog>\n")
     return "\n".join(lines)
+
+
+def _subagent_artifact_requirement(
+    definition: SubagentDefinition,
+) -> dict[str, list[str]] | None:
+    capability_names: list[str] = []
+    required_tools: list[str] = []
+    success_event_types: list[str] = []
+    for raw_name in definition.required_capabilities:
+        capability = get_capability_definition(raw_name)
+        if capability is None or not capability.materializes_artifacts:
+            continue
+        capability_names.append(capability.name)
+        required_tools.extend(capability.required_tool_names)
+        success_event_types.extend(capability.success_event_types)
+    if not capability_names:
+        return None
+    return {
+        "required_capabilities": list(dict.fromkeys(capability_names)),
+        "required_tools": list(dict.fromkeys(required_tools)),
+        "success_event_types": list(dict.fromkeys(success_event_types)),
+    }
+
+
+def _subagent_success_event_types(sub_session: Any) -> set[str]:
+    store = getattr(sub_session, "store", None)
+    snapshot = getattr(store, "events_snapshot", None)
+    if not callable(snapshot):
+        return set()
+    try:
+        events = snapshot()
+    except Exception:  # noqa: BLE001 - absent evidence must degrade, not crash cleanup
+        return set()
+    if not isinstance(events, list):
+        return set()
+    return {
+        str(event.get("type") or "").strip()
+        for event in events
+        if isinstance(event, dict) and str(event.get("type") or "").strip()
+    }
 
 
 def _tool_event_metadata(tool: ToolDef | None) -> dict[str, Any]:
@@ -1266,6 +1325,7 @@ def build_tools(
         return selected_model, ROLE_CODING
 
     def _subagent_run(args: dict[str, Any]) -> dict[str, Any]:
+        cancellation_token = args.get(_SUBAGENT_CANCELLATION_TOKEN_ARG)
         if not subagents_enabled:
             return {"error": "Subagents are disabled for this session."}
         if subagent_depth > 0:
@@ -1289,22 +1349,72 @@ def build_tools(
             return {"error": "Missing required argument: task"}
 
         definition = _resolve_subagent_definition(raw_name)
-        if definition is None:
-            available = sorted(subagent_registry.keys()) if subagent_registry else []
+        capability_unavailability = subagent_unavailability(
+            raw_name,
+            registry=subagent_registry,
+            cfg=cfg,
+            available_tool_names={tool.name for tool in tools},
+        )
+        if capability_unavailability is not None:
+            available = available_subagent_names(
+                registry=subagent_registry,
+                cfg=cfg,
+                available_tool_names={tool.name for tool in tools},
+            )
             return {
-                "error": f"Unknown subagent: {raw_name}",
+                "error": f"Subagent unavailable: {capability_unavailability.name}",
+                "error_code": "subagent_capability_unavailable",
+                "unavailable_reason": capability_unavailability.reason,
+                "resolution": capability_unavailability.resolution,
+                "requires_new_session": capability_unavailability.requires_new_session,
                 "available_subagents": available,
             }
-        deadline_decision = _deadline_start_decision(
+        if definition is None:
+            available = available_subagent_names(
+                registry=subagent_registry,
+                cfg=cfg,
+                available_tool_names={tool.name for tool in tools},
+            )
+            return {
+                "error": f"Unknown subagent: {raw_name}",
+                "error_code": "unknown_subagent",
+                "available_subagents": available,
+            }
+        configured_subagent_timeout_s = float(cfg.subagent_timeout_s)
+        child_execution_deadline = derive_subagent_deadline(
+            execution_deadline,
+            configured_subagent_timeout_s,
+        )
+        resolved_timeout_s = child_execution_deadline.remaining_seconds()
+        resolved_deadline_source = str(
+            child_execution_deadline.telemetry_snapshot().get("source") or "unknown"
+        )
+
+        def _child_deadline_telemetry_fields() -> dict[str, Any]:
+            return {
+                "subagent_timeout_s": configured_subagent_timeout_s,
+                "resolved_timeout_s": resolved_timeout_s,
+                "resolved_deadline_source": resolved_deadline_source,
+                "deadline": child_execution_deadline.telemetry_snapshot(),
+            }
+
+        deadline_decision = child_execution_deadline.start_decision(
             DeadlineOperation.SUBAGENT,
             minimum_remaining_seconds=MINIMUM_SUBAGENT_START_SECONDS,
-        )
-        if deadline_decision is not None and not bool(deadline_decision.get("allowed")):
-            payload = _deadline_error(
-                "Subagent launch skipped because the run deadline has too little remaining time.",
-                prevented_launch=True,
-                start_decision=deadline_decision,
-            )
+        ).telemetry_snapshot()
+        if not bool(deadline_decision.get("allowed")):
+            payload = {
+                "error": (
+                    "Subagent launch skipped because the run deadline has too little "
+                    "remaining time."
+                ),
+                "failure_category": "deadline",
+                "deadline_exhausted": child_execution_deadline.is_exhausted(),
+                "deadline_prevented_launch": True,
+                "remaining_seconds": child_execution_deadline.remaining_seconds(),
+                "deadline_start_decision": deadline_decision,
+                **_child_deadline_telemetry_fields(),
+            }
             payload.update(
                 {
                     "subagent": definition.name,
@@ -1313,6 +1423,18 @@ def build_tools(
                     "elapsed_ms": 0,
                 }
             )
+            if crash_diagnostics is not None:
+                crash_diagnostics.event(
+                    "deadline_exhausted",
+                    {
+                        "operation": DeadlineOperation.SUBAGENT.value,
+                        "deadline_exhausted": payload["deadline_exhausted"],
+                        "remaining_seconds": payload["remaining_seconds"],
+                        "deadline": payload["deadline"],
+                        "deadline_start_decision": deadline_decision,
+                    },
+                    durable=True,
+                )
             store.append(
                 "subagent_end",
                 {
@@ -1325,6 +1447,7 @@ def build_tools(
                     "remaining_seconds": payload["remaining_seconds"],
                     "steps_completed": 0,
                     "elapsed_ms": 0,
+                    **_child_deadline_telemetry_fields(),
                 },
             )
             return payload
@@ -1372,41 +1495,39 @@ def build_tools(
         )
         effective_subagent_max_steps = resolution.resolved_max_steps
 
-        store.append(
-            "subagent_start",
-            {
-                "name": definition.name,
-                "subagent_session_id": None,
-                "mode": resolved_mode,
-                "model": selected_model,
-                "temperature_role": temperature_role,
-                "temperature": resolved_temperature,
-                "max_steps": effective_subagent_max_steps,
-                "parent_turn_budget": parent_turn_budget,
-                "step_budget": resolution.to_payload(),
-                "task": task,
-                "deadline": (
-                    execution_deadline.telemetry_snapshot()
-                    if execution_deadline is not None
-                    else None
-                ),
-            },
-        )
-        if crash_diagnostics is not None:
-            crash_diagnostics.event(
-                "subagent_started",
+        def _record_subagent_start(subagent_session_id: str | None) -> None:
+            store.append(
+                "subagent_start",
                 {
-                    "subagent": definition.name,
-                    "subagent_role": temperature_role,
+                    "name": definition.name,
+                    "subagent_session_id": subagent_session_id,
+                    "mode": resolved_mode,
                     "model": selected_model,
+                    "temperature_role": temperature_role,
+                    "temperature": resolved_temperature,
                     "max_steps": effective_subagent_max_steps,
-                    "deadline": (
-                        execution_deadline.telemetry_snapshot()
-                        if execution_deadline is not None
-                        else None
-                    ),
+                    "parent_turn_budget": parent_turn_budget,
+                    "step_budget": resolution.to_payload(),
+                    "task": task,
+                    **_child_deadline_telemetry_fields(),
                 },
             )
+            if crash_diagnostics is not None:
+                crash_diagnostics.event(
+                    "subagent_started",
+                    {
+                        "subagent": definition.name,
+                        "subagent_session_id": subagent_session_id,
+                        "subagent_role": temperature_role,
+                        "model": selected_model,
+                        "max_steps": effective_subagent_max_steps,
+                        **_child_deadline_telemetry_fields(),
+                    },
+                )
+
+        inherited_active_workdir_relpath = (
+            get_active_workdir_relpath() if callable(get_active_workdir_relpath) else "."
+        )
         subagent_surface = NestedSubagentSurface(
             surface,
             subagent_name=definition.name,
@@ -1417,6 +1538,7 @@ def build_tools(
             SubagentStartEvent(
                 name=definition.name,
                 mode=resolved_mode,
+                description=str(definition.description or ""),
             )
         )
 
@@ -1452,11 +1574,22 @@ def build_tools(
                 subagents_enabled=False,
                 subagent_depth=subagent_depth + 1,
                 subagent_registry=subagent_registry,
-                execution_deadline=execution_deadline,
+                active_workdir_relpath_override=inherited_active_workdir_relpath,
+                execution_deadline=child_execution_deadline,
                 crash_diagnostic_log_path=crash_diagnostic_log_path,
             )
+            subagent_session_id = str(
+                getattr(getattr(sub_session, "store", None), "session_id", "") or ""
+            )
+            if not subagent_session_id:
+                try:
+                    sub_session.close()
+                except Exception:
+                    pass
+                raise AgentRuntimeError("Created subagent session has no session ID.")
         except Exception as e:  # noqa: BLE001
             elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
+            _record_subagent_start(None)
             subagent_surface.on_subagent_end(
                 SubagentEndEvent(
                     name=definition.name,
@@ -1476,6 +1609,7 @@ def build_tools(
                     "error": f"Failed to initialize subagent session: {e}",
                     "elapsed_ms": elapsed_ms,
                     "steps_completed": subagent_surface.steps_completed,
+                    **_child_deadline_telemetry_fields(),
                 },
             )
             return {
@@ -1484,18 +1618,78 @@ def build_tools(
                 "steps_completed": subagent_surface.steps_completed,
             }
 
-        subagent_session_id = str(
-            getattr(getattr(sub_session, "store", None), "session_id", "") or ""
-        )
+        _record_subagent_start(subagent_session_id)
         main_tool_names = list(sub_session.tools.keys())
-        allowed_names = allowed_subagent_tool_names(
+        tool_scope = resolve_subagent_tool_scope(
             tool_names=main_tool_names,
             allow_tools=definition.allow_tools,
             deny_tools=definition.deny_tools,
         )
+        allowed_names = list(tool_scope.allowed_names)
+        unavailable_allowed_tools = list(tool_scope.unavailable_allowed_tools)
+        is_custom_allowlist = definition.prompt_trust != "trusted" and any(
+            str(name).strip() for name in definition.allow_tools
+        )
+        if is_custom_allowlist and unavailable_allowed_tools:
+            sub_session.close()
+            elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
+            error_message = (
+                f"Subagent '{definition.name}' requested unavailable allowlist tools: "
+                f"{', '.join(unavailable_allowed_tools)}."
+            )
+            requested_allowed_tools = [
+                str(name).strip() for name in definition.allow_tools if str(name).strip()
+            ]
+            available_tool_names = sorted(
+                name for name in main_tool_names if name != "subagent_run"
+            )
+            failure_payload = {
+                "name": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "failed",
+                "failure_category": "tool_scope",
+                "error_code": "subagent_allowlist_unavailable",
+                "error": error_message,
+                "effective_mode": resolved_mode,
+                "requested_allowed_tools": requested_allowed_tools,
+                "resolved_allowed_tools": allowed_names,
+                "unavailable_allowed_tools": unavailable_allowed_tools,
+                "available_tool_names": available_tool_names,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                **_child_deadline_telemetry_fields(),
+            }
+            store.append("subagent_end", failure_payload)
+            subagent_surface.on_subagent_end(
+                SubagentEndEvent(
+                    name=definition.name,
+                    mode=resolved_mode,
+                    status="failed",
+                    elapsed_ms=elapsed_ms,
+                    steps_completed=subagent_surface.steps_completed,
+                    subagent_session_id=subagent_session_id,
+                    error=error_message,
+                )
+            )
+            return {
+                "error": error_message,
+                "subagent": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "failed",
+                "failure_category": "tool_scope",
+                "error_code": "subagent_allowlist_unavailable",
+                "effective_mode": resolved_mode,
+                "requested_allowed_tools": requested_allowed_tools,
+                "resolved_allowed_tools": allowed_names,
+                "unavailable_allowed_tools": unavailable_allowed_tools,
+                "available_tool_names": available_tool_names,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+            }
         filtered_tools = {
             name: sub_session.tools[name] for name in allowed_names if name in sub_session.tools
         }
+        artifact_requirement = _subagent_artifact_requirement(definition)
         sub_session.tools = filtered_tools
         sub_session.tool_list = [tool.as_openai_tool() for tool in filtered_tools.values()]
         if not filtered_tools:
@@ -1521,6 +1715,7 @@ def build_tools(
                     "error": "No tools available after allow/deny sandboxing.",
                     "elapsed_ms": elapsed_ms,
                     "steps_completed": subagent_surface.steps_completed,
+                    **_child_deadline_telemetry_fields(),
                 },
             )
             return {
@@ -1541,10 +1736,70 @@ def build_tools(
                 "tool_count": len(filtered_tools),
             },
         )
+        required_artifact_tools = set(
+            artifact_requirement.get("required_tools", []) if artifact_requirement else []
+        )
+        missing_required_tools = sorted(required_artifact_tools - set(filtered_tools))
+        if missing_required_tools:
+            sub_session.close()
+            elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
+            error_message = (
+                f"Subagent '{definition.name}' cannot produce its required artifact because "
+                f"its sandbox is missing: {', '.join(missing_required_tools)}."
+            )
+            degraded_payload = {
+                "name": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "degraded",
+                "failure_category": "artifact_capability",
+                "error_code": "required_artifact_tool_unavailable",
+                "artifact_requirement_problem": "required_tool_not_exposed",
+                **(artifact_requirement or {}),
+                "missing_required_tools": missing_required_tools,
+                "error": error_message,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                **_child_deadline_telemetry_fields(),
+                "sandbox": {
+                    "mode": resolved_mode,
+                    "tools": list(filtered_tools),
+                },
+            }
+            store.append("subagent_end", degraded_payload)
+            subagent_surface.on_subagent_end(
+                SubagentEndEvent(
+                    name=definition.name,
+                    mode=resolved_mode,
+                    status="degraded",
+                    elapsed_ms=elapsed_ms,
+                    steps_completed=subagent_surface.steps_completed,
+                    subagent_session_id=subagent_session_id,
+                    error=error_message,
+                )
+            )
+            return {
+                "error": error_message,
+                "subagent": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "degraded",
+                "failure_category": "artifact_capability",
+                "error_code": "required_artifact_tool_unavailable",
+                "artifact_requirement_problem": "required_tool_not_exposed",
+                **(artifact_requirement or {}),
+                "missing_required_tools": missing_required_tools,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                "sandbox": {
+                    "mode": resolved_mode,
+                    "tools": list(filtered_tools),
+                },
+            }
 
         final_text = ""
         final_text_source = "missing"
+        report_safety_payload = sanitize_subagent_report("").metadata()
         usage_payload: dict[str, Any] = {}
+        artifact_success_event_types: set[str] = set()
         exit_code = 1
         usage_replayed = False
 
@@ -1566,17 +1821,102 @@ def build_tools(
                     },
                 )
 
+        def _cancellation_requested(exc: BaseException | None = None) -> bool:
+            if cancellation_token is not None and bool(
+                getattr(cancellation_token, "is_cancelled", False)
+            ):
+                return True
+            marker = str(exc or "").strip().casefold()
+            return "cancelled_by_user" in marker or "canceled_by_user" in marker
+
+        def _cancelled_subagent_result(exc: BaseException) -> dict[str, Any]:
+            nonlocal usage_payload
+            usage_payload = sub_session.usage_summary.totals()
+            _try_replay_subagent_usage_once()
+            elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
+            error_message = "Subagent cancelled by the parent turn."
+            cancelled_payload = {
+                "name": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "cancelled",
+                "failure_category": "cancelled",
+                "error_code": "subagent_cancelled",
+                "exit_code": exit_code,
+                "error": error_message,
+                "cancellation_reason": str(exc or "cancelled_by_user"),
+                "usage": usage_payload,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                **_child_deadline_telemetry_fields(),
+            }
+            store.append("subagent_end", cancelled_payload)
+            subagent_surface.on_subagent_end(
+                SubagentEndEvent(
+                    name=definition.name,
+                    mode=resolved_mode,
+                    status="cancelled",
+                    elapsed_ms=elapsed_ms,
+                    steps_completed=subagent_surface.steps_completed,
+                    subagent_session_id=subagent_session_id,
+                    error=error_message,
+                )
+            )
+            if crash_diagnostics is not None:
+                crash_diagnostics.event(
+                    "subagent_completed",
+                    {
+                        "subagent": definition.name,
+                        "subagent_session_id": subagent_session_id,
+                        "status": "cancelled",
+                        "failure_category": "cancelled",
+                        "error_code": "subagent_cancelled",
+                        "exit_code": exit_code,
+                        "duration_ms": elapsed_ms,
+                        "steps_completed": subagent_surface.steps_completed,
+                        **_child_deadline_telemetry_fields(),
+                    },
+                )
+            return {
+                "error": error_message,
+                "subagent": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "cancelled",
+                "failure_category": "cancelled",
+                "error_code": "subagent_cancelled",
+                "exit_code": exit_code,
+                "usage": usage_payload,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+            }
+
         try:
-            exit_code = sub_session.run_turn(task)
+            if cancellation_token is None:
+                exit_code = sub_session.run_turn(task)
+            else:
+                exit_code = sub_session.run_turn(task, cancellation_token=cancellation_token)
+            if _cancellation_requested():
+                raise RuntimeError("cancelled_by_user")
             final_text, final_text_source = _resolve_subagent_final_text(
                 sub_session=sub_session,
                 subagent_surface=subagent_surface,
             )
+            sanitized_report = sanitize_subagent_report(final_text)
+            final_text = sanitized_report.text
+            report_safety_payload = sanitized_report.metadata()
             usage_payload = sub_session.usage_summary.totals()
+            artifact_success_event_types = _subagent_success_event_types(sub_session)
+        except KeyboardInterrupt as e:
+            if not _cancellation_requested(e):
+                raise
+            return _cancelled_subagent_result(e)
         except Exception as e:  # noqa: BLE001
+            if _cancellation_requested(e):
+                return _cancelled_subagent_result(e)
             usage_payload = sub_session.usage_summary.totals()
             _try_replay_subagent_usage_once()
             elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
+            safe_execution_error = sanitize_subagent_report(f"Subagent execution failed: {e}")
+            report_safety_payload = safe_execution_error.metadata()
             store.append(
                 "subagent_end",
                 {
@@ -1584,10 +1924,12 @@ def build_tools(
                     "subagent_session_id": subagent_session_id,
                     "status": "failed",
                     "exit_code": exit_code,
-                    "error": f"Subagent execution failed: {e}",
+                    "error": safe_execution_error.text,
+                    "report_safety": report_safety_payload,
                     "usage": usage_payload,
                     "elapsed_ms": elapsed_ms,
                     "steps_completed": subagent_surface.steps_completed,
+                    **_child_deadline_telemetry_fields(),
                 },
             )
             subagent_surface.on_subagent_end(
@@ -1598,19 +1940,32 @@ def build_tools(
                     elapsed_ms=elapsed_ms,
                     steps_completed=subagent_surface.steps_completed,
                     subagent_session_id=subagent_session_id,
-                    error=f"Subagent execution failed: {e}",
+                    error=safe_execution_error.text,
                 )
             )
             return {
-                "error": f"Subagent '{definition.name}' execution failed: {e}",
+                "error": f"Subagent '{definition.name}' execution failed: "
+                f"{safe_execution_error.text.removeprefix('Subagent execution failed: ')}",
                 "subagent": definition.name,
                 "subagent_session_id": subagent_session_id,
+                "report_safety": report_safety_payload,
                 "usage": usage_payload,
                 "elapsed_ms": elapsed_ms,
                 "steps_completed": subagent_surface.steps_completed,
             }
         finally:
-            sub_session.close()
+            try:
+                sub_session.close()
+            except Exception as e:  # noqa: BLE001 - cleanup failure must not duplicate lifecycle end
+                store.append(
+                    "warning",
+                    {
+                        "warning": "subagent_close_failed",
+                        "name": definition.name,
+                        "subagent_session_id": subagent_session_id,
+                        "error": str(e),
+                    },
+                )
 
         if exit_code != 0:
             _try_replay_subagent_usage_once()
@@ -1623,10 +1978,10 @@ def build_tools(
                 "usage": usage_payload,
                 "elapsed_ms": elapsed_ms,
                 "steps_completed": subagent_surface.steps_completed,
-                "deadline_exhausted": (
-                    execution_deadline.is_exhausted() if execution_deadline is not None else False
-                ),
+                "deadline_exhausted": child_execution_deadline.is_exhausted(),
                 "deadline_prevented_launch": False,
+                **_child_deadline_telemetry_fields(),
+                "report_safety": report_safety_payload,
             }
             if final_text:
                 error_payload["final_text"] = final_text
@@ -1653,11 +2008,7 @@ def build_tools(
                         "exit_code": exit_code,
                         "duration_ms": elapsed_ms,
                         "steps_completed": subagent_surface.steps_completed,
-                        "deadline": (
-                            execution_deadline.telemetry_snapshot()
-                            if execution_deadline is not None
-                            else None
-                        ),
+                        **_child_deadline_telemetry_fields(),
                     },
                 )
             return {
@@ -1672,6 +2023,7 @@ def build_tools(
                 "steps_completed": subagent_surface.steps_completed,
                 "deadline_exhausted": error_payload["deadline_exhausted"],
                 "deadline_prevented_launch": False,
+                "report_safety": report_safety_payload,
             }
 
         final_report_problem = _subagent_final_report_problem(
@@ -1696,11 +2048,11 @@ def build_tools(
                 "usage": usage_payload,
                 "elapsed_ms": elapsed_ms,
                 "steps_completed": subagent_surface.steps_completed,
-                "deadline_exhausted": (
-                    execution_deadline.is_exhausted() if execution_deadline is not None else False
-                ),
+                "deadline_exhausted": child_execution_deadline.is_exhausted(),
                 "deadline_prevented_launch": False,
                 "error": error_message,
+                **_child_deadline_telemetry_fields(),
+                "report_safety": report_safety_payload,
             }
             if final_text:
                 degraded_payload["final_text"] = final_text
@@ -1727,11 +2079,7 @@ def build_tools(
                         "duration_ms": elapsed_ms,
                         "steps_completed": subagent_surface.steps_completed,
                         "final_report_problem": final_report_problem,
-                        "deadline": (
-                            execution_deadline.telemetry_snapshot()
-                            if execution_deadline is not None
-                            else None
-                        ),
+                        **_child_deadline_telemetry_fields(),
                     },
                 )
             return {
@@ -1748,14 +2096,119 @@ def build_tools(
                 "steps_completed": subagent_surface.steps_completed,
                 "deadline_exhausted": degraded_payload["deadline_exhausted"],
                 "deadline_prevented_launch": False,
+                "report_safety": report_safety_payload,
                 "sandbox": {
                     "mode": resolved_mode,
                     "tools": list(filtered_tools.keys()),
                 },
             }
 
+        required_success_event_types = set(
+            artifact_requirement.get("success_event_types", []) if artifact_requirement else []
+        )
+        observed_success_event_types = sorted(
+            required_success_event_types & artifact_success_event_types
+        )
+        missing_success_event_types = sorted(
+            required_success_event_types - artifact_success_event_types
+        )
+        if missing_success_event_types:
+            _try_replay_subagent_usage_once()
+            elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
+            error_message = (
+                f"Subagent '{definition.name}' returned a report without evidence that its "
+                "required artifact was generated successfully."
+            )
+            degraded_payload = {
+                "name": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "degraded",
+                "failure_category": "artifact_capability",
+                "error_code": "required_artifact_evidence_missing",
+                "artifact_requirement_problem": "successful_generation_not_evidenced",
+                **(artifact_requirement or {}),
+                "observed_success_event_types": observed_success_event_types,
+                "missing_success_event_types": missing_success_event_types,
+                "final_text": final_text,
+                "final_text_source": final_text_source,
+                "exit_code": exit_code,
+                "usage": usage_payload,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                "deadline_exhausted": child_execution_deadline.is_exhausted(),
+                "deadline_prevented_launch": False,
+                "error": error_message,
+                **_child_deadline_telemetry_fields(),
+                "report_safety": report_safety_payload,
+                "sandbox": {
+                    "mode": resolved_mode,
+                    "tools": list(filtered_tools),
+                },
+            }
+            store.append("subagent_end", degraded_payload)
+            subagent_surface.on_subagent_end(
+                SubagentEndEvent(
+                    name=definition.name,
+                    mode=resolved_mode,
+                    status="degraded",
+                    elapsed_ms=elapsed_ms,
+                    steps_completed=subagent_surface.steps_completed,
+                    subagent_session_id=subagent_session_id,
+                    error=error_message,
+                )
+            )
+            if crash_diagnostics is not None:
+                crash_diagnostics.event(
+                    "subagent_completed",
+                    {
+                        "subagent": definition.name,
+                        "subagent_session_id": subagent_session_id,
+                        "status": "degraded",
+                        "failure_category": "artifact_capability",
+                        "error_code": "required_artifact_evidence_missing",
+                        "exit_code": exit_code,
+                        "duration_ms": elapsed_ms,
+                        "steps_completed": subagent_surface.steps_completed,
+                        "missing_success_event_types": missing_success_event_types,
+                        **_child_deadline_telemetry_fields(),
+                    },
+                )
+            return {
+                "error": error_message,
+                "subagent": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "degraded",
+                "failure_category": "artifact_capability",
+                "error_code": "required_artifact_evidence_missing",
+                "artifact_requirement_problem": "successful_generation_not_evidenced",
+                **(artifact_requirement or {}),
+                "observed_success_event_types": observed_success_event_types,
+                "missing_success_event_types": missing_success_event_types,
+                "usage": usage_payload,
+                "final_text": final_text,
+                "final_text_source": final_text_source,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                "deadline_exhausted": degraded_payload["deadline_exhausted"],
+                "deadline_prevented_launch": False,
+                "report_safety": report_safety_payload,
+                "sandbox": {
+                    "mode": resolved_mode,
+                    "tools": list(filtered_tools),
+                },
+            }
+
         _try_replay_subagent_usage_once()
         elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
+
+        artifact_evidence = (
+            {
+                **(artifact_requirement or {}),
+                "observed_success_event_types": observed_success_event_types,
+            }
+            if artifact_requirement is not None
+            else None
+        )
 
         store.append(
             "subagent_end",
@@ -1768,10 +2221,11 @@ def build_tools(
                 "elapsed_ms": elapsed_ms,
                 "steps_completed": subagent_surface.steps_completed,
                 "final_text_source": final_text_source,
-                "deadline_exhausted": (
-                    execution_deadline.is_exhausted() if execution_deadline is not None else False
-                ),
+                "deadline_exhausted": child_execution_deadline.is_exhausted(),
                 "deadline_prevented_launch": False,
+                **_child_deadline_telemetry_fields(),
+                "report_safety": report_safety_payload,
+                **({"artifact_evidence": artifact_evidence} if artifact_evidence else {}),
             },
         )
         subagent_surface.on_subagent_end(
@@ -1794,14 +2248,10 @@ def build_tools(
                     "exit_code": exit_code,
                     "duration_ms": elapsed_ms,
                     "steps_completed": subagent_surface.steps_completed,
-                    "deadline": (
-                        execution_deadline.telemetry_snapshot()
-                        if execution_deadline is not None
-                        else None
-                    ),
+                    **_child_deadline_telemetry_fields(),
                 },
             )
-        return {
+        success_result = {
             "subagent": definition.name,
             "subagent_session_id": subagent_session_id,
             "result": final_text,
@@ -1809,15 +2259,17 @@ def build_tools(
             "usage": usage_payload,
             "elapsed_ms": elapsed_ms,
             "steps_completed": subagent_surface.steps_completed,
-            "deadline_exhausted": (
-                execution_deadline.is_exhausted() if execution_deadline is not None else False
-            ),
+            "deadline_exhausted": child_execution_deadline.is_exhausted(),
             "deadline_prevented_launch": False,
+            "report_safety": report_safety_payload,
             "sandbox": {
                 "mode": resolved_mode,
                 "tools": list(filtered_tools.keys()),
             },
         }
+        if artifact_evidence is not None:
+            success_result["artifact_evidence"] = artifact_evidence
+        return success_result
 
     tools: list[ToolDef] = []
 
@@ -2168,6 +2620,54 @@ def build_tools(
         )
 
     _append_builtin_tool("fs_mkdir", run=_fs_mkdir)
+
+    if cfg is not None and cfg.image_generation.enabled:
+
+        def _image_generate(args: dict[str, Any]) -> dict[str, Any]:
+            try:
+                count = int(args.get("count", 1))
+                planned = plan_image_output_paths(
+                    root=root,
+                    output_path=str(args.get("output_path") or ""),
+                    count=count,
+                )
+            except (ImageGenerationError, TypeError, ValueError) as exc:
+                raise AgentRuntimeError(f"Invalid image generation request: {exc}") from exc
+            relative_paths = [relative for _path, relative in planned]
+            for relative_path in relative_paths:
+                _guard_write_path(relative_path)
+            preview = (
+                "Generate image asset(s)\n"
+                f"model: {cfg.image_generation.model}\n"
+                f"paths: {', '.join(relative_paths)}\n"
+                f"count: {count}\n"
+                f"size: {str(args.get('size') or 'auto')}\n"
+                f"quality: {str(args.get('quality') or 'auto')}\n"
+                f"background: {str(args.get('background') or 'auto')}"
+            )
+            guard_write("image_generate", preview, files=relative_paths)
+            try:
+                result = generate_images(
+                    root=root,
+                    cfg=cfg,
+                    fallback_api_key=api_key,
+                    prompt=str(args.get("prompt") or ""),
+                    output_path=str(args.get("output_path") or ""),
+                    count=count,
+                    size=str(args.get("size") or "auto"),
+                    quality=str(args.get("quality") or "auto"),
+                    background=str(args.get("background") or "auto"),
+                    timeout_s=_deadline_timeout(
+                        cfg.image_generation.timeout_s,
+                        operation="image_generate",
+                    ),
+                )
+            except (ImageGenerationError, DeadlineExhausted) as exc:
+                raise AgentRuntimeError(f"Image generation failed: {exc}") from exc
+            store.append("image_generated", dict(result))
+            return result
+
+        _append_builtin_tool("image_generate", run=_image_generate)
 
     _append_builtin_tool(
         "fs_list",
@@ -3586,7 +4086,11 @@ def build_tools(
     _append_builtin_tool("git_apply_patch", run=_git_apply)
 
     if subagents_enabled and subagent_depth == 0:
-        available_subagent_names = sorted(subagent_registry.keys()) if subagent_registry else []
+        callable_subagent_names = available_subagent_names(
+            registry=subagent_registry,
+            cfg=cfg,
+            available_tool_names={tool.name for tool in tools},
+        )
         subagent_parameters = copied_tool_parameters("subagent_run")
         properties = subagent_parameters.get("properties")
         if not isinstance(properties, dict):
@@ -3594,8 +4098,8 @@ def build_tools(
         subagent_name_schema = properties.get("name")
         if not isinstance(subagent_name_schema, dict):
             raise AgentRuntimeError("subagent_run parameters must define a name property")
-        if available_subagent_names:
-            subagent_name_schema["enum"] = available_subagent_names
+        if callable_subagent_names:
+            subagent_name_schema["enum"] = callable_subagent_names
 
         _append_builtin_tool(
             "subagent_run",
@@ -3644,9 +4148,16 @@ def build_tools(
         if metadata.name in active_tools:
             mark_available(metadata.name)
         elif metadata.optional:
-            reason = metadata.optional_unavailable_reason or (
-                "not registered in active tool registry "
-                f"for mode={mode} runtime_kind={resolved_runtime_kind.value}"
-            )
+            if metadata.name == "image_generate" and (
+                cfg is None or not cfg.image_generation.enabled
+            ):
+                reason = "image_generation.enabled is false"
+            elif metadata.name == "image_generate":
+                reason = f"image generation is not exposed in mode={mode}"
+            else:
+                reason = metadata.optional_unavailable_reason or (
+                    "not registered in active tool registry "
+                    f"for mode={mode} runtime_kind={resolved_runtime_kind.value}"
+                )
             mark_unavailable(metadata.name, reason)
     return active_tools

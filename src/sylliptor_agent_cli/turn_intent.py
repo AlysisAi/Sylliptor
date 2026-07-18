@@ -95,7 +95,8 @@ _EXPLANATORY_NON_EXECUTION_PATTERNS = (
 )
 _READ_ONLY_REPO_INSPECTION_PATTERNS = (
     re.compile(
-        r"^(?:(?:can|could)\s+you\s+|please\s+)?"
+        r"^(?:please\s+)?(?:(?:can|could)\s+you\s+|"
+        r"(?:use|ask)\s+(?:(?:a|the)\s+)?(?:[\w-]+\s+)?subagent\s+to\s+)?"
         r"(?:locate\s+(?:and\s+)?inspect|inspect|look\s+(?:at|over|through)|"
         r"take\s+a\s+look\s+at|list|show|map|summari[sz]e|orient(?:\s+me)?|"
         r"check\s+(?:the\s+)?status|read)\b"

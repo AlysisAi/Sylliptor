@@ -622,6 +622,39 @@ def _short_subagent_desc(text: str, limit: int = 46) -> str:
     return summary
 
 
+def _chat_subagent_result_body(*, subagent_name: str, result: dict[str, Any]) -> str:
+    """Render an explicit ``/subagent`` result as a native markdown block.
+
+    The classic CLI draws this as a box-drawn Rich panel, which reads as a pasted
+    terminal dump inside the alt-screen. In the TUI the result is the *answer* to
+    what the user asked for, so it renders like any other assistant turn: a dim
+    attribution line reusing the ``↩`` mark the subagent trace already uses (see
+    ``TuiSurface.on_subagent_end``), then the text as real markdown.
+    """
+    sandbox_obj = result.get("sandbox")
+    sandbox = sandbox_obj if isinstance(sandbox_obj, dict) else {}
+    clean_name = str(subagent_name or "").strip() or "subagent"
+    bits = [f"↩ {clean_name}"]
+    mode_used = str(sandbox.get("mode") or "").strip()
+    if mode_used:
+        bits.append(mode_used)
+    tools_obj = sandbox.get("tools")
+    if isinstance(tools_obj, list):
+        tools = [str(item).strip() for item in tools_obj if str(item).strip()]
+        if tools:
+            shown = ", ".join(tools[:4])
+            if len(tools) > 4:
+                shown += f" +{len(tools) - 4}"
+            bits.append(shown)
+    steps = result.get("steps_completed")
+    if isinstance(steps, int) and steps > 0:
+        bits.append(f"{steps} step{'s' if steps != 1 else ''}")
+    text = str(result.get("result") or result.get("final_text") or "").strip()
+    if not text:
+        text = "_(no text result)_"
+    return f"*{' · '.join(bits)}*\n\n{text}"
+
+
 # --------------------------------------------------------------------- Forge
 # Task-status buckets — kept EXACTLY in sync with cli_common._forge_task_status_counts
 # (the authority for the done/failed/remaining summary) so a row's tone never
@@ -949,6 +982,7 @@ __all__ = [
     "_chat_terminals_panel_spec",
     "_chat_skill_listing_panel_spec",
     "_short_subagent_desc",
+    "_chat_subagent_result_body",
     "_forge_status_tone",
     "_chat_forge_intro_panel_spec",
     "_chat_forge_plan_panel_spec",

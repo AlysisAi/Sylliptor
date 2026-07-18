@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from sylliptor_agent_cli.config import (
+    DEFAULT_SUBAGENT_TIMEOUT_S,
     DEFAULT_VERIFY_COMMANDS,
     AppConfig,
     ConfigError,
@@ -521,6 +522,7 @@ def test_config_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     cfg.step_budget_policy = "fixed"
     cfg.task_max_steps = 144
     cfg.subagent_max_steps = 12
+    cfg.subagent_timeout_s = 321.5
     cfg.web_search_mode = "auto"
     cfg.web_search_adapter = "openrouter_web"
     cfg.web_search_base_url = "https://api.openai.com/v1"
@@ -549,6 +551,7 @@ def test_config_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert cfg2.step_budget_policy == "limited"
     assert cfg2.task_max_steps == 144
     assert cfg2.subagent_max_steps == 12
+    assert cfg2.subagent_timeout_s == 321.5
     assert cfg2.web_search_mode == "auto"
     assert cfg2.web_search_adapter == "openrouter_web"
     assert cfg2.web_search_base_url == "https://api.openai.com/v1"
@@ -577,6 +580,23 @@ def test_app_config_uses_shared_step_budget_defaults() -> None:
     assert cfg.max_steps == DEFAULT_CHAT_MAX_STEPS
     assert cfg.task_max_steps == DEFAULT_TASK_MAX_STEPS
     assert cfg.subagent_max_steps == DEFAULT_SUBAGENT_MAX_STEPS
+    assert cfg.subagent_timeout_s == DEFAULT_SUBAGENT_TIMEOUT_S
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), float("-inf")])
+def test_app_config_rejects_invalid_subagent_timeout(value: float) -> None:
+    with pytest.raises(ValueError):
+        AppConfig(subagent_timeout_s=value)
+
+
+def test_set_subagent_timeout_value_validation() -> None:
+    cfg = AppConfig()
+
+    cfg = set_config_value(cfg, "subagent_timeout_s", "321.5")
+    assert cfg.subagent_timeout_s == 321.5
+    for value in ("0", "-1", "nan", "inf", "-inf", "not-a-number"):
+        with pytest.raises(ConfigError):
+            set_config_value(cfg, "subagent_timeout_s", value)
 
 
 def test_stream_defaults_on() -> None:

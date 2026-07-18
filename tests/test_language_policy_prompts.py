@@ -60,6 +60,9 @@ def test_router_prompt_has_host_owned_route_context_policy() -> None:
     assert "host-owned system message" in _ROUTER_SYSTEM_PROMPT
     assert "stable workspace grounding" in _ROUTER_SYSTEM_PROMPT
     assert "active task state" in _ROUTER_SYSTEM_PROMPT
+    assert "artifact_capabilities" in _ROUTER_SYSTEM_PROMPT
+    assert "does not know the internal tool or subagent name" in _ROUTER_SYSTEM_PROMPT
+    assert "Do not downgrade a requested deliverable" in _ROUTER_SYSTEM_PROMPT
 
 
 def test_router_prompt_requires_execution_posture_schema_and_policy() -> None:

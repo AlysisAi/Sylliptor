@@ -197,7 +197,65 @@ def test_subagent_status_reports_current_state() -> None:
     )
 
     assert result == "handled"
-    assert stream.getvalue().strip() == "Subagents: on"
+    output = stream.getvalue()
+    assert output.startswith("Subagents: on\n")
+    assert "Available now: none" in output
+    assert "Unavailable: visual-designer" in output
+    assert "image_generation.enabled true" in output.replace("\n", " ")
+
+
+def test_nested_subagent_command_is_rejected_before_any_agent_runs() -> None:
+    tool = _RecordingSubagentTool()
+    session = type("Session", (), {})()
+    session.subagents_enabled = True
+    session.cfg = AppConfig(model="test-model")
+    session.mode = "review"
+    session.tools = {"subagent_run": tool}
+    session.subagent_registry = {}
+
+    stream = io.StringIO()
+    result = cli_mod._handle_chat_command(
+        input_text=(
+            "/subagent frontend-engineer /subagent visual-designer Create a square forest image."
+        ),
+        root=Path("."),
+        session=session,
+        pending_images=[],
+        console=Console(file=stream, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert tool.calls == []
+    output = " ".join(stream.getvalue().split())
+    assert "cannot start another /subagent command" in output
+    assert "/subagent visual-designer Create a square forest image." in output
+
+
+def test_nested_subagent_rejection_escapes_user_controlled_rich_markup() -> None:
+    tool = _RecordingSubagentTool()
+    session = type("Session", (), {})()
+    session.subagents_enabled = True
+    session.cfg = AppConfig(model="test-model")
+    session.mode = "review"
+    session.tools = {"subagent_run": tool}
+    session.subagent_registry = {}
+
+    stream = io.StringIO()
+    result = cli_mod._handle_chat_command(
+        input_text="/subagent explorer /subagent [bold]visual[/bold] Create an image.",
+        root=Path("."),
+        session=session,
+        pending_images=[],
+        console=Console(file=stream, force_terminal=False),
+        forge_state=cli_mod._ForgeChatState(),
+        plan_mode_state=cli_mod._ChatPlanModeState(),
+    )
+
+    assert result == "handled"
+    assert tool.calls == []
+    assert "[bold]visual[/bold]" in stream.getvalue()
 
 
 @pytest.mark.parametrize(

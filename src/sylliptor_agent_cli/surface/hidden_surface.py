@@ -4,6 +4,7 @@ import threading
 from dataclasses import replace
 from typing import Any
 
+from ..safety.subagent_report import sanitize_subagent_report
 from .base import Surface
 from .events import Event
 from .noop_surface import NoopSurface
@@ -197,6 +198,7 @@ class NestedSubagentSurface(HiddenApprovalSurface):
         self._tool_call_prefix = f"subagent:{subagent_name}:"
         self._steps_completed = 0
         self._assistant_messages_done: list[str] = []
+        self._assistant_message_chunks: dict[tuple[str | None, str | None], list[str]] = {}
 
     @property
     def steps_completed(self) -> int:
@@ -245,12 +247,8 @@ class NestedSubagentSurface(HiddenApprovalSurface):
         worker_id: str | None = None,
         role: str | None = None,
     ) -> None:
-        self._call_parent_emit(
-            "emit_message_delta",
-            text,
-            worker_id=self._scoped_worker_id(worker_id),
-            role=self._scoped_role(role),
-        )
+        key = (worker_id, role)
+        self._assistant_message_chunks.setdefault(key, []).append(str(text or ""))
 
     def emit_message_end(
         self,
@@ -259,9 +257,20 @@ class NestedSubagentSurface(HiddenApprovalSurface):
         worker_id: str | None = None,
         role: str | None = None,
     ) -> None:
+        key = (worker_id, role)
+        buffered_text = "".join(self._assistant_message_chunks.pop(key, []))
+        complete_text = str(text or "") or buffered_text
+        safe_text = sanitize_subagent_report(complete_text).text
+        if safe_text:
+            self._call_parent_emit(
+                "emit_message_delta",
+                safe_text,
+                worker_id=self._scoped_worker_id(worker_id),
+                role=self._scoped_role(role),
+            )
         self._call_parent_emit(
             "emit_message_end",
-            text,
+            safe_text,
             worker_id=self._scoped_worker_id(worker_id),
             role=self._scoped_role(role),
         )
@@ -279,7 +288,7 @@ class NestedSubagentSurface(HiddenApprovalSurface):
             "emit_tool_call_started",
             self._scoped_tool_call_id(call_id),
             name,
-            arguments_preview,
+            sanitize_subagent_report(arguments_preview).text,
             worker_id=self._scoped_worker_id(worker_id),
             role=self._scoped_role(role),
         )
@@ -295,7 +304,7 @@ class NestedSubagentSurface(HiddenApprovalSurface):
         self._call_parent_emit(
             "emit_tool_call_progress",
             self._scoped_tool_call_id(call_id),
-            text,
+            sanitize_subagent_report(text).text,
             worker_id=self._scoped_worker_id(worker_id),
             role=self._scoped_role(role),
         )
@@ -313,7 +322,7 @@ class NestedSubagentSurface(HiddenApprovalSurface):
             "emit_tool_call_completed",
             self._scoped_tool_call_id(call_id),
             success,
-            result_preview,
+            sanitize_subagent_report(result_preview).text,
             worker_id=self._scoped_worker_id(worker_id),
             role=self._scoped_role(role),
         )
@@ -351,7 +360,7 @@ class NestedSubagentSurface(HiddenApprovalSurface):
     ) -> None:
         self._call_parent_emit(
             "emit_warning",
-            message,
+            sanitize_subagent_report(message).text,
             worker_id=self._scoped_worker_id(worker_id),
             role=self._scoped_role(role),
         )
@@ -368,7 +377,7 @@ class NestedSubagentSurface(HiddenApprovalSurface):
         self._call_parent_emit(
             "emit_error",
             code,
-            message,
+            sanitize_subagent_report(message).text,
             recoverable,
             worker_id=self._scoped_worker_id(worker_id),
             role=self._scoped_role(role),
@@ -383,7 +392,7 @@ class NestedSubagentSurface(HiddenApprovalSurface):
     ) -> None:
         self._call_parent_emit(
             "emit_info",
-            message,
+            sanitize_subagent_report(message).text,
             worker_id=self._scoped_worker_id(worker_id),
             role=self._scoped_role(role),
         )
@@ -405,6 +414,7 @@ class NestedSubagentSurface(HiddenApprovalSurface):
             replace(
                 event,
                 tool_call_id=self._scoped_tool_call_id(event.tool_call_id),
+                chunk=sanitize_subagent_report(event.chunk).text,
                 subagent_name=self._subagent_name,
                 subagent_mode=self._subagent_mode,
                 nesting_depth=max(int(event.nesting_depth), 0) + 1,

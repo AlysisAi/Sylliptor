@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import errno
 import os
-import pty
 import select
 import subprocess
 from pathlib import Path
 
 import pytest
 from _terminal_matrix_harness import load_scenario, panel_present
+
+pytest.importorskip("termios", reason="show-owl PTY matrix requires POSIX terminal support")
+pty = pytest.importorskip("pty", reason="show-owl PTY matrix requires the POSIX pty module")
 
 ROOT = Path(__file__).resolve().parents[1]
 SHOW_OWL = ROOT / "src" / "sylliptor_agent_cli" / "assets" / "owl" / "show-owl.sh"

@@ -144,6 +144,12 @@ Routing rules:
   results from one of those custom tools, classify it as route="repo" with
   execution_posture="execute". Custom tools are available only inside the repository-capable agent
   loop; do not answer that the custom tool is unavailable when it appears in the route context.
+- The route context may list `artifact_capabilities`, each with a semantic description and an
+  authoritative `available` or `unavailable` status. When the user requests an outcome matching
+  one of those descriptions, classify it as route="repo" with execution_posture="execute" even
+  when the user provides no output path and does not know the internal tool or subagent name. The
+  repository-capable agent will either produce the deliverable or report the grounded unavailable
+  reason. Do not downgrade a requested deliverable into prompt-writing or general advice.
 - If the user asks to write, save, create, update, or verify a local file path such as
   `reports/result.txt`, classify it as route="repo" even when an MCP/web tool is needed first.
 - If the route context lists web tools and the request depends on unstable external facts,

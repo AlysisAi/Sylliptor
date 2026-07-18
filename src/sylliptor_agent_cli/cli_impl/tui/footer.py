@@ -16,9 +16,11 @@ from prompt_toolkit.formatted_text import FormattedText
 
 from .content import pretty_model_label
 from .state import TuiState
+from .subagent_identity import subagent_identity
 
 _BRAND_MARK = "◇"
 _BRANCH_MARK = "⎇"
+_SUBAGENT_MARK = "↪"
 _DOT = "  ·  "
 
 # Compact labels for the execution-mode badge (full names live in the /mode popup).
@@ -111,6 +113,18 @@ def _line2(state: TuiState) -> tuple[Fragments, Fragments]:
         if left:
             left.append(("class:tui.footer.dim", _DOT))
         left.append((mode_style, short))
+    if state.active_subagent:
+        # A nested agent is doing the work right now — keep its name pinned so
+        # the user always knows who they are talking through. The ↪ glyph is the
+        # same one the transcript's subagent trace uses (single-width, so the
+        # no-wrap math stays exact).
+        name = state.active_subagent
+        if len(name) > 16:
+            name = name[:15] + "…"
+        if left:
+            left.append(("class:tui.footer.dim", _DOT))
+        accent = subagent_identity(state.active_subagent).color
+        left.append((f"class:tui.footer.subagent bold {accent}", f"{_SUBAGENT_MARK} {name}"))
     if state.username:
         if left:
             left.append(("class:tui.footer.dim", _DOT))

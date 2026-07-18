@@ -31,6 +31,7 @@ class DeadlineSource(StrEnum):
     ENVIRONMENT = "environment"
     CONFIG = "config"
     INHERITED_PARENT = "inherited_parent"
+    SUBAGENT_FALLBACK = "subagent_fallback"
     ABSENT = "absent"
     UNKNOWN = "unknown"
 
@@ -561,6 +562,43 @@ class ExecutionDeadline:
                 for key, observation in sorted(self._duration_observations.items())
             },
         }
+
+
+def derive_subagent_deadline(
+    parent_deadline: ExecutionDeadline | None,
+    fallback_seconds: float,
+) -> ExecutionDeadline:
+    """Return the earlier of an active parent ceiling and a finite child fallback."""
+
+    fallback = validate_deadline_seconds(fallback_seconds, key="subagent_timeout_s")
+    if parent_deadline is None:
+        return ExecutionDeadline.from_duration(
+            fallback,
+            source=DeadlineSource.SUBAGENT_FALLBACK,
+        )
+
+    clock = parent_deadline._clock
+    now = float(clock())
+    fallback_deadline_monotonic = now + fallback
+    if parent_deadline.enabled and parent_deadline.phase() in {
+        DeadlinePhase.FINALIZATION_WINDOW,
+        DeadlinePhase.EXHAUSTED,
+    }:
+        return parent_deadline
+    if (
+        parent_deadline.deadline_monotonic is not None
+        and parent_deadline.deadline_monotonic <= fallback_deadline_monotonic
+    ):
+        return parent_deadline
+
+    return ExecutionDeadline.from_absolute(
+        started_at_monotonic=now,
+        deadline_monotonic=fallback_deadline_monotonic,
+        configured_duration_seconds=fallback,
+        clock=clock,
+        source=DeadlineSource.SUBAGENT_FALLBACK,
+        finalization_policy=parent_deadline.finalization_policy,
+    )
 
 
 def _normalize_operation(operation: str | DeadlineOperation) -> str:

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import typer
+from rich.markup import escape as escape_rich_markup
 
 from ...compaction.conversation_compactor import CompactionState
 from ...error_text import sanitize_error_text_for_output
@@ -167,6 +168,123 @@ def _resolve_forge_entry_root(*, session: Any, fallback_root: Path) -> Path:
 
 def _default_subagent_task(subagent_name: str) -> str:
     return _SUBAGENT_DEFAULT_TASKS.get(str(subagent_name or "").strip().lower(), "")
+
+
+# "on"/"off"/"status" are instant local toggles; everything else with both a name
+# and a task spawns a nested agent session and must go to the worker thread.
+_SUBAGENT_INSTANT_ACTIONS = frozenset({"on", "off", "status"})
+
+
+def _is_deferrable_subagent_command(text: str) -> bool:
+    """True for an explicit ``/subagent <name> <task>`` that spawns a real run.
+
+    False for the bare form (the TUI picker intercepts it), for the instant
+    ``on|off|status`` toggles, and for ``/subagent <name>`` with no task (which
+    only prints usage) — none of those block, so they stay on the fast path.
+    """
+    parts = str(text or "").strip().split()
+    if len(parts) < 3 or parts[0].lower() != "/subagent":
+        return False
+    return parts[1].lower() not in _SUBAGENT_INSTANT_ACTIONS
+
+
+def _subagent_no_task_hint(
+    *,
+    registry: dict[str, Any],
+    raw_name: str,
+    cfg: Any | None = None,
+    available_tool_names: set[str] | None = None,
+) -> str:
+    """One line for a TUI ``/subagent <name>`` submitted with no task.
+
+    The classic handler answers this with the full usage panel — every
+    subagent's whole multi-sentence description, a dense wall that lands right
+    after picking an agent from the picker and pressing Enter too early. Say
+    only what is missing, in the agent's own voice (its activity tagline).
+    """
+    from ...subagents import canonical_subagent_name, subagent_unavailability
+    from ..tui.subagent_identity import subagent_tagline
+
+    name = canonical_subagent_name(raw_name) or str(raw_name or "").strip()
+    if name in registry:
+        unavailable = subagent_unavailability(
+            name,
+            registry=registry,
+            cfg=cfg,
+            available_tool_names=available_tool_names,
+        )
+        if unavailable is not None:
+            resolution = f" {unavailable.resolution}" if unavailable.resolution else ""
+            return f"{name} is unavailable: {unavailable.reason}{resolution}"
+        tagline = subagent_tagline(name, str(getattr(registry.get(name), "description", "") or ""))
+        ready = f" · {tagline}" if tagline else ""
+        return f"{name}{ready} — not started; run one task: /subagent {name} <task>"
+    unavailable = subagent_unavailability(
+        name,
+        registry=registry,
+        cfg=cfg,
+        available_tool_names=available_tool_names,
+    )
+    if unavailable is not None:
+        resolution = f" {unavailable.resolution}" if unavailable.resolution else ""
+        return f"{name} is unavailable: {unavailable.reason}{resolution}"
+    available = ", ".join(sorted(registry)) or "none"
+    return (
+        f"Unknown subagent '{raw_name}' (available: {available}) — bare /subagent opens the picker"
+    )
+
+
+def _nested_subagent_command(subagent_task: str) -> str | None:
+    """Return an inner slash command only when it occupies the task-command slot."""
+
+    task = str(subagent_task or "").strip()
+    if not task:
+        return None
+    first_token = task.split(maxsplit=1)[0].casefold()
+    return task if first_token == "/subagent" else None
+
+
+def _subagent_error_notice(result: dict[str, Any]) -> tuple[str, str]:
+    error = str(result.get("error") or "Unknown error")
+    plain_lines = [f"Subagent error: {error}"]
+    markup_lines = [f"[red]Subagent error:[/red] {escape_rich_markup(error)}"]
+
+    reason = str(result.get("unavailable_reason") or "").strip()
+    if reason:
+        plain_lines.append(f"Reason: {reason}")
+        markup_lines.append(f"[dim]Reason:[/dim] {escape_rich_markup(reason)}")
+    resolution = str(result.get("resolution") or "").strip()
+    if resolution:
+        plain_lines.append(f"Resolution: {resolution}")
+        markup_lines.append(f"[dim]Resolution:[/dim] {escape_rich_markup(resolution)}")
+
+    available_obj = result.get("available_subagents")
+    if isinstance(available_obj, list) and available_obj:
+        available = ", ".join(str(item) for item in available_obj)
+        plain_lines.append(f"Available now: {available}")
+        markup_lines.append(f"[dim]Available now:[/dim] {escape_rich_markup(available)}")
+    return "\n".join(plain_lines), "\n".join(markup_lines)
+
+
+def _subagent_picker_row_specs(*, registry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rows for the TUI spawn picker — each agent's name (the same name its
+    spawn line and result attribution use) over the first-clause summary of what
+    it is for."""
+    from ..commands.chat_tui_panels import _short_subagent_desc
+
+    rows: list[dict[str, Any]] = []
+    for value, _label, desc in _chat_subagent_rows(registry=registry):
+        rows.append(
+            {
+                "label": str(value),
+                # Full first-clause summary — the picker wraps it to a couple of
+                # lines rather than clipping on the right.
+                "description": _short_subagent_desc(desc, limit=120),
+                "value": str(value),
+                "current": False,
+            }
+        )
+    return rows
 
 
 def _chat_plan_usage_lines() -> tuple[str, ...]:
@@ -521,7 +639,35 @@ def _artifact_display_ref(*args: Any, **kwargs: Any) -> Any:
     return _rendering._artifact_display_ref(*args, **kwargs)
 
 
-def _ensure_subagents_enabled_for_session(*, session: Any, console: Console) -> bool:
+def _emit_subagent_notice(
+    *,
+    console: Console,
+    notice_sink: Any | None,
+    role: str,
+    plain: str,
+    markup: str,
+) -> None:
+    """Route a ``/subagent`` status line to the TUI surface, else the console.
+
+    ``notice_sink`` is supplied only by the TUI, which renders the line as a real
+    transcript entry (``role`` picks the style) instead of Rich markup captured
+    into a flat system dump. Classic CLI keeps the original markup verbatim.
+    """
+    if callable(notice_sink):
+        try:
+            notice_sink(role, plain)
+            return
+        except Exception:  # noqa: BLE001 - a broken sink must never kill the command
+            pass
+    console.print(markup)
+
+
+def _ensure_subagents_enabled_for_session(
+    *,
+    session: Any,
+    console: Console,
+    notice_sink: Any | None = None,
+) -> bool:
     if bool(getattr(session, "subagents_enabled", False)):
         return True
     session.subagents_enabled = True
@@ -533,9 +679,24 @@ def _ensure_subagents_enabled_for_session(*, session: Any, console: Console) -> 
             mode=str(getattr(session, "mode", "review")),
         )
     except Exception as e:  # noqa: BLE001
-        console.print(f"[red]Failed to enable subagents:[/red] {e}")
+        _emit_subagent_notice(
+            console=console,
+            notice_sink=notice_sink,
+            role="error",
+            plain=f"Failed to enable subagents: {e}",
+            markup=f"[red]Failed to enable subagents:[/red] {e}",
+        )
         return False
-    console.print("[dim]Subagents enabled for this session.[/dim]")
+    # Spawning one subagent explicitly also flips session-wide auto-delegation on
+    # (the tool only exists when it is). Say so where the user can actually see it
+    # rather than burying it in captured console output.
+    _emit_subagent_notice(
+        console=console,
+        notice_sink=notice_sink,
+        role="trace",
+        plain="Subagents enabled for this session · auto-delegation on",
+        markup="[dim]Subagents enabled for this session.[/dim]",
+    )
     return True
 
 
@@ -552,29 +713,68 @@ def _run_explicit_subagent(
     console: Console,
     subagent_name: str,
     subagent_task: str,
+    result_sink: Any | None = None,
+    notice_sink: Any | None = None,
 ) -> str:
-    if not _ensure_subagents_enabled_for_session(session=session, console=console):
+    nested_command = _nested_subagent_command(subagent_task)
+    if nested_command is not None:
+        message = (
+            "A /subagent task cannot start another /subagent command. "
+            f"Run the intended command directly: {nested_command}"
+        )
+        _emit_subagent_notice(
+            console=console,
+            notice_sink=notice_sink,
+            role="error",
+            plain=message,
+            markup=(f"[red]Invalid subagent command:[/red] {escape_rich_markup(message)}"),
+        )
+        return "handled"
+    if not _ensure_subagents_enabled_for_session(
+        session=session,
+        console=console,
+        notice_sink=notice_sink,
+    ):
         return "handled"
     subagent_tool = getattr(session, "tools", {}).get("subagent_run")
     if subagent_tool is None:
-        console.print("[red]subagent_run tool is unavailable in this session.[/red]")
+        _emit_subagent_notice(
+            console=console,
+            notice_sink=notice_sink,
+            role="error",
+            plain="subagent_run tool is unavailable in this session.",
+            markup="[red]subagent_run tool is unavailable in this session.[/red]",
+        )
         return "handled"
     try:
         result_raw = subagent_tool.run({"name": subagent_name, "task": subagent_task})
     except Exception as e:  # noqa: BLE001
-        console.print(f"[red]Subagent failed:[/red] {e}")
+        _emit_subagent_notice(
+            console=console,
+            notice_sink=notice_sink,
+            role="error",
+            plain=f"Subagent failed: {e}",
+            markup=f"[red]Subagent failed:[/red] {e}",
+        )
         return "handled"
     result = result_raw if isinstance(result_raw, dict) else {"result": str(result_raw)}
     if "error" in result:
-        err = str(result.get("error") or "Unknown error")
-        available_obj = result.get("available_subagents")
-        if isinstance(available_obj, list) and available_obj:
-            available = ", ".join(str(item) for item in available_obj)
-            console.print(f"[red]Subagent error:[/red] {err} [dim](available: {available})[/dim]")
-        else:
-            console.print(f"[red]Subagent error:[/red] {err}")
+        plain, markup = _subagent_error_notice(result)
+        _emit_subagent_notice(
+            console=console,
+            notice_sink=notice_sink,
+            role="error",
+            plain=plain,
+            markup=markup,
+        )
         return "handled"
     effective_name = str(result.get("subagent") or subagent_name)
+    if callable(result_sink):
+        try:
+            result_sink(effective_name, result)
+            return "handled"
+        except Exception:  # noqa: BLE001 - fall back to the console panel
+            pass
     _render_explicit_subagent_panel(
         console=console,
         subagent_name=effective_name,
@@ -2127,6 +2327,87 @@ def chat(
 
                     return _run
 
+                def _tui_make_subagent_execute(command_text: str, width: int):
+                    """Build the worker job for an explicit "/subagent <name> <task>".
+
+                    Spawning a subagent runs a full nested agent session (its own
+                    multi-step model loop), so it must never run on the synchronous
+                    runner — that blocks the prompt_toolkit event loop, which freezes
+                    the pane AND kills Ctrl+C (the interrupt is itself a key binding).
+                    On the worker it gets the cancellation token, the elapsed timer,
+                    and a live repaint of the ↪/▸/↩ trace the nested surface already
+                    forwards (see ``NestedSubagentSurface`` → ``TuiSurface``).
+                    """
+
+                    def _run(token: Any) -> None:
+                        import io as _io
+
+                        from rich.console import Console as _RichConsole
+
+                        from ..commands.chat_tui_panels import _chat_subagent_result_body
+
+                        built = _tui_box.get("session")
+                        if built is None:
+                            return
+                        surface = getattr(built, "surface", None)
+
+                        def _dropped() -> bool:
+                            return surface is None or bool(getattr(token, "is_cancelled", False))
+
+                        def _notice_sink(role: str, text_line: str) -> None:
+                            if _dropped():
+                                return
+                            surface.append_note(str(text_line), role=str(role or "system"))
+
+                        def _result_sink(name: str, result: dict[str, Any]) -> None:
+                            if _dropped():
+                                return
+                            body = _chat_subagent_result_body(subagent_name=name, result=result)
+                            # role="assistant" so the result reads as the answer it is —
+                            # a real markdown block — not a box-drawn console dump.
+                            surface.append_note(body, role="assistant")
+
+                        buf = _io.StringIO()
+                        cap = _RichConsole(
+                            file=buf,
+                            force_terminal=False,
+                            no_color=True,
+                            highlight=False,
+                            width=max(20, min(int(width or 100), 120)),
+                        )
+                        try:
+                            _handle_chat_command(
+                                input_text=command_text,
+                                root=focus_path,
+                                session=built,
+                                pending_images=[],
+                                console=cap,
+                                forge_state=_tui_forge_state,
+                                plan_mode_state=_tui_plan_state,
+                                plan_mode_escape_supported=False,
+                                subagent_result_sink=_result_sink,
+                                subagent_notice_sink=_notice_sink,
+                            )
+                        except Exception as _sub_exc:  # noqa: BLE001
+                            if not _dropped():
+                                try:
+                                    surface.append_system(f"Subagent failed: {_sub_exc}")
+                                except Exception:
+                                    pass
+                            return
+                        # Anything the handler still wrote to the console (usage panel
+                        # for a bad name, etc.) — surface it rather than swallow it.
+                        if _dropped():
+                            return
+                        leftover = buf.getvalue().rstrip("\n")
+                        if leftover:
+                            try:
+                                surface.append_system(leftover)
+                            except Exception:
+                                pass
+
+                    return _run
+
                 def _tui_command_runner(
                     sess: Any, text: str, width: int
                 ) -> tuple[str, str, str | None, dict[str, Any] | None]:
@@ -2146,6 +2427,47 @@ def chat(
                                     text.strip(), width
                                 )
                             },
+                        )
+                    # An explicit "/subagent <name> <task>" spawns a nested agent
+                    # session — defer it to the worker for the same reason /execute is
+                    # deferred below. The bare form is intercepted by the picker and
+                    # "on|off|status" is instant, so neither reaches here.
+                    if _is_deferrable_subagent_command(text):
+                        return (
+                            "run",
+                            "",
+                            text.strip(),
+                            {"_deferred_execute": _tui_make_subagent_execute(text.strip(), width)},
+                        )
+                    # "/subagent <name>" with no task (the picker prefill submitted
+                    # early, or a hand-typed name) — keep the answer to one line
+                    # instead of the classic full usage panel (see the hint helper).
+                    _sub_parts = text.strip().split()
+                    if (
+                        len(_sub_parts) == 2
+                        and _sub_parts[0].lower() == "/subagent"
+                        and _sub_parts[1].lower() not in _SUBAGENT_INSTANT_ACTIONS
+                    ):
+                        _sub_built = _tui_box.get("session")
+                        _sub_registry = (
+                            getattr(_sub_built, "subagent_registry", None)
+                            if _sub_built is not None
+                            else None
+                        )
+                        return (
+                            "handled",
+                            _subagent_no_task_hint(
+                                registry=(_sub_registry if isinstance(_sub_registry, dict) else {}),
+                                raw_name=_sub_parts[1],
+                                cfg=getattr(_sub_built, "cfg", None),
+                                available_tool_names=(
+                                    set(getattr(_sub_built, "tools", {}) or {})
+                                    if _sub_built is not None
+                                    else None
+                                ),
+                            ),
+                            None,
+                            None,
                         )
                     # "/execute plan" inside Forge runs the swarm — defer it to the
                     # worker thread (not the synchronous runner, which would freeze
@@ -2867,10 +3189,13 @@ def chat(
                             }
                         )
                     enabled = bool(getattr(built, "subagents_enabled", False))
-                    hint = "↑↓ select · Enter to spawn · Esc cancel"
+                    # Enter PREFILLS "/subagent <name> " — it does not spawn (the task
+                    # still has to be typed). Say that, rather than promising a spawn
+                    # the keypress never performs.
+                    hint = "↑↓ select · Enter — then type the task · Esc cancel"
                     if not enabled:
                         # Own line so it never crowds / clips the keybinding hint.
-                        hint += "\nauto-delegate off · enable with /subagent on"
+                        hint += "\nauto-delegate off · spawning one also turns it on"
                     return {
                         "title": "Spawn Subagent",
                         "rows": rows,

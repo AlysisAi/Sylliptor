@@ -164,7 +164,7 @@ Six capability surfaces. Four of them — skills, custom tools, MCP servers, hoo
 - [**MCP**](docs/mcp.md) — connect stdio or Streamable HTTP MCP servers, with OAuth, frozen catalogs, and narrowing-only project overrides.
 - [**Custom tools**](docs/custom_tools.md) — drop Python scripts into `.sylliptor/tools/*.py`. AST-only discovery, trust-keyed by file hash.
 - [**Skills**](docs/skills.md) — `SKILL.md` instruction bundles. Native + interop roots (`.sylliptor_skills/`, `.agents/skills/`, `.claude/skills/`, `.github/skills/`).
-- [**Subagents**](docs/subagents.md) — focused delegation. Drop YAML+markdown into `.sylliptor_agents/*.md` for custom agents. Built-ins: `explorer`, `reviewer`, `test-strategist`.
+- [**Subagents**](docs/subagents.md) — focused delegation. Drop YAML+markdown into `.sylliptor_agents/*.md` for custom agents. Built-ins: `explorer`, `implementer`, `frontend-engineer`, `debugger`, `code-reviewer`, `test-strategist`, plus the opt-in `visual-designer` image generator.
 - [**Hooks**](docs/hooks.md) — lifecycle policy across 11 events (`PreToolUse`, `PostToolUse`, `SessionStart`, ...). Three trust layers.
 - [**Plugins**](docs/plugins.md) — declarative bundles of skills + custom tools + MCP servers + hooks. Pinned install (registry id or `git+https://...@<sha40>`).
 

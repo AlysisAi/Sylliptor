@@ -144,6 +144,9 @@ each has a clear trust model.
   events and require trust for project-local configuration.
 - Subagents are focused helper sessions used by normal chat and one-shot flows
   for exploration, review, or testing strategy.
+- Subagents use the earlier of the parent run's absolute deadline and their
+  finite configured fallback ceiling, so delegation cannot extend a one-shot
+  run beyond its original time limit and cannot run unbounded without one.
 
 See [MCP](mcp.md), [Skills](skills.md), [Plugins](plugins.md),
 [Custom tools](custom_tools.md), [Lifecycle hooks](hooks.md), and

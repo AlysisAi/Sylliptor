@@ -6,6 +6,7 @@ import re
 import shlex
 from collections.abc import Collection
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from itertools import count
 from time import perf_counter
@@ -126,7 +127,12 @@ from ..routing import (
     _should_add_non_repo_turn_hint,
     _TurnRouteDecision,
 )
-from ..tools_assembly import _ROUTING_MODE_CODE_ONLY, ToolDef, _tool_event_metadata
+from ..tools_assembly import (
+    _ROUTING_MODE_CODE_ONLY,
+    _SUBAGENT_CANCELLATION_TOKEN_ARG,
+    ToolDef,
+    _tool_event_metadata,
+)
 from ..verification import (
     TurnExecutionState,
     _completion_gate_blocker_allows_final,
@@ -184,6 +190,8 @@ MAX_IDENTICAL_EXPLORATION_ATTEMPTS = 3
 MAX_EXPLORATION_NUDGES_PER_TURN = 1
 MAX_POST_EXPLORE_BOOTSTRAP_NUDGES_PER_TURN = 1
 MAX_STAGNATION_NUDGES_PER_TURN = 2
+_PARALLEL_SUBAGENT_CANCELLATION_POLL_SECONDS = 0.02
+_PARALLEL_SUBAGENT_CANCELLATION_GRACE_SECONDS = 1.0
 MAX_FAILED_EDIT_STEPS_BEFORE_NUDGE = 2
 MAX_IDENTICAL_FAILED_EDIT_ATTEMPTS = 2
 MAX_EDIT_NUDGES_PER_TURN = 1
@@ -305,11 +313,15 @@ _SUBAGENT_REQUEST_PATTERNS = (
     re.compile(
         r"\b(?:use|run|call|ask|spawn|start|invoke)\b(?:\s+\S+){0,8}\s+"
         r"\b(?:sub[\s-]?agents?|helper\s+agents?|speciali[sz]ed\s+agents?|"
-        r"parallel\s+agents?|explorer|reviewer|test[\s-]?strategist|general[\s-]?purpose)\b"
+        r"parallel\s+agents?|explorer|implementer|debugger|code[\s-]?reviewer|"
+        r"reviewer|test[\s-]?strategist|front[\s-]?end[\s-]?engineer|"
+        r"visual[\s-]?designer)\b"
     ),
     re.compile(
         r"\b(?:sub[\s-]?agents?|helper\s+agents?|speciali[sz]ed\s+agents?|"
-        r"parallel\s+agents?|explorer|reviewer|test[\s-]?strategist|general[\s-]?purpose)\b"
+        r"parallel\s+agents?|explorer|implementer|debugger|code[\s-]?reviewer|"
+        r"reviewer|test[\s-]?strategist|front[\s-]?end[\s-]?engineer|"
+        r"visual[\s-]?designer)\b"
         r"(?:\s+\S+){0,8}\s+\b(?:use|run|call|ask|spawn|start|invoke)\b"
     ),
     re.compile(
@@ -354,6 +366,7 @@ _DEADLINE_FINALIZATION_MUTATION_TOOL_NAMES = frozenset(
         "fs_move",
         "fs_write",
         "git_apply_patch",
+        "image_generate",
         "shell_run",
         "verify_run",
     }
@@ -2154,7 +2167,7 @@ def run_turn(
         gate_turn_intent: _OneShotRepoTurnIntent,
     ) -> bool:
         if self.one_shot_execution:
-            return True
+            return gate_turn_intent == "execute"
         if _assistant_text_has_completion_marker(final_text):
             return True
         return gate_turn_intent == "execute" and repo_tool_activity_observed
@@ -3008,12 +3021,62 @@ def run_turn(
             parallel_subagent_executor: ThreadPoolExecutor | None = None
             parallel_subagent_futures: dict[str, Future[Any]] = {}
 
-            def _shutdown_parallel_subagent_executor() -> None:
+            def _cancellation_requested() -> bool:
+                return cancellation_token is not None and bool(
+                    getattr(cancellation_token, "is_cancelled", False)
+                )
+
+            def _subagent_dispatch_arguments(arguments: dict[str, Any]) -> dict[Any, Any]:
+                dispatch_arguments: dict[Any, Any] = copy.deepcopy(arguments)
+                if cancellation_token is not None:
+                    dispatch_arguments[_SUBAGENT_CANCELLATION_TOKEN_ARG] = cancellation_token
+                return dispatch_arguments
+
+            def _run_tool_with_turn_cancellation(
+                tool: ToolDef,
+                *,
+                tool_name: str,
+                arguments: dict[str, Any],
+            ) -> dict[str, Any]:
+                if tool_name.strip().casefold() != "subagent_run":
+                    return tool.run(arguments)
+                return tool.run(_subagent_dispatch_arguments(arguments))
+
+            def _shutdown_parallel_subagent_executor(*, cancelled: bool = False) -> None:
                 nonlocal parallel_subagent_executor
                 if parallel_subagent_executor is None:
                     return
-                parallel_subagent_executor.shutdown(wait=True, cancel_futures=False)
+                cancellation_path = cancelled or _cancellation_requested()
+                parallel_subagent_executor.shutdown(
+                    wait=not cancellation_path,
+                    cancel_futures=cancellation_path,
+                )
                 parallel_subagent_executor = None
+
+            def _await_parallel_subagent_future(
+                future: Future[Any],
+                sibling_futures: Collection[Future[Any]],
+            ) -> Any:
+                cancellation_observed_at: float | None = None
+                while True:
+                    try:
+                        return future.result(timeout=_PARALLEL_SUBAGENT_CANCELLATION_POLL_SECONDS)
+                    except FutureTimeoutError:
+                        if not _cancellation_requested():
+                            continue
+                        if cancellation_observed_at is None:
+                            cancellation_observed_at = perf_counter()
+                            continue
+                        if (
+                            perf_counter() - cancellation_observed_at
+                            < _PARALLEL_SUBAGENT_CANCELLATION_GRACE_SECONDS
+                        ):
+                            continue
+                        for pending_future in sibling_futures:
+                            pending_future.cancel()
+                        _shutdown_parallel_subagent_executor(cancelled=True)
+                        _throw_if_cancelled()
+                        raise RuntimeError("cancelled_by_user") from None
 
             if _can_prelaunch_parallel_subagent_batch(
                 tool_calls=tool_calls,
@@ -3033,8 +3096,10 @@ def run_turn(
                 )
                 parallel_subagent_futures = {
                     tc.id: parallel_subagent_executor.submit(
-                        turn_tools[tc.name].run,
-                        copy.deepcopy(tc.arguments),
+                        _run_tool_with_turn_cancellation,
+                        turn_tools[tc.name],
+                        tool_name=tc.name,
+                        arguments=tc.arguments,
                     )
                     for tc in tool_calls
                 }
@@ -3348,9 +3413,16 @@ def run_turn(
                             try:
                                 future = parallel_subagent_futures.get(tc.id)
                                 if future is not None:
-                                    result = future.result()
+                                    result = _await_parallel_subagent_future(
+                                        future,
+                                        tuple(parallel_subagent_futures.values()),
+                                    )
                                 else:
-                                    result = tool.run(effective_tool_arguments)
+                                    result = _run_tool_with_turn_cancellation(
+                                        tool,
+                                        tool_name=effective_tool_name,
+                                        arguments=effective_tool_arguments,
+                                    )
                             except ApprovalDeclinedError as e:
                                 terminal_approval_declined_error = e
                                 result = {
@@ -4708,7 +4780,11 @@ def run_turn(
                 self.root,
                 base_ref=workspace_git_base,
             )
-            if self.one_shot_execution and workspace_diff.empty:
+            if (
+                self.one_shot_execution
+                and repo_turn_execution_intent == "execute"
+                and workspace_diff.empty
+            ):
                 empty_diff_payload = {
                     "step": step,
                     "max_steps": turn_max_steps,
@@ -5387,7 +5463,7 @@ def run_turn(
             self.root,
             base_ref=workspace_git_base,
         )
-        if workspace_diff.empty:
+        if repo_turn_execution_intent == "execute" and workspace_diff.empty:
             forced_payload = {
                 "step": turn_max_steps,
                 "max_steps": turn_max_steps,

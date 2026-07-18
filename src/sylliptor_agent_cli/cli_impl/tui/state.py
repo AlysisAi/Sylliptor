@@ -33,6 +33,10 @@ class TuiState:
     # "forge"); drives the footer FORGE badge + the forge-specific placeholder.
     forge_mode: bool = False
     forge_run_id: str = ""  # short run id shown in the FORGE badge, e.g. "run-1a2b"
+    # Name of the subagent currently running (explicit /subagent spawn or
+    # auto-delegation); drives the footer "↪ <name>" badge so the user always
+    # knows a nested agent is doing the work. Empty when no subagent is active.
+    active_subagent: str = ""
     auto_approve: bool = True
     username: str = ""
     workspace: str = ""  # short display form, e.g. "~/coder-plugin-install"

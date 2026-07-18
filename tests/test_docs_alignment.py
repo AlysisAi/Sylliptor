@@ -124,8 +124,18 @@ def test_public_docs_cover_core_user_and_contributor_topics() -> None:
     assert "workspace_root" in architecture
     assert "active_workdir" in architecture
     assert "Subagents" in subagents
-    assert "explorer" in subagents
-    assert "reviewer" in subagents
+    for name in (
+        "explorer",
+        "implementer",
+        "frontend-engineer",
+        "debugger",
+        "code-reviewer",
+        "test-strategist",
+        "visual-designer",
+    ):
+        assert name in subagents
+    assert "image_generation.enabled" in subagents
+    assert "Visual QA" in subagents
     assert "Streamable HTTP" in mcp
     assert "OAuth" in mcp
     assert "Skills" in skills

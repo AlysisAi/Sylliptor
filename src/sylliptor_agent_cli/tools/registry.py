@@ -115,6 +115,28 @@ def _preview_verify_run(args: dict[str, Any]) -> str:
     return _truncate_inline(f"{first} (+{len(commands) - 1} more)", max_chars=120) or "-"
 
 
+def _preview_image_generate(args: dict[str, Any]) -> str:
+    output_path = str(args.get("output_path") or "").strip()
+    prompt = _truncate_inline(str(args.get("prompt") or ""), max_chars=72)
+    count = args.get("count", 1)
+    return _truncate_inline(f"{output_path} x{count} - {prompt}", max_chars=120) or "-"
+
+
+def _summary_image_generate(parsed: dict[str, Any]) -> str:
+    if is_tool_unavailable_result(parsed):
+        return "Image generation unavailable."
+    error = str(parsed.get("error") or "").strip()
+    if error:
+        return _truncate_inline(f"Image generation failed: {error}", max_chars=160)
+    paths = parsed.get("output_paths")
+    if isinstance(paths, list) and paths:
+        return _truncate_inline(
+            "Generated image asset(s): " + ", ".join(str(path) for path in paths),
+            max_chars=160,
+        )
+    return "Image generation finished."
+
+
 def _preview_git_history(args: dict[str, Any]) -> str:
     mode = str(args.get("mode") or "").strip()
     if mode == "log":
@@ -1203,6 +1225,75 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
         built_in_subagent_exposure="readonly",
     ),
     BuiltinToolMetadata(
+        name="image_generate",
+        description=(
+            "Generate one to four raster image assets through the configured "
+            "OpenAI-compatible image provider and write them under the workspace root. "
+            "This is an external billable operation and is exposed only when "
+            "image_generation.enabled=true. Output paths must be new .png, .jpg, .jpeg, "
+            "or .webp files; existing files are never overwritten. The result includes "
+            "dimensions, format, alpha-channel presence, byte count, SHA-256, provider "
+            "request metadata, and technical validation status."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32000,
+                    "description": (
+                        "Concrete production brief covering subject, composition, style, "
+                        "palette, lighting, negative constraints, and intended use."
+                    ),
+                },
+                "output_path": {
+                    "type": "string",
+                    "description": (
+                        "New workspace-root-relative .png, .jpg, .jpeg, or .webp path. "
+                        "For count > 1, -1, -2, etc. are appended before the extension."
+                    ),
+                },
+                "count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4,
+                    "default": 1,
+                },
+                "size": {
+                    "type": "string",
+                    "enum": ["auto", "1024x1024", "1536x1024", "1024x1536"],
+                    "default": "auto",
+                },
+                "quality": {
+                    "type": "string",
+                    "enum": ["auto", "low", "medium", "high"],
+                    "default": "auto",
+                },
+                "background": {
+                    "type": "string",
+                    "enum": ["auto", "opaque", "transparent"],
+                    "default": "auto",
+                },
+            },
+            "required": ["prompt", "output_path"],
+        },
+        categories=("write", "image", "generation", "network"),
+        rich=RichToolMetadata(
+            display_name="Generate Image",
+            reasoning_hint="Create a production raster asset from a precise visual brief.",
+            action_hint="Generate, validate, and atomically write a new image asset.",
+            fallback_hint=(
+                "If unavailable, report the missing image-generation configuration; do not "
+                "substitute placeholder bytes or claim an asset was generated."
+            ),
+            input_preview_formatter=_preview_image_generate,
+            output_summary_formatter=_summary_image_generate,
+        ),
+        optional=True,
+        optional_unavailable_reason="image_generation.enabled is false",
+    ),
+    BuiltinToolMetadata(
         name="verify_run",
         description=(
             "Run configured verification commands. Prefer for tests/lint/build. "
@@ -1623,7 +1714,9 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
             "\n"
             "Parameters\n"
             "- name (required, string): registered subagent name. Built-in names include "
-            "`explorer`, `general-purpose`, `reviewer`, and `test-strategist`. "
+            "`explorer`, `implementer`, `frontend-engineer`, `debugger`, "
+            "`code-reviewer`, `test-strategist`, and, when image generation is enabled, "
+            "`visual-designer`. "
             "Project-level custom subagents "
             "from `.sylliptor_agents/*.md` and user-level ones from the user config dir are "
             "also resolvable. Names are case-insensitive and a small alias table is applied "
@@ -1683,8 +1776,9 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
                 "name": {
                     "type": "string",
                     "description": (
-                        "Registered subagent name. Built-in: explorer, "
-                        "reviewer, test-strategist, general-purpose. "
+                        "Registered subagent name. Built-in: explorer, implementer, "
+                        "frontend-engineer, debugger, code-reviewer, test-strategist; "
+                        "visual-designer is available when image generation is enabled. "
                         "Project-defined custom names from "
                         ".sylliptor_agents/ are also valid. "
                         "Case-insensitive."

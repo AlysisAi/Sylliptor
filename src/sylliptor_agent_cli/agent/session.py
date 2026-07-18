@@ -105,7 +105,7 @@ from ..sandbox_settings import resolve_shell_sandbox_settings
 from ..session_store import SessionStore, make_session_id, resolve_sessions_dir
 from ..skills import ConventionDocument, SkillBundle, SkillCatalogEntry
 from ..step_budget import StepBudgetRuntime, normalize_step_budget_policy
-from ..subagents import SubagentDefinition
+from ..subagents import SubagentDefinition, unavailable_builtin_subagents
 from ..surface import ApprovalRequest, NoopSurface, StatusEvent
 from ..surface.base import Surface
 from ..terminal_manager import TerminalManager
@@ -134,6 +134,8 @@ from .prompt_context import (
     _repo_summary_data,
     _resolve_requested_workdir_within_workspace,
     _session_verify_command_selection,
+    _subagent_context_message,
+    _workspace_binding_context_message,
     _workspace_relpath_for_path,
     _WorkspaceGroundingDescriptor,
     prepare_session_prompt_context,
@@ -2049,7 +2051,66 @@ def create_session(
             store.append("mcp_catalog_snapshot", mcp_manager.catalog_snapshot_metadata())
         tool_list = [t.as_openai_tool() for t in tools.values()]
         messages: list[dict[str, Any]] = list(prompt_context.messages)
+        if active_workdir_relpath_override is not None:
+            binding_context = _workspace_binding_context_message(
+                workspace_root=workspace_context.workspace_root,
+                focus_dir=workspace_context.focus_path,
+                focus_relpath=workspace_context.focus_relpath,
+                workspace_kind=workspace_context.workspace_kind,
+                active_workdir=initial_active_workdir,
+                active_workdir_relpath=initial_active_workdir_relpath,
+                binding_requested_path=binding_requested_path,
+                binding_source=binding_source,
+                binding_risk_level=binding_risk_level,
+                binding_created_path=binding_created_path,
+            )
+            for index, message in enumerate(messages):
+                if str(message.get("role") or "") != "user":
+                    continue
+                if (
+                    not str(message.get("content") or "")
+                    .lstrip()
+                    .startswith("<workspace_binding_context>")
+                ):
+                    continue
+                messages[index] = {**message, "content": binding_context}
+                break
         pinned_prefix_len = prompt_context.pinned_prefix_len
+        if resolved_subagents_enabled and subagent_depth == 0:
+            effective_subagent_context = _subagent_context_message(
+                subagent_registry=resolved_subagent_registry,
+                unavailable_subagents=unavailable_builtin_subagents(
+                    registry=resolved_subagent_registry,
+                    cfg=session_cfg,
+                    available_tool_names=set(tools),
+                ),
+            )
+            replaced_subagent_context = False
+            for message_index, message in enumerate(messages):
+                if str(message.get("role") or "") == "user" and "<subagent_context>" in str(
+                    message.get("content") or ""
+                ):
+                    if effective_subagent_context is not None:
+                        messages[message_index] = {
+                            **message,
+                            "content": effective_subagent_context,
+                        }
+                    replaced_subagent_context = True
+                    break
+            if effective_subagent_context is not None and not replaced_subagent_context:
+                insert_at = next(
+                    (
+                        index
+                        for index, message in enumerate(messages)
+                        if "<environment_context>" in str(message.get("content") or "")
+                    ),
+                    len(messages),
+                )
+                messages.insert(
+                    insert_at,
+                    {"role": "user", "content": effective_subagent_context},
+                )
+                pinned_prefix_len += 1
         hooks_config = load_resolved_hooks_config(workspace_context.workspace_root)
         hooks_config, hook_dropped_counts = _filter_hooks_config_for_plugins(
             config=hooks_config,

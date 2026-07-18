@@ -13,6 +13,7 @@ from sylliptor_agent_cli import cli as cli_mod
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.session_store import read_session_events
+from sylliptor_agent_cli.subagents import SubagentDefinition
 from sylliptor_agent_cli.workspace_binding import resolve_workspace_binding
 
 
@@ -61,10 +62,13 @@ def _create_chat_session(
     focus_path: Path | None = None,
     no_log: bool = True,
     active_workdir_relpath_override: str | None = None,
+    subagents_enabled: bool = False,
+    subagent_registry: dict[str, SubagentDefinition] | None = None,
 ) -> tuple[object, _FakeShellRunner, Path]:
     repo = tmp_path / "repo"
     (repo / "packages" / "app").mkdir(parents=True, exist_ok=True)
     (repo / "packages" / "lib").mkdir(parents=True, exist_ok=True)
+    (repo / "packages" / "b").mkdir(parents=True, exist_ok=True)
     (repo / "package.json").write_text('{"name":"repo-root"}\n', encoding="utf-8")
     (repo / "packages" / "app" / "package.json").write_text(
         '{"name":"packages-app"}\n',
@@ -80,7 +84,11 @@ def _create_chat_session(
     runner = _FakeShellRunner()
     monkeypatch.setattr(agent_loop_mod, "build_shell_runner", lambda **_kwargs: runner)
     session = create_session(
-        cfg=AppConfig(model="test-model", web_search_mode="off"),
+        cfg=AppConfig(
+            model="test-model",
+            web_search_mode="off",
+            subagents_enabled=subagents_enabled,
+        ),
         root=workspace_binding.workspace_context.workspace_root,
         mode="auto",
         runtime_kind="interactive_chat",
@@ -93,6 +101,8 @@ def _create_chat_session(
         session_log_dir_override=tmp_path / "sessions",
         workspace_binding=workspace_binding,
         active_workdir_relpath_override=active_workdir_relpath_override,
+        subagents_enabled=subagents_enabled,
+        subagent_registry=subagent_registry,
     )
     return session, runner, repo
 
@@ -112,6 +122,18 @@ def _run_chat_command(session: object, command: str) -> tuple[object, str]:
         plan_mode_escape_supported=False,
     )
     return result, buffer.getvalue()
+
+
+def _workdir_subagent_registry() -> dict[str, SubagentDefinition]:
+    return {
+        "focused-worker": SubagentDefinition(
+            name="focused-worker",
+            description="Inspect the current package focus.",
+            system_prompt="Inspect only the requested package and report grounded findings.",
+            mode="auto",
+            allow_tools=("fs_read", "search_rg", "shell_run"),
+        )
+    }
 
 
 def test_create_session_initializes_active_workdir_from_git_subdirectory(
@@ -159,6 +181,9 @@ def test_create_session_active_workdir_override_initializes_session_start(
         start_event = next(event for event in events if event.get("type") == "session_start")
         assert start_event["payload"]["active_workdir_relpath"] == "packages/app"
         assert start_event["payload"]["active_workdir"] == str(expected_path)
+        binding_context = _binding_context_content(session)
+        assert f"active_workdir: {expected_path.resolve()}" in binding_context
+        assert "active_workdir_relpath: packages/app" in binding_context
     finally:
         session.close()
 
@@ -330,6 +355,148 @@ def test_session_set_workdir_tool_refreshes_binding_context_and_logging(
         assert workdir_event["payload"]["active_workdir_relpath"] == expected_relpath
         assert cmd_event["cwd"] == str((repo / "packages" / "app").resolve())
         assert cmd_event["active_workdir_relpath"] == expected_relpath
+    finally:
+        session.close()
+
+
+def test_subagent_inherits_active_workdir_in_prompt_store_and_tool_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _workdir_subagent_registry()
+    session, runner, repo = _create_chat_session(
+        tmp_path,
+        monkeypatch,
+        no_log=False,
+        subagents_enabled=True,
+        subagent_registry=registry,
+    )
+    (repo / "README.md").write_text("root readme\n", encoding="utf-8")
+    package_dir = repo / "packages" / "b"
+    (package_dir / "README.md").write_text("package b readme\n", encoding="utf-8")
+    search_calls: list[dict[str, object]] = []
+    child_evidence: dict[str, object] = {}
+    real_create_session = agent_loop_mod.create_session
+
+    def _fake_search_rg(
+        *, root: Path, pattern: str, root_path: str, **kwargs: object
+    ) -> dict[str, object]:
+        search_calls.append(
+            {
+                "root": root,
+                "pattern": pattern,
+                "root_path": root_path,
+                **kwargs,
+            }
+        )
+        return {"root_path": root_path, "matches": []}
+
+    def _create_child(**kwargs: object) -> object:
+        child = real_create_session(**kwargs)
+        child_evidence["session"] = child
+
+        def _run_child(_task: str) -> int:
+            child_evidence["active_workdir_relpath"] = child.active_workdir_relpath
+            child_evidence["store_cwd"] = child.store.cwd
+            child_evidence["prompt"] = _binding_context_content(child)
+            child_evidence["session_start"] = next(
+                event
+                for event in child.store.events_snapshot()
+                if event.get("type") == "session_start"
+            )
+            child.tools["shell_run"].run({"cmd": "pwd"})
+            child.tools["search_rg"].run({"pattern": "needle"})
+            child_evidence["focused_read"] = child.tools["fs_read"].run({"path": "README.md"})[
+                "content"
+            ]
+            child_evidence["root_read"] = child.tools["fs_read"].run(
+                {"path": "README.md", "path_base": "workspace_root"}
+            )["content"]
+            final_text = "Focused child inspected package b without changing files."
+            child.messages.append({"role": "assistant", "content": final_text})
+            child.store.append("final", {"content": final_text})
+            return 0
+
+        child.run_turn = _run_child
+        return child
+
+    try:
+        session.tools["session_set_workdir"].run({"path": "packages/b"})
+        monkeypatch.setattr(agent_loop_mod, "search_rg", _fake_search_rg)
+        monkeypatch.setattr(agent_loop_mod, "create_session", _create_child)
+
+        result = session.tools["subagent_run"].run(
+            {"name": "focused-worker", "task": "Inspect README.md in the current package."}
+        )
+
+        expected_path = package_dir.resolve()
+        assert result["result"] == "Focused child inspected package b without changing files."
+        assert child_evidence["active_workdir_relpath"] == "packages/b"
+        assert child_evidence["store_cwd"] == str(expected_path)
+        child_start = child_evidence["session_start"]
+        assert isinstance(child_start, dict)
+        assert child_start["payload"]["active_workdir"] == str(expected_path)
+        assert child_start["payload"]["active_workdir_relpath"] == "packages/b"
+        child_prompt = str(child_evidence["prompt"])
+        assert f"active_workdir: {expected_path}" in child_prompt
+        assert "active_workdir_relpath: packages/b" in child_prompt
+
+        assert runner.calls[-1]["root"] == repo.resolve()
+        assert runner.calls[-1]["cwd"] == expected_path
+        assert search_calls[-1]["root"] == repo.resolve()
+        assert search_calls[-1]["root_path"] == "packages/b"
+        assert str(child_evidence["focused_read"]).replace("\r\n", "\n") == "package b readme\n"
+        assert str(child_evidence["root_read"]).replace("\r\n", "\n") == "root readme\n"
+
+        parent_events = list(read_session_events(session.store.path))
+        starts = [event for event in parent_events if event.get("type") == "subagent_start"]
+        ends = [event for event in parent_events if event.get("type") == "subagent_end"]
+        assert len(starts) == len(ends) == 1
+        child_session_id = starts[0]["payload"]["subagent_session_id"]
+        assert child_session_id
+        assert ends[0]["payload"]["subagent_session_id"] == child_session_id
+    finally:
+        session.close()
+
+
+def test_subagent_missing_inherited_workdir_fails_before_client_or_tool_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _workdir_subagent_registry()
+    session, _runner, repo = _create_chat_session(
+        tmp_path,
+        monkeypatch,
+        no_log=False,
+        subagents_enabled=True,
+        subagent_registry=registry,
+    )
+    client_construction_calls: list[dict[str, object]] = []
+
+    def _unexpected_client(**kwargs: object) -> object:
+        client_construction_calls.append(dict(kwargs))
+        raise AssertionError("model client must not be constructed for an invalid child workdir")
+
+    try:
+        session.tools["session_set_workdir"].run({"path": "packages/b"})
+        (repo / "packages" / "b").rmdir()
+        monkeypatch.setattr(agent_loop_mod, "OpenAICompatClient", _unexpected_client)
+
+        result = session.tools["subagent_run"].run(
+            {"name": "focused-worker", "task": "Inspect the current package."}
+        )
+
+        assert "Failed to initialize subagent session" in result["error"]
+        assert "Directory does not exist" in result["error"]
+        assert client_construction_calls == []
+        parent_events = list(read_session_events(session.store.path))
+        starts = [event for event in parent_events if event.get("type") == "subagent_start"]
+        ends = [event for event in parent_events if event.get("type") == "subagent_end"]
+        assert len(starts) == len(ends) == 1
+        assert starts[0]["payload"]["subagent_session_id"] is None
+        assert ends[0]["payload"]["subagent_session_id"] is None
+        assert ends[0]["payload"]["status"] == "failed"
+        assert len(list((tmp_path / "sessions").glob("*.jsonl"))) == 1
     finally:
         session.close()
 

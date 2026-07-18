@@ -51,7 +51,15 @@ def resolve_subagent_step_profile(subagent_name: Any) -> str | None:
     normalized = str(subagent_name or "").strip().lower()
     if not normalized:
         return None
-    if normalized in {"explorer", "reviewer", "test-strategist"}:
+    if normalized in {
+        "explorer",
+        "implementer",
+        "frontend-engineer",
+        "debugger",
+        "code-reviewer",
+        "test-strategist",
+        "visual-designer",
+    }:
         return normalized
     return "default"
 

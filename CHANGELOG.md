@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-18
+
+### Added
+
+- Added specialized built-in `frontend-engineer`, `test-strategist`, and
+  capability-gated `visual-designer` roles alongside the existing explorer,
+  implementer, debugger, and code-reviewer agents.
+- Added opt-in image generation for the sandboxed visual-designer role, with
+  protected-path enforcement, output validation, provider limits, and concrete
+  setup guidance when the capability is unavailable.
+- Added capability-aware role discovery and status reporting so autonomous and
+  explicit delegation share the same grounded catalog of callable and gated
+  agents.
+
+### Improved
+
+- Made Subagent activity native to the TUI with live nested progress, concise
+  role taglines, per-agent accents, result attribution, and badges that remain
+  correct across nested runs and interrupts.
+- Improved child-agent tool grounding, custom role permissions, cancellation,
+  parent-deadline propagation, usage accounting, and completion reporting.
+- Expanded Subagent documentation and focused benchmark, cancellation, image,
+  prompt, registry, routing, and TUI coverage.
+
+### Fixed
+
+- Prevented late or stale child events from clearing a newer agent's activity,
+  and preserved useful tool arguments when nested calls fail.
+- Hardened child-result handling so untrusted reports cannot change authority,
+  permissions, tool policy, or parent-session instructions.
+
 ## [0.10.0] - 2026-07-12
 
 ### Added

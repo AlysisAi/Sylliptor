@@ -80,7 +80,7 @@ def test_explicit_limit_is_the_effective_safety_ceiling() -> None:
             hard_cap=16,
             fixed_override=99,
             parent_turn_budget=8,
-            subagent_name="reviewer",
+            subagent_name="code-reviewer",
         )
     )
 

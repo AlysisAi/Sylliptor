@@ -111,6 +111,25 @@ def test_subagent_turn_policy_requires_explicit_request_and_respects_opt_out(tmp
     assert "policy: required_by_user" in context
     assert "Call subagent_run before finalizing" in context
 
+    for instruction in (
+        "Run the explorer to map the parser.",
+        "Use the implementer for this scoped change.",
+        "Ask the debugger to isolate the failure.",
+        "Run the code-reviewer on the current diff.",
+        "Use the test strategist to identify regression cases.",
+        "Use the frontend engineer to build the responsive settings page.",
+        "Run the visual designer to create the empty-state illustration.",
+    ):
+        role_request = agent_loop._resolve_subagent_turn_policy(
+            instruction=instruction,
+            subagents_enabled=True,
+            subagent_depth=0,
+            subagent_registry=registry,
+            turn_tools=tools,  # type: ignore[arg-type]
+            repo_turn_execution_intent="advisory_non_execution",
+        )
+        assert role_request.level == "required_by_user", instruction
+
     opted_out = agent_loop._resolve_subagent_turn_policy(
         instruction="Fix the parser, but do not use subagents for this one.",
         subagents_enabled=True,

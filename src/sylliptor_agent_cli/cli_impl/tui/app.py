@@ -121,6 +121,9 @@ _STYLE = Style.from_dict(
         # Forge-session badge: a distinct bold violet chip so the planning mode is
         # unmistakable (green stays the chat accent, cyan the brand/branch).
         "tui.footer.forge": "bold #bc8cff",
+        # Active-subagent badge: bold blue — the subagent identity colour (distinct
+        # from green chat accent, violet forge, and cyan brand).
+        "tui.footer.subagent": "bold #58a6ff",
         # User's own message: a full-width highlighted band (the "> " in accent).
         "tui.transcript.userband": f"bold bg:{_BAND_BG}",
         "tui.transcript.userprompt": f"bold {_ACCENT} bg:{_BAND_BG}",
@@ -135,6 +138,9 @@ _STYLE = Style.from_dict(
         "tui.transcript.trace": "#6c6c6c",
         "tui.transcript.error": "#e06c75",
         "tui.transcript.warn": "#d19a66",
+        # Subagent entry line ("↪ <name> · <mode> — <tagline>") — the shared
+        # subagent blue (per-agent accents live in the footer badge).
+        "tui.transcript.subagent": "bold #58a6ff",
         "tui.status": "#8a8a8a",
         # Working line turns amber once a turn has run long (>=30s).
         "tui.status.warn": "#d29922",
@@ -1409,6 +1415,14 @@ def run_tui(
     # ---- build the agent surface + session (eager; failure → caller falls back) ----
     surface: TuiSurface | None = None
     session: Any | None = None
+
+    def _set_active_subagent(name: str | None) -> None:
+        # Called from the worker thread on subagent start/end: pin (or clear) the
+        # footer's "↪ <name>" badge so the user always knows a nested agent is
+        # doing the work right now.
+        state.active_subagent = str(name or "")
+        _safe_invalidate()
+
     if session_builder is not None:
         surface = TuiSurface(
             transcript,
@@ -1419,6 +1433,7 @@ def run_tui(
             # once it ends. Distinct from on_turn_complete so the end-of-turn hook
             # keeps its fire-once-per-turn contract.
             on_hud_refresh=on_hud_refresh,
+            on_subagent_activity=_set_active_subagent,
         )
         session = session_builder(surface)
         # Seed the footer HUD from the freshly built session so the bottom-right
@@ -1477,6 +1492,7 @@ def run_tui(
         "error": "class:tui.transcript.error",
         "warn": "class:tui.transcript.warn",
         "info": "class:tui.transcript.system",
+        "subagent": "class:tui.transcript.subagent",
     }
 
     def _transcript_fragments() -> FormattedText:
@@ -1792,6 +1808,9 @@ def run_tui(
             # blocked, and we must not stomp on its state when we finally unwind.
             if cancel_box.get("token") is my_token:
                 transcript.set_status(None)
+                # The turn is over — no subagent can still be active. Idempotent
+                # (the end event normally cleared it); catches error unwinds.
+                state.active_subagent = ""
                 if on_turn_complete is not None:
                     try:
                         on_turn_complete()
@@ -1848,6 +1867,15 @@ def run_tui(
         running["on"] = False
         cancel_box["token"] = None
         transcript.set_status(None)
+        # The abandoned worker may never deliver its subagent-end event; drop the
+        # badge now so the footer cannot claim a dead subagent is still working.
+        state.active_subagent = ""
+        clear_subagents = getattr(surface, "clear_subagent_activity", None)
+        if callable(clear_subagents):
+            try:
+                clear_subagents()
+            except Exception:
+                pass
         scroll["follow"] = True
         _safe_invalidate()
 

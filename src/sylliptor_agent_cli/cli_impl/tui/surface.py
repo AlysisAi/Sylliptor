@@ -30,6 +30,7 @@ from ...surface.types import (
     ToolOutputEvent,
     ToolStartEvent,
 )
+from .subagent_identity import subagent_tagline
 from .transcript import TuiTranscript
 
 # Per-worker-thread cancellation token. The TUI sets this at the top of each turn
@@ -121,6 +122,18 @@ _FORGE_OBSOLETE_SET = {"superseded", "invalidated"}
 _FORGE_RUNNING_SET = {"in_progress", "running", "executing", "active"}
 
 
+def _condense_subagent_desc(description: str, *, limit: int = 72) -> str:
+    """One brief clause of what the subagent is for, from its (often huge)
+    definition description. Reuses the spawn picker's condenser so the entry
+    line and the picker can never describe the same agent differently."""
+    try:
+        from ..commands.chat_tui_panels import _short_subagent_desc
+
+        return _short_subagent_desc(description, limit=limit)
+    except Exception:
+        return _truncate(str(description or ""), limit=limit)
+
+
 class TuiSurface:
     """Surface implementation backed by a :class:`TuiTranscript`."""
 
@@ -133,6 +146,7 @@ class TuiSurface:
         auto_approve: Callable[[], bool],
         request_approval_ui: Callable[[ApprovalRequest], ApprovalDecision] | None = None,
         on_hud_refresh: Callable[[], None] | None = None,
+        on_subagent_activity: Callable[[str | None], None] | None = None,
     ) -> None:
         self._t = transcript
         self._auto_approve = auto_approve
@@ -161,6 +175,12 @@ class TuiSurface:
         self._forge_last_refresh: float = 0.0
         self._forge_token: object | None = None
         self._forge_run_id: str = ""
+        # Live subagent identity. Pair each name with the worker thread that
+        # started it so a late event from an abandoned turn cannot pop a
+        # same-named agent that a newer turn owns.
+        self._on_subagent_activity = on_subagent_activity
+        self._subagent_stack: list[tuple[int, str]] = []
+        self._subagent_status_word: dict[str, str] = {}
 
     @property
     def trace_level(self) -> str:
@@ -210,6 +230,9 @@ class TuiSurface:
         # Turn boundary: drop argument previews stranded by an interrupted turn
         # (a cancelled turn's on_tool_end returns before popping its entry).
         self._tool_details.clear()
+        # And drop any subagent identity stranded the same way, so the footer
+        # badge can never claim a subagent from an abandoned turn is still active.
+        self.clear_subagent_activity()
 
     def on_assistant_token(self, delta: str) -> None:
         if _worker_cancelled():
@@ -458,10 +481,20 @@ class TuiSurface:
             self._t.set_status("Working…")
             return
         if arg_detail and event.tool_call_id:
-            # Stale-entry backstop: evict oldest first, never in-flight wholesale.
+            # Keep argument context for nested failures too; their successful
+            # calls stay quiet, but a failure must identify which invocation
+            # failed when the agent retries a tool with different inputs.
             while len(self._tool_details) > 256:
                 self._tool_details.pop(next(iter(self._tool_details)))
             self._tool_details[event.tool_call_id] = arg_detail
+        if event.subagent_name and self._trace_level != "full":
+            # A nested subagent's tool call: the entry line already said who is
+            # working and on what, so its step-by-step chatter stays out of the
+            # transcript — the live status alone shows what the agent is doing
+            # right now. Trace "full" opts back into the committed lines.
+            detail = f" · {arg_detail}" if arg_detail else ""
+            self._t.set_status(_truncate(f"↪ {event.subagent_name} ▸ {label}{detail}…", limit=80))
+            return
         if self._trace_level == "full":
             detail = f" · {arg_detail}" if arg_detail else ""
             self._t.append("trace", f"▸ {label}{detail}")
@@ -485,6 +518,26 @@ class TuiSurface:
             label = f"{label} · {arg_detail}"
         elapsed = _format_ms(event.elapsed_ms)
         suffix = f" ({elapsed})" if elapsed else ""
+        if event.subagent_name and self._trace_level != "full":
+            # Nested subagent steps stay out of the transcript (minimal view) —
+            # except failures, which are real signal and keep their ✗ line,
+            # attributed to the agent that hit them. Successes just roll the
+            # live status back to "working" until the ↩ end line closes the run.
+            if event.status != "done":
+                meta = event.meta if isinstance(event.meta, dict) else {}
+                verdict = "approval declined" if meta.get("approval_declined") else "failed"
+                err = str(meta.get("error") or "")
+                detail = f": {_truncate(err)}" if err else ""
+                self._t.append(
+                    "error", f"✗ {event.subagent_name} ▸ {label} {verdict}{suffix}{detail}"
+                )
+            if self._trace_level == "off":
+                self._t.set_status(None)
+            else:
+                word = self._subagent_status_word.get(str(event.subagent_name), "working")
+                self._t.set_status(f"↪ {event.subagent_name} · {word}…")
+            self._maybe_refresh_hud()
+            return
         if event.status == "done" and self._trace_level != "off":
             # Consecutive successes of the SAME tool group under one header:
             #   ✓ Search Web · current date today (1.5s)
@@ -520,16 +573,72 @@ class TuiSurface:
         self._maybe_refresh_hud()
 
     # --------------------------------------------------------------- subagents
-    def on_subagent_start(self, event: SubagentStartEvent) -> None:
-        if _worker_cancelled() or self._trace_level == "off":
+    def _sync_subagent_badge(self) -> None:
+        """Tell the app which subagent name to pin in the footer (None clears)."""
+        fn = self._on_subagent_activity
+        if fn is None:
             return
-        self._t.append("trace", f"↪ {event.name} · {event.mode}")
+        try:
+            fn(self._subagent_stack[-1][1] if self._subagent_stack else None)
+        except Exception:
+            pass
+
+    def clear_subagent_activity(self) -> None:
+        """Forget live subagents and make abandoned late events harmless."""
+        if self._subagent_stack:
+            self._subagent_stack.clear()
+            self._sync_subagent_badge()
+        self._subagent_status_word.clear()
+
+    def on_subagent_start(self, event: SubagentStartEvent) -> None:
+        if _worker_cancelled():
+            return
+        # The badge is identity, not trace — it shows at every trace level.
+        name = str(event.name)
+        self._subagent_stack.append((threading.get_ident(), name))
+        self._sync_subagent_badge()
+        tagline = subagent_tagline(name, event.description)
+        self._subagent_status_word[name] = tagline or "working"
+        if self._trace_level == "off":
+            return
+        # One minimal line: who is working now, in which mode, and its activity
+        # tagline (custom agents fall back to a condensed description). The
+        # nested run's own tool chatter stays off the transcript (see the
+        # event.subagent_name branches in on_tool_start/on_tool_end); trace
+        # level "full" opts back in.
+        detail = tagline or _condense_subagent_desc(event.description)
+        line = f"↪ {name} · {event.mode}"
+        if detail:
+            line = f"{line} — {detail}"
+        self._t.append("subagent", line)
+        self._t.set_status(f"↪ {name} · {tagline or 'working'}…")
 
     def on_subagent_end(self, event: SubagentEndEvent) -> None:
+        # Only the thread that recorded a start may unwind that run. A missing
+        # match is a stale event and must not alter the current badge or status.
+        entry = (threading.get_ident(), str(event.name))
+        matched = False
+        for index in range(len(self._subagent_stack) - 1, -1, -1):
+            if self._subagent_stack[index] == entry:
+                del self._subagent_stack[index]
+                matched = True
+                break
+        if not matched:
+            return
+        name = entry[1]
+        if all(stacked_name != name for _tid, stacked_name in self._subagent_stack):
+            self._subagent_status_word.pop(name, None)
+        self._sync_subagent_badge()
+        if not self._subagent_stack:
+            self._t.set_status(None)
         if _worker_cancelled() or self._trace_level == "off":
             return
         status = "finished" if event.status == "success" else event.status
         self._t.append("trace", f"↩ {event.name} · {status} · {event.steps_completed} steps")
+        if self._subagent_stack:
+            top = self._subagent_stack[-1][1]
+            word = self._subagent_status_word.get(top, "working")
+            self._t.set_status(f"↪ {top} · {word}…")
 
     def on_patch_generated(self, event: PatchEvent) -> None:
         if _worker_cancelled() or self._trace_level == "off":

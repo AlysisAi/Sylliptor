@@ -11,6 +11,7 @@ from sylliptor_agent_cli.execution_deadline import (
     DeadlineSource,
     ExecutionDeadline,
     deadline_timeout_or_raise,
+    derive_subagent_deadline,
     temporarily_clamp_client_timeout,
     validate_deadline_seconds,
 )
@@ -133,6 +134,74 @@ def test_absolute_deadline_is_shared_by_children_without_drift() -> None:
 
     assert child.deadline_monotonic == parent.deadline_monotonic
     assert child.remaining_seconds() == parent.remaining_seconds() == 8.0
+
+
+def test_subagent_deadline_uses_finite_fallback_without_parent() -> None:
+    child = derive_subagent_deadline(None, 900.0)
+
+    assert child.enabled is True
+    assert child.configured_duration_seconds == 900.0
+    assert child.source == DeadlineSource.SUBAGENT_FALLBACK
+    assert child.remaining_seconds() is not None
+    assert 899.0 <= child.remaining_seconds() <= 900.0
+
+
+def test_subagent_deadline_reuses_exact_earlier_parent_object() -> None:
+    clock = _FakeClock(10.0)
+    parent = ExecutionDeadline.from_duration(20.0, clock=clock)
+
+    child = derive_subagent_deadline(parent, 900.0)
+
+    assert child is parent
+    assert child.deadline_monotonic == 30.0
+
+
+def test_subagent_deadline_caps_disabled_parent_with_same_clock_and_policy() -> None:
+    clock = _FakeClock(10.0)
+    parent = ExecutionDeadline.from_duration(None, clock=clock)
+
+    child = derive_subagent_deadline(parent, 30.0)
+
+    assert child is not parent
+    assert child.deadline_monotonic == 40.0
+    assert child.remaining_seconds() == 30.0
+    assert child.source == DeadlineSource.SUBAGENT_FALLBACK
+    assert child.finalization_policy is parent.finalization_policy
+    clock.advance(4.0)
+    assert child.remaining_seconds() == 26.0
+
+
+def test_subagent_deadline_caps_later_active_parent() -> None:
+    clock = _FakeClock(10.0)
+    parent = ExecutionDeadline.from_duration(100.0, clock=clock)
+
+    child = derive_subagent_deadline(parent, 30.0)
+
+    assert child is not parent
+    assert child.deadline_monotonic == 40.0
+    assert child.remaining_seconds() == 30.0
+    assert child.source == DeadlineSource.SUBAGENT_FALLBACK
+    assert child.finalization_policy is parent.finalization_policy
+
+
+def test_subagent_deadline_reuses_later_parent_already_in_finalization() -> None:
+    clock = _FakeClock(0.0)
+    parent = ExecutionDeadline.from_duration(20.0, clock=clock)
+    parent.observe_duration(DeadlineOperation.MAIN_LLM, 4.0)
+    clock.advance(16.0)
+
+    assert parent.phase() == DeadlinePhase.FINALIZATION_WINDOW
+    assert parent.deadline_monotonic == 20.0
+    child = derive_subagent_deadline(parent, 2.0)
+
+    assert child is parent
+    assert child.deadline_monotonic > clock() + 2.0
+    decision = child.start_decision(
+        DeadlineOperation.SUBAGENT,
+        minimum_remaining_seconds=2.0,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "finalization_disallows_operation"
 
 
 @pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), "-inf"])

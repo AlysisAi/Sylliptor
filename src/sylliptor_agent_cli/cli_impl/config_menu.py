@@ -18,6 +18,7 @@ from rich.panel import Panel
 from ..branding import env_get
 from ..config import (
     _ROLE_TEMPERATURE_FIELDS,
+    DEFAULT_SUBAGENT_TIMEOUT_S,
     AgentRuntimeSettings,
     AppConfig,
     ConfigError,
@@ -138,6 +139,7 @@ _FIELD_LABELS: dict[str, str] = {
     "max_steps": "Max steps per response",
     "task_max_steps": "Max steps per task",
     "subagent_max_steps": "Max steps per subagent run",
+    "subagent_timeout_s": "Subagent timeout (seconds)",
 }
 _API_KEY_ENV_PROMPT = "API key env var name (NOT the key itself, e.g. 'ANTHROPIC_API_KEY')"
 _API_KEY_ENV_FIELD_NAME = "API key env var name"
@@ -306,6 +308,9 @@ class ConfigMenuState:
                 "max_steps": _format_integer(getattr(cfg, "max_steps", 25)),
                 "task_max_steps": _format_integer(getattr(cfg, "task_max_steps", 100)),
                 "subagent_max_steps": _format_integer(getattr(cfg, "subagent_max_steps", 16)),
+                "subagent_timeout_s": _format_number(
+                    getattr(cfg, "subagent_timeout_s", DEFAULT_SUBAGENT_TIMEOUT_S)
+                ),
                 "stream": "true" if bool(getattr(cfg, "stream", True)) else "false",
                 "prompt_cache_mode": _normalize_prompt_cache_mode(
                     getattr(cfg, "prompt_cache_mode", "manual") or "manual"
@@ -461,6 +466,7 @@ class ConfigMenuState:
             "max_steps",
             "task_max_steps",
             "subagent_max_steps",
+            "subagent_timeout_s",
             "prompt_cache_mode",
             "prompt_cache_key",
             "prompt_cache_retention",
@@ -508,6 +514,9 @@ class ConfigMenuState:
 
     def set_subagent_max_steps(self, value: str) -> None:
         self.fields["subagent_max_steps"] = str(value)
+
+    def set_subagent_timeout_s(self, value: str) -> None:
+        self.fields["subagent_timeout_s"] = str(value)
 
     def set_role_model(self, role: str, model: str) -> None:
         role_key = _normalize_role(role)
@@ -966,6 +975,19 @@ class ConfigMenuState:
                 set_config_value(cfg, key, str(desired_int))
                 changes[key] = desired_int
 
+        desired_subagent_timeout = float(str(self.fields.get("subagent_timeout_s", "")).strip())
+        current_subagent_timeout = _finite_float(
+            getattr(cfg, "subagent_timeout_s", None),
+            fallback=None,
+        )
+        if current_subagent_timeout != desired_subagent_timeout:
+            set_config_value(
+                cfg,
+                "subagent_timeout_s",
+                _format_number(desired_subagent_timeout),
+            )
+            changes["subagent_timeout_s"] = desired_subagent_timeout
+
         desired_cache_mode = _normalize_prompt_cache_mode(
             self.fields.get("prompt_cache_mode", "manual")
         )
@@ -1249,6 +1271,13 @@ class ConfigMenuState:
                 return f"{label} must be a positive integer."
             if value <= 0:
                 return f"{label} must be a positive integer."
+        subagent_timeout_text = str(self.fields.get("subagent_timeout_s", "")).strip()
+        try:
+            subagent_timeout = float(subagent_timeout_text)
+        except ValueError:
+            return "Subagent timeout (seconds) must be a positive number."
+        if subagent_timeout <= 0 or not math.isfinite(subagent_timeout):
+            return "Subagent timeout (seconds) must be a positive number."
         try:
             _normalize_prompt_cache_mode(self.fields.get("prompt_cache_mode", "manual"))
         except ValueError as exc:

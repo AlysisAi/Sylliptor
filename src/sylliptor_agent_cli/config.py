@@ -60,6 +60,7 @@ _VALID_TOOLBAR_ITEMS: set[str] = {
     "plan",
 }
 _DEFAULT_TOOLBAR_ITEMS: tuple[str, ...] = ("mode", "model", "ctx", "subagents")
+DEFAULT_SUBAGENT_TIMEOUT_S = 900.0
 DEFAULT_VERIFY_COMMANDS: tuple[str, ...] = ("pytest -q",)
 VERIFY_RUNNER_PREFIXES: frozenset[tuple[str, str]] = frozenset(
     {
@@ -125,6 +126,58 @@ class AssetsConfig(BaseModel):
     comprehension: AssetsComprehensionConfig = Field(default_factory=AssetsComprehensionConfig)
     planner: AssetsPlannerConfig = Field(default_factory=AssetsPlannerConfig)
     worker: AssetsWorkerConfig = Field(default_factory=AssetsWorkerConfig)
+
+
+class ImageGenerationConfig(BaseModel):
+    """Opt-in OpenAI-compatible image generation capability.
+
+    Generation is disabled by default because every successful call can incur a
+    separate provider charge.  When no image-specific endpoint or credential is
+    configured, the active profile endpoint and resolved API key are reused.
+    """
+
+    enabled: bool = False
+    model: str = "gpt-image-1"
+    base_url: str | None = None
+    api_key_env: str | None = None
+    timeout_s: float = Field(default=180.0, gt=0.0, le=900.0)
+    max_images_per_call: int = Field(default=4, ge=1, le=4)
+    max_image_bytes: int = Field(default=25_000_000, ge=1024, le=100_000_000)
+    max_pixels: int = Field(default=16_777_216, ge=1_000_000, le=67_108_864)
+
+    @model_validator(mode="after")
+    def validate_provider_settings(self) -> Self:
+        self.model = str(self.model or "").strip()
+        if not self.model:
+            raise ValueError("Image generation model cannot be empty.")
+        self.api_key_env = str(self.api_key_env or "").strip() or None
+        if (
+            self.api_key_env
+            and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*",
+                self.api_key_env,
+            )
+            is None
+        ):
+            raise ValueError(
+                "Image generation api_key_env must be a valid environment variable name."
+            )
+        self.base_url = str(self.base_url or "").strip() or None
+        if self.base_url:
+            parsed = urlsplit(self.base_url)
+            if (
+                parsed.scheme.lower() not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "Image generation base_url must be a credential-free HTTP(S) URL "
+                    "without a query or fragment."
+                )
+        return self
 
 
 _RUNTIME_SECRET_FIELD_NAMES = frozenset(
@@ -291,6 +344,12 @@ class AppConfig(BaseModel):
     step_budget_policy: str = AUTONOMOUS_STEP_BUDGET_POLICY
     task_max_steps: int = DEFAULT_TASK_MAX_STEPS
     subagent_max_steps: int = DEFAULT_SUBAGENT_MAX_STEPS
+    subagent_timeout_s: float = Field(
+        default=DEFAULT_SUBAGENT_TIMEOUT_S,
+        gt=0,
+        allow_inf_nan=False,
+        description="Fallback wall-clock ceiling in seconds for each ordinary subagent run.",
+    )
     subagents_enabled: bool = True
     skills_enabled: bool = True
     skills_auto_invoke: bool = Field(
@@ -332,6 +391,7 @@ class AppConfig(BaseModel):
         default_factory=lambda: list(_DEFAULT_TOOLBAR_ITEMS),
     )
     assets: AssetsConfig = Field(default_factory=AssetsConfig)
+    image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
 
     # Internal: allow future keys without crashing older clients.
     extra_fields: dict[str, Any] = Field(default_factory=dict, exclude=True)
@@ -1310,6 +1370,7 @@ _SETTABLE_KEYS: set[str] = {
     "custom_tools_enabled",
     "task_max_steps",
     "subagent_max_steps",
+    "subagent_timeout_s",
     "web_search_mode",
     "web_search_policy",
     "web_search_enabled",
@@ -1317,6 +1378,14 @@ _SETTABLE_KEYS: set[str] = {
     "web_search_base_url",
     "web_search_model",
     "web_search_timeout_s",
+    "image_generation.enabled",
+    "image_generation.model",
+    "image_generation.base_url",
+    "image_generation.api_key_env",
+    "image_generation.timeout_s",
+    "image_generation.max_images_per_call",
+    "image_generation.max_image_bytes",
+    "image_generation.max_pixels",
     "update_check_enabled",
     "update_check_interval_hours",
     "update_check_timeout_s",
@@ -2319,6 +2388,10 @@ def set_config_value(
         setattr(cfg, key, _coerce_positive_int(value, key=key))
         return cfg
 
+    if key == "subagent_timeout_s":
+        cfg.subagent_timeout_s = _coerce_positive_float(value, key=key)
+        return cfg
+
     if key == "temperature":
         _apply_legacy_temperature_override(cfg, _coerce_non_negative_float(value, key=key))
         return cfg
@@ -2424,6 +2497,67 @@ def set_config_value(
 
     if key == "web_search_timeout_s":
         cfg.web_search_timeout_s = _coerce_positive_float(value, key=key)
+        return cfg
+
+    if key == "image_generation.enabled":
+        cfg.image_generation.enabled = _coerce_bool(value, key=key)
+        return cfg
+
+    if key == "image_generation.model":
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ConfigError("image_generation.model cannot be empty")
+        payload = cfg.image_generation.model_dump()
+        payload["model"] = normalized
+        cfg.image_generation = ImageGenerationConfig.model_validate(payload)
+        return cfg
+
+    if key == "image_generation.base_url":
+        from .profiles import validate_base_url
+
+        normalized = str(value or "").strip()
+        payload = cfg.image_generation.model_dump()
+        payload["base_url"] = (
+            validate_base_url(normalized, key=key, allow_empty=True) if normalized else None
+        )
+        try:
+            cfg.image_generation = ImageGenerationConfig.model_validate(payload)
+        except ValidationError as exc:
+            raise ConfigError(str(exc.errors()[0]["msg"])) from exc
+        return cfg
+
+    if key == "image_generation.api_key_env":
+        normalized = str(value or "").strip()
+        if normalized and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized) is None:
+            raise ConfigError(
+                "image_generation.api_key_env must be a valid environment variable name"
+            )
+        payload = cfg.image_generation.model_dump()
+        payload["api_key_env"] = normalized or None
+        cfg.image_generation = ImageGenerationConfig.model_validate(payload)
+        return cfg
+
+    if key == "image_generation.timeout_s":
+        payload = cfg.image_generation.model_dump()
+        payload["timeout_s"] = _coerce_positive_float(value, key=key)
+        try:
+            cfg.image_generation = ImageGenerationConfig.model_validate(payload)
+        except ValidationError as exc:
+            raise ConfigError(str(exc.errors()[0]["msg"])) from exc
+        return cfg
+
+    if key in {
+        "image_generation.max_images_per_call",
+        "image_generation.max_image_bytes",
+        "image_generation.max_pixels",
+    }:
+        field_name = key.rsplit(".", 1)[1]
+        payload = cfg.image_generation.model_dump()
+        payload[field_name] = _coerce_positive_int(value, key=key)
+        try:
+            cfg.image_generation = ImageGenerationConfig.model_validate(payload)
+        except ValidationError as exc:
+            raise ConfigError(str(exc.errors()[0]["msg"])) from exc
         return cfg
 
     if key == "update_check_enabled":

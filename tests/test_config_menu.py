@@ -330,6 +330,29 @@ def test_commit_does_not_rewrite_unchanged_subscription_model() -> None:
     assert get_active_profile(cfg).default_model == "gpt-5.6-luna"
 
 
+def test_config_menu_round_trips_subagent_timeout() -> None:
+    cfg = AppConfig(model="default", subagent_timeout_s=123.5)
+    state = ConfigMenuState.from_cfg(cfg)
+
+    assert state.fields["subagent_timeout_s"] == "123.5"
+    state.set_subagent_timeout_s("321.5")
+    assert state.validate() is None
+
+    result = state.commit_to(cfg)
+
+    assert result.changes["subagent_timeout_s"] == 321.5
+    assert cfg.subagent_timeout_s == 321.5
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "nan", "inf", "not-a-number"])
+def test_config_menu_rejects_invalid_subagent_timeout(value: str) -> None:
+    state = ConfigMenuState.from_cfg(AppConfig(model="default"))
+
+    state.set_field("subagent_timeout_s", value)
+
+    assert state.validate() == "Subagent timeout (seconds) must be a positive number."
+
+
 def test_commit_persists_default_model_section_to_active_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

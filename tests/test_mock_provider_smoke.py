@@ -75,6 +75,8 @@ def _write_config(
     *,
     base_url: str,
     repo: Path,
+    subagents_enabled: bool = False,
+    subagent_max_steps: int = 1,
     verify_commands: list[str] | None = None,
 ) -> None:
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -84,11 +86,12 @@ def _write_config(
         "default_mode": "fullaccess",
         "stream": False,
         "routing_mode": "code_only",
-        "subagents_enabled": False,
+        "subagents_enabled": subagents_enabled,
         "skills_enabled": False,
+        "update_check_enabled": False,
         "max_steps": 8,
         "task_max_steps": 8,
-        "subagent_max_steps": 1,
+        "subagent_max_steps": subagent_max_steps,
         # A real, assertive, always-passing verification so the completion gate is
         # satisfiable in the smoke (the seeded README always exists). The agent runs it
         # via verify_run on the mock's "run the configured verification" path.
@@ -132,6 +135,8 @@ def _env(work_dir: Path) -> dict[str, str]:
             "NO_COLOR": "1",
             "TERM": "xterm-256color",
             "SYLLIPTOR_ROUTING_MODE": "code_only",
+            "SYLLIPTOR_TUI": "0",
+            "SYLLIPTOR_UPDATE_CHECK_ENABLED": "0",
             # Portability: no Docker / Bubblewrap required for the smoke.
             "SYLLIPTOR_SHELL_SANDBOX_MODE": "off",
             "SYLLIPTOR_VERIFY_SANDBOX_MODE": "off",
@@ -144,7 +149,12 @@ def _env(work_dir: Path) -> dict[str, str]:
 
 
 def _run_cli(
-    args: list[str], *, cwd: Path, env: dict[str, str], timeout: float = 90.0
+    args: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    input_text: str | None = None,
+    timeout: float = 90.0,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [*CLI, *args],
@@ -153,6 +163,7 @@ def _run_cli(
         check=False,
         capture_output=True,
         text=True,
+        input=input_text,
         timeout=timeout,
     )
 
@@ -251,6 +262,134 @@ def test_mock_provider_pytest_no_tests_does_not_trip_completion_gate(tmp_path: P
     )
     assert "completion_gate_error" not in combined
     assert "forced diff marker" in (repo / "README.md").read_text(encoding="utf-8")
+    _assert_no_raw_error(result)
+
+
+@pytest.mark.smoke
+def test_smoke_classic_chat_subagent_reads_readme_end_to_end(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _make_repo(repo)
+    initial_readme = (repo / "README.md").read_text(encoding="utf-8")
+    task = "Read existing README.md and report its contents."
+
+    with MockLLMServer() as server:
+        _write_config(
+            tmp_path / "config",
+            base_url=server.base_url,
+            repo=repo,
+            subagents_enabled=True,
+            subagent_max_steps=3,
+        )
+        result = _run_cli(
+            [
+                "chat",
+                "--path",
+                os.fspath(repo.resolve()),
+                "--allow-broad-workspace",
+                "--mode",
+                "review",
+                "--model",
+                QA_MODEL,
+                "--base-url",
+                server.base_url,
+                "--api-key",
+                "mock-key",
+                "--no-stream",
+                "--subagents",
+                "--max-steps",
+                "4",
+                "--yes",
+            ],
+            cwd=repo,
+            env=_env(tmp_path),
+            input_text=f"/subagent explorer {task}\n/exit\n",
+        )
+        requests = list(server.requests)
+
+    assert result.returncode == 0, (
+        f"classic-chat subagent run did not exit cleanly ({result.returncode})\n"
+        f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+    )
+    assert "Subagent Result" in result.stdout
+    assert "subagent: explorer" in result.stdout
+    assert "mode: readonly" in result.stdout
+    assert initial_readme.strip() in result.stdout
+
+    task_requests = [
+        request
+        for request in requests
+        if any(
+            message.get("role") == "user" and task in str(message.get("content") or "")
+            for message in request.get("messages") or ()
+            if isinstance(message, dict)
+        )
+    ]
+    assert len(task_requests) >= 2, "the child did not complete its fs_read tool round trip"
+
+    exposed_tool_names = {
+        str(function.get("name") or "")
+        for tool in task_requests[0].get("tools") or ()
+        if isinstance(tool, dict)
+        for function in [tool.get("function")]
+        if isinstance(function, dict)
+    }
+    assert "fs_read" in exposed_tool_names
+    assert exposed_tool_names.isdisjoint({"fs_write", "fs_edit", "shell_run"})
+
+    child_messages = [
+        message
+        for request in task_requests
+        for message in request.get("messages") or ()
+        if isinstance(message, dict)
+    ]
+    assert any(
+        isinstance(call, dict)
+        and isinstance(call.get("function"), dict)
+        and call["function"].get("name") == "fs_read"
+        for message in child_messages
+        for call in message.get("tool_calls") or ()
+    )
+    assert any(
+        message.get("role") == "tool"
+        and initial_readme.strip() in str(message.get("content") or "")
+        for message in child_messages
+    )
+
+    session_dir = tmp_path / "data" / "sessions"
+    session_events = [
+        json.loads(line)
+        for path in session_dir.glob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    starts = [event for event in session_events if event.get("type") == "subagent_start"]
+    catalogs = [event for event in session_events if event.get("type") == "subagent_tool_catalog"]
+    ends = [event for event in session_events if event.get("type") == "subagent_end"]
+    assert any(event.get("payload", {}).get("name") == "explorer" for event in starts)
+    explorer_catalog = next(
+        event["payload"] for event in catalogs if event.get("payload", {}).get("name") == "explorer"
+    )
+    child_session_id = str(explorer_catalog.get("subagent_session_id") or "")
+    assert child_session_id
+    assert (session_dir / f"{child_session_id}.jsonl").is_file()
+    assert "fs_read" in explorer_catalog["tool_names"]
+    assert set(explorer_catalog["tool_names"]).isdisjoint({"fs_write", "fs_edit", "shell_run"})
+    assert any(
+        event.get("payload", {}).get("name") == "explorer"
+        and event.get("payload", {}).get("subagent_session_id") == child_session_id
+        and event.get("payload", {}).get("status") == "success"
+        for event in ends
+    )
+
+    assert (repo / "README.md").read_text(encoding="utf-8") == initial_readme
+    assert not (repo / "qa_written.txt").exists()
+    git_status = subprocess.run(
+        ["git", "-C", os.fspath(repo), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert git_status.stdout == ""
     _assert_no_raw_error(result)
 
 

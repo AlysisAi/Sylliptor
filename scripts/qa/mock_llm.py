@@ -133,6 +133,63 @@ def _raw_agent_proxy_response(
     text: str,
 ) -> dict[str, Any] | None:
     lowered = text.lower()
+    last_user_lowered = _last_user_text(messages).lower()
+    if (
+        last_user_lowered.strip() == "read existing readme.md and report its contents."
+        and _has_tool_call(messages, "fs_read")
+    ):
+        return _response("README.md contents: `# Smoke`")
+    if "subagent_bench_m03" in lowered:
+        if _has_tool_call(messages, "verify_run"):
+            return _response(
+                "Implemented src/a.py and tests/test_a.py; the focused verification passed."
+            )
+        if _has_tool_call(messages, "fs_write"):
+            return _tool_response("verify_run", {})
+        return _tool_response_many(
+            (
+                _write_call(
+                    "src/a.py",
+                    "def add(left: int, right: int) -> int:\n    return left + right\n",
+                ),
+                _write_call(
+                    "tests/test_a.py",
+                    (
+                        "from src.a import add\n\n\n"
+                        "def test_add() -> None:\n"
+                        "    assert add(2, 3) == 5\n"
+                    ),
+                ),
+            )
+        )
+    if "subagent_bench_m04_child_" in last_user_lowered:
+        if _has_tool_call(messages, "fs_read"):
+            return _response("Readonly inspection completed with file-backed evidence.")
+        path = "src/app.py" if "child_beta" in last_user_lowered else "README.md"
+        return _tool_response("fs_read", {"path": path})
+    if "subagent_bench_m04" in lowered:
+        if _has_tool_call(messages, "subagent_run"):
+            return _response(
+                "README.md identifies the benchmark repository; src/app.py defines main()."
+            )
+        return _tool_response_many(
+            (
+                (
+                    "subagent_run",
+                    {
+                        "name": "explorer",
+                        "task": "SUBAGENT_BENCH_M04_CHILD_ALPHA inspect README.md; do not edit.",
+                    },
+                ),
+                (
+                    "subagent_run",
+                    {
+                        "name": "code-reviewer",
+                        "task": "SUBAGENT_BENCH_M04_CHILD_BETA inspect src/app.py; do not edit.",
+                    },
+                ),
+            )
+        )
     if "raw_proxy_force_verify" in lowered:
         if _has_tool_call(messages, "verify_run"):
             return _response("Done. Forced verification was completed.")
@@ -302,6 +359,15 @@ class _Handler(BaseHTTPRequestHandler):
         messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
         user_text = _last_user_text(messages).lower()
         all_text = _all_message_text(messages)
+        if "subagent_bench_m04_child_" in user_text and not _has_tool_call(messages, "fs_read"):
+            child_label = "beta" if "child_beta" in user_text else "alpha"
+            with self.server.benchmark_parallel_lock:
+                self.server.benchmark_parallel_arrivals.add(child_label)
+                if len(self.server.benchmark_parallel_arrivals) == 2:
+                    self.server.benchmark_parallel_event.set()
+            reached_rendezvous = self.server.benchmark_parallel_event.wait(timeout=5.0)
+            with self.server.benchmark_parallel_lock:
+                self.server.benchmark_parallel_rendezvous[child_label] = reached_rendezvous
         if "qa_429" in user_text:
             self._send_json(429, {"error": {"message": "rate limit exceeded"}})
             return
@@ -382,6 +448,10 @@ class _Handler(BaseHTTPRequestHandler):
 
 class _Server(ThreadingHTTPServer):
     requests: list[dict[str, Any]]
+    benchmark_parallel_arrivals: set[str]
+    benchmark_parallel_rendezvous: dict[str, bool]
+    benchmark_parallel_event: threading.Event
+    benchmark_parallel_lock: threading.Lock
 
 
 @dataclass
@@ -392,6 +462,10 @@ class MockLLMServer:
     def __post_init__(self) -> None:
         self._server = _Server((self.host, self.port), _Handler)
         self._server.requests = []
+        self._server.benchmark_parallel_arrivals = set()
+        self._server.benchmark_parallel_rendezvous = {}
+        self._server.benchmark_parallel_event = threading.Event()
+        self._server.benchmark_parallel_lock = threading.Lock()
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     @property
@@ -402,6 +476,11 @@ class MockLLMServer:
     @property
     def requests(self) -> list[dict[str, Any]]:
         return self._server.requests
+
+    @property
+    def benchmark_parallel_rendezvous(self) -> dict[str, bool]:
+        with self._server.benchmark_parallel_lock:
+            return dict(self._server.benchmark_parallel_rendezvous)
 
     def start(self) -> MockLLMServer:
         self._thread.start()

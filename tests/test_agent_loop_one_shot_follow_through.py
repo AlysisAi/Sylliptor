@@ -1049,6 +1049,10 @@ def test_matching_effective_verification_commands_maps_targeted_commands_to_cove
         ("Could you walk me through the issue before making the change?", "execute"),
         ("Give me a plan only; do not modify files.", "plan_or_analysis_only"),
         ("Review the repo and suggest improvements; no code changes.", "advisory_non_execution"),
+        (
+            "Use the explorer subagent to inspect the repository and summarize it; do not edit.",
+            "advisory_non_execution",
+        ),
         ("How does the parser module work?", "advisory_non_execution"),
         ("What does this module do?", "advisory_non_execution"),
         ("What is the right fix for this parser bug?", "advisory_non_execution"),
@@ -8901,6 +8905,83 @@ def _install_stub_subagent_run(
     )
 
 
+def test_one_shot_readonly_explorer_subagent_synthesis_skips_mutating_completion_guards(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo_with_commit(repo)
+    sessions_dir = tmp_path / "sessions"
+    session_id = "one-shot-readonly-explorer-synthesis"
+    session = create_session(
+        cfg=AppConfig(model="test-model", routing_mode="code_only"),
+        root=repo,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        subagents_enabled=True,
+        verification_enabled=False,
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    report = "README.md describes the repository as a sample project."
+    final_text = f"Explorer finding: {report}"
+    _install_stub_subagent_run(session, result_text=report)
+    client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-explorer",
+                        name="subagent_run",
+                        arguments={
+                            "name": "explorer",
+                            "task": "Inspect README.md and report what the repository is.",
+                        },
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content=final_text, tool_calls=[], raw={}),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn(
+            "Use the explorer subagent to inspect the repository and summarize it; do not edit."
+        )
+    finally:
+        session.close()
+
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    event_types = [str(event.get("type") or "") for event in events]
+    assert exit_code == 0
+    assert client.calls == 2
+    assert any(
+        event.get("type") == "tool_result"
+        and (event.get("payload") or {}).get("name") == "subagent_run"
+        and ((event.get("payload") or {}).get("result") or {}).get("result") == report
+        for event in events
+    )
+    assert any(
+        event.get("type") == "final" and (event.get("payload") or {}).get("content") == final_text
+        for event in events
+    )
+    assert "empty_diff_finalization_blocked" not in event_types
+    assert "empty_diff_forced" not in event_types
+    assert "one_shot_no_material_edits_detected" not in event_types
+    assert "no_material_edits_bootstrap_nudge" not in event_types
+    assert "completion_gate_nudge" not in event_types
+    assert not subprocess.run(
+        ["git", "-C", os.fspath(repo), "diff", "--quiet", "HEAD", "--"],
+        check=False,
+    ).returncode
+
+
 def test_one_shot_exploration_stagnation_emits_nudge(tmp_path: Path) -> None:
     _write_test_files(tmp_path, [f"f{i}.txt" for i in range(1, 7)])
 
@@ -9024,7 +9105,7 @@ def test_one_shot_post_explore_stagnation_emits_implementation_bootstrap_nudge(
                     ToolCall(
                         id="tc1",
                         name="subagent_run",
-                        arguments={"name": "general-purpose", "task": "Map repo"},
+                        arguments={"name": "explorer", "task": "Map repo"},
                     )
                 ],
                 raw={},

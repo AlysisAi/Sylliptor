@@ -18,6 +18,7 @@ class _FakeClient:
     model = "test-model"
     temperature = 0.2
     reasoning_trace_capability = ReasoningTraceCapability(
+        adapter="test_safe_summary",
         output_kind=ReasoningOutputKind.SUMMARY,
         supports_streaming=True,
         supports_buffered=True,

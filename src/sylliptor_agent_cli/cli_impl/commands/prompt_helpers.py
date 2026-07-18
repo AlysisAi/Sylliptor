@@ -34,6 +34,8 @@ def _handle_chat_command(
     console: Console,
     forge_state: _ForgeChatState,
     plan_mode_state: _ChatPlanModeState,
+    subagent_result_sink: Any | None = None,
+    subagent_notice_sink: Any | None = None,
 ) -> str | _ChatExecutionRequest:
     from ..chat import _handle_chat_command_impl
 
@@ -46,6 +48,8 @@ def _handle_chat_command(
         console=console,
         forge_state=forge_state,
         plan_mode_state=plan_mode_state,
+        subagent_result_sink=subagent_result_sink,
+        subagent_notice_sink=subagent_notice_sink,
     )
 
 

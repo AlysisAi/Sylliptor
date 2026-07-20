@@ -354,10 +354,10 @@ def test_config_menu_preset_rows_explain_compatibility_and_native_modes() -> Non
     advanced = config_menu_mod._advanced_profile_presets_for_setup()
     advanced_keys = [preset.key for preset in advanced]
 
-    # The /config "add preset" picker mirrors setup: the MiMo trial + native
-    # first-party providers lead, every other hosted provider follows, and only
+    # The /config "add preset" picker mirrors setup: native first-party
+    # providers lead, every other hosted provider follows, and only
     # compatibility/local/custom/legacy presets stay behind the advanced picker.
-    assert keys[:4] == ["sylliptor", "openai-responses", "anthropic", "gemini"]
+    assert keys[:4] == ["openai-responses", "anthropic", "gemini", "deepseek"]
     assert "deepseek" in keys
     assert "anthropic-compat" not in keys
     assert "gemini-compat" not in keys
@@ -403,9 +403,9 @@ def test_config_menu_add_preset_surfaces_provider_diagnostic_warnings(monkeypatc
 
     config_menu_mod._run_profile_add_preset(state, console)
 
-    # The picker highlights the first primary row (the hosted MiMo trial) by
+    # The picker highlights the first primary row (OpenAI Responses) by
     # default; the diagnostic warnings below are what this test actually guards.
-    assert picker.calls[0]["current_value"] == "sylliptor"
+    assert picker.calls[0]["current_value"] == "openai-responses"
     rendered = output.getvalue()
     assert "Provider diagnostic:" in rendered
     assert "web_search_mode=external is incompatible" in rendered

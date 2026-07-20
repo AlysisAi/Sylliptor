@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from ...config import (
     ConfigError,
@@ -42,6 +43,16 @@ from ...profile_presets import (
 from ...profiles import ProfileSpec, validate_base_url
 from ...provider_auth import ProviderAccountStatus, ProviderAuthError, create_provider_auth
 from ...provider_diagnostics import provider_diagnostic_warning_lines
+from ...reasoning_contracts import (
+    ALWAYS_ON,
+    OFF_SWAPS_MODEL,
+    UNKNOWN_CONTRACT,
+    WIRE_REASONING_EFFORT,
+    WIRE_THINKING_ADAPTIVE,
+    WIRE_THINKING_LEVEL,
+    ReasoningContract,
+    reasoning_contract_for,
+)
 from ...sandbox_settings import normalize_sandbox_mode
 from ...web_search_adapters import normalize_web_search_adapter
 from ...web_search_policy import normalize_web_search_policy
@@ -52,8 +63,10 @@ from ...workspace_binding import (
 )
 from ..config_menu import (
     _ADVANCED_PROVIDER_PRESETS_VALUE,
+    _CLEAR_KEY_PENDING,
     _CUSTOM_MODEL_VALUE,
     _INHERIT_DEFAULT_MODEL_VALUE,
+    _MISSING_REQUIRED,
     _ROLE_TEMPERATURE_FIELDS,
     ANTHROPIC_PROMPT_CACHE_TTLS,
     FORGE_ROLE_ORDER,
@@ -61,13 +74,17 @@ from ..config_menu import (
     ROLE_ORDER,
     ConfigMenuResult,
     ConfigMenuState,
+    _active_preset,
     _active_subscription_profile,
     _advanced_profile_presets_for_setup,
+    _api_key_summary_text,
+    _cache_aware_summary_text,
     _cache_policy_summary_text,
     _default_model_picker_subtitle,
     _default_model_rows,
     _finite_float,
     _format_number,
+    _is_direct_subscription_id,
     _looks_like_secret,
     _normalize_anthropic_prompt_cache_ttl,
     _normalize_bool_text,
@@ -77,7 +94,6 @@ from ..config_menu import (
     _override_summary_text,
     _parse_header_text,
     _pending_change_count,
-    _preset_description,
     _resolved_cache_policy_for_state,
     _role_description,
     _role_label,
@@ -87,7 +103,6 @@ from ..config_menu import (
     _sandbox_mode_env_override,
     _temperature_controls_available,
     _thinking_labels_for_state,
-    _top_level_menu_rows,
     _web_search_mode_rows,
     _web_search_policy_rows,
 )
@@ -101,6 +116,95 @@ _SECRET_FORCE_TOKEN = "force"
 # Sentinel row values on the top-level menu for the two trailing action rows.
 _SAVE = "__save__"
 _CANCEL = "__cancel__"
+
+# One-line preset descriptions for the TUI picker; the full protocol prose from
+# ``_preset_description`` stays in the classic Rich menu and docs.
+_NATIVE_PROTOCOL_SHORT = {
+    "openai_responses": "native · OpenAI Responses",
+    "anthropic_messages": "native · Anthropic Messages",
+    "gemini_generate_content": "native · Gemini GenerateContent",
+}
+
+
+def _short_preset_label(preset: Any) -> str:
+    # "OpenAI - Native Responses" → "OpenAI"; the description carries the rest.
+    return preset_selection_label(preset).split(" - ")[0]
+
+
+def _thinking_labels_allowed_by_contract(
+    contract: ReasoningContract, labels: list[str], *, current: str
+) -> list[str]:
+    """Filter thinking-picker options to what the model's contract accepts.
+
+    Rules (capability report, Part A): an ``always-on`` model never shows
+    "off" — unless "off" *swaps the model* (kimi-code), which stays visible so
+    the substitution can be warned about instead of hidden. When the contract
+    publishes an exact value set, out-of-set efforts are dropped. The current
+    selection is never hidden (the user must always be able to see and change
+    it), and an unknown contract leaves the list untouched.
+    """
+    if contract is UNKNOWN_CONTRACT:
+        return labels
+    # ``values`` are effort words only on effort-style wires; on toggle wires
+    # (thinking_type / enable_thinking) they describe the toggle itself and
+    # must not be used to filter effort labels.
+    effort_wires = {WIRE_REASONING_EFFORT, WIRE_THINKING_LEVEL, WIRE_THINKING_ADAPTIVE}
+    filter_by_values = bool(contract.values) and contract.wire in effort_wires
+    out: list[str] = []
+    for label in labels:
+        fold = label.casefold()
+        if label == current:
+            out.append(label)
+            continue
+        if fold == "off":
+            if contract.mode == ALWAYS_ON and contract.off != OFF_SWAPS_MODEL:
+                continue
+            out.append(label)
+            continue
+        if filter_by_values and fold not in contract.values:
+            continue
+        out.append(label)
+    return out
+
+
+def _cache_mode_subtitle(state: Any) -> str:
+    """Plain-language caching status for the section header.
+
+    The old subtitle was the raw policy dump ("Effective: unsupported;
+    strategy=none; source=default; allowed=none; emits=no fields; usage=none")
+    — debug output, not UI. The full detail remains available in /status.
+    """
+    raw = _cache_policy_summary_text(_resolved_cache_policy_for_state(state), compact=True)
+    if "unsupported" in raw:
+        return (
+            "The active provider does not support prompt caching; "
+            "these settings apply where a provider does."
+        )
+    return f"Provider caching: {raw}"
+
+
+def _pretty_key_source(source: str | None) -> str:
+    """Humanize ``api_key_source`` values (``stored:profile=x`` → prose)."""
+    raw = str(source or "").strip()
+    if raw.startswith("stored:profile="):
+        return f"saved in profile {raw.removeprefix('stored:profile=')}"
+    if raw.startswith("env:"):
+        return f"from ${raw.removeprefix('env:')}"
+    if raw == "stored":
+        return "saved in config"
+    return raw or "not set"
+
+
+def _short_preset_description(preset: Any) -> str:
+    if preset.key == "sylliptor":
+        return "hosted MiMo — Sylliptor account"
+    short = _NATIVE_PROTOCOL_SHORT.get(preset.protocol)
+    if short:
+        return short
+    host = urlparse(preset.base_url).netloc
+    return host or "any OpenAI-compatible base URL"
+
+
 _SEARCH_ROUTER_MODELS = "__search_router_models__"
 _ROUTER_INLINE_MODEL_LIMIT = 40
 _ROUTER_SEARCH_RESULT_LIMIT = 100
@@ -116,6 +220,8 @@ _STAGE_MODE: dict[str, Mode] = {
     "subscription_connecting": "busy",
     "subscription_disconnecting": "busy",
     "advanced": "list",
+    "subagent_roles": "list",
+    "forge_roles": "list",
     "workspace": "list",
     "workspace_path": "input",
     "workspace_action": "list",
@@ -345,6 +451,7 @@ class ConfigFlow:
         self._resume_stage = "menu"
         self._sub_steps: list[tuple[str, str]] = []
         self._sub_i = 0
+        self._forge_role = ""
         self._sub_model_snapshot: dict[str, str] = {}
         self._sub_temp_snapshot: dict[str, str] = {}
         self._forge_i = 0
@@ -395,7 +502,7 @@ class ConfigFlow:
         if self.stage == "subagent_field":
             return f"subagent_field:{self._sub_i}"
         if self.stage == "forge_field":
-            return f"forge_field:{self._forge_i}"
+            return f"forge_field:{self._forge_role or '0'}"
         if self.stage == "provider_edit":
             return f"provider_edit:{self._edit_i}"
         return self.stage
@@ -405,6 +512,8 @@ class ConfigFlow:
         self.status_tone = tone
 
     def _goto(self, stage: str, *, index: int = 0, keep_status: bool = False) -> None:
+        if stage == "menu" and index == 0:
+            index = getattr(self, "_menu_resume_index", 0)
         self.stage = stage
         self.index = index
         if not keep_status:
@@ -441,6 +550,17 @@ class ConfigFlow:
         else:
             scr = builder()
         scr.index = self.index
+        # Never leave the cursor on a header/spacer row (e.g. index 0 of the
+        # grouped menu): snap forward to the first selectable item.
+        if scr.mode == "list" and scr.rows:
+            n = len(scr.rows)
+            i = scr.index if 0 <= scr.index < n else 0
+            for _ in range(n):
+                if getattr(scr.rows[i], "kind", "item") == "item":
+                    break
+                i = (i + 1) % n
+            scr.index = i
+            self.index = i
         if not scr.status:
             scr.status = self.status
             scr.status_tone = self.status_tone
@@ -449,25 +569,59 @@ class ConfigFlow:
         return scr
 
     def _screen_menu(self) -> Screen:
-        # The per-role model overrides (subagent + forge) are advanced/optional, so
-        # they live under a single "Advanced" entry instead of cluttering the menu.
+        # Grouped, breathing layout: one short fact per row — the full detail
+        # lives inside each section screen. Per-role model overrides (subagent +
+        # forge) stay tucked under a single "Advanced" entry.
+        st = self.state
+        delegated = st.execution_backend == "delegated" and not _is_direct_subscription_id(
+            st.execution_runtime
+        )
+        direct_sub = st.execution_backend == "delegated" and _is_direct_subscription_id(
+            st.execution_runtime
+        )
+        native_suffix = " (inactive)" if delegated else ""
+        profile_desc, profile_tone = self._short_profile(delegated)
+        model_desc, model_tone = self._short_model(delegated)
+        key_desc, key_tone = self._short_api_key(delegated, direct_sub)
+        access_desc, access_tone = self._short_execution()
+
         rows = [
+            Row(label="Workspace", kind="header"),
+            Row(label="Project", description=self._short_workspace(), value="workspace"),
+            Row(label="Sandbox", description=self._short_sandbox(), value="sandbox"),
+            Row(label="", kind="spacer"),
+            Row(label="Model", kind="header"),
+            Row(label="Model Access", description=access_desc, value="execution", tone=access_tone),
             Row(
-                label="Project / Workspace",
-                description=self._workspace_summary(),
-                value="workspace",
-            )
+                label=f"Provider Profile{native_suffix}",
+                description=profile_desc,
+                value="profile",
+                tone=profile_tone,
+            ),
+            Row(
+                label=f"Default Model{native_suffix}",
+                description=model_desc,
+                value="default",
+                tone=model_tone,
+            ),
+            # The status ("not used" / "inactive") lives in the description —
+            # repeating it as a label suffix read twice on one row.
+            Row(
+                label="API Key",
+                description=key_desc,
+                value="api_key",
+                tone=key_tone,
+            ),
+            Row(label="", kind="spacer"),
+            Row(label="Behavior", kind="header"),
+            Row(label="Web Search", description=self._short_web_search(), value="web_search"),
+            Row(label="Context & Cache", description=self._short_cache(), value="cache"),
+            Row(label="Routing", description=self._short_routing(), value="router"),
+            Row(label="Advanced", description=self._short_advanced(), value="advanced"),
+            Row(label="", kind="spacer"),
+            Row(label="Save & exit", description="write changes to disk and close", value=_SAVE),
+            Row(label="Discard & close", description="close without saving", value=_CANCEL),
         ]
-        rows.extend(
-            Row(label=label, description=_strip_markup(summary), value=value)
-            for value, label, summary in _top_level_menu_rows(self.state)
-            if value not in ("subagents", "forge")
-        )
-        rows.append(Row(label="Advanced", description=self._advanced_summary(), value="advanced"))
-        rows.append(
-            Row(label="Save & exit", description="Write changes to disk and close", value=_SAVE)
-        )
-        rows.append(Row(label="Discard & close", description="Close without saving", value=_CANCEL))
         pending = _pending_change_count(self.state)
         subtitle = f"{pending} pending change(s)" if pending else "No pending changes."
         if self.state.config_warning:
@@ -478,8 +632,88 @@ class ConfigFlow:
             title="Sylliptor configuration",
             subtitle=subtitle,
             rows=rows,
-            hint="↑↓ move · 1-9 jump · Enter open · s save · Esc/q close",
+            numbered=False,
+            hint="",
         )
+
+    # ------------------------------------------------- short menu summaries
+    #
+    # The grouped top-level menu shows ONE short fact per row; the dense
+    # multi-fragment summaries remain available inside each section screen.
+
+    def _short_workspace(self) -> str:
+        if self.current_workspace:
+            return Path(self.current_workspace).name
+        default = self.state.default_workspace_path
+        if default:
+            return f"default: {Path(default).name}"
+        return "not set"
+
+    def _short_sandbox(self) -> str:
+        mode = normalize_sandbox_mode(self.state.fields.get("sandbox_mode", "strict"))
+        base = {
+            "strict": "strict — sandboxed",
+            "warn": "warn — fail-closed",
+            "off": "off — host execution",
+        }[mode]
+        if _sandbox_mode_env_override() is not None:
+            return f"{base} · env override"
+        return base
+
+    def _short_execution(self) -> tuple[str, str]:
+        st = self.state
+        if st.execution_backend == "native":
+            return "API key", ""
+        runtime = str(st.execution_runtime or "").strip()
+        if not runtime:
+            return "subscription not configured", "warn"
+        labels = {value: label for value, label, _description in _runtime_setup_rows()}
+        return labels.get(runtime, runtime), ""
+
+    def _short_profile(self, delegated: bool) -> tuple[str, str]:
+        st = self.state
+        if st.active_profile:
+            return st.active_profile, ""
+        if st.profiles:
+            return f"{len(st.profiles)} profiles, none active", "" if delegated else "warn"
+        return ("not configured", "") if delegated else ("missing — required", "warn")
+
+    def _short_model(self, delegated: bool) -> tuple[str, str]:
+        model = self.state.fields.get("model", "").strip()
+        if model:
+            return model, ""
+        return ("not configured", "") if delegated else ("missing — required", "warn")
+
+    def _short_api_key(self, delegated: bool, direct_sub: bool) -> tuple[str, str]:
+        if direct_sub:
+            return "not used", ""
+        if delegated:
+            return "inactive", ""
+        raw = _api_key_summary_text(self.state)
+        if raw == _MISSING_REQUIRED:
+            return "missing — required", "warn"
+        if raw == _CLEAR_KEY_PENDING:
+            return "cleared on save", "warn"
+        return _strip_markup(raw), ""
+
+    def _short_web_search(self) -> str:
+        policy = normalize_web_search_policy(self.state.fields.get("web_search_policy", "auto"))
+        return "model decides" if policy == "auto" else "off"
+
+    def _short_cache(self) -> str:
+        mode = _normalize_prompt_cache_mode(self.state.fields.get("prompt_cache_mode", "manual"))
+        compaction = _cache_aware_summary_text(self.state).split(" · ")[0]
+        return f"{mode} · {compaction}"
+
+    def _short_routing(self) -> str:
+        return str(self.state.fields.get("routing_mode", "auto") or "auto")
+
+    def _short_advanced(self) -> str:
+        sub = self._subagent_override_summary()
+        forge = _override_summary_text(self.state.forge_role_models)
+        if sub == "none" and forge == "none":
+            return "no overrides"
+        return f"subagents {sub} · forge {forge}"
 
     def _screen_execution_backend(self) -> Screen:
         return Screen(
@@ -503,7 +737,7 @@ class ConfigFlow:
                     current=self.state.execution_backend == "delegated",
                 ),
             ],
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_execution_runtime(self) -> Screen:
@@ -522,7 +756,7 @@ class ConfigFlow:
             title="AI Subscription",
             subtitle=("Choose a provider to connect, reconnect, switch accounts, or disconnect."),
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _refresh_subscription_account_status(self) -> ProviderAccountStatus:
@@ -567,7 +801,7 @@ class ConfigFlow:
             title="AI Subscription Account",
             subtitle=subtitle,
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_subscription_disconnect_confirm(self) -> Screen:
@@ -644,7 +878,49 @@ class ConfigFlow:
             title="Advanced",
             subtitle="Per-role model overrides — leave empty to inherit the default model.",
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
+        )
+
+    def _role_override_row(self, role: str, *, model: str, temperature: str = "") -> Row:
+        parts = [model or "inherit default"]
+        if temperature:
+            parts.append(f"temp {temperature}")
+        return Row(label=_role_label(role), description=" · ".join(parts), value=role)
+
+    def _screen_subagent_roles(self) -> Screen:
+        rows = [
+            self._role_override_row(
+                role,
+                model=str(self.state.role_models.get(role, "") or ""),
+                temperature=str(self.state.role_temperatures.get(role, "") or ""),
+            )
+            for role in ROLE_ORDER
+        ]
+        rows.append(Row(label="Back", description="Return to Advanced", value="back"))
+        return Screen(
+            stage="subagent_roles",
+            mode="list",
+            title="Subagent model overrides",
+            subtitle="Pick a role to edit; roles without an override inherit the default model.",
+            rows=rows,
+            hint="",
+        )
+
+    def _screen_forge_roles(self) -> Screen:
+        rows = [
+            self._role_override_row(
+                role, model=str(self.state.forge_role_models.get(role, "") or "")
+            )
+            for role in FORGE_ROLE_ORDER
+        ]
+        rows.append(Row(label="Back", description="Return to Advanced", value="back"))
+        return Screen(
+            stage="forge_roles",
+            mode="list",
+            title="Forge model overrides",
+            subtitle="Pick a role to edit; roles without an override inherit the default model.",
+            rows=rows,
+            hint="",
         )
 
     # ----------------------------------------------------------- project / workspace
@@ -705,7 +981,7 @@ class ConfigFlow:
             title="Project / Workspace",
             subtitle=f"Current: {cur}  ·  default: {default}",
             rows=rows,
-            hint="↑↓ move · 1-9 pick · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_workspace_path(self) -> Screen:
@@ -739,7 +1015,7 @@ class ConfigFlow:
             title="Project / Workspace",
             subtitle=f"Selected: {self._pending_workspace}",
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_switching(self) -> Screen:
@@ -782,7 +1058,7 @@ class ConfigFlow:
             title="Sandbox",
             subtitle=subtitle,
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_model(self) -> Screen:
@@ -790,7 +1066,9 @@ class ConfigFlow:
         rows = [
             Row(
                 label=label,
-                description=desc,
+                # The "(current)" tag already says it — repeating "current
+                # configured model" as the description is noise.
+                description="" if desc == "current configured model" else desc,
                 value=value,
                 current=value == current,
             )
@@ -804,13 +1082,30 @@ class ConfigFlow:
             subtitle += (
                 "  API-key model setting is preserved but inactive while using an AI subscription."
             )
+        status = ""
+        status_tone: Tone = "dim"
+        if not rows:
+            # Never render a bare, row-less screen (e.g. subscription mode with
+            # no live catalog and no saved model): explain why it is empty and
+            # leave the custom-name escape hatch selectable.
+            rows = [
+                Row(
+                    label="Type a custom model name",
+                    description="use a model id you know is available",
+                    value=_CUSTOM_MODEL_VALUE,
+                )
+            ]
+            status = "No models advertised yet — sign in first (/login) or type a name."
+            status_tone = "warn"
         return Screen(
             stage="model",
             mode="list",
             title="Default model",
             subtitle=subtitle,
             rows=rows,
-            hint="↑↓ move · 1-9 pick · Enter select · Esc back",
+            status=status,
+            status_tone=status_tone,
+            hint="",
         )
 
     def _screen_custom_model(self) -> Screen:
@@ -838,26 +1133,44 @@ class ConfigFlow:
     def _screen_model_thinking(self) -> Screen:
         current = self.state.thinking_label
         labels = _thinking_labels_for_state(self.state)
-        rows = [
-            Row(
-                label=label,
-                description=_THINKING_DESCRIPTIONS.get(label, "provider-specific reasoning budget"),
-                value=label,
-                current=label == current,
+        preset = _active_preset(self.state)
+        contract = reasoning_contract_for(
+            getattr(preset, "provider_key", None),
+            self.state.fields.get("model", ""),
+            preset_key=getattr(preset, "key", None),
+        )
+        labels = _thinking_labels_allowed_by_contract(contract, labels, current=current)
+        rows = []
+        for label in labels:
+            description = _THINKING_DESCRIPTIONS.get(label, "provider-specific reasoning budget")
+            tone = ""
+            if label.casefold() == "off" and contract.off == OFF_SWAPS_MODEL:
+                # kimi-code: "off" is not a speed knob — a different model answers.
+                description = "silently routes the request to K2.6 — a different model answers"
+                tone = "warn"
+            rows.append(
+                Row(
+                    label=label,
+                    description=description,
+                    value=label,
+                    current=label == current,
+                    tone=tone,
+                )
             )
-            for label in labels
-        ]
+        subtitle = (
+            "Reasoning effort supported by the selected subscription model."
+            if _active_subscription_profile(self.state) is not None
+            else "Reasoning effort. Some providers ignore this until they add native support."
+        )
+        if contract.mode == ALWAYS_ON:
+            subtitle += "  Reasoning cannot be disabled on this model."
         return Screen(
             stage="model_thinking",
             mode="list",
             title="Default model",
-            subtitle=(
-                "Reasoning effort supported by the selected subscription model."
-                if _active_subscription_profile(self.state) is not None
-                else "Reasoning effort. Some providers ignore this until they add native support."
-            ),
+            subtitle=subtitle,
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_model_timeout(self) -> Screen:
@@ -882,7 +1195,7 @@ class ConfigFlow:
                 Row(label=label, description=description, value=value, current=value == current)
                 for value, label, description in _web_search_policy_rows()
             ],
-            hint="Enter select / Esc back",
+            hint="",
         )
 
     def _screen_web_search_mode(self) -> Screen:
@@ -896,7 +1209,7 @@ class ConfigFlow:
                 Row(label=label, description=description, value=value, current=value == current)
                 for value, label, description in _web_search_mode_rows()
             ],
-            hint="Enter select / Esc back",
+            hint="",
         )
 
     def _screen_cache_mode(self) -> Screen:
@@ -914,15 +1227,9 @@ class ConfigFlow:
             stage="cache_mode",
             mode="list",
             title="Context & Cache",
-            subtitle=(
-                "Effective: "
-                + _cache_policy_summary_text(
-                    _resolved_cache_policy_for_state(self.state),
-                    compact=False,
-                )
-            ),
+            subtitle=_cache_mode_subtitle(self.state),
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_cache_key(self) -> Screen:
@@ -972,7 +1279,7 @@ class ConfigFlow:
             title="Context & Cache",
             subtitle="Anthropic cache_control override.",
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_cache_anthropic_ttl(self) -> Screen:
@@ -994,7 +1301,7 @@ class ConfigFlow:
             title="Context & Cache",
             subtitle="Anthropic cache_control TTL.",
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_cache_compaction_enabled(self) -> Screen:
@@ -1022,7 +1329,7 @@ class ConfigFlow:
             title="Context & Cache",
             subtitle="Cache-aware compaction trigger.",
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_cache_compaction_min_trigger(self) -> Screen:
@@ -1047,7 +1354,7 @@ class ConfigFlow:
             title="Router Model",
             subtitle=subtitle,
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _router_model_screen_rows(self) -> list[Row]:
@@ -1140,19 +1447,21 @@ class ConfigFlow:
             title="Routing",
             subtitle="How the agent routes requests.",
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_subagent_field(self) -> Screen:
         role, kind = self._sub_steps[self._sub_i]
         label = _role_label(role)
         if kind == "model":
-            field_label = f"{label} model (blank to keep / inherit)"
+            field_label = f'{label} model (blank keeps · "clear" inherits)'
             default = self.state.role_models.get(role, "")
         else:
-            field_label = f"{label} temperature (blank to keep / inherit)"
+            field_label = f'{label} temperature (blank keeps · "clear" inherits)'
             default = self.state.role_temperatures.get(role, "")
-        subtitle = f"{_role_description(role)}  ·  step {self._sub_i + 1}/{len(self._sub_steps)}"
+        subtitle = _role_description(role)
+        if len(self._sub_steps) > 1:
+            subtitle += f"  ·  step {self._sub_i + 1}/{len(self._sub_steps)}"
         if not _temperature_controls_available(self.state):
             subtitle += "  ·  temperature is managed by the AI subscription"
         return Screen(
@@ -1166,20 +1475,21 @@ class ConfigFlow:
         )
 
     def _screen_forge_field(self) -> Screen:
-        role = FORGE_ROLE_ORDER[self._forge_i]
-        subtitle = f"{_role_description(role)}  ·  step {self._forge_i + 1}/{len(FORGE_ROLE_ORDER)}"
+        role = self._forge_role or FORGE_ROLE_ORDER[0]
         return Screen(
             stage="forge_field",
             mode="input",
             title="Forge model overrides",
-            subtitle=subtitle,
-            input_label=f'{_role_label(role)} model (blank keeps; "clear" to inherit)',
+            subtitle=_role_description(role),
+            input_label=f'{_role_label(role)} model (blank keeps · "clear" inherits)',
             input_default=self.state.forge_role_models.get(role, ""),
-            hint="Enter next · Esc cancel section",
+            hint="Enter save · Esc cancel",
         )
 
     def _screen_api_key(self) -> Screen:
-        subtitle = f"Stored: {self.state.masked_api_key} · source: {self.state.api_key_source}"
+        subtitle = (
+            f"Stored: {self.state.masked_api_key} · {_pretty_key_source(self.state.api_key_source)}"
+        )
         staged_profile = self.state.staged_api_key_target_profile()
         if staged_profile and staged_profile != (self.state.active_profile or None):
             subtitle += f"; unsaved key remains bound to profile {staged_profile}"
@@ -1227,7 +1537,7 @@ class ConfigFlow:
             title="Provider profile",
             subtitle=subtitle,
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_provider_switch(self) -> Screen:
@@ -1246,14 +1556,14 @@ class ConfigFlow:
             title="Switch profile",
             subtitle=f"Active: {self.state.active_profile or 'none'}",
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_provider_add_preset(self) -> Screen:
         rows = [
             Row(
-                label=preset_selection_label(preset),
-                description=_preset_description(preset),
+                label=_short_preset_label(preset),
+                description=_short_preset_description(preset),
                 value=preset.key,
             )
             for preset in _ordered_profile_presets_for_setup()
@@ -1261,7 +1571,7 @@ class ConfigFlow:
         rows.append(
             Row(
                 label="Advanced / local / compatibility providers",
-                description="Local endpoints (Ollama, LM Studio, vLLM), custom URLs, and legacy OpenAI-compatible presets.",
+                description="Ollama, LM Studio, vLLM, custom URLs",
                 value=_ADVANCED_PROVIDER_PRESETS_VALUE,
             )
         )
@@ -1271,14 +1581,14 @@ class ConfigFlow:
             title="Add provider preset",
             subtitle="Pick a provider preset.",
             rows=rows,
-            hint="↑↓ move · 1-9 pick · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_provider_add_preset_advanced(self) -> Screen:
         rows = [
             Row(
-                label=preset_selection_label(preset),
-                description=_preset_description(preset),
+                label=_short_preset_label(preset),
+                description=_short_preset_description(preset),
                 value=preset.key,
             )
             for preset in _advanced_profile_presets_for_setup()
@@ -1289,7 +1599,7 @@ class ConfigFlow:
             title="Advanced provider preset",
             subtitle="Compatibility, local, custom, and legacy providers.",
             rows=rows,
-            hint="↑↓ move · 1-9 pick · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_provider_preset_name(self) -> Screen:
@@ -1368,7 +1678,7 @@ class ConfigFlow:
             title="Remove profile",
             subtitle="Pick a profile to remove (applied on save).",
             rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
+            hint="",
         )
 
     def _screen_provider_remove_confirm(self) -> Screen:
@@ -1405,11 +1715,21 @@ class ConfigFlow:
         scr = self.screen()
         if scr.mode != "list" or not scr.rows:
             return
-        self.index = (self.index + delta) % len(scr.rows)
+        # Step over header/spacer rows so the cursor only ever rests on items.
+        n = len(scr.rows)
+        i = self.index
+        for _ in range(n):
+            i = (i + delta) % n
+            if getattr(scr.rows[i], "kind", "item") == "item":
+                break
+        self.index = i
 
     def choose_index(self, idx: int) -> None:
         scr = self.screen()
         if scr.mode != "list" or not scr.rows:
+            return
+        if not getattr(scr, "numbered", True):
+            # Unnumbered lists (the grouped menu) advertise no digit shortcuts.
             return
         if 0 <= idx < len(scr.rows):
             self.index = idx
@@ -1419,7 +1739,10 @@ class ConfigFlow:
         scr = self.screen()
         if scr.mode != "list" or not scr.rows:
             return
-        self.choose(scr.rows[self.index].value)
+        row = scr.rows[self.index]
+        if getattr(row, "kind", "item") != "item":
+            return
+        self.choose(row.value)
 
     def choose(self, value: str) -> None:
         handler = {
@@ -1428,6 +1751,8 @@ class ConfigFlow:
             "execution_runtime": self._choose_execution_runtime,
             "subscription_account": self._choose_subscription_account,
             "advanced": self._choose_advanced,
+            "subagent_roles": self._choose_subagent_roles,
+            "forge_roles": self._choose_forge_roles,
             "workspace": self._choose_workspace,
             "workspace_action": self._choose_workspace_action,
             "sandbox": self._choose_sandbox,
@@ -1491,11 +1816,14 @@ class ConfigFlow:
         if self.stage == "subagent_field":
             self.state.role_models = dict(self._sub_model_snapshot)
             self.state.role_temperatures = dict(self._sub_temp_snapshot)
-            self._goto("advanced")
+            self._goto("subagent_roles")
             return
         if self.stage == "forge_field":
             self.state.forge_role_models = dict(self._forge_snapshot)
             self.state._sync_active_profile_router_maps()
+            self._goto("forge_roles")
+            return
+        if self.stage in {"subagent_roles", "forge_roles"}:
             self._goto("advanced")
             return
         if self.stage == "cancel_confirm":
@@ -1529,6 +1857,9 @@ class ConfigFlow:
     def _choose_menu(self, value: str) -> None:
         # Any return to the top menu ends an in-progress add-provider chain.
         self._preset_setup_chain = False
+        # Remember where the cursor was so Esc-ing back out of a section lands
+        # on the row the user came from, not back at the top.
+        self._menu_resume_index = self.index
         if value == _SAVE:
             self._goto("saving")
             return
@@ -1611,9 +1942,32 @@ class ConfigFlow:
         if value == "back":
             self._goto("menu")
         elif value == "subagents":
-            self._enter_subagents()
+            self._goto("subagent_roles")
         elif value == "forge":
-            self._enter_forge()
+            self._goto("forge_roles")
+
+    def _choose_subagent_roles(self, value: str) -> None:
+        if value == "back":
+            self._goto("advanced")
+            return
+        # Edit exactly the picked role (model, plus temperature where the
+        # provider exposes it) — never a forced walk through every role.
+        self._sub_model_snapshot = dict(self.state.role_models)
+        self._sub_temp_snapshot = dict(self.state.role_temperatures)
+        steps: list[tuple[str, str]] = [(value, "model")]
+        if _temperature_controls_available(self.state) and value in _ROLE_TEMPERATURE_FIELDS:
+            steps.append((value, "temp"))
+        self._sub_steps = steps
+        self._sub_i = 0
+        self._goto("subagent_field")
+
+    def _choose_forge_roles(self, value: str) -> None:
+        if value == "back":
+            self._goto("advanced")
+            return
+        self._forge_snapshot = dict(self.state.forge_role_models)
+        self._forge_role = value
+        self._goto("forge_field")
 
     # ----------------------------------------------------- project / workspace
 
@@ -1948,27 +2302,18 @@ class ConfigFlow:
 
     # ----------------------------------------------------- subagent overrides
 
-    def _enter_subagents(self) -> None:
-        self._sub_model_snapshot = dict(self.state.role_models)
-        self._sub_temp_snapshot = dict(self.state.role_temperatures)
-        steps: list[tuple[str, str]] = []
-        temperature_controls_available = _temperature_controls_available(self.state)
-        for role in ROLE_ORDER:
-            steps.append((role, "model"))
-            if temperature_controls_available and role in _ROLE_TEMPERATURE_FIELDS:
-                steps.append((role, "temp"))
-        self._sub_steps = steps
-        self._sub_i = 0
-        self._goto("subagent_field")
-
     def _submit_subagent_field(self, text: str) -> None:
         role, kind = self._sub_steps[self._sub_i]
         value = text.strip()
         if kind == "model":
-            if value:
+            if value.casefold() == "clear":
+                self.state.set_role_model(role, "")
+            elif value:
                 self.state.set_role_model(role, value)
         else:
-            if value:
+            if value.casefold() == "clear":
+                self.state.set_role_temperature(role, "")
+            elif value:
                 number = _finite_float(value, fallback=None)
                 if number is None or number < 0:
                     self._set_status("Temperature must be a non-negative number.", "err")
@@ -1977,35 +2322,26 @@ class ConfigFlow:
         self._advance_subagent()
 
     def _advance_subagent(self) -> None:
+        role, _kind = self._sub_steps[self._sub_i]
         self._sub_i += 1
         if self._sub_i >= len(self._sub_steps):
-            self._goto("advanced")
-            self._set_status("Subagent overrides updated. Save to apply.", "ok")
+            self._goto("subagent_roles")
+            self._set_status(f"{_role_label(role)} override updated. Save to apply.", "ok")
         else:
             self.status = ""
             self.status_tone = "dim"
 
     # -------------------------------------------------------- forge overrides
 
-    def _enter_forge(self) -> None:
-        self._forge_snapshot = dict(self.state.forge_role_models)
-        self._forge_i = 0
-        self._goto("forge_field")
-
     def _submit_forge_field(self, text: str) -> None:
-        role = FORGE_ROLE_ORDER[self._forge_i]
+        role = self._forge_role or FORGE_ROLE_ORDER[0]
         value = text.strip()
         if value.casefold() == "clear":
             self.state.set_forge_role_model(role, "")
         elif value:
             self.state.set_forge_role_model(role, value)
-        self._forge_i += 1
-        if self._forge_i >= len(FORGE_ROLE_ORDER):
-            self._goto("advanced")
-            self._set_status("Forge overrides updated. Save to apply.", "ok")
-        else:
-            self.status = ""
-            self.status_tone = "dim"
+        self._goto("forge_roles")
+        self._set_status(f"{_role_label(role)} override updated. Save to apply.", "ok")
 
     # ----------------------------------------------------------- api key
 

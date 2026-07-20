@@ -280,9 +280,9 @@ def test_set_model_and_base_url_syncs_active_profile(
     loaded = load_config()
     profile = get_active_profile(loaded)
     assert loaded.base_url == "https://api.anthropic.com/v1"
-    assert loaded.model == "claude-sonnet-4-6"
+    assert loaded.model == "claude-sonnet-5"
     assert profile.base_url == "https://api.anthropic.com/v1"
-    assert profile.default_model == "claude-sonnet-4-6"
+    assert profile.default_model == "claude-sonnet-5"
 
 
 def test_set_model_alias_switches_to_matching_provider_profile(
@@ -360,8 +360,8 @@ def test_set_model_canonicalizes_legacy_numeric_separator_alias(
 
     profile = get_active_profile(cfg)
     assert profile.name == "mistral"
-    assert cfg.model == "mistral-medium-3-5"
-    assert profile.default_model == "mistral-medium-3-5"
+    assert cfg.model == "mistral-medium-2604"
+    assert profile.default_model == "mistral-medium-2604"
 
 
 @pytest.mark.parametrize(

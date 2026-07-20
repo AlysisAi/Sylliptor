@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-07-20
+
+### Added
+
+- Redesigned the `/config` TUI with grouped sections, clearer per-setting summaries,
+  cursor memory, cleaner provider/model pickers, and a single context-aware footer legend.
+- Added provider/model reasoning contracts so configuration only offers supported thinking
+  modes and effort levels, with explicit guidance when reasoning cannot be disabled.
+
+### Improved
+
+- Refreshed the built-in provider model catalog, validation models, aliases, and setup
+  warnings; removed the obsolete 01.AI preset and stopped promoting hosted MiMo as a trial.
+- Reworked Advanced role overrides into per-role editors with clear-to-inherit support for
+  subagent and Forge model selections.
+- Made cache status and API-key storage descriptions easier to understand in the config UI.
+
+### Fixed
+
+- Saving `/config` before the first chat message now updates the pending session and footer
+  in place instead of restarting the TUI.
+- Corrected input-budget calculation for shared-window models whose maximum output equals
+  their full context window.
+- Removed duplicate or contradictory key hints from config input screens and aligned footer
+  actions with each screen.
+
 ## [0.11.0] - 2026-07-18
 
 ### Added

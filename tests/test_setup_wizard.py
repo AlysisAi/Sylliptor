@@ -741,10 +741,10 @@ def test_setup_wizard_creates_anthropic_profile_with_chosen_model(
     cfg = load_config()
     profile = cfg.extra_fields["profiles"]["anthropic"]
     assert cfg.extra_fields["active_profile"] == "anthropic"
-    assert cfg.model == "claude-sonnet-4-6"
+    assert cfg.model == "claude-sonnet-5"
     assert profile["protocol"] == "anthropic_messages"
     assert profile["base_url"] == "https://api.anthropic.com/v1"
-    assert profile["default_model"] == "claude-sonnet-4-6"
+    assert profile["default_model"] == "claude-sonnet-5"
     assert profile["web_search_adapter"] == "anthropic_messages"
     assert profile["extra_headers"] == {}
     assert load_persisted_profile_keys()["anthropic"] == "sk-ant-test"
@@ -787,10 +787,10 @@ def test_setup_profile_picker_separates_compatibility_and_native_presets() -> No
     advanced = setup_wizard_mod._advanced_setup_presets()
     advanced_keys = [preset.key for preset in advanced]
 
-    # The MiMo trial and the native first-party providers lead the primary
-    # picker; every other hosted provider follows so users are not limited to
+    # Native first-party providers lead the primary picker; every other hosted
+    # provider follows so users are not limited to
     # the big-three brands.
-    assert keys[:4] == ["sylliptor", "openai-responses", "anthropic", "gemini"]
+    assert keys[:4] == ["openai-responses", "anthropic", "gemini", "deepseek"]
     assert "deepseek" in keys
     assert "openrouter" in keys
     assert all(preset.protocol != "gemini_interactions" for preset in presets)
@@ -869,7 +869,7 @@ def test_setup_wizard_surfaces_provider_diagnostic_warnings(
 def test_model_picker_rows_include_preset_suggestions(monkeypatch, tmp_path: Path) -> None:
     _config_env(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
-    picker = PickerScript(["openai", "gpt-5.5"])
+    picker = PickerScript(["openai", "gpt-5.6-terra"])
     monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
     monkeypatch.setattr(
         setup_wizard_mod.typer, "prompt", PromptScript(["", "sk-test-1234", os.fspath(tmp_path)])
@@ -878,9 +878,9 @@ def test_model_picker_rows_include_preset_suggestions(monkeypatch, tmp_path: Pat
     assert setup_wizard_mod.run_setup_wizard() is True
     model_rows = picker.calls[1]["rows"]
     assert (
-        "gpt-5.5",
-        "gpt-5.5",
-        "default - flagship model for complex coding and reasoning",
+        "gpt-5.6-terra",
+        "gpt-5.6-terra",
+        "default - balanced 5.6 tier, 1.05M context",
     ) in model_rows
     assert model_rows[-1][1] == "Type a custom model name"
 
@@ -914,8 +914,9 @@ def test_gemini_model_picker_uses_stable_models(monkeypatch, tmp_path: Path) -> 
     model_values = [value for value, _label, _description in picker.calls[1]["rows"]]
     assert model_values[0] == "gemini-3.5-flash"
     assert "gemini-3.1-flash-lite" in model_values
-    assert "gemini-2.5-pro" in model_values
-    assert "gemini-2.5-flash" in model_values
+    assert "gemini-3.1-pro-preview" in model_values
+    assert "gemini-2.5-pro" not in model_values
+    assert "gemini-2.5-flash" not in model_values
     assert "gemini-3.1-preview" not in model_values
     assert "gemini-3-pro-preview" not in model_values
     assert "gemini-3.1-flash-lite-preview" not in model_values
@@ -1631,10 +1632,10 @@ def test_setup_wizard_escape_at_workspace_returns_to_model_with_preselection(
     picker = PickerScript(
         [
             "openai",
-            "gpt-5.5",
+            "gpt-5.6-terra",
             setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
             None,
-            "gpt-5.5",
+            "gpt-5.6-terra",
             setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
         ],
         auto_router_inherit=False,
@@ -1647,7 +1648,7 @@ def test_setup_wizard_escape_at_workspace_returns_to_model_with_preselection(
     assert picker.calls[3]["title"] == "Router Model"
     assert picker.calls[3]["current_value"] == setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE
     assert picker.calls[4]["title"] == "Default Model"
-    assert picker.calls[4]["current_value"] == "gpt-5.5"
+    assert picker.calls[4]["current_value"] == "gpt-5.6-terra"
 
 
 def test_setup_wizard_profile_change_invalidates_api_key_and_model_results(
@@ -1664,7 +1665,7 @@ def test_setup_wizard_profile_change_invalidates_api_key_and_model_results(
             None,
             None,
             "anthropic",
-            "claude-sonnet-4-6",
+            "claude-sonnet-5",
             setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
         ],
         auto_router_inherit=False,
@@ -1689,7 +1690,7 @@ def test_setup_wizard_profile_change_invalidates_api_key_and_model_results(
     api_prompts = [call[0] for call in text_input.calls if call[0].startswith("Paste your API key")]
     assert api_prompts[-1] == "Paste your API key"
     assert picker.calls[-2]["title"] == "Default Model"
-    assert any(row[0] == "claude-sonnet-4-6" for row in picker.calls[-2]["rows"])
+    assert any(row[0] == "claude-sonnet-5" for row in picker.calls[-2]["rows"])
 
 
 def test_setup_wizard_ctrl_c_confirmation_decline_stays_on_same_step(

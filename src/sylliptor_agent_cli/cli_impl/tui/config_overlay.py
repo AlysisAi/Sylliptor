@@ -198,7 +198,11 @@ class ConfigOverlay:
 
         if scr.mode == "list" and scr.rows:
             picker = _render_picker_rows(
-                [_row_to_dict(r) for r in scr.rows], scr.index, width, hint=scr.hint
+                [_row_to_dict(r) for r in scr.rows],
+                scr.index,
+                width,
+                hint=scr.hint,
+                numbered=getattr(scr, "numbered", True),
             )
             located = next(
                 (i for i, prow in enumerate(picker) if any("selcaret" in s for s, _ in prow)),
@@ -220,9 +224,8 @@ class ConfigOverlay:
             if scr.input_default and not scr.input_password:
                 for line in _wrap_line(f"current: {scr.input_default}", width):
                     rows.append([("class:setup.dim", line)])
-            if scr.hint:
-                rows.append([("", "")])
-                rows.append([("class:setup.dim", scr.hint)])
+            # No in-body hint: the footer is the single key legend and shows
+            # this screen's action verb (see _footer_fragments).
         elif scr.mode == "busy":
             frame = _SPINNER_FRAMES[self._spinner["i"] % len(_SPINNER_FRAMES)]
             rows.append(
@@ -262,13 +265,36 @@ class ConfigOverlay:
         is_menu = flow is not None and getattr(flow, "stage", "") == "menu"
         mode = self._mode()
         if mode == "list":
-            right_text = (
-                "Enter open · 1-9 jump · s save · Esc close"
-                if is_menu
-                else "Enter select · Esc back"
-            )
+            if is_menu:
+                right_text = "↑↓ move · Enter open · s save · Esc close"
+            else:
+                # Advertise digit shortcuts only on numbered lists; the footer is
+                # the single key legend now that in-body nav hints are gone.
+                numbered = True
+                if flow is not None:
+                    try:
+                        numbered = bool(getattr(flow.screen(), "numbered", True))
+                    except Exception:
+                        numbered = True
+                right_text = (
+                    "↑↓ move · 1-9 pick · Enter select · Esc back"
+                    if numbered
+                    else "↑↓ move · Enter select · Esc back"
+                )
         elif mode == "input":
-            right_text = "Enter next · Esc back · Ctrl+C cancel"
+            # Honour the screen's own action verb ("Enter save", "Enter add",
+            # …) so the legend never contradicts what Enter actually does.
+            screen_hint = ""
+            if flow is not None:
+                try:
+                    screen_hint = str(getattr(flow.screen(), "hint", "") or "")
+                except Exception:
+                    screen_hint = ""
+            right_text = (
+                f"{screen_hint} · Ctrl+C cancel"
+                if screen_hint
+                else "Enter next · Esc back · Ctrl+C cancel"
+            )
         elif mode == "confirm":
             right_text = "Y / N · Esc back"
         elif mode == "busy":

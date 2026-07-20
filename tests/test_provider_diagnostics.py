@@ -589,7 +589,7 @@ def test_provider_diagnostics_reports_stale_model_alias() -> None:
             protocol="gemini_generate_content",
             base_url="https://generativelanguage.googleapis.com/v1beta",
             api_key_env="GEMINI_API_KEY",
-            default_model="gemini-3-flash-preview",
+            default_model="gemini-2.5-flash",
             web_search_adapter="gemini_grounding",
         )
     )

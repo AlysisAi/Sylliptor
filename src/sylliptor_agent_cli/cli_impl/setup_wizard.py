@@ -339,7 +339,7 @@ def _maybe_offer_sylliptor_login(
 ) -> None:
     """If the user chose the hosted MiMo (login-based) preset, offer to connect now.
 
-    That preset needs no API key — it unlocks the free trial via `sylliptor login`.
+    That preset authenticates via `sylliptor login` instead of an API key.
     Running the handshake here saves a separate step; declining is harmless (the
     profile is already configured and `sylliptor login` can be run any time).
     """
@@ -352,7 +352,7 @@ def _maybe_offer_sylliptor_login(
     console.print()
     try:
         connect = _prompt_yes_no(
-            "Connect your Sylliptor account now to unlock the free MiMo trial? [Y/n]",
+            "Connect your Sylliptor account now? [Y/n]",
             default=True,
         )
     except _GoBack:
@@ -374,7 +374,7 @@ def _maybe_offer_sylliptor_login(
         return
 
     who = f" as [bold]{result.email}[/bold]" if result.email else ""
-    console.print(f"[green]Logged in{who}.[/green] Your free MiMo trial is ready.")
+    console.print(f"[green]Logged in{who}.[/green] Your Sylliptor account is connected.")
     console.print(
         f"[dim]Default model: [/dim][bold]{result.model}[/bold][dim] · "
         "switch with /model in chat or `sylliptor config`.[/dim]"
@@ -437,6 +437,46 @@ def _subscription_picker_rows() -> list[tuple[str, str, str]]:
         if not runtime_id or not label:
             continue
         rows.append((f"{_RUNTIME_EXECUTION_PREFIX}{runtime_id}", label, description))
+    return rows
+
+
+_SYLLIPTOR_HOSTED_PRESET_KEY = "sylliptor"
+
+
+def _connect_provider_picker_rows() -> list[tuple[str, str, str]]:
+    """One merged "Connect a provider" list.
+
+    Subscription sign-ins and API-key providers appear side by side, so the
+    auth method is a property of the row rather than an upfront branch.
+    Subscription rows lead, then the hosted providers in preset order; the
+    Sylliptor-hosted MiMo preset sits last among providers (the free trial is
+    over, so it is not promoted), and the advanced sub-list (local endpoints,
+    custom URLs, legacy presets) stays behind the final row. Values are either
+    a preset key, a ``runtime:<id>`` subscription value, or
+    :data:`_ADVANCED_PROVIDER_PRESETS_VALUE`.
+    """
+    rows: list[tuple[str, str, str]] = []
+    for value, label, description in _subscription_picker_rows():
+        rows.append((value, label, description or "Browser sign-in with your subscription."))
+    presets = _setup_presets()
+    rows.extend(
+        (preset.key, preset_selection_label(preset), "API key")
+        for preset in presets
+        if preset.key != _SYLLIPTOR_HOSTED_PRESET_KEY
+    )
+    rows.extend(
+        (preset.key, preset_selection_label(preset), "Sylliptor account sign-in — no API key")
+        for preset in presets
+        if preset.key == _SYLLIPTOR_HOSTED_PRESET_KEY
+    )
+    rows.append(
+        (
+            _ADVANCED_PROVIDER_PRESETS_VALUE,
+            "Advanced / local / compatibility providers",
+            "Local endpoints (Ollama, LM Studio, vLLM), custom URLs, and legacy "
+            "OpenAI-compatible presets.",
+        )
+    )
     return rows
 
 

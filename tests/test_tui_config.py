@@ -96,21 +96,27 @@ def test_menu_lists_sections_and_actions():
     flow = ConfigFlow(cfg=_cfg())
     scr = flow.screen()
     assert scr.stage == "menu" and scr.mode == "list"
-    values = [r.value for r in scr.rows]
+    values = [r.value for r in scr.rows if r.kind == "item"]
     assert values == [
         "workspace",
+        "sandbox",
+        "execution",
         "profile",
-        "api_key",
         "default",
+        "api_key",
         "web_search",
         "cache",
         "router",
-        "sandbox",
-        "execution",
         "advanced",
         "__save__",
         "__cancel__",
     ]
+    # Grouped layout: three section captions, no digit numbering, no in-body
+    # hint (the overlay footer owns the key legend).
+    assert [r.label for r in scr.rows if r.kind == "header"] == ["Workspace", "Model", "Behavior"]
+    assert scr.numbered is False and scr.hint == ""
+    # The cursor starts on the first real item, never on a header row.
+    assert scr.rows[scr.index].value == "workspace"
     assert not flow.state.dirty
 
 
@@ -145,10 +151,14 @@ def test_execution_backend_flow_creates_native_subscription_profile():
     assert flow.state.active_profile == "chatgpt-codex"
     rows = {row.value: row for row in flow.screen().rows}
     assert "inactive" not in rows["profile"].label.lower()
-    assert "not used" in rows["api_key"].label.lower()
+    # Status lives in the description only — the label stays clean.
+    assert rows["api_key"].label == "API Key"
+    assert rows["api_key"].description == "not used"
     assert "inactive" not in rows["default"].label.lower()
     assert rows["execution"].label == "Model Access"
-    assert rows["execution"].description.startswith("AI subscription · ChatGPT Codex subscription")
+    # Grouped menu shows the one key fact; the "AI subscription ·" prefix moved
+    # into the Model Access section screen.
+    assert rows["execution"].description == "ChatGPT Codex subscription"
 
 
 def test_execution_backend_flow_saves_native_subscription_profile(
@@ -429,7 +439,10 @@ def test_context_cache_screen_shows_effective_cache_capability():
     screen = flow.screen()
 
     assert screen.stage == "cache_mode"
-    assert "Effective:" in screen.subtitle
+    # Humanized subtitle: the raw "Effective: strategy=…; emits=…" debug dump
+    # is gone; a supported provider still names its caching strategy.
+    assert "Effective:" not in screen.subtitle
+    assert screen.subtitle.startswith("Provider caching:")
     assert "openai_prompt_cache" in screen.subtitle
 
 
@@ -479,28 +492,37 @@ def test_routing_flow_has_no_budget_input_stage():
 # --------------------------------------------------------------------------- subagent / forge
 
 
-def test_subagent_overrides_sequence_and_field_key():
+def test_subagent_roles_list_and_single_role_edit():
     flow = ConfigFlow(cfg=_cfg())
     flow.choose("advanced")
     flow.choose("subagents")
+    # A role list now, not a forced walk: one row per role plus Back.
+    scr = flow.screen()
+    assert flow.stage == "subagent_roles"
+    values = [r.value for r in scr.rows]
+    assert values[-1] == "back"
+    assert "coding" in values
+    flow.choose("coding")
     assert flow.stage == "subagent_field" and flow.field_key() == "subagent_field:0"
     flow.submit_input("mini")  # coding model
-    assert flow.field_key() == "subagent_field:1"
+    assert flow.field_key() == "subagent_field:1"  # temperature step for this role
     assert flow.state.role_models.get("coding") == "mini"
-    # Walk to the end (blank keeps each subsequent field).
-    guard = 0
-    while flow.stage == "subagent_field":
-        flow.submit_input("")
-        guard += 1
-        assert guard < 30
-    assert flow.stage == "advanced"  # completion returns to the Advanced sub-menu
-    assert flow.state.role_models.get("coding") == "mini"
+    flow.submit_input("")  # blank keeps the temperature
+    assert flow.stage == "subagent_roles"  # back on the role list, not Advanced
+    rows = {r.value: r for r in flow.screen().rows}
+    assert "mini" in rows["coding"].description
+    # "clear" removes an override again.
+    flow.choose("coding")
+    flow.submit_input("clear")
+    flow.submit_input("")
+    assert flow.state.role_models.get("coding") == ""
 
 
 def test_subagent_temperature_validation():
     flow = ConfigFlow(cfg=_cfg())
     flow.choose("advanced")
     flow.choose("subagents")
+    flow.choose("coding")
     flow.submit_input("")  # coding model -> step to coding temp
     assert flow.field_key() == "subagent_field:1"
     flow.submit_input("-1")  # invalid temperature
@@ -692,12 +714,14 @@ def test_subscription_subagent_overrides_hide_unsupported_temperature_controls()
     flow = ConfigFlow(cfg=_cfg_with_subscription_profile())
     flow.choose("advanced")
     flow.choose("subagents")
+    flow.choose("coding")
 
+    # Single-step edit (no temperature) with the subscription note visible.
     assert all(kind == "model" for _role, kind in flow._sub_steps)
     assert "temperature is managed by the AI subscription" in flow.screen().subtitle
 
     flow.submit_input("subscription-mini")
-    assert flow.field_key() == "subagent_field:1"
+    assert flow.stage == "subagent_roles"
     assert flow.state.role_models.get("coding") == "subscription-mini"
 
 
@@ -705,25 +729,31 @@ def test_subagent_esc_reverts():
     flow = ConfigFlow(cfg=_cfg())
     flow.choose("advanced")
     flow.choose("subagents")
+    flow.choose("coding")
     flow.submit_input("changed")
     assert flow.state.role_models.get("coding") == "changed"
-    flow.back()  # Esc cancels the section
-    assert flow.stage == "advanced"
+    flow.back()  # Esc cancels this role's edit
+    assert flow.stage == "subagent_roles"
     assert flow.state.role_models.get("coding") == ""  # reverted
+    flow.back()
+    assert flow.stage == "advanced"
 
 
-def test_forge_overrides_sequence():
+def test_forge_overrides_edit_roles_individually():
     flow = ConfigFlow(cfg=_cfg())
     flow.choose("advanced")
     flow.choose("forge")
-    assert flow.stage == "forge_field" and flow.field_key() == "forge_field:0"
+    assert flow.stage == "forge_roles"
+    values = [r.value for r in flow.screen().rows]
+    assert "coding" in values and "router" in values and values[-1] == "back"
+    flow.choose("coding")
+    assert flow.stage == "forge_field"
     flow.submit_input("forge-model")
-    while flow._forge_i < len(flow_mod.FORGE_ROLE_ORDER) - 1:
-        flow.submit_input("")
-    router_screen = flow.screen()
-    assert "Router model" in router_screen.input_label
+    assert flow.stage == "forge_roles"
+    flow.choose("router")
+    assert "Router model" in flow.screen().input_label
     flow.submit_input("forge-router")
-    assert flow.stage == "advanced"
+    assert flow.stage == "forge_roles"
     assert flow.state.forge_role_models.get("coding") == "forge-model"
     assert flow.state.forge_role_models.get("router") == "forge-router"
 
@@ -735,14 +765,13 @@ def test_forge_router_override_can_be_cleared_to_inherit():
 
     flow.choose("advanced")
     flow.choose("forge")
-    while flow._forge_i < len(flow_mod.FORGE_ROLE_ORDER) - 1:
-        flow.submit_input("")
+    flow.choose("router")
 
     assert "clear" in flow.screen().input_label
     assert flow.screen().input_default == "old-forge-router"
     flow.submit_input("clear")
 
-    assert flow.stage == "advanced"
+    assert flow.stage == "forge_roles"
     assert flow.state.forge_role_models.get("router") == ""
 
 
@@ -753,6 +782,7 @@ def test_forge_cancel_does_not_resurrect_router_change_after_profile_switch() ->
 
     flow.choose("advanced")
     flow.choose("forge")
+    flow.choose("router")
     flow.state.set_forge_role_model("router", "cancelled-router")
     flow.back()
     flow.state.set_active_profile_name("anthropic")
@@ -1140,11 +1170,43 @@ def test_set_save_failure_surfaces_on_apply():
 # --------------------------------------------------------------------------- project / workspace
 
 
+def test_thinking_labels_follow_reasoning_contracts():
+    from sylliptor_agent_cli.cli_impl.tui.config_flow import _thinking_labels_allowed_by_contract
+    from sylliptor_agent_cli.reasoning_contracts import (
+        UNKNOWN_CONTRACT,
+        reasoning_contract_for,
+    )
+
+    labels = ["off", "low", "medium", "high", "max"]
+    # kimi-code k3: "off" stays visible (it swaps the model and must be warned
+    # about, not hidden); "medium" is outside the allowed effort set.
+    k3 = reasoning_contract_for("moonshot", "k3", preset_key="kimi-code")
+    assert _thinking_labels_allowed_by_contract(k3, labels, current="high") == [
+        "off",
+        "low",
+        "high",
+        "max",
+    ]
+    # moonshot k2.7-code: always-on with a hard 400 on disable — "off" is
+    # hidden; its values describe the toggle wire, so efforts are untouched.
+    k27 = reasoning_contract_for("moonshot", "kimi-k2.7-code")
+    assert _thinking_labels_allowed_by_contract(k27, labels, current="high") == [
+        "low",
+        "medium",
+        "high",
+        "max",
+    ]
+    # The current selection is never hidden, even when out of contract.
+    assert "medium" in _thinking_labels_allowed_by_contract(k3, labels, current="medium")
+    # Unknown contract leaves the list untouched.
+    assert _thinking_labels_allowed_by_contract(UNKNOWN_CONTRACT, labels, current="off") == labels
+
+
 def test_menu_has_project_workspace_first():
     flow = ConfigFlow(cfg=_cfg(), current_workspace="/home/me/proj")
-    rows = flow.screen().rows
-    assert rows[0].value == "workspace" and rows[0].label == "Project / Workspace"
-    assert "proj" in rows[0].description  # current workspace name shown
+    items = [r for r in flow.screen().rows if r.kind == "item"]
+    assert items[0].value == "workspace" and items[0].label == "Project"
+    assert "proj" in items[0].description  # current workspace name shown
 
 
 def test_workspace_screen_offers_type_path_and_back():

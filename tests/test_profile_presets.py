@@ -95,6 +95,7 @@ def test_provider_presets_select_documented_hosted_search_adapters() -> None:
         "qwen-cn": "dashscope_chat",
         "zhipu": "zhipu_web_search",
         "moonshot": "moonshot_kimi",
+        "moonshot-cn": "moonshot_kimi",
         "minimax": "minimax_coding_plan",
         "bytedance": "volcengine_web_search",
         "groq": "groq_compound",
@@ -113,10 +114,10 @@ def test_provider_presets_select_documented_hosted_search_adapters() -> None:
 def test_presets_without_provider_hosted_search_remain_model_independent() -> None:
     for key in (
         "deepseek",
-        "01ai",
         "cerebras",
         "together",
         "fireworks",
+        "kimi-code",
         "ollama",
         "lm-studio",
         "vllm",
@@ -155,11 +156,12 @@ def test_openai_preset_uses_working_chat_completion_models() -> None:
     assert preset is not None
     assert preset.base_url == "https://api.openai.com/v1"
     assert preset.suggested_models == (
-        "gpt-5.5",
-        "gpt-5.5-pro",
+        "gpt-5.6-terra",
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
+        "gpt-5.3-codex",
         "gpt-5.4-mini",
         "gpt-5.4-nano",
-        "gpt-5.4",
     )
 
 
@@ -169,6 +171,15 @@ def test_openai_preset_preserves_legacy_nano_alias_without_hiding_current_nano()
     assert preset is not None
     assert canonical_model_alias_for_preset(preset, "gpt-5-nano") == "gpt-5.4-nano"
     assert canonical_model_alias_for_preset(preset, "gpt-5.4-nano") == "gpt-5.4-nano"
+
+
+def test_moonshot_presets_alias_retired_kimi_k2_to_current_model() -> None:
+    for key in ("moonshot", "moonshot-cn"):
+        preset = get_preset(key)
+
+        assert preset is not None
+        assert "kimi-k2" not in preset.suggested_models
+        assert canonical_model_alias_for_preset(preset, "kimi-k2") == "kimi-k2.6"
 
 
 def test_provider_presets_use_current_openai_compatible_base_urls() -> None:
@@ -187,10 +198,11 @@ def test_provider_presets_use_current_openai_compatible_base_urls() -> None:
         "qwen-us": "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
         "qwen-cn": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "zhipu": "https://open.bigmodel.cn/api/paas/v4/",
-        "moonshot": "https://api.moonshot.cn/v1",
+        "moonshot": "https://api.moonshot.ai/v1",
+        "kimi-code": "https://api.kimi.com/coding/v1",
+        "moonshot-cn": "https://api.moonshot.cn/v1",
         "minimax": "https://api.minimax.io/v1",
         "bytedance": "https://ark.cn-beijing.volces.com/api/v3",
-        "01ai": "https://api.lingyiwanwu.com/v1",
         "groq": "https://api.groq.com/openai/v1",
         "cerebras": "https://api.cerebras.ai/v1",
         "mistral": "https://api.mistral.ai/v1",
@@ -220,9 +232,11 @@ def test_anthropic_preset_uses_native_messages_endpoint_and_current_models() -> 
     assert preset.base_url.rstrip("/").endswith("/v1")
     assert preset.extra_headers == {}
     assert preset.suggested_models == (
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5-20251001",
+        "claude-sonnet-5",
         "claude-opus-4-8",
+        "claude-fable-5",
+        "claude-haiku-4-5",
+        "claude-opus-4-7",
     )
 
 
@@ -248,36 +262,58 @@ def test_launch_provider_presets_use_supported_chat_models() -> None:
         "deepseek": ("deepseek-v4-pro", "deepseek-v4-flash"),
         "gemini": (
             "gemini-3.5-flash",
-            "gemini-3.1-flash-lite",
             "gemini-3.1-pro-preview",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash-lite",
-            "gemini-2.5-flash",
+            "gemini-3.1-flash-lite",
+            "gemini-3-flash-preview",
         ),
         "groq": (
             "openai/gpt-oss-120b",
+            "qwen/qwen3.6-27b",
             "openai/gpt-oss-20b",
-            "llama-3.3-70b-versatile",
+            "groq/compound",
         ),
-        "mistral": ("mistral-medium-3-5", "devstral-2512", "mistral-small-2603"),
+        "mistral": (
+            "mistral-medium-2604",
+            "mistral-large-2512",
+            "mistral-small-2603",
+            "codestral-2508",
+            "ministral-8b-2512",
+        ),
+        "moonshot": (
+            "kimi-k2.7-code",
+            "kimi-k3",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k2.6",
+        ),
+        "moonshot-cn": (
+            "kimi-k2.7-code",
+            "kimi-k3",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k2.6",
+        ),
+        "kimi-code": ("k3", "kimi-for-coding", "kimi-for-coding-highspeed"),
         "openrouter": (
-            "openai/gpt-5.5",
+            "anthropic/claude-sonnet-5",
             "anthropic/claude-opus-4.8",
-            "google/gemini-3.5-flash",
-            "qwen/qwen3.7-plus",
+            "openai/gpt-5.6-terra",
+            "openai/gpt-5.6-luna",
+            "z-ai/glm-5.2",
             "deepseek/deepseek-v4-pro",
         ),
         "together": (
-            "zai-org/GLM-5.1",
-            "moonshotai/Kimi-K2.6",
+            "zai-org/GLM-5.2",
+            "moonshotai/Kimi-K2.7-Code",
             "deepseek-ai/DeepSeek-V4-Pro",
-            "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+            "MiniMaxAI/MiniMax-M3",
             "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
         ),
         "xai": (
+            "grok-4.5",
+            "grok-build-0.1",
             "grok-4.3",
             "grok-4.20-0309-reasoning",
-            "grok-code-fast-1",
+            "grok-4.20-0309-non-reasoning",
         ),
     }
 
@@ -381,7 +417,8 @@ def test_profile_conversion_targets_first_party_native_and_compatibility_presets
     assert converted.name == "claude"
     assert converted.protocol == "anthropic_messages"
     assert converted.base_url == "https://api.anthropic.com/v1"
-    assert converted.default_model == "claude-sonnet-4-6"
+    # claude-sonnet-4-6 is a stale alias now; conversion canonicalises it.
+    assert converted.default_model == "claude-sonnet-5"
 
     compat_preset = target_preset_for_profile_conversion(converted, target="compatibility")
     assert compat_preset is not None
@@ -423,7 +460,7 @@ def test_profile_conversion_replaces_provider_qualified_model_ids() -> None:
     converted = convert_profile_to_preset(profile, native_preset)
 
     assert converted.protocol == "anthropic_messages"
-    assert converted.default_model == "claude-sonnet-4-6"
+    assert converted.default_model == "claude-sonnet-5"
 
 
 def test_profile_conversion_replaces_known_stale_alias_for_target_preset() -> None:
@@ -432,7 +469,9 @@ def test_profile_conversion_replaces_known_stale_alias_for_target_preset() -> No
         protocol="openai_compat",
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         api_key_env="GEMINI_API_KEY",
-        default_model="gemini-3-flash-preview",
+        # gemini-2.5-flash shuts down 2026-10-16 and is aliased forward;
+        # (gemini-3-flash-preview is now a real fallback row, not an alias).
+        default_model="gemini-2.5-flash",
         web_search_adapter="gemini_grounding",
     )
 

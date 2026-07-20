@@ -117,7 +117,7 @@ def _strip_rich_markup(text: Any) -> str:
 def _print_chat_missing_model_guidance(console: Any) -> None:
     console.print("[yellow]No model is configured yet.[/yellow]")
     console.print(
-        "Run `sylliptor setup` for guided setup, or `sylliptor login` to start the free MiMo trial."
+        "Run `sylliptor setup` for guided setup, or `sylliptor login` to connect your Sylliptor account."
     )
     console.print("You can also set one directly with `sylliptor config set model <MODEL>`.")
 
@@ -2067,7 +2067,10 @@ def chat(
 
                 def _tui_session_builder(surface: Any) -> Any:
                     built = create_session(
-                        cfg=effective,
+                        # A /config save that happened before the first message
+                        # parks the reloaded config here (see _tui_on_config_saved)
+                        # so the lazy build uses it without a full TUI restart.
+                        cfg=_tui_box.get("cfg_override") or effective,
                         root=session_root,
                         mode=effective_mode,
                         runtime_kind=RuntimeKind.INTERACTIVE_CHAT,
@@ -2155,10 +2158,27 @@ def chat(
                     # user the running session was NOT updated (parity with classic).
                     built = _tui_box.get("session")
                     if built is None:
-                        from prompt_toolkit.application.current import get_app
+                        # No live session yet (the common launch → /config → save
+                        # path): there is nothing to rebuild, so do NOT tear the
+                        # TUI down for a slow full restart — hand the freshly
+                        # saved config to the lazy session builder and keep the
+                        # footer in sync. CLI connection flags stay authoritative.
+                        try:
+                            from ...config import clone_cfg
 
-                        get_app().exit(result=("restart_config", str(session_root)))
-                        return True
+                            reloaded = clone_cfg(load_config())
+                            if base_url is not None:
+                                reloaded.base_url = base_url
+                            if model is not None:
+                                reloaded.model = model
+                            _tui_box["cfg_override"] = reloaded
+                            _tui_state.model_name = str(getattr(reloaded, "model", "") or "")
+                            return True
+                        except Exception:
+                            from prompt_toolkit.application.current import get_app
+
+                            get_app().exit(result=("restart_config", str(session_root)))
+                            return True
                     try:
                         from ...config import clone_cfg
                         from ...profiles import connection_fingerprint

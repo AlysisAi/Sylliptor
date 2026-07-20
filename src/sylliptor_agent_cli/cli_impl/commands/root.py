@@ -826,7 +826,7 @@ def tools() -> None:
 
 @app.command()
 def login() -> None:
-    """Connect your Sylliptor account and unlock the free MiMo trial."""
+    """Connect your Sylliptor account."""
     from ... import account_login
 
     console = _console()
@@ -881,7 +881,7 @@ def whoami() -> None:
     cfg = _patchable("load_config", load_config)()
     status = account_login.login_status(cfg)
     if not status.logged_in:
-        console.print("Not logged in. Run `sylliptor login` to start your free MiMo trial.")
+        console.print("Not logged in. Run `sylliptor login` to connect your Sylliptor account.")
         return
     active = "active" if status.active else "not active"
     console.print("[green]Logged in[/green] to the Sylliptor MiMo trial.")

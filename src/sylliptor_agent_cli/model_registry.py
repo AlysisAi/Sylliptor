@@ -147,6 +147,57 @@ _BUILT_IN_MODEL_METADATA: dict[str, dict[str, Any]] = {
         "input_cost_per_token": 0.000000435,
         "output_cost_per_token": 0.00000087,
     },
+    # Kimi Code membership ids served by api.kimi.com/coding/v1 (subscription
+    # billing, so no per-token costs). Context windows from
+    # kimi.com/code/docs, July 2026.
+    "k3": {
+        "context_window_tokens": 1_048_576,
+        "max_output_tokens": 1_048_576,
+        "supports_vision": True,
+        "supports_reasoning": True,
+    },
+    "kimi-for-coding": {
+        "context_window_tokens": 262_144,
+        "max_output_tokens": 262_144,
+        "supports_vision": True,
+        "supports_reasoning": True,
+    },
+    "kimi-for-coding-highspeed": {
+        "context_window_tokens": 262_144,
+        "max_output_tokens": 262_144,
+        "supports_vision": True,
+        "supports_reasoning": True,
+    },
+    # Moonshot Kimi models newer than the bundled LiteLLM snapshot (which tops
+    # out at moonshot/kimi-k2.6). Values from platform.kimi.ai/docs/pricing,
+    # July 2026; remove once a snapshot refresh covers these ids.
+    "kimi-k3": {
+        "context_window_tokens": 1_048_576,
+        "max_output_tokens": 1_048_576,
+        "supports_vision": True,
+        "supports_reasoning": True,
+        "input_cost_per_token": 0.000003,
+        "output_cost_per_token": 0.000015,
+        "cache_read_input_cost_per_token": 0.0000003,
+    },
+    "kimi-k2.7-code": {
+        "context_window_tokens": 262_144,
+        "max_output_tokens": 262_144,
+        "supports_vision": True,
+        "supports_reasoning": True,
+        "input_cost_per_token": 0.00000095,
+        "output_cost_per_token": 0.000004,
+        "cache_read_input_cost_per_token": 0.00000019,
+    },
+    "kimi-k2.7-code-highspeed": {
+        "context_window_tokens": 262_144,
+        "max_output_tokens": 262_144,
+        "supports_vision": True,
+        "supports_reasoning": True,
+        "input_cost_per_token": 0.0000019,
+        "output_cost_per_token": 0.000008,
+        "cache_read_input_cost_per_token": 0.00000038,
+    },
 }
 
 
@@ -724,10 +775,15 @@ class ModelRegistry:
         )
 
         if max_output_tokens >= context_window_tokens:
-            clamped = max(1, context_window_tokens - 1)
+            # Shared-window metadata (e.g. the Kimi Code ids publish max_tokens
+            # up to the full context). Clamping to window-1 — the old behaviour —
+            # left a 1-token input budget, which surfaced as "context: 0% left"
+            # on a fresh 1M-context session. Reserve a conservative response
+            # allowance instead so the input budget keeps most of the window.
+            clamped = max(1, min(max_output_tokens, max(4096, context_window_tokens // 8)))
             warnings.append(
-                "max_output_tokens >= context_window_tokens; "
-                f"clamped max_output_tokens to {clamped}."
+                "max_output_tokens >= context_window_tokens (shared window); "
+                f"reserving {clamped} tokens for output."
             )
             max_output_tokens = clamped
 

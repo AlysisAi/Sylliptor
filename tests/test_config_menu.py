@@ -380,9 +380,9 @@ def test_commit_persists_default_model_section_to_active_profile(
     loaded = load_config()
     profile = get_active_profile(loaded)
     assert result.saved is True
-    assert loaded.model == "claude-sonnet-4-6"
+    assert loaded.model == "claude-sonnet-5"
     assert loaded.base_url == "https://anthropic.example/v1"
-    assert profile.default_model == "claude-sonnet-4-6"
+    assert profile.default_model == "claude-sonnet-5"
     assert profile.base_url == "https://anthropic.example/v1"
 
 
@@ -657,7 +657,7 @@ def test_default_model_rows_fallback_to_base_url_provider() -> None:
         value for value, _label, _description in config_menu_mod._default_model_rows(state)
     ]
 
-    assert "claude-sonnet-4-6" in model_values
+    assert "claude-sonnet-5" in model_values
     assert "deepseek-v4-flash" not in model_values
 
 

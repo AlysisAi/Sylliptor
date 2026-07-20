@@ -29,6 +29,25 @@ def test_compute_input_budget_with_clamp() -> None:
     assert budget == 512
 
 
+def test_compute_input_budget_shared_window_keeps_input_room() -> None:
+    # Kimi Code metadata declares max_output == context (a shared window, no
+    # fixed output reservation). The budget must reserve a fraction, not the
+    # whole window — regression for the fresh-session "context: 0% left" bug.
+    cap = ModelMeta(
+        model_name="k3",
+        context_window_tokens=1_048_576,
+        max_output_tokens=1_048_576,
+    )
+    budget = compute_input_budget(cap, safety_margin=512)
+    assert budget == 1_048_576 - (1_048_576 // 8) - 512
+    cap_small = ModelMeta(
+        model_name="kimi-for-coding",
+        context_window_tokens=262_144,
+        max_output_tokens=262_144,
+    )
+    assert compute_input_budget(cap_small, safety_margin=512) == 262_144 - 32_768 - 512
+
+
 def test_estimate_tokens_returns_positive_for_non_empty() -> None:
     assert estimate_tokens("hello world") > 0
 

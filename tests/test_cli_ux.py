@@ -155,7 +155,7 @@ def test_setup_wizard_saves_config(monkeypatch, tmp_path: Path) -> None:
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\n2\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
+        input=f"\n1\n1\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
@@ -172,7 +172,7 @@ def test_setup_wizard_can_persist_api_key(monkeypatch, tmp_path: Path) -> None:
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\n2\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
+        input=f"\n1\n1\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
@@ -2203,14 +2203,14 @@ def test_setup_wizard_can_pick_first_suggested_model(monkeypatch, tmp_path: Path
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\n2\npersisted-key\n1\n1\n{tmp_path}\n",
+        input=f"\n1\n1\npersisted-key\n1\n1\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
 
     cfg_path = tmp_path / "cfg" / "config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    assert cfg["model"] == "gpt-5.5"
+    assert cfg["model"] == "gpt-5.6-terra"
     assert cfg["default_workspace_path"] == os.fspath(tmp_path.resolve())
 
 
@@ -2220,7 +2220,7 @@ def test_setup_wizard_reprompts_invalid_workspace(monkeypatch, tmp_path: Path) -
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\n2\npersisted-key\n6\ngpt-5-nano\n1\n/does/not/exist\n{tmp_path}\n",
+        input=f"\n1\n1\npersisted-key\n6\ngpt-5-nano\n1\n/does/not/exist\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0

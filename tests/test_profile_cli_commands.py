@@ -162,7 +162,7 @@ def test_profile_preset_clones_into_named_profile(monkeypatch, tmp_path: Path) -
     profile = load_config().extra_fields["profiles"]["claude"]
     assert profile["protocol"] == "anthropic_messages"
     assert profile["base_url"] == "https://api.anthropic.com/v1"
-    assert profile["default_model"] == "claude-sonnet-4-6"
+    assert profile["default_model"] == "claude-sonnet-5"
     assert profile["extra_headers"] == {}
 
 
@@ -330,5 +330,5 @@ def test_profile_convert_to_compatibility_updates_gemini_native_profile(
     profile = load_config().extra_fields["profiles"]["gemini-native"]
     assert profile["protocol"] == "openai_compat"
     assert profile["base_url"] == "https://generativelanguage.googleapis.com/v1beta/openai/"
-    assert profile["default_model"] == "gemini-3.5-flash"
+    assert profile["default_model"] == "gemini-3-flash-preview"
     assert profile["web_search_adapter"] == "gemini_grounding"

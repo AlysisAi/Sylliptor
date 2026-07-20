@@ -69,17 +69,18 @@ def _drive_busy(flow: SetupFlow) -> None:
 
 
 def _start_native(flow: SetupFlow) -> None:
+    """Advance past the welcome screen onto the merged provider picker.
+
+    The caller then chooses an API-key provider row (native execution is
+    implied by the row, not a separate step).
+    """
     flow.advance_message()
-    assert flow.stage == "execution"
-    flow.choose(flow_mod._wiz._NATIVE_EXECUTION_VALUE)
-    assert flow.stage == "provider"
+    assert flow.stage == "connect_provider"
 
 
 def _start_subscription(flow: SetupFlow, runtime_id: str = "openai-codex") -> None:
     flow.advance_message()
-    assert flow.stage == "execution"
-    flow.choose(flow_mod._wiz._SUBSCRIPTION_EXECUTION_VALUE)
-    assert flow.stage == "runtime"
+    assert flow.stage == "connect_provider"
     flow.choose(f"{flow_mod._wiz._RUNTIME_EXECUTION_PREFIX}{runtime_id}")
     assert flow.stage == "workspace"
 
@@ -210,33 +211,26 @@ def test_flow_subscription_skips_api_key_provider_steps(monkeypatch, tmp_path):
 
     flow = SetupFlow()
     flow.advance_message()
-    assert flow.stage == "execution"
-    connection_screen = flow.screen()
-    assert connection_screen.title == "Connection Method"
-    assert [row.label for row in connection_screen.rows] == [
-        "Use an API key",
-        "Use an AI subscription",
-    ]
-    assert all("Codex" not in row.label for row in connection_screen.rows)
-
-    flow.choose(flow_mod._wiz._SUBSCRIPTION_EXECUTION_VALUE)
-    assert flow.stage == "runtime"
+    assert flow.stage == "connect_provider"
+    picker_screen = flow.screen()
+    assert picker_screen.title == "Connect a Provider"
     runtime_value = f"{flow_mod._wiz._RUNTIME_EXECUTION_PREFIX}openai-codex"
-    runtime_rows = {row.value: row for row in flow.screen().rows}
-    assert runtime_value in runtime_rows
-    assert runtime_rows[runtime_value].label == "ChatGPT Codex subscription"
-    assert all(value.startswith(flow_mod._wiz._RUNTIME_EXECUTION_PREFIX) for value in runtime_rows)
+    picker_rows = {row.value: row for row in picker_screen.rows}
+    # Subscription sign-ins and API-key providers share one merged list.
+    assert runtime_value in picker_rows
+    assert picker_rows[runtime_value].label == "ChatGPT Codex subscription"
+    assert "openai-responses" in picker_rows
 
     flow.back()
-    assert flow.stage == "execution"
-    flow.choose(flow_mod._wiz._SUBSCRIPTION_EXECUTION_VALUE)
-    assert flow.stage == "runtime"
+    assert flow.stage == "welcome"
+    flow.advance_message()
+    assert flow.stage == "connect_provider"
 
     flow.choose(runtime_value)
     assert flow.stage == "workspace"
-    assert flow.screen().progress.startswith("Step 4 of 4")
+    assert flow.screen().progress.startswith("Step 3 of 3")
     flow.back()
-    assert flow.stage == "runtime"
+    assert flow.stage == "connect_provider"
     flow.choose(runtime_value)
     assert flow.stage == "workspace"
     assert flow.profile_result is None
@@ -356,24 +350,33 @@ def test_flow_subscription_login_failure_is_non_fatal(monkeypatch, tmp_path):
 
 
 def test_provider_screen_surfaces_hosted_providers_with_advanced_branch():
-    # The TUI setup provider screen surfaces the MiMo trial + native first-party
-    # providers AND every other hosted provider (DeepSeek, OpenRouter, …)
-    # directly, so users aren't limited to the big-three brands. Only local,
-    # compatibility, custom, and legacy presets stay behind the "Advanced" branch.
-    # Asserts the *displayed rows*, not just handler behaviour.
+    # The merged "Connect a Provider" picker surfaces subscription sign-ins and
+    # every hosted provider (DeepSeek, OpenRouter, …) side by side, so users
+    # aren't limited to the big-three brands. Only local, compatibility, custom,
+    # and legacy presets stay behind the "Advanced" branch. Asserts the
+    # *displayed rows*, not just handler behaviour.
     flow = SetupFlow()
     _start_native(flow)
-    assert flow.stage == "provider"
 
-    values = [r.value for r in flow.screen().rows]
-    assert values[0] == "sylliptor"
-    labels = [r.label for r in flow.screen().rows]
-    assert any("free trial" in label for label in labels)
+    rows = flow.screen().rows
+    values = [r.value for r in rows]
+    # Subscription sign-ins lead, then the hosted API-key providers.
+    assert values[0].startswith(flow_mod._wiz._RUNTIME_EXECUTION_PREFIX)
+    assert values[1] == "openai-responses"
+    labels = [r.label for r in rows]
+    # The free trial is over: MiMo is not promoted and no row claims a trial.
+    assert not any("free trial" in label for label in labels)
     assert sum("recommended" in label.lower() for label in labels) == 0
-    assert "deepseek" in values  # hosted providers now sit on the primary screen…
+    assert values[-1] == flow_mod._wiz._ADVANCED_PROVIDER_PRESETS_VALUE
+    assert values[-2] == "sylliptor"  # demoted to the end of the hosted list
+    assert "deepseek" in values  # hosted providers sit on the primary screen…
     assert "openrouter" in values
     assert "ollama" not in values  # …local endpoints stay behind the advanced branch
-    assert flow_mod._wiz._ADVANCED_PROVIDER_PRESETS_VALUE in values
+
+    # The description column carries the auth method per row.
+    by_value = {r.value: r for r in rows}
+    assert by_value["openai-responses"].description == "API key"
+    assert "no API key" in by_value["sylliptor"].description
 
     # The advanced branch holds the local / compatibility / custom / legacy presets.
     flow.choose(flow_mod._wiz._ADVANCED_PROVIDER_PRESETS_VALUE)
@@ -383,11 +386,11 @@ def test_provider_screen_surfaces_hosted_providers_with_advanced_branch():
     assert "deepseek" not in advanced_values  # promoted to the primary screen
     assert "ollama" in advanced_values
     assert "custom" in advanced_values
-    assert flow.screen().progress.startswith("Step 3 of 8")
+    assert flow.screen().progress.startswith("Step 2 of 7")
     assert "Provider (advanced)" in flow.screen().progress
 
     flow.back()
-    assert flow.stage == "provider"
+    assert flow.stage == "connect_provider"
 
     # Choosing a hosted provider directly (no advanced hop) proceeds to the key step.
     flow.choose("deepseek")
@@ -403,7 +406,7 @@ def test_provider_advanced_back_returns_to_provider():
     flow.choose(flow_mod._wiz._ADVANCED_PROVIDER_PRESETS_VALUE)
     assert flow.stage == "provider_advanced"
     flow.back()
-    assert flow.stage == "provider"
+    assert flow.stage == "connect_provider"
 
 
 # --------------------------------------------------------------------------- flow: validation
@@ -514,7 +517,7 @@ def test_flow_router_model_inherit_clears_override_and_navigates(monkeypatch, tm
 
     assert flow.stage == "router_model"
     screen = flow.screen()
-    assert screen.progress.startswith("Step 6 of 8")
+    assert screen.progress.startswith("Step 5 of 7")
     assert screen.rows[0].value == flow_mod._wiz._INHERIT_DEFAULT_MODEL_VALUE
     assert "llama3.3" in screen.rows[0].description
 
@@ -585,7 +588,7 @@ def test_flow_custom_router_model_not_found_can_retry_or_accept(monkeypatch, tmp
     flow.submit_input("router-missing")
     _drive_busy(flow)
     assert flow.stage == "router_model_not_found_confirm"
-    assert flow.screen().progress.startswith("Step 6 of 8")
+    assert flow.screen().progress.startswith("Step 5 of 7")
     flow.confirm(False)
     assert flow.stage == "router_model"
 
@@ -669,7 +672,7 @@ def test_flow_workspace_missing_folder_confirms_and_creates(monkeypatch, tmp_pat
 
     assert flow.stage == "workspace_create_confirm"
     screen = flow.screen()
-    assert screen.progress.startswith("Step 7 of 8")
+    assert screen.progress.startswith("Step 6 of 7")
     assert "create_if_missing" not in screen.subtitle
     assert any(os.fspath(missing.resolve()) in text for text, _tone in screen.lines)
 
@@ -683,11 +686,11 @@ def test_flow_workspace_missing_folder_confirms_and_creates(monkeypatch, tmp_pat
 
 def test_flow_progress_counts_sandbox_as_setup_step():
     flow = SetupFlow()
-    assert flow._progress("router_model").startswith("Step 6 of 8")
+    assert flow._progress("router_model").startswith("Step 5 of 7")
     flow.stage = "workspace"
-    assert flow.screen().progress.startswith("Step 7 of 8")
+    assert flow.screen().progress.startswith("Step 6 of 7")
     flow.stage = "sandbox_choice"
-    assert flow.screen().progress.startswith("Step 8 of 8")
+    assert flow.screen().progress.startswith("Step 7 of 7")
     assert "Sandbox" in flow.screen().progress
 
 
@@ -844,9 +847,7 @@ def test_flow_back_navigation(monkeypatch):
     flow.choose("openai")
     assert flow.stage == "api_key"
     flow.back()
-    assert flow.stage == "provider"
-    flow.back()
-    assert flow.stage == "execution"
+    assert flow.stage == "connect_provider"
     flow.back()
     assert flow.stage == "welcome"
 
@@ -867,14 +868,15 @@ def _headless(keys: str, **kwargs: Any) -> bool:
 
 def test_headless_cancel_returns_false(tmp_path, monkeypatch):
     _config_env(tmp_path, monkeypatch)
-    # welcome Enter -> execution; Ctrl+C exits immediately (no confirm to get stuck on).
+    # welcome Enter -> provider picker; Ctrl+C exits immediately (no confirm to get stuck on).
     assert _headless("\r\x03") is False
 
 
 def test_headless_ctrl_c_exits_from_input_step(tmp_path, monkeypatch):
     _config_env(tmp_path, monkeypatch)
-    # welcome -> native execution -> provider(idx0) -> api_key input; Ctrl+C must still exit.
-    assert _headless("\r\r\r\x03") is False
+    # welcome -> picker(down to row 1 = openai-responses, API key) -> api_key input;
+    # Ctrl+C must still exit.
+    assert _headless("\r\x1b[B\r\x03") is False
 
 
 def test_headless_full_path_saves(tmp_path, monkeypatch):
@@ -884,9 +886,9 @@ def test_headless_full_path_saves(tmp_path, monkeypatch):
         sandbox_doctor, "diagnose_sandbox", lambda _cfg, **_k: _fake_diag(ready=True)
     )
 
-    # welcome -> native execution -> provider(row 1 openai-responses, key required) -> type key ->
+    # welcome -> picker(row 1 openai-responses, key required) -> type key ->
     # model(idx0) -> router(inherit) -> workspace(default home, Enter) -> complete -> done.
-    keys = "\r" + "\r" + "\x1b[B" + "\r" + "sk-xyz" + "\r" + "\r" + "\r" + "\r" + "\r"
+    keys = "\r" + "\x1b[B" + "\r" + "sk-xyz" + "\r" + "\r" + "\r" + "\r" + "\r"
     assert _headless(keys) is True
     cfg = load_config()
     assert cfg.model  # a default model was persisted

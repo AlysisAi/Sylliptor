@@ -186,6 +186,8 @@ _STYLE = Style.from_dict(
         "tui.picker.num": "#8a8a8a bg:#0d1117",
         "tui.picker.label": "#c9d1d9 bg:#0d1117",
         "tui.picker.desc": "#8a8a8a bg:#0d1117",
+        "tui.picker.warndesc": "#d29922 bg:#0d1117",
+        "tui.picker.header": "bold #6e7681 bg:#0d1117",
         "tui.picker.tag": f"{_ACCENT} bg:#0d1117",
         "tui.picker.hint": "italic #6e7681 bg:#0d1117",
         "tui.picker.sel": f"bg:{_BAND_BG}",
@@ -958,7 +960,7 @@ _PICKER_MAX_DESC_LINES = 3
 
 
 def _render_picker_rows(
-    rows: list[PickerRow], index: int, width: int, hint: str = _PICKER_HINT
+    rows: list[PickerRow], index: int, width: int, hint: str = _PICKER_HINT, numbered: bool = True
 ) -> list[list[tuple[str, str]]]:
     """Render a numbered, selectable option list for the picker popup.
 
@@ -967,13 +969,27 @@ def _render_picker_rows(
     continuation lines (indented under the column), capped at
     :data:`_PICKER_MAX_DESC_LINES` so it never grows unbounded. The focused row
     (``index``) is painted with the band background and an accent caret/label
-    across all its lines, and the active setting is tagged "(current)". Every row
-    is padded to ``width`` so the highlight band stays aligned.
+    across all its lines, and the active setting is tagged "(current)" — unless
+    the row carries a ``tag`` key, which overrides the tag text (an empty string
+    suppresses it entirely). Every row is padded to ``width`` so the highlight
+    band stays aligned.
+
+    Rows may carry a ``kind``: "header" paints a dim upper-case section caption
+    and "spacer" a blank band line — both flush-left, unnumbered, unselectable.
+    With ``numbered=False`` the ``N.`` prefixes are dropped (grouped menus
+    navigate by arrows, not digits). A row ``tone`` of "warn" tints the
+    description so problem summaries stand out without stealing the selection
+    band.
     """
     width = max(20, int(width))
     gap = 2
-    num_w = max((len(f"{i + 1}. ") for i in range(len(rows))), default=3)
-    label_w = max((len(str(r.get("label", ""))) for r in rows), default=0)
+
+    def _kind(r: PickerRow) -> str:
+        return str(r.get("kind", "item") or "item")
+
+    items = [r for r in rows if _kind(r) == "item"]
+    num_w = max((len(f"{i + 1}. ") for i in range(len(items))), default=3) if numbered else 0
+    label_w = max((len(str(r.get("label", ""))) for r in items), default=0)
     # Aligned description column = caret + number + widest label + gap, capped so a
     # very long label / narrow panel still leaves room for the description.
     desc_col = min(2 + num_w + label_w + gap, max(12, width - 12))
@@ -981,35 +997,67 @@ def _render_picker_rows(
     label_room = max(1, desc_col - 2 - num_w - gap)
 
     out: list[list[tuple[str, str]]] = []
+    item_no = 0
     for i, row in enumerate(rows):
+        kind = _kind(row)
+        if kind == "spacer":
+            out.append([("class:tui.picker", " " * width)])
+            continue
+        if kind == "header":
+            text = str(row.get("label", "")).upper()
+            if len(text) > width:
+                text = text[: max(1, width - 1)] + "…"
+            out.append(
+                [
+                    ("class:tui.picker.header", text),
+                    ("class:tui.picker", " " * max(0, width - len(text))),
+                ]
+            )
+            continue
+        item_no += 1
         sel = i == index
         base = "class:tui.picker.sel" if sel else "class:tui.picker"
         caret_style = "class:tui.picker.selcaret" if sel else "class:tui.picker.num"
         num_style = "class:tui.picker.selnum" if sel else "class:tui.picker.num"
         label_style = "class:tui.picker.sellabel" if sel else "class:tui.picker.label"
-        desc_style = "class:tui.picker.seldesc" if sel else "class:tui.picker.desc"
+        if sel:
+            desc_style = "class:tui.picker.seldesc"
+        elif str(row.get("tone", "") or "") == "warn":
+            desc_style = "class:tui.picker.warndesc"
+        else:
+            desc_style = "class:tui.picker.desc"
         tag_style = "class:tui.picker.seltag" if sel else "class:tui.picker.tag"
 
-        num = f"{i + 1}. "
+        num = f"{item_no}. " if numbered else ""
         label = str(row.get("label", ""))
         if len(label) > label_room:  # only trips on a very narrow panel
             label = label[: max(1, label_room - 1)] + "…"
         desc = str(row.get("description", "") or "")
-        tag = " (current)" if row.get("current") else ""
+        if "tag" in row:
+            tag = str(row.get("tag") or "")
+        else:
+            tag = "(current)" if row.get("current") else ""
 
         desc_lines = _wrap_line(desc, desc_w) if desc else [""]
         if len(desc_lines) > _PICKER_MAX_DESC_LINES:
             desc_lines = desc_lines[:_PICKER_MAX_DESC_LINES]
             last = desc_lines[-1][: max(1, desc_w - 1)].rstrip()
             desc_lines[-1] = last + "…"
-        # The "(current)" tag rides the last description line when it fits, else a
-        # line of its own — so it never pushes a row past the panel width.
+        # The tag rides the last description line when it fits; otherwise the
+        # description's last word is pulled down with it so the tag reads as a
+        # natural wrap — never a lone, misaligned "(current)"/"(default)" line.
         tag_line = -1
         if tag:
-            if len(desc_lines[-1]) + len(tag) <= desc_w:
+            last = desc_lines[-1]
+            if not last or len(last) + 1 + len(tag) <= desc_w:
                 tag_line = len(desc_lines) - 1
             else:
-                desc_lines.append("")
+                cut = last.rfind(" ")
+                if 0 < cut and (len(last) - cut - 1) + 1 + len(tag) <= desc_w:
+                    desc_lines[-1] = last[:cut]
+                    desc_lines.append(last[cut + 1 :])
+                else:
+                    desc_lines.append("")
                 tag_line = len(desc_lines) - 1
 
         for li, dline in enumerate(desc_lines):
@@ -1027,8 +1075,9 @@ def _render_picker_rows(
                 frags.append((desc_style, dline))
                 used += len(dline)
             if li == tag_line and tag:
-                frags.append((tag_style, tag))
-                used += len(tag)
+                tag_frag = f" {tag}" if dline else tag
+                frags.append((tag_style, tag_frag))
+                used += len(tag_frag)
             if used < width:
                 frags.append((base, " " * (width - used)))
             out.append(frags)

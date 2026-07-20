@@ -85,5 +85,13 @@ def trim_text_to_budget(text: str, max_tokens: int) -> tuple[str, bool]:
 def compute_input_budget(cap: object, safety_margin: int = 512) -> int:
     context = int(getattr(cap, "context_window_tokens", 8192))
     output = int(getattr(cap, "max_output_tokens", 2048))
+    if output >= context > 0:
+        # Shared-window metadata (e.g. the Kimi Code ids, where max_tokens may
+        # be raised up to the full context): there is no fixed output
+        # reservation, so subtracting the whole window would leave the 512-token
+        # floor as the input budget on a 1M-context model — the fresh-session
+        # "context: 0% left" footer bug. Reserve a conservative response
+        # allowance instead of the entire window.
+        output = min(output, max(4096, context // 8))
     budget = context - output - max(0, int(safety_margin))
     return max(512, budget)

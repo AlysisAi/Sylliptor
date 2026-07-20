@@ -2,10 +2,12 @@
 
 The classic first-run wizard (:mod:`cli_impl.setup_wizard`) is a Rich-print +
 prompt_toolkit-prompt flow. When ``SYLLIPTOR_TUI`` is on we want the *onboarding*
-to match the alt-screen launch experience too, so this module re-expresses the
-same branched flow — connection method, then either API-provider and model setup
-or an AI subscription selection, followed by workspace and commit — as a step machine
-that renders a :class:`Screen` description. The prompt_toolkit application in
+to match the alt-screen launch experience too, so this module expresses the flow
+as a step machine that renders a :class:`Screen` description. Unlike the classic
+wizard's method-first branching, the TUI opens with a single merged "Connect a
+Provider" list (subscription sign-ins and API-key providers side by side); the
+selected row dispatches to the right branch — API-key/model setup or subscription OAuth — followed by workspace and
+commit. The prompt_toolkit application in
 :mod:`cli_impl.tui.setup_app` reads that description and routes key events back
 into the flow; nothing here imports prompt_toolkit, so the whole thing is unit
 testable by driving the public methods synchronously.
@@ -53,20 +55,17 @@ Tone = Literal["ok", "warn", "err", "dim", "plain"]
 # decisions the user makes).
 _PROGRESS_STAGES = (
     "welcome",
-    "execution",
-    "provider",
+    "connect_provider",
     "api_key",
     "model",
     "router_model",
     "workspace",
     "sandbox_choice",
 )
-_SUBSCRIPTION_PROGRESS_STAGES = ("welcome", "execution", "runtime", "workspace")
+_SUBSCRIPTION_PROGRESS_STAGES = ("welcome", "connect_provider", "workspace")
 _PROGRESS_LABELS = {
     "welcome": "Welcome",
-    "execution": "Connection",
-    "runtime": "Subscription",
-    "provider": "Provider",
+    "connect_provider": "Provider",
     "api_key": "API key",
     "model": "Model",
     "router_model": "Router model",
@@ -74,10 +73,10 @@ _PROGRESS_LABELS = {
     "sandbox_choice": "Sandbox",
 }
 _PROGRESS_ALIASES = {
-    "provider_advanced": ("provider", "Provider (advanced)"),
-    "custom_name": ("provider", "Provider (custom)"),
-    "custom_url": ("provider", "Provider (custom)"),
-    "custom_headers": ("provider", "Provider (custom)"),
+    "provider_advanced": ("connect_provider", "Provider (advanced)"),
+    "custom_name": ("connect_provider", "Provider (custom)"),
+    "custom_url": ("connect_provider", "Provider (custom)"),
+    "custom_headers": ("connect_provider", "Provider (custom)"),
     "validating_key": ("api_key", "API key"),
     "custom_model": ("model", "Model"),
     "validating_model": ("model", "Model"),
@@ -128,9 +127,7 @@ _STAGE_MODE: dict[str, Mode] = {
     "welcome": "message",
     "complete": "message",
     "fatal": "message",
-    "execution": "list",
-    "runtime": "list",
-    "provider": "list",
+    "connect_provider": "list",
     "provider_advanced": "list",
     "model": "list",
     "router_model": "list",
@@ -166,12 +163,20 @@ _STAGE_MODE: dict[str, Mode] = {
 
 @dataclass
 class Row:
-    """One selectable option in a ``list`` screen (mirrors the picker rows)."""
+    """One selectable option in a ``list`` screen (mirrors the picker rows).
+
+    ``kind`` distinguishes real options ("item") from visual-only rows: a
+    "header" renders as a dim section caption and a "spacer" as a blank line;
+    neither is selectable. ``tone`` optionally tints the description ("warn"
+    highlights a problem summary, e.g. a missing required setting).
+    """
 
     label: str
     description: str = ""
     value: str = ""
     current: bool = False
+    kind: str = "item"
+    tone: str = ""
 
 
 @dataclass
@@ -187,6 +192,8 @@ class Screen:
     # ``list`` mode.
     rows: list[Row] = field(default_factory=list)
     index: int = 0
+    # Whether ``list`` rows carry "N." prefixes and answer 1-9 digit jumps.
+    numbered: bool = True
     # ``input`` mode.
     input_label: str = ""
     input_default: str = ""
@@ -277,7 +284,7 @@ class SetupFlow:
         return preset.key == PROFILE_KEY
 
     def _progress(self, stage: str) -> str:
-        uses_subscription = self.stage == "runtime" or (
+        uses_subscription = (
             self.execution_result is not None and self.execution_result.backend == "delegated"
         )
         progress_stages = _SUBSCRIPTION_PROGRESS_STAGES if uses_subscription else _PROGRESS_STAGES
@@ -323,65 +330,31 @@ class SetupFlow:
             title="Welcome to Sylliptor",
             subtitle="A coding agent that runs in your terminal.",
             lines=[
-                ("First choose how Sylliptor should connect to AI models.", "plain"),
+                ("First pick the AI provider Sylliptor should connect to.", "plain"),
                 ("", "plain"),
-                ("Use an API key to connect directly to a supported model provider.", "dim"),
                 (
-                    "Use an AI subscription to sign in through a supported provider's "
-                    "official client.",
+                    "One list covers everything: subscription sign-ins, API-key "
+                    "providers, and local endpoints.",
                     "dim",
                 ),
-                ("Both paths ask for the workspace folder you want to work on.", "dim"),
+                ("Setup then asks for the workspace folder you want to work on.", "dim"),
             ],
             hint="▶  Press Enter to begin",
         )
 
-    def _screen_execution(self) -> Screen:
+    def _screen_connect_provider(self) -> Screen:
+        # One merged list (Kilo-style): subscription sign-ins first, then
+        # API-key providers, with local/custom endpoints behind the advanced
+        # row. The description column carries the auth method so no upfront
+        # method choice is needed.
         rows = [
             Row(label=label, description=description, value=value)
-            for value, label, description in _wiz._connection_method_picker_rows()
+            for value, label, description in _wiz._connect_provider_picker_rows()
         ]
         return Screen(
-            stage="execution",
+            stage="connect_provider",
             mode="list",
-            title="Connection Method",
-            subtitle="How would you like to connect Sylliptor to AI models?",
-            rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
-        )
-
-    def _screen_runtime(self) -> Screen:
-        rows = [
-            Row(label=label, description=description, value=value)
-            for value, label, description in _wiz._subscription_picker_rows()
-        ]
-        return Screen(
-            stage="runtime",
-            mode="list",
-            title="AI Subscription",
-            subtitle="Choose the subscription you want to connect.",
-            rows=rows,
-            hint="↑↓ move · Enter select · Esc back",
-        )
-
-    def _screen_provider(self) -> Screen:
-        # Minimal list — just the provider names. The label already differentiates
-        # native vs compatibility vs local; the long protocol/host blurbs are
-        # noise for someone simply picking a provider.
-        rows = [
-            Row(label=_wiz.preset_selection_label(preset), value=preset.key)
-            for preset in _wiz._setup_presets()
-        ]
-        rows.append(
-            Row(
-                label="Advanced / local / compatibility providers",
-                value=_wiz._ADVANCED_PROVIDER_PRESETS_VALUE,
-            )
-        )
-        return Screen(
-            stage="provider",
-            mode="list",
-            title="Provider Profile",
+            title="Connect a Provider",
             subtitle="Pick the provider you want Sylliptor to use.",
             rows=rows,
             hint="↑↓ move · Enter select · Esc back",
@@ -697,8 +670,8 @@ class SetupFlow:
             stage="login_confirm",
             mode="confirm",
             title="Sylliptor account",
-            subtitle="Your provider is the hosted MiMo free trial.",
-            lines=[("Connect your Sylliptor account now to unlock the free MiMo trial?", "plain")],
+            subtitle="Your provider is the Sylliptor-hosted MiMo endpoint.",
+            lines=[("Connect your Sylliptor account now?", "plain")],
             hint="Y connect · N later · Esc skip",
             confirm_default=True,
         )
@@ -926,12 +899,8 @@ class SetupFlow:
         self.choose(scr.rows[self.index].value)
 
     def choose(self, value: str) -> None:
-        if self.stage == "execution":
-            self._choose_execution(value)
-        elif self.stage == "runtime":
-            self._choose_runtime(value)
-        elif self.stage == "provider":
-            self._choose_provider(value)
+        if self.stage == "connect_provider":
+            self._choose_connect_provider(value)
         elif self.stage == "provider_advanced":
             self._choose_provider(value)
         elif self.stage == "model":
@@ -1007,7 +976,7 @@ class SetupFlow:
     def advance_message(self) -> None:
         """Enter on a ``message`` screen."""
         if self.stage == "welcome":
-            self._goto("execution")
+            self._goto("connect_provider")
         elif self.stage == "complete":
             self._finish(True)
         elif self.stage == "fatal":
@@ -1016,20 +985,18 @@ class SetupFlow:
     def back(self) -> None:
         custom_profile = self.profile_result is not None and self.profile_result.preset is None
         prev = {
-            "execution": "welcome",
-            "runtime": "execution",
-            "provider": "execution",
-            "provider_advanced": "provider",
-            "custom_name": "provider",
+            "connect_provider": "welcome",
+            "provider_advanced": "connect_provider",
+            "custom_name": "provider_advanced",
             "custom_url": "custom_name",
             "custom_headers": "custom_url",
-            "api_key": "custom_headers" if custom_profile else "provider",
+            "api_key": "custom_headers" if custom_profile else "connect_provider",
             "model": "api_key",
             "custom_model": "model",
             "router_model": "model",
             "custom_router_model": "router_model",
             "workspace": (
-                "runtime"
+                "connect_provider"
                 if self.execution_result is not None
                 and self.execution_result.backend == "delegated"
                 else "router_model"
@@ -1103,42 +1070,40 @@ class SetupFlow:
 
     # --------------------------------------------------------- provider step
 
-    def _choose_execution(self, value: str) -> None:
-        if value == _wiz._SUBSCRIPTION_EXECUTION_VALUE:
-            self._goto("runtime")
-            return
-        try:
-            selected = _wiz._execution_result_from_value(value)
-        except ConfigError as exc:
-            self._set_status(str(exc), "err")
-            return
-        if self.execution_result is not None and selected != self.execution_result:
-            self.profile_result = None
-            self.api_key_result = None
-            self.model_result = None
-            self.router_model_result = None
-        self.execution_result = selected
-        if selected.backend == "delegated":
-            self._goto("workspace")
-        else:
-            self._goto("provider")
+    def _choose_connect_provider(self, value: str) -> None:
+        """Dispatch a merged-picker row to the right branch.
 
-    def _choose_runtime(self, value: str) -> None:
-        try:
-            selected = _wiz._execution_result_from_value(value)
-        except ConfigError as exc:
-            self._set_status(str(exc), "err")
+        Rows are either a subscription (``runtime:<id>`` → workspace, OAuth
+        happens post-commit), the advanced sub-list, or an API-key/local
+        provider preset (→ API key step). Switching between a subscription and
+        a provider — or between different subscriptions — invalidates the
+        dependent step results, mirroring the old method-first reset.
+        """
+        if value == _wiz._ADVANCED_PROVIDER_PRESETS_VALUE:
+            self._goto("provider_advanced")
             return
-        if selected.backend != "delegated":
-            self._set_status("Choose an available AI subscription.", "err")
+        if value.startswith(_wiz._RUNTIME_EXECUTION_PREFIX):
+            try:
+                selected = _wiz._execution_result_from_value(value)
+            except ConfigError as exc:
+                self._set_status(str(exc), "err")
+                return
+            if self.execution_result is not None and selected != self.execution_result:
+                self.profile_result = None
+                self.api_key_result = None
+                self.model_result = None
+                self.router_model_result = None
+            self.execution_result = selected
+            self._goto("workspace")
             return
+        selected = _ExecutionStepResult(backend="native")
         if self.execution_result is not None and selected != self.execution_result:
             self.profile_result = None
             self.api_key_result = None
             self.model_result = None
             self.router_model_result = None
         self.execution_result = selected
-        self._goto("workspace")
+        self._choose_provider(value)
 
     def _choose_provider(self, key: str) -> None:
         if key == _wiz._ADVANCED_PROVIDER_PRESETS_VALUE:
@@ -1737,7 +1702,7 @@ class SetupFlow:
             return
         who = f" as {result.email}" if getattr(result, "email", None) else ""
         self.login_ok = True
-        self.login_summary = f"connected{who} — free MiMo trial ready"
+        self.login_summary = f"connected{who} — Sylliptor account ready"
         self._goto("complete")
 
     # ----------------------------------------------------------- busy driver

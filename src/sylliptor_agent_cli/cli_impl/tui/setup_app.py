@@ -82,6 +82,8 @@ def _row_to_dict(row: Row) -> dict[str, Any]:
         "description": row.description,
         "value": row.value,
         "current": row.current,
+        "kind": row.kind,
+        "tone": row.tone,
     }
 
 

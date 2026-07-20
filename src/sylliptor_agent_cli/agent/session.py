@@ -83,6 +83,7 @@ from ..mcp.manager import ForgeTaskScopedMcpManager, McpManager, create_mcp_mana
 from ..model_metadata_policy import ActiveModelRef, evaluate_active_model_metadata_policy
 from ..model_registry import ModelRegistry, resolve_model_provider_key
 from ..model_router import ROLE_CODING, ROLE_COMPACTOR, ROLE_ROUTER, resolve_model_for_role
+from ..profile_presets import find_preset_for_profile
 from ..profiles import get_active_profile, resolve_effective_base_url
 from ..provider_telemetry import set_provider_telemetry_sink
 from ..repo_scan import scan_workspace as scan_workspace
@@ -1480,12 +1481,18 @@ def create_session(
         cfg=session_cfg,
         profile=active_profile,
     )
+    cache_affinity_preset = find_preset_for_profile(active_profile)
+    session_scoped_cache_affinity = (
+        cache_affinity_preset is not None
+        and str(cache_affinity_preset.provider_key or "").strip().lower() == "moonshot"
+    )
 
     def _prompt_cache_namespace(role: str) -> str | None:
         return build_prompt_cache_namespace(
             workspace_root=workspace_context.workspace_root,
             role=role,
             profile_name=active_profile_name,
+            session_id=session_id if session_scoped_cache_affinity else None,
         )
 
     registry = ModelRegistry(cfg=session_cfg, api_key=api_key)

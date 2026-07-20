@@ -11,7 +11,10 @@ from sylliptor_agent_cli.litellm_static_provider import (
     get_bundled_model_catalog_provenance,
     resolve_litellm_static_metadata,
 )
-from sylliptor_agent_cli.model_registry import ModelRegistry
+from sylliptor_agent_cli.model_registry import (
+    OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE,
+    ModelRegistry,
+)
 from sylliptor_agent_cli.token_budget import compute_input_budget
 from sylliptor_agent_cli.usage_tracker import compute_context_left
 
@@ -525,6 +528,49 @@ def test_built_in_deepseek_v4_metadata_beats_fallback_when_bundled_catalog_lags(
     assert meta.field_sources["max_output_tokens"] == "built_in"
     assert registry.last_error is None
     assert not any("fallback context/max_output" in warning for warning in meta.warnings)
+
+
+def test_official_moonshot_k3_metadata_preserves_large_input_budget() -> None:
+    cfg = AppConfig(base_url="https://api.moonshot.ai/v1", model="kimi-k3")
+
+    meta = ModelRegistry(cfg=cfg).get("kimi-k3")
+
+    assert meta.model_name == "kimi-k3"
+    assert meta.context_window_tokens == 1_048_576
+    assert meta.max_output_tokens == 131_072
+    assert meta.supports_vision is True
+    assert meta.supports_reasoning is True
+    assert meta.input_cost_per_token == 0.000003
+    assert meta.output_cost_per_token == 0.000015
+    assert meta.cache_read_input_cost_per_token == 0.0000003
+    assert compute_input_budget(meta) == 916_992
+
+
+def test_official_moonshot_k26_metadata_overrides_stale_bundled_capacity() -> None:
+    cfg = AppConfig(base_url="https://api.moonshot.cn/v1", model="kimi-k2.6")
+
+    meta = ModelRegistry(cfg=cfg).get("kimi-k2.6")
+
+    assert meta.context_window_tokens == 262_144
+    assert meta.max_output_tokens == 32_768
+    assert meta.field_sources["context_window_tokens"] == (
+        f"{OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE}:moonshot"
+    )
+    assert meta.field_sources["max_output_tokens"] == (
+        f"{OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE}:moonshot"
+    )
+
+
+def test_official_moonshot_metadata_is_scoped_to_moonshot_routes() -> None:
+    cfg = AppConfig(base_url="https://custom.example/v1", model="kimi-k3")
+
+    meta = ModelRegistry(cfg=cfg).get("kimi-k3")
+
+    assert meta.provider_key is None
+    assert all(
+        not source.startswith(OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE)
+        for source in meta.field_sources.values()
+    )
 
 
 def test_per_field_mixing_sets_source_to_mixed(monkeypatch) -> None:

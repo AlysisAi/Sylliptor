@@ -5,8 +5,9 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
+from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.litellm_static_provider import BUNDLED_MODEL_CATALOG_SOURCE
-from sylliptor_agent_cli.model_registry import ModelMeta
+from sylliptor_agent_cli.model_registry import ModelMeta, ModelRegistry
 from sylliptor_agent_cli.request_estimation import (
     estimate_request_token_breakdown,
     request_contains_media,
@@ -672,6 +673,28 @@ def test_build_usage_record_computes_cache_aware_cost_when_pricing_is_known() ->
     payload = record.to_payload()
     assert payload["cache_read_input_cost_per_token"] == 0.01
     assert payload["cache_creation_1h_input_cost_per_token"] == 0.15
+
+
+def test_kimi_k3_cached_tokens_use_global_moonshot_discount() -> None:
+    registry = ModelRegistry(cfg=AppConfig(base_url="https://api.moonshot.ai/v1", model="kimi-k3"))
+
+    record = build_usage_record(
+        role="main",
+        requested_model="kimi-k3",
+        response_model="kimi-k3",
+        messages=[{"role": "user", "content": "hello"}],
+        response_content="world",
+        response_tool_calls=[],
+        api_prompt_tokens=100,
+        api_completion_tokens=10,
+        api_total_tokens=110,
+        api_input_tokens_uncached=20,
+        api_cache_read_input_tokens=80,
+        registry=registry,
+    )
+
+    assert record.cache_cost_pricing_missing is False
+    assert record.cost_usd == (20 * 0.000003) + (80 * 0.0000003) + (10 * 0.000015)
 
 
 def test_build_usage_record_records_prompt_estimate_calibration() -> None:

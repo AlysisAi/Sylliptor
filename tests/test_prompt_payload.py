@@ -365,6 +365,58 @@ def test_create_session_auto_prompt_cache_key_is_workspace_scoped(tmp_path: Path
         session.close()
 
 
+def test_create_session_kimi_auto_cache_key_is_resume_stable_and_session_scoped(
+    tmp_path: Path,
+) -> None:
+    _fake_git_repo(tmp_path)
+    cfg = AppConfig(
+        model="kimi-k3",
+        base_url="https://api.moonshot.ai/v1",
+        web_search_mode="off",
+        prompt_cache_mode="auto",
+    )
+
+    first = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=1,
+        no_log=True,
+        api_key_override="override-key",
+        session_id_override="cache-session-1",
+    )
+    resumed = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=1,
+        no_log=True,
+        api_key_override="override-key",
+        session_id_override="cache-session-1",
+    )
+    different = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=1,
+        no_log=True,
+        api_key_override="override-key",
+        session_id_override="cache-session-2",
+    )
+    try:
+        assert first.client.prompt_cache_key is not None
+        assert resumed.client.prompt_cache_key is not None
+        assert first.client.prompt_cache_key == resumed.client.prompt_cache_key
+        assert first.client.prompt_cache_key != different.client.prompt_cache_key
+    finally:
+        first.close()
+        resumed.close()
+        different.close()
+
+
 def test_route_context_payload_stays_compact_and_structured(tmp_path: Path) -> None:
     _fake_git_repo(tmp_path)
     (tmp_path / "README.md").write_text("notes cli\n", encoding="utf-8")

@@ -137,6 +137,10 @@ def test_reasoning_trace_capabilities_only_mark_safe_summaries_as_displayable() 
         provider_key="mistral",
         protocol=OPENAI_COMPAT_PROTOCOL,
     )
+    moonshot = resolve_reasoning_trace_capability(
+        provider_key="moonshot",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+    )
     unknown = resolve_reasoning_trace_capability(
         provider_key="custom",
         protocol=OPENAI_COMPAT_PROTOCOL,
@@ -154,6 +158,8 @@ def test_reasoning_trace_capabilities_only_mark_safe_summaries_as_displayable() 
     assert deepseek.requestable is False
     assert mistral.has_safe_summary is False
     assert mistral.continuation_state == "sensitive"
+    assert moonshot.adapter == "moonshot_reasoning"
+    assert moonshot.continuation_state == "sensitive"
     assert unknown.adapter == "openai_compat_passive"
     assert unknown.has_safe_summary is False
 

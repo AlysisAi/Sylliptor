@@ -22,6 +22,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Reworked Advanced role overrides into per-role editors with clear-to-inherit support for
   subagent and Forge model selections.
 - Made cache status and API-key storage descriptions easier to understand in the config UI.
+- Added first-class Moonshot/Kimi runtime support for K3, K2.7 Code,
+  K2.7 Code Highspeed, and K2.6, including provider-scoped context, output,
+  vision, reasoning, and global pricing metadata. Kimi requests now preserve
+  reasoning continuation state, apply each model family's supported thinking
+  and tool-choice shape, support resume-stable session cache affinity in
+  automatic cache mode, and normalize Moonshot's cached-token usage for cost reporting.
 
 ### Fixed
 

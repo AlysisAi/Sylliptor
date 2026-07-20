@@ -97,6 +97,7 @@ def build_prompt_cache_namespace(
     workspace_root: str | os.PathLike[str] | None = None,
     role: str | None = None,
     profile_name: str | None = None,
+    session_id: str | None = None,
 ) -> str | None:
     parts: list[tuple[str, str]] = []
     if workspace_root is not None:
@@ -107,6 +108,9 @@ def build_prompt_cache_namespace(
     normalized_profile = str(profile_name or "").strip().lower()
     if normalized_profile:
         parts.append(("profile", normalized_profile))
+    normalized_session = str(session_id or "").strip().lower()
+    if normalized_session:
+        parts.append(("session", normalized_session))
     if not parts:
         return None
     return json.dumps(parts, ensure_ascii=False, separators=(",", ":"))

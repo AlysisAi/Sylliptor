@@ -17,6 +17,7 @@ ANTHROPIC_MESSAGES_PROVIDER_METADATA_KEY = "anthropic_messages"
 GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY = "gemini_generate_content"
 GEMINI_INTERACTIONS_PROVIDER_METADATA_KEY = "gemini_interactions"
 MISTRAL_PROVIDER_METADATA_KEY = "mistral"
+MOONSHOT_PROVIDER_METADATA_KEY = "moonshot"
 MISTRAL_CONTENT_CHUNKS_KEY = "content_chunks"
 TOOL_CALL_PROVIDER_METADATA_KEY = "_tool_calls"
 DEEPSEEK_REASONING_CONTENT_KEY = "reasoning_content"
@@ -32,6 +33,9 @@ STATEFUL_PROVIDER_METADATA_KEYS = frozenset(
         # Mistral requires the full assistant content, including opaque
         # ThinkChunk/signature state, to be replayed on later same-route turns.
         MISTRAL_PROVIDER_METADATA_KEY,
+        # Kimi requires reasoning_content to be replayed for same-route
+        # multi-turn and tool continuations, including ordinary K3 replies.
+        MOONSHOT_PROVIDER_METADATA_KEY,
     }
 )
 _HIERARCHICAL_URL_RE = re.compile(

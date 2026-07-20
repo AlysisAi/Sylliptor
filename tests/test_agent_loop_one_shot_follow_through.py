@@ -40,6 +40,7 @@ from sylliptor_agent_cli.agent_loop import (
 )
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse, ToolCall
+from sylliptor_agent_cli.llm.types import AssistantResponsePhase
 from sylliptor_agent_cli.session_store import read_session_events
 from sylliptor_agent_cli.surface.noop_surface import NoopSurface
 from sylliptor_agent_cli.tools.availability import WEB_UNAVAILABLE_OBSERVATION
@@ -1110,6 +1111,9 @@ def test_one_shot_marker_matching_is_accent_insensitive_for_greek() -> None:
     blocker_unaccented = "δεν μπορω να προχωρησω, χρειαζομαι εγκριση."
     assert _assistant_text_has_blocker_marker(blocker_accented) is True
     assert _assistant_text_has_blocker_marker(blocker_unaccented) is True
+    assert _assistant_text_contains_progress_intent(
+        "The project now has a real Next.js site."
+    ) is False
 
 
 def test_one_shot_continues_after_non_final_progress_message(tmp_path: Path) -> None:
@@ -1186,6 +1190,122 @@ def test_one_shot_continues_after_non_final_progress_message(tmp_path: Path) -> 
     assert "one_shot_non_final_progress_detected" in event_types
     assert "continuation_nudge" in event_types
     assert "one_shot_completion_gate_incomplete_after_retries" not in event_types
+
+
+def test_provider_declared_final_answer_is_not_reclassified_from_nextjs_text(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(model="test-model", routing_mode="code_only")
+    sessions_dir = tmp_path / "sessions"
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=False,
+        verification_enabled=False,
+        session_log_dir_override=sessions_dir,
+        session_id_override="structured-final-phase",
+    )
+    final_text = "The project now has a real Next.js site and is ready to host locally."
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content=final_text,
+                tool_calls=[],
+                raw={},
+                assistant_phase=AssistantResponsePhase.FINAL_ANSWER,
+            )
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Inspect the repository and report what you find.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert session.client.calls == 1  # type: ignore[attr-defined]
+    events = list(read_session_events(sessions_dir / "structured-final-phase.jsonl"))
+    event_types = [event.get("type") for event in events]
+    assert "interactive_non_final_progress_detected" not in event_types
+    assert "continuation_nudge" not in event_types
+    assert "empty_model_response_model_control_anomaly" not in event_types
+
+
+def test_provider_declared_final_after_failed_service_tool_avoids_model_control(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(model="test-model", routing_mode="code_only")
+    sessions_dir = tmp_path / "sessions"
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=6,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=False,
+        verification_enabled=False,
+        session_log_dir_override=sessions_dir,
+        session_id_override="structured-final-after-service-failure",
+    )
+    session.tools["shell_service_start"] = ToolDef(
+        name="shell_service_start",
+        description="Start a durable local service.",
+        parameters={"type": "object", "properties": {}},
+        run=lambda _args: {"error": "Durable service tools are unavailable in this session."},
+    )
+    session.tool_list = [tool.as_openai_tool() for tool in session.tools.values()]
+    final_text = (
+        "I couldn't expose the Next.js site because the service runtime is unavailable. "
+        "Run npm run dev locally, then open http://localhost:3000."
+    )
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="Starting the Next.js development server.",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-service",
+                        name="shell_service_start",
+                        arguments={"cmd": "npm run dev"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content=final_text,
+                tool_calls=[],
+                raw={},
+                assistant_phase=AssistantResponsePhase.FINAL_ANSWER,
+            ),
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Host the website locally now.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert session.client.calls == 2  # type: ignore[attr-defined]
+    events = list(
+        read_session_events(sessions_dir / "structured-final-after-service-failure.jsonl")
+    )
+    event_types = [event.get("type") for event in events]
+    assert "tool_result" in event_types
+    assert "interactive_non_final_progress_detected" not in event_types
+    assert "continuation_nudge" not in event_types
+    assert "completion_gate_nudge" not in event_types
+    assert "empty_model_response_model_control_anomaly" not in event_types
+    assert "empty_model_response_anomaly_incomplete_after_retries" not in event_types
+    final_events = [event for event in events if event.get("type") == "final"]
+    assert final_events[-1]["payload"]["content"] == final_text
 
 
 def test_one_shot_plan_only_then_final_records_single_continuation_intervention(

@@ -25,7 +25,7 @@ from ...execution_deadline import (
 from ...failure_category import classify_failure_category, is_context_window_exceeded_error
 from ...llm.base import effective_tools_for_client
 from ...llm.metadata import assistant_message_from_response
-from ...llm.types import LLMError
+from ...llm.types import AssistantResponsePhase, LLMError
 from ...runtime_kind import RuntimeKind
 from ...step_budget import StepBudgetRequest, resolve_step_budget, step_budget_is_autonomous
 from ...subagents import SubagentDefinition, canonical_subagent_name, normalize_subagent_mode
@@ -4279,6 +4279,7 @@ def run_turn(
             and continuation_nudges_sent < MAX_NON_FINAL_CONTINUATIONS_PER_TURN
             and bool(final_text)
             and _assistant_text_contains_progress_intent(final_text)
+            and resp.assistant_phase is not AssistantResponsePhase.FINAL_ANSWER
             and not _assistant_text_has_completion_marker(final_text)
             and not _assistant_text_has_blocker_marker(final_text)
         )

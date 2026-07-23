@@ -154,6 +154,7 @@ Common keys:
 - `step_budget_policy`
 - `stream`
 - `routing_mode`
+- `route_arbitration_enabled`
 - `role_models.router`
 - `subagents_enabled`
 - `custom_tools_enabled`

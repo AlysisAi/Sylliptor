@@ -341,6 +341,9 @@ class AppConfig(BaseModel):
     chat_temperature: float = 0.7
     stream: bool = True
     routing_mode: str = "auto"  # auto|code_only
+    # Kill-switch for capability arbitration over router verdicts; env override
+    # SYLLIPTOR_ROUTE_ARBITRATION=off wins over the config value.
+    route_arbitration_enabled: bool = True
     step_budget_policy: str = AUTONOMOUS_STEP_BUDGET_POLICY
     task_max_steps: int = DEFAULT_TASK_MAX_STEPS
     subagent_max_steps: int = DEFAULT_SUBAGENT_MAX_STEPS
@@ -1362,6 +1365,7 @@ _SETTABLE_KEYS: set[str] = {
     "chat_temperature",
     "stream",
     "routing_mode",
+    "route_arbitration_enabled",
     "step_budget_policy",
     "subagents_enabled",
     "skills_enabled",
@@ -2416,6 +2420,16 @@ def set_config_value(
             raise ConfigError("routing_mode must be one of: auto, code_only")
         cfg.routing_mode = v
         return cfg
+
+    if key == "route_arbitration_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.route_arbitration_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.route_arbitration_enabled = False
+            return cfg
+        raise ConfigError("route_arbitration_enabled must be true/false")
 
     if key == "step_budget_policy":
         normalized = value.strip().lower()

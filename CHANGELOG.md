@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Added deterministic route arbitration so writable one-shot repository runs retain their
+  tool capabilities and interactive execute-class turns can recover from non-execute routing.
 - Redesigned the `/config` TUI with grouped sections, clearer per-setting summaries,
   cursor memory, cleaner provider/model pickers, and a single context-aware footer legend.
 - Added provider/model reasoning contracts so configuration only offers supported thinking

@@ -103,6 +103,7 @@ from ..prompt_context import (
 from ..routing import (
     _NON_REPO_TURN_SYSTEM_HINT,
     _ROUTING_MODE_AUTO,
+    _arbitrate_route_capability,
     _build_turn_language_system_message,
     _fallback_route_decision,
     _is_stream_unsupported_error,
@@ -121,8 +122,10 @@ from ..routing import (
     _resolve_degraded_route_execution_posture,
     _resolve_repo_turn_execution_intent,
     _respond_non_repo_turn,
+    _route_arbitration_enabled,
     _route_reply_for_non_repo_turn,
     _route_turn,
+    _router_intent_execution_disagreement,
     _safe_forced_tool_choice_for_recovery,
     _should_add_non_repo_turn_hint,
     _TurnRouteDecision,
@@ -1634,6 +1637,105 @@ def run_turn(
                     **_local_materialization_payload(),
                 },
             )
+        # Capability arbitration: routing decides which capabilities are
+        # provisioned, not what the agent must do. Operates only on classifier
+        # outputs and runtime facts; the disagreement metric is logged on every
+        # turn regardless of the kill-switch so raw router error rate stays
+        # measurable.
+        route_arbitration_enabled = _route_arbitration_enabled(self.cfg)
+        session_runtime_kind = str(getattr(self, "runtime_kind", "") or "")
+        arbitration_interactive = not self.one_shot_execution and (
+            not session_runtime_kind or session_runtime_kind == RuntimeKind.INTERACTIVE_CHAT.value
+        )
+        arbitration_workspace_writable = (
+            str(getattr(self, "mode", "") or "").strip().lower() != "readonly"
+        )
+        # None (not False) when the decision is fallback-sourced: with no
+        # independent router verdict there is no router error to measure, and
+        # counting these turns would inflate the disagreement rate.
+        router_intent_disagreement = (
+            None
+            if original_route_decision_source.startswith("fallback")
+            else _router_intent_execution_disagreement(
+                route=original_route,
+                execution_posture=original_route_execution_posture,
+                classified_turn_intent=str(one_shot_turn_intent),
+            )
+        )
+        route_arbitration_verdict = _arbitrate_route_capability(
+            route=route_decision.route,
+            execution_posture=route_execution_posture,
+            classified_turn_intent=str(one_shot_turn_intent),
+            workspace_is_repo_backed=_workspace_kind_is_repo_backed(self.store.workspace_kind),
+            workspace_writable=arbitration_workspace_writable,
+            interactive=arbitration_interactive,
+            decision_source=str(getattr(route_decision, "decision_source", "") or "router"),
+        )
+        route_arbitrated = False
+        route_arbitration_rule = None
+        # Power Mode's answer-production choice (chat-answer capsule vs repo
+        # swarm) keeps seeing the pre-arbitration route: arbitration provisions
+        # capabilities, it does not re-scope which turns Power Mode treats as
+        # conversational. Without this, an escalated general question would
+        # silently launch the multi-candidate repo swarm.
+        power_mode_shadow_route = route_decision.route
+        if route_arbitration_verdict.override and route_arbitration_enabled:
+            route_arbitrated = True
+            route_arbitration_rule = route_arbitration_verdict.rule
+            arbitration_original_route = route_decision.route
+            arbitration_original_posture = route_execution_posture
+            arbitration_route_changed = route_arbitration_verdict.route != route_decision.route
+            arbitration_posture_changed = (
+                route_arbitration_verdict.execution_posture != route_execution_posture
+            )
+            self.store.append(
+                "route_arbitration_override",
+                {
+                    "rule": route_arbitration_rule,
+                    "pre_arbitration_route": arbitration_original_route,
+                    "pre_arbitration_execution_posture": arbitration_original_posture,
+                    "confidence": route_decision.confidence,
+                    "arbitrated_route": route_arbitration_verdict.route,
+                    "arbitrated_execution_posture": (route_arbitration_verdict.execution_posture),
+                    "signals": {
+                        "workspace_kind": str(self.store.workspace_kind or ""),
+                        "workspace_writable": arbitration_workspace_writable,
+                        "interactive": arbitration_interactive,
+                        "runtime_kind": session_runtime_kind,
+                        "one_shot_execution": bool(self.one_shot_execution),
+                        "classified_turn_intent": one_shot_turn_intent,
+                        "classified_turn_intent_kind": classified_turn_intent_kind,
+                        "router_route": original_route,
+                        "router_execution_posture": original_route_execution_posture,
+                        "router_confidence": original_route_decision.confidence,
+                        "router_decision_source": original_route_decision_source,
+                        "router_intent_execution_disagreement": (router_intent_disagreement),
+                    },
+                },
+            )
+            route_decision = _TurnRouteDecision(
+                route=route_arbitration_verdict.route,
+                execution_posture=route_arbitration_verdict.execution_posture,
+                confidence=route_decision.confidence,
+                reply="",
+                language=route_decision.language,
+                script=route_decision.script,
+                explicit_language_override=route_decision.explicit_language_override,
+                language_source=route_decision.language_source,
+                decision_source=route_decision.decision_source,
+                execution_posture_source=(
+                    "route_arbitration"
+                    if arbitration_posture_changed
+                    else route_execution_posture_source
+                ),
+                tool_family=getattr(route_decision, "tool_family", "none"),
+                tool_candidates=tuple(getattr(route_decision, "tool_candidates", ()) or ()),
+            )
+            if arbitration_route_changed:
+                route_selection_source = "route_arbitration"
+            route_execution_posture = route_arbitration_verdict.execution_posture
+            if arbitration_posture_changed:
+                route_execution_posture_source = "route_arbitration"
         self.store.append(
             "route_decision",
             {
@@ -1662,6 +1764,11 @@ def run_turn(
                 "classified_turn_intent": one_shot_turn_intent,
                 "classified_turn_intent_kind": classified_turn_intent_kind,
                 "route_override_reason": route_override_reason,
+                "arbitrated": route_arbitrated,
+                "original_execution_posture": original_route_execution_posture,
+                "route_arbitration_rule": route_arbitration_rule,
+                "route_arbitration_enabled": route_arbitration_enabled,
+                "router_intent_execution_disagreement": router_intent_disagreement,
                 **_local_materialization_payload(),
                 "route_context": (
                     route_context.to_payload() if route_context is not None else None
@@ -1801,6 +1908,9 @@ def run_turn(
     else:
         one_shot_turn_intent = _classify_one_shot_repo_turn_intent(instruction)
         route_execution_posture = str(one_shot_turn_intent or "execute")
+        route_arbitrated = False
+        route_arbitration_rule = None
+        power_mode_shadow_route = "repo"
         self.store.append(
             "language_decision",
             {
@@ -1847,7 +1957,6 @@ def run_turn(
         route_execution_posture=route_execution_posture,
         classified_turn_intent=one_shot_turn_intent,
     )
-
     execution_safeguards_enabled = repo_turn_execution_intent == "execute"
     resolved_turn_intent_kind = (
         "mutating_execution" if execution_safeguards_enabled else "read_only"
@@ -1868,6 +1977,8 @@ def run_turn(
             ),
             "router_execution_posture": route_execution_posture,
             "execution_safeguards_enabled": execution_safeguards_enabled,
+            "route_arbitrated": route_arbitrated,
+            "route_arbitration_rule": route_arbitration_rule,
             **_local_materialization_payload(),
         },
     )

@@ -347,6 +347,15 @@ class AppConfig(BaseModel):
     # Kill-switch for the fact-based completion-evidence classifier (evidence v2);
     # env override SYLLIPTOR_EVIDENCE_V2=off reverts to legacy string-shape evidence.
     evidence_v2_enabled: bool = True
+    # Kill-switch for the baseline-first regression protocol (step 3); env override
+    # SYLLIPTOR_REGRESSION_BASELINE=off keeps capture/telemetry but reverts the
+    # completion-gate policy to legacy (no regression/unattributed attribution).
+    regression_baseline_enabled: bool = True
+    # Kill-switch for turn-contract v2 (step 4: apply-don't-advise + spec literalism);
+    # env override SYLLIPTOR_TURN_CONTRACT_V2=off keeps expectation extraction/telemetry
+    # but reverts the completion-gate policy (no expectations_unaddressed / advisory
+    # completion enforcement). Prompt additions are unconditional either way.
+    turn_contract_v2_enabled: bool = True
     step_budget_policy: str = AUTONOMOUS_STEP_BUDGET_POLICY
     task_max_steps: int = DEFAULT_TASK_MAX_STEPS
     subagent_max_steps: int = DEFAULT_SUBAGENT_MAX_STEPS
@@ -1370,6 +1379,8 @@ _SETTABLE_KEYS: set[str] = {
     "routing_mode",
     "route_arbitration_enabled",
     "evidence_v2_enabled",
+    "regression_baseline_enabled",
+    "turn_contract_v2_enabled",
     "step_budget_policy",
     "subagents_enabled",
     "skills_enabled",
@@ -2444,6 +2455,26 @@ def set_config_value(
             cfg.evidence_v2_enabled = False
             return cfg
         raise ConfigError("evidence_v2_enabled must be true/false")
+
+    if key == "regression_baseline_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.regression_baseline_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.regression_baseline_enabled = False
+            return cfg
+        raise ConfigError("regression_baseline_enabled must be true/false")
+
+    if key == "turn_contract_v2_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.turn_contract_v2_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.turn_contract_v2_enabled = False
+            return cfg
+        raise ConfigError("turn_contract_v2_enabled must be true/false")
 
     if key == "step_budget_policy":
         normalized = value.strip().lower()

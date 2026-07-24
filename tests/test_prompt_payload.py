@@ -210,9 +210,10 @@ def test_interactive_bootstrap_payload_stays_bounded(tmp_path: Path) -> None:
     try:
         messages_json = json.dumps(session.messages, ensure_ascii=True)
         tools_json = json.dumps(session.tool_list, ensure_ascii=True)
-        # Bound rebased after immutable-test and execution-evidence guidance grew
-        # the interactive prompt; keep ~5% headroom over the measured size.
-        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 7200
+        # Budget tripwire, not a correctness bound. Rebased after the turn-contract
+        # v2 apply-and-verify norms were added to the base prompt; keep ~5% headroom
+        # over the measured size (7440).
+        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 7800
     finally:
         session.close()
 
@@ -283,9 +284,10 @@ def test_one_shot_bootstrap_payload_stays_bounded(tmp_path: Path) -> None:
     try:
         messages_json = json.dumps(session.messages, ensure_ascii=True)
         tools_json = json.dumps(session.tool_list, ensure_ascii=True)
-        # Bound rebased after repo-map/test-discovery schemas and execution-evidence
-        # guidance grew the one-shot prompt; keep ~5% headroom over the measured size.
-        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 8100
+        # Budget tripwire, not a correctness bound. Rebased after the turn-contract
+        # v2 apply-and-verify norms were added to the base prompt; keep ~5% headroom
+        # over the measured size (8176).
+        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 8600
     finally:
         session.close()
 

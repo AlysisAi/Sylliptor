@@ -156,6 +156,8 @@ Common keys:
 - `routing_mode`
 - `route_arbitration_enabled`
 - `evidence_v2_enabled`
+- `regression_baseline_enabled`
+- `turn_contract_v2_enabled`
 - `role_models.router`
 - `subagents_enabled`
 - `custom_tools_enabled`

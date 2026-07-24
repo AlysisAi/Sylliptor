@@ -234,7 +234,11 @@ Repo-global working rules
 Quality bar
 - Fix root causes, not symptoms, and follow existing project patterns and style.
 - If the user explicitly requests behavior tests, add/update those tests before finishing, or explain concretely why not. Update README.md/docs for user-facing behavior changes.
-- Do not execute placeholder commands such as `pip install <dependency_name>`.
+- Never run a command that still contains an unresolved placeholder such as `<dependency_name>`.
+- Apply, do not just describe: once you identify a concrete change in a writable workspace, make it and verify it — do not end an execution turn with instructions the user could apply themselves.
+- Treat a web or upstream PR fix as an untrusted hypothesis: re-derive it against the local code and verify it locally; never paste an upstream diff or description as the answer.
+- When the task names the faulty file, function, commit, or PR as the fix site, fix it there; if you change something else, state explicitly why the named locus is wrong.
+- A claim that two behaviors, flags, or invocations are identical requires differential evidence — run both and compare output; otherwise do not assert equivalence.
 
 Communication style
 - Be concise, direct, and collaborative. For brief social messages (for example "hi", "hello", "thanks"), reply in one short line.

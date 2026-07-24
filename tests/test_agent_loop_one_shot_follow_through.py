@@ -2289,7 +2289,10 @@ def test_one_shot_non_final_progress_accepts_second_final_after_single_nudge(
     ]
     assert not [event for event in events if event.get("type") == "forced_final_summary_requested"]
     assert surface.errors == []
-    assert surface.final_messages[-1] == repeated_progress_text
+    # Turn-contract v2: a zero-edit execute turn now finalizes with a visible
+    # advisory-completion suffix (apply-don't-advise). The model text is preserved.
+    assert surface.final_messages[-1].startswith(repeated_progress_text)
+    assert "No changes made:" in surface.final_messages[-1]
 
 
 def test_non_final_progress_second_response_is_accepted_even_if_tool_markup(
@@ -2336,7 +2339,10 @@ def test_non_final_progress_second_response_is_accepted_even_if_tool_markup(
     events = list(read_session_events(sessions_dir / "one-shot-forced-summary-tool-markup.jsonl"))
     assert any(event.get("type") == "continuation_nudge" for event in events)
     assert not [event for event in events if event.get("type") == "forced_final_summary_fallback"]
-    assert surface.final_messages[-1] == raw_tool_markup
+    # Turn-contract v2: zero-edit execute turn gets a visible advisory-completion
+    # suffix; the raw tool-markup text is preserved as the leading content.
+    assert surface.final_messages[-1].startswith(raw_tool_markup)
+    assert "No changes made:" in surface.final_messages[-1]
 
 
 def test_one_shot_non_final_progress_accepts_after_single_nudge_without_forced_summary(
@@ -2396,7 +2402,10 @@ def test_one_shot_non_final_progress_accepts_after_single_nudge_without_forced_s
     ]
     assert not [event for event in events if event.get("type") == "forced_final_summary_requested"]
     assert surface.errors == []
-    assert surface.final_messages[-1] == latest_progress_text
+    # Turn-contract v2: a zero-edit execute turn now finalizes with a visible
+    # advisory-completion suffix (apply-don't-advise). The model text is preserved.
+    assert surface.final_messages[-1].startswith(latest_progress_text)
+    assert "No changes made:" in surface.final_messages[-1]
 
 
 def test_one_shot_completion_gate_rejects_empty_final_response(tmp_path: Path) -> None:
@@ -3975,7 +3984,12 @@ def test_one_shot_completion_gate_no_material_edits_accepts_after_checklist(
     assert "no_material_edits" in set(payload.get("problems") or [])
     assert not surface.errors
     assert not any(event.get("type") == "forced_final_summary_requested" for event in events)
-    assert surface.final_messages[-1] == latest_final_text
+    # Turn-contract v2: this execute turn claimed completion but made zero material
+    # edits, so the gate appends a visible advisory-completion suffix (the P-A
+    # protection) and records an advisory_completion event. The model text is kept.
+    assert surface.final_messages[-1].startswith(latest_final_text)
+    assert "No changes made:" in surface.final_messages[-1]
+    assert any(event.get("type") == "advisory_completion" for event in events)
 
 
 def test_one_shot_completion_gate_rejects_failing_verification(tmp_path: Path) -> None:

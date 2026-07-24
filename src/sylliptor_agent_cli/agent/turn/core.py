@@ -100,6 +100,7 @@ from ..prompt_context import (
     _workspace_kind_is_repo_backed,
     refresh_session_task_brief_message,
 )
+from ..regression_baseline import _regression_baseline_enabled
 from ..routing import (
     _NON_REPO_TURN_SYSTEM_HINT,
     _ROUTING_MODE_AUTO,
@@ -136,9 +137,16 @@ from ..tools_assembly import (
     ToolDef,
     _tool_event_metadata,
 )
+from ..turn_contract import (
+    _turn_contract_v2_enabled,
+    build_advisory_completion_summary,
+    build_unconfirmed_expectations_marker,
+    resolve_advisory_completion,
+)
 from ..verification import (
     EVIDENCE_REPAIR_ROUND_BOUND,
     HONEST_UNVERIFIED_FINALIZATION_MARKER,
+    REGRESSION_BASELINE_PRE_EDIT_ADVISORY,
     TurnExecutionState,
     _completion_gate_blocker_allows_final,
     _completion_gate_nudge_message,
@@ -155,6 +163,8 @@ from ..verification import (
     _sorted_missing_verification_commands,
     _successful_verification_claim_kind,
     _verification_expected_for_turn,
+    build_regressions_unresolved_marker,
+    build_unattributed_failures_marker,
 )
 from ..verification_evidence import _evidence_v2_enabled
 from .events import (
@@ -2202,6 +2212,21 @@ def run_turn(
         if self.one_shot_execution
         else "interactive_completion_gate_unverified_finalized"
     )
+    completion_gate_regressions_unresolved_event = (
+        "one_shot_completion_gate_regressions_unresolved"
+        if self.one_shot_execution
+        else "interactive_completion_gate_regressions_unresolved"
+    )
+    completion_gate_unattributed_event = (
+        "one_shot_completion_gate_unattributed_failures"
+        if self.one_shot_execution
+        else "interactive_completion_gate_unattributed_failures"
+    )
+    completion_gate_expectations_unaddressed_event = (
+        "one_shot_completion_gate_expectations_unconfirmed"
+        if self.one_shot_execution
+        else "interactive_completion_gate_expectations_unconfirmed"
+    )
     non_final_progress_detected_event = (
         "one_shot_non_final_progress_detected"
         if self.one_shot_execution
@@ -2252,6 +2277,9 @@ def run_turn(
     clarification_advisory_sent = False
     finalization_checklist_sent = False
     honest_unverified_finalization = False
+    regressions_unresolved_finalization = False
+    unattributed_failures_finalization = False
+    expectations_unconfirmed_finalization = False
     blocking_finalization_correctives_sent = 0
     existing_test_edit_violation_count = 0
     existing_test_edit_forced_logged = False
@@ -2508,6 +2536,30 @@ def run_turn(
 
     def _acceptance_contract_fields() -> dict[str, Any]:
         return acceptance_contract_problem_payload(execution_state.acceptance_contract)
+
+    def _unaddressed_expectation_details() -> list[str]:
+        # Turn-contract v2: name each unaddressed expectation (id + a short quote of
+        # its text) so the repair nudge is concrete rather than generic.
+        assessment = execution_state.latest_expectation_assessment or {}
+        unaddressed = list(assessment.get("unaddressed") or [])
+        if not unaddressed:
+            return []
+        contract = execution_state.acceptance_contract
+        by_id = {
+            expectation.expectation_id: expectation
+            for expectation in (contract.expectations if contract is not None else [])
+        }
+        details: list[str] = []
+        for expectation_id in unaddressed:
+            expectation = by_id.get(expectation_id)
+            if expectation is None:
+                details.append(str(expectation_id))
+                continue
+            text = " ".join(str(expectation.text).split())
+            if len(text) > 80:
+                text = text[:77] + "..."
+            details.append(f"{expectation_id}: {text}")
+        return details
 
     def _stagnation_budget_state_payload() -> dict[str, Any]:
         active: dict[str, Any] = {
@@ -3726,6 +3778,44 @@ def run_turn(
                     verification_authoritative=bool(self.verification_authoritative),
                     evidence_v2=_evidence_v2_enabled(self.cfg),
                 )
+                # Baseline-first regression protocol (step 3): drain captured test
+                # runs to telemetry. Baselines carry the pre-edit facts attribution
+                # needs; capture happens regardless of the kill-switch.
+                if execution_state.pending_regression_capture_events:
+                    for capture_event in execution_state.pending_regression_capture_events:
+                        self.store.append(
+                            "test_baseline_captured",
+                            {
+                                "step": step,
+                                "runtime_kind": self.runtime_kind.value,
+                                **capture_event,
+                            },
+                        )
+                    execution_state.pending_regression_capture_events.clear()
+                # Pre-edit baseline nudge (advisory, at most once per turn): the
+                # first verification-relevant edit just landed with no baseline for
+                # any known verification-contract command. Never blocks the edit.
+                regression_baseline_pre_edit_note = ""
+                regression_baseline_pre_edit_payload: dict[str, Any] | None = None
+                if (
+                    _regression_baseline_enabled(self.cfg)
+                    and execution_safeguards_enabled
+                    and not execution_state.regression_baseline_pre_edit_nudge_sent
+                    and verification_relevant_generation_before_tool == 0
+                    and execution_state.verification_relevant_edit_generation >= 1
+                    and known_verification_commands
+                    and not execution_state.has_baseline_for_any(known_verification_commands)
+                ):
+                    execution_state.regression_baseline_pre_edit_nudge_sent = True
+                    regression_baseline_pre_edit_note = REGRESSION_BASELINE_PRE_EDIT_ADVISORY
+                    regression_baseline_pre_edit_payload = {
+                        "tool": effective_tool_name,
+                        "requested_tool": tc.name,
+                        "tool_call_id": tc.id,
+                        "step": step,
+                        "known_verification_commands": list(known_verification_commands),
+                        "message": REGRESSION_BASELINE_PRE_EDIT_ADVISORY,
+                    }
                 verified_state_invalidation_note = ""
                 verified_state_invalidation_payload: dict[str, Any] | None = None
                 if (
@@ -3965,6 +4055,18 @@ def run_turn(
                         detail="verified_state_invalidated_by_edit",
                         step=step,
                         metadata=verified_state_invalidation_payload,
+                    )
+                if regression_baseline_pre_edit_payload is not None:
+                    self.store.append(
+                        "regression_baseline_pre_edit_nudge",
+                        regression_baseline_pre_edit_payload,
+                    )
+                    _append_controller_system_message(
+                        regression_baseline_pre_edit_note,
+                        intervention_class="other",
+                        detail="regression_baseline_pre_edit_advisory",
+                        step=step,
+                        metadata=regression_baseline_pre_edit_payload,
                     )
                 self._append_hook_messages(
                     event_name="tool_hook_context",
@@ -5113,7 +5215,48 @@ def run_turn(
                     ),
                     evidence_v2=_evidence_v2_enabled(self.cfg),
                     turn_intent=completion_gate_turn_intent,
+                    regression_baseline_enabled=_regression_baseline_enabled(self.cfg),
+                    turn_contract_v2_enabled=_turn_contract_v2_enabled(self.cfg),
                 )
+                # Turn-contract v2 (step 4): surface any expected-output literal an
+                # observed post-edit run confirmed (supporting evidence for a
+                # confirmed disposition).
+                if execution_state.latest_expectation_evidence:
+                    self.store.append(
+                        "expectation_evidence",
+                        {
+                            "step": step,
+                            "runtime_kind": self.runtime_kind.value,
+                            "evidence": list(execution_state.latest_expectation_evidence),
+                            "assessment": dict(execution_state.latest_expectation_assessment),
+                            **_turn_intent_payload(
+                                completion_gate_turn_intent=completion_gate_turn_intent,
+                            ),
+                        },
+                    )
+                # Baseline-first regression protocol (step 3): surface the
+                # mechanical attribution (pre-existing / regression / unattributed /
+                # agent-authored) whenever any failing test was classified.
+                if execution_state.latest_regression_diff and any(
+                    execution_state.latest_regression_diff.get(key)
+                    for key in (
+                        "regressions",
+                        "unattributed",
+                        "pre_existing",
+                        "agent_authored",
+                    )
+                ):
+                    self.store.append(
+                        "regression_diff",
+                        {
+                            "step": step,
+                            "runtime_kind": self.runtime_kind.value,
+                            **execution_state.latest_regression_diff,
+                            **_turn_intent_payload(
+                                completion_gate_turn_intent=completion_gate_turn_intent,
+                            ),
+                        },
+                    )
                 live_background_processes = _live_background_processes_at_finalization()
                 spec_faithfulness_advisory_needed = bool(
                     live_background_processes > 0
@@ -5305,6 +5448,18 @@ def run_turn(
                         )
                         and not execution_state.has_post_edit_execution_evidence()
                     )
+                    regression_deficit = bool(
+                        _regression_baseline_enabled(self.cfg)
+                        and gate_stage == "regressions_detected"
+                    )
+                    unattributed_deficit = bool(
+                        _regression_baseline_enabled(self.cfg)
+                        and gate_stage == "unattributed_failures"
+                    )
+                    expectations_deficit = bool(
+                        _turn_contract_v2_enabled(self.cfg)
+                        and gate_stage == "expectations_unaddressed"
+                    )
                     if ordering_evidence_deficit:
                         # A post-edit execution-evidence deficit is action-only:
                         # prose cannot clear it, only a new qualifying run can. Nudge
@@ -5319,6 +5474,51 @@ def run_turn(
                         ):
                             accept_open_problems_now = True
                             honest_unverified_finalization = True
+                        else:
+                            accept_open_problems_now = False
+                    elif regression_deficit:
+                        # Regressions the change introduced are action-only: prose
+                        # cannot clear them, only making the named tests pass can.
+                        # Same bound as the evidence deficit; then finalize honestly
+                        # with a visible REGRESSIONS UNRESOLVED marker (fail honest).
+                        regression_repair_rounds = (
+                            execution_state.completion_gate_regression_repair_attempts
+                        )
+                        if (
+                            regression_repair_rounds >= EVIDENCE_REPAIR_ROUND_BOUND
+                            or _step_limit_reached(step)
+                        ):
+                            accept_open_problems_now = True
+                            regressions_unresolved_finalization = True
+                        else:
+                            accept_open_problems_now = False
+                    elif unattributed_deficit:
+                        # Unattributed failures need a fact (a rerun of the
+                        # baseline-known command) to be attributed. One repair round,
+                        # then finalize honestly with an UNATTRIBUTED FAILURES marker.
+                        unattributed_repair_rounds = (
+                            execution_state.completion_gate_unattributed_repair_attempts
+                        )
+                        if unattributed_repair_rounds >= 1 or _step_limit_reached(step):
+                            accept_open_problems_now = True
+                            unattributed_failures_finalization = True
+                        else:
+                            accept_open_problems_now = False
+                    elif expectations_deficit:
+                        # Turn-contract v2: task-named expectations neither confirmed
+                        # nor disposed. Action-only — editing the named locus or
+                        # producing the expected output clears it, prose cannot. Same
+                        # bound as the evidence/regression deficits; then finalize
+                        # honestly with a visible UNCONFIRMED EXPECTATIONS marker.
+                        expectations_repair_rounds = (
+                            execution_state.completion_gate_expectations_repair_attempts
+                        )
+                        if (
+                            expectations_repair_rounds >= EVIDENCE_REPAIR_ROUND_BOUND
+                            or _step_limit_reached(step)
+                        ):
+                            accept_open_problems_now = True
+                            expectations_unconfirmed_finalization = True
                         else:
                             accept_open_problems_now = False
                     else:
@@ -5356,6 +5556,9 @@ def run_turn(
                                     execution_state.latest_completion_certificate
                                 ),
                                 "honest_unverified": honest_unverified_finalization,
+                                "regressions_unresolved": regressions_unresolved_finalization,
+                                "unattributed_failures": unattributed_failures_finalization,
+                                "expectations_unconfirmed": expectations_unconfirmed_finalization,
                                 "post_edit_execution_evidence_present": (
                                     execution_state.has_post_edit_execution_evidence()
                                 ),
@@ -5406,6 +5609,187 @@ def run_turn(
                                 final_text = (
                                     final_text or ""
                                 ) + HONEST_UNVERIFIED_FINALIZATION_MARKER
+                        if regressions_unresolved_finalization:
+                            # Fail honest: regressions the change introduced that a
+                            # bounded action-only repair could not resolve are not
+                            # silently accepted. Distinct event + visible marker.
+                            regression_diff_payload = dict(
+                                execution_state.latest_regression_diff
+                            )
+                            regressed_ids = list(
+                                regression_diff_payload.get("regressions") or []
+                            )
+                            regression_baseline_command = str(
+                                regression_diff_payload.get("baseline_command") or ""
+                            )
+                            self.store.append(
+                                completion_gate_regressions_unresolved_event,
+                                {
+                                    "step": step,
+                                    "runtime_kind": self.runtime_kind.value,
+                                    "stage": gate_stage,
+                                    "problems": gate_problems,
+                                    "problem_summary": _completion_gate_problem_summary(
+                                        gate_problems
+                                    ),
+                                    "regressions": regressed_ids,
+                                    "baseline_command": regression_baseline_command,
+                                    "regression_repair_rounds": (
+                                        execution_state.completion_gate_regression_repair_attempts
+                                    ),
+                                    "regression_repair_round_bound": EVIDENCE_REPAIR_ROUND_BOUND,
+                                    "regression_diff": regression_diff_payload,
+                                    "completion_certificate": dict(
+                                        execution_state.latest_completion_certificate
+                                    ),
+                                    "content": final_text,
+                                    **_turn_intent_payload(
+                                        completion_gate_turn_intent=completion_gate_turn_intent,
+                                    ),
+                                    **_verification_evidence_fields(),
+                                    **_acceptance_contract_fields(),
+                                },
+                            )
+                            regression_marker = build_regressions_unresolved_marker(
+                                regressed_ids,
+                                baseline_command=regression_baseline_command,
+                            )
+                            if regression_marker.strip() and regression_marker not in (
+                                final_text or ""
+                            ):
+                                final_text = (final_text or "") + regression_marker
+                        if unattributed_failures_finalization:
+                            # Fail honest: failures whose relationship to the change
+                            # could not be established are finalized as UNATTRIBUTED,
+                            # never as silent success.
+                            regression_diff_payload = dict(
+                                execution_state.latest_regression_diff
+                            )
+                            unattributed_ids = list(
+                                regression_diff_payload.get("unattributed") or []
+                            )
+                            self.store.append(
+                                completion_gate_unattributed_event,
+                                {
+                                    "step": step,
+                                    "runtime_kind": self.runtime_kind.value,
+                                    "stage": gate_stage,
+                                    "problems": gate_problems,
+                                    "problem_summary": _completion_gate_problem_summary(
+                                        gate_problems
+                                    ),
+                                    "unattributed_failures": unattributed_ids,
+                                    "unattributed_repair_rounds": (
+                                        execution_state.completion_gate_unattributed_repair_attempts
+                                    ),
+                                    "regression_diff": regression_diff_payload,
+                                    "completion_certificate": dict(
+                                        execution_state.latest_completion_certificate
+                                    ),
+                                    "content": final_text,
+                                    **_turn_intent_payload(
+                                        completion_gate_turn_intent=completion_gate_turn_intent,
+                                    ),
+                                    **_verification_evidence_fields(),
+                                    **_acceptance_contract_fields(),
+                                },
+                            )
+                            unattributed_marker = build_unattributed_failures_marker(
+                                unattributed_ids
+                            )
+                            if unattributed_marker.strip() and unattributed_marker not in (
+                                final_text or ""
+                            ):
+                                final_text = (final_text or "") + unattributed_marker
+                        if expectations_unconfirmed_finalization:
+                            # Fail honest (turn-contract v2): task-named expectations
+                            # neither confirmed by observed evidence nor disposed are
+                            # finalized as UNCONFIRMED, never as silent success.
+                            assessment_payload = dict(
+                                execution_state.latest_expectation_assessment
+                            )
+                            unaddressed_expectation_ids = list(
+                                assessment_payload.get("unaddressed") or []
+                            )
+                            self.store.append(
+                                completion_gate_expectations_unaddressed_event,
+                                {
+                                    "step": step,
+                                    "runtime_kind": self.runtime_kind.value,
+                                    "stage": gate_stage,
+                                    "problems": gate_problems,
+                                    "problem_summary": _completion_gate_problem_summary(
+                                        gate_problems
+                                    ),
+                                    "unaddressed_expectations": unaddressed_expectation_ids,
+                                    "expectations_repair_rounds": (
+                                        execution_state.completion_gate_expectations_repair_attempts
+                                    ),
+                                    "expectations_repair_round_bound": EVIDENCE_REPAIR_ROUND_BOUND,
+                                    "expectation_assessment": assessment_payload,
+                                    "completion_certificate": dict(
+                                        execution_state.latest_completion_certificate
+                                    ),
+                                    "content": final_text,
+                                    **_turn_intent_payload(
+                                        completion_gate_turn_intent=completion_gate_turn_intent,
+                                    ),
+                                    **_verification_evidence_fields(),
+                                    **_acceptance_contract_fields(),
+                                },
+                            )
+                            expectations_marker = build_unconfirmed_expectations_marker(
+                                unaddressed_expectation_ids
+                            )
+                            if expectations_marker.strip() and expectations_marker not in (
+                                final_text or ""
+                            ):
+                                final_text = (final_text or "") + expectations_marker
+                        if (
+                            _turn_contract_v2_enabled(self.cfg)
+                            and gate_stage == "no_material_edits"
+                            and (self.one_shot_execution or completion_gate_turn_intent == "execute")
+                            and not honest_unverified_finalization
+                            and not regressions_unresolved_finalization
+                            and not unattributed_failures_finalization
+                            and not expectations_unconfirmed_finalization
+                        ):
+                            # Apply-don't-advise (turn-contract v2): an execute-intent
+                            # turn finalizing with zero material edits must record an
+                            # explicit advisory-completion reason, surfaced in the
+                            # summary. Never silent — the gate always resolves one.
+                            advisory = resolve_advisory_completion(
+                                execution_state.recorded_advisory_completion
+                            )
+                            self.store.append(
+                                "advisory_completion",
+                                {
+                                    "step": step,
+                                    "runtime_kind": self.runtime_kind.value,
+                                    "stage": gate_stage,
+                                    "reason": advisory.reason.value,
+                                    "explanation": advisory.explanation,
+                                    "material_edit_count": execution_state.material_edit_count,
+                                    "no_material_edits_repair_rounds": (
+                                        execution_state.completion_gate_no_material_edits_repair_attempts
+                                    ),
+                                    "completion_certificate": dict(
+                                        execution_state.latest_completion_certificate
+                                    ),
+                                    "content": final_text,
+                                    **_turn_intent_payload(
+                                        completion_gate_turn_intent=completion_gate_turn_intent,
+                                    ),
+                                    **_acceptance_contract_fields(),
+                                },
+                            )
+                            advisory_summary = build_advisory_completion_summary(
+                                advisory.reason, advisory.explanation
+                            )
+                            if advisory_summary.strip() and advisory_summary not in (
+                                final_text or ""
+                            ):
+                                final_text = (final_text or "") + advisory_summary
                     else:
                         self.store.append(
                             completion_gate_failed_event,
@@ -5434,6 +5818,7 @@ def run_turn(
                                 else "after your last edit"
                             )
                             execution_evidence_missing_detail = f"{where} (step {step})"
+                        regression_diff_for_nudge = dict(execution_state.latest_regression_diff)
                         nudge = _completion_gate_nudge_message(
                             gate_problems,
                             prefix_key=completion_gate_nudge_prefix_key,
@@ -5455,6 +5840,16 @@ def run_turn(
                             one_shot_execution=self.one_shot_execution,
                             live_background_processes=live_background_processes,
                             execution_evidence_missing_detail=execution_evidence_missing_detail,
+                            regression_ids=list(
+                                regression_diff_for_nudge.get("regressions") or []
+                            ),
+                            regression_baseline_command=str(
+                                regression_diff_for_nudge.get("baseline_command") or ""
+                            ),
+                            unattributed_ids=list(
+                                regression_diff_for_nudge.get("unattributed") or []
+                            ),
+                            expectation_details=_unaddressed_expectation_details(),
                         )
                         if _nudge_would_repeat_without_progress(nudge, decision):
                             self.store.append(

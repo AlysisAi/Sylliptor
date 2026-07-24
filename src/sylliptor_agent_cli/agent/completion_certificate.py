@@ -39,6 +39,15 @@ class CompletionCertificate:
     failed_hard_criterion_ids: tuple[str, ...] = tuple()
     evidence_hierarchy: tuple[str, ...] = tuple()
     reason: str = ""
+    # Baseline-first regression attribution (step 3): failing test ids mechanically
+    # split against the pre-edit same-command baseline. pre_existing/agent_authored
+    # do not block; regressions/unattributed do (see gate policy).
+    regressions: tuple[str, ...] = tuple()
+    unattributed_failures: tuple[str, ...] = tuple()
+    pre_existing_failures: tuple[str, ...] = tuple()
+    agent_authored_failures: tuple[str, ...] = tuple()
+    # Turn-contract v2 (step 4): expectation ids left unaddressed at the gate.
+    expectations_unaddressed: tuple[str, ...] = tuple()
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -49,6 +58,11 @@ class CompletionCertificate:
             "failed_hard_criterion_ids": list(self.failed_hard_criterion_ids),
             "evidence_hierarchy": list(self.evidence_hierarchy),
             "reason": self.reason,
+            "regressions": list(self.regressions),
+            "unattributed_failures": list(self.unattributed_failures),
+            "pre_existing_failures": list(self.pre_existing_failures),
+            "agent_authored_failures": list(self.agent_authored_failures),
+            "expectations_unaddressed": list(self.expectations_unaddressed),
         }
 
 
@@ -74,6 +88,26 @@ class CompletionCertificateInput:
     # verification contract exists.
     execution_evidence_required: bool = False
     post_edit_execution_evidence_present: bool = False
+    # Baseline-first regression attribution (step 3). The four lists are the
+    # aggregated diff of post-edit test failures vs the same-command pre-edit
+    # baseline. ``regression_attribution_supersedes_last_failure`` is True when the
+    # last verification attempt was a test run and the diff attributes at least one
+    # failure as pre-existing/regression/unattributed — so the specific attribution
+    # (below) replaces the generic ``verification_failed``: pre-existing-only does
+    # not block (sympy-12489), regressions/unattributed get their own problem.
+    regression_baseline_enabled: bool = False
+    regressions: tuple[str, ...] = tuple()
+    unattributed_failures: tuple[str, ...] = tuple()
+    pre_existing_failures: tuple[str, ...] = tuple()
+    agent_authored_failures: tuple[str, ...] = tuple()
+    regression_attribution_supersedes_last_failure: bool = False
+    # Turn-contract v2 (step 4). ``expectations_unaddressed`` are the ids of task
+    # expectations (expected-output literals / named loci) that were neither
+    # mechanically confirmed nor explicitly disposed. They block as a repairable
+    # INSUFFICIENT problem (a nudge, bounded, then an honest UNCONFIRMED marker) —
+    # never CONTRADICTED, since a missing disposition is not a proven failure.
+    turn_contract_v2_enabled: bool = False
+    expectations_unaddressed: tuple[str, ...] = tuple()
 
 
 def evaluate_completion_certificate(
@@ -91,17 +125,52 @@ def evaluate_completion_certificate(
     elif certificate_input.require_material_result and certificate_input.material_edit_count <= 0:
         problems.append("no_material_edits")
 
+    regression_enabled = certificate_input.regression_baseline_enabled
+    has_regressions = regression_enabled and bool(certificate_input.regressions)
+    has_unattributed = regression_enabled and bool(certificate_input.unattributed_failures)
+
+    # When attribution supersedes a failed non-contract run (its failures are all
+    # pre-existing / regression / unattributed), the generic verification_failed is
+    # replaced by the specific attribution below — but the missing/stale coverage
+    # checks must still run, so this only suppresses the failed-run branch itself.
+    supersede_last_failure = regression_enabled and bool(
+        certificate_input.regression_attribution_supersedes_last_failure
+    )
     if certificate_input.verification_expected:
         if certificate_input.verification_attempt_count <= 0:
             problems.append("verification_not_attempted")
         elif certificate_input.failed_verification_commands:
+            # A named contract command failed: this always blocks. Regression
+            # attribution never clears a contract failure (step 2 stays intact).
             problems.append("verification_failed")
-        elif certificate_input.last_verification_passed is not True:
+        elif certificate_input.last_verification_passed is not True and not supersede_last_failure:
             problems.append("verification_failed")
         elif certificate_input.missing_verification_commands:
             problems.append("verification_incomplete")
         elif certificate_input.verification_coverage_stale:
             problems.append("verification_incomplete")
+
+    # Regression attribution problems are independent of which attempt ran last AND
+    # of whether a named verify contract resolved: a regression proven by the
+    # agent's own before/after runs must block even when verification_expected is
+    # False (e.g. no resolvable verify command). No-edit/advisory turns are exempt
+    # structurally (the diff is empty without post-edit runs); blocked
+    # finalizations are exempt to stay consistent with step 2.
+    if regression_enabled and not certificate_input.blocked:
+        if has_regressions:
+            problems.append("regressions_detected")
+        elif has_unattributed and certificate_input.verification_expected:
+            problems.append("unattributed_failures")
+
+    # Turn-contract v2: task-named expectations left unaddressed (neither confirmed
+    # by observed evidence nor explicitly disposed) block this execute turn until
+    # resolved. Blocked finalizations are exempt (consistent with steps 2-3).
+    if (
+        certificate_input.turn_contract_v2_enabled
+        and not certificate_input.blocked
+        and certificate_input.expectations_unaddressed
+    ):
+        problems.append("expectations_unaddressed")
 
     # Ordering rule: post-edit execution evidence. Applies even when no named
     # verification contract exists, catching "edited source, then only ran a
@@ -140,7 +209,11 @@ def evaluate_completion_certificate(
     status = CompletionCertificateStatus.SUFFICIENT
     reason = "requirements_satisfied"
     deduped_problems = tuple(dict.fromkeys(problems))
-    if failed_hard or "verification_failed" in deduped_problems:
+    if (
+        failed_hard
+        or "verification_failed" in deduped_problems
+        or "regressions_detected" in deduped_problems
+    ):
         status = CompletionCertificateStatus.CONTRADICTED
         reason = "hard_requirement_failed"
     elif deduped_problems:
@@ -155,6 +228,21 @@ def evaluate_completion_certificate(
         failed_hard_criterion_ids=tuple(failed_hard),
         evidence_hierarchy=_evidence_hierarchy(certificate_input.accepted_verification_evidence),
         reason=reason,
+        regressions=tuple(certificate_input.regressions) if regression_enabled else tuple(),
+        unattributed_failures=(
+            tuple(certificate_input.unattributed_failures) if regression_enabled else tuple()
+        ),
+        pre_existing_failures=(
+            tuple(certificate_input.pre_existing_failures) if regression_enabled else tuple()
+        ),
+        agent_authored_failures=(
+            tuple(certificate_input.agent_authored_failures) if regression_enabled else tuple()
+        ),
+        expectations_unaddressed=(
+            tuple(certificate_input.expectations_unaddressed)
+            if certificate_input.turn_contract_v2_enabled
+            else tuple()
+        ),
     )
 
 

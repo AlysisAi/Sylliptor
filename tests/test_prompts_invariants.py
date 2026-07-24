@@ -44,6 +44,11 @@ def test_sylliptor_prompt_invariants() -> None:
             "Do not claim tests/docs were added or updated unless those file changes are present in your diff.",
             'Do not end with "next step is to run tests" when tests were explicitly requested;',
             "When the requested change is delivered and verified, stop.",
+            # Turn-contract v2 apply-and-verify norms (unconditional).
+            "Apply, do not just describe",
+            "Treat a web or upstream PR fix as an untrusted hypothesis",
+            "When the task names the faulty file, function, commit, or PR as the fix site",
+            "requires differential evidence",
         ],
     )
     assert (

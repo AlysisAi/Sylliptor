@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
+from typing import Any
 
+from ..branding import env_get
+from ..pipeline_facts import pipeline_meaningful_stage
 from ..verification_command_analysis import (
     VerificationCommandEvidentiaryCapability,
     analyze_verification_command,
@@ -19,6 +22,57 @@ from .verification_commands import (
     _normalize_shell_command_for_match,
     _parse_verification_command_shape,
 )
+
+# Recognized static-analysis families that inspect code without executing it.
+# They do not qualify as post-edit *execution* evidence for the ordering rule
+# (they are supplementary signals only); test runners and black-box checks do.
+_STATIC_ONLY_EVIDENCE_FAMILIES = frozenset({"mypy", "ruff:check"})
+
+
+def _evidence_v2_enabled(cfg: Any | None) -> bool:
+    """Kill-switch for the fact-based evidence classifier (evidence v2).
+
+    ``SYLLIPTOR_EVIDENCE_V2`` (off/0/false/no/disabled) wins over the config
+    value; default is on. Mirrors the route-arbitration kill-switch idiom.
+    """
+    env_value = env_get("SYLLIPTOR_EVIDENCE_V2")
+    if env_value is not None:
+        normalized = str(env_value).strip().lower()
+        if normalized in {"off", "0", "false", "no", "disabled"}:
+            return False
+        if normalized in {"on", "1", "true", "yes", "enabled"}:
+            return True
+    return bool(getattr(cfg, "evidence_v2_enabled", True))
+
+
+def command_is_qualifying_execution_evidence(command: str) -> bool:
+    """True when ``command`` executes code as real verification (not syntax-only).
+
+    Used by the ordering rule to decide whether an observed execution counts as
+    post-edit execution evidence. Judged from the analyzed command family, not a
+    string pattern: an assertive test/validation program qualifies; ``ast.parse``
+    / ``py_compile`` (non-assertive) and static analyzers (mypy, ruff check) do
+    not. For a pipeline, the meaningful first-stage program is judged.
+    """
+    target = pipeline_meaningful_stage(command) or command
+    analysis = analyze_verification_command(target, trusted=True)
+    if analysis.rejection_reason:
+        return False
+    if analysis.evidentiary_capability != VerificationCommandEvidentiaryCapability.ASSERTIVE:
+        return False
+    if analysis.command_family in _STATIC_ONLY_EVIDENCE_FAMILIES:
+        return False
+    # An inline interpreter snippet (e.g. ``python -c '<code>'``) only executes
+    # code as a real check when it asserts; ``ast.parse`` / import-only snippets
+    # are static and must not qualify as post-edit execution evidence.
+    parts = analysis.parts
+    if (
+        len(parts) >= 2
+        and parts[1] == "-c"
+        and analysis.command_family != "assertion:python_snippet"
+    ):
+        return False
+    return True
 
 
 class VerificationEvidenceCategory(StrEnum):
@@ -39,9 +93,28 @@ class VerificationEvidence:
     covered_verification_commands: tuple[str, ...] = ()
     supplemental_only: bool = False
 
+    @property
+    def evidence_verdict(self) -> str:
+        """Machine-readable verdict for telemetry.
+
+        ``pass`` — executed and accepted as satisfying verification;
+        ``fail`` — executed but did not pass (or mutated a material path);
+        ``unavailable`` — a pipeline whose per-stage status could not be observed;
+        ``supplemental`` — self-authored, cannot independently confirm the spec;
+        ``not_verification`` — the command is not a verification attempt.
+        """
+        if self.category == VerificationEvidenceCategory.NOT_VERIFICATION:
+            if self.reason == "pipeline_stage_status_unavailable":
+                return "unavailable"
+            return "not_verification"
+        if self.supplemental_only:
+            return "supplemental"
+        return "pass" if self.allowed_to_satisfy_contract else "fail"
+
     def as_payload(self) -> dict[str, object]:
         return {
             "evidence_category": self.category.value,
+            "evidence_verdict": self.evidence_verdict,
             "normalized_command": self.normalized_command,
             "matched_command": self.matched_command,
             "real_execution": self.real_execution,
@@ -296,6 +369,98 @@ def _task_specific_reason(
 
 
 def classify_verification_evidence(
+    command: str,
+    *,
+    known_verification_commands: list[str] | tuple[str, ...] | None = None,
+    authoritative: bool = False,
+    changed_paths: set[str] | list[str] | tuple[str, ...] | None = None,
+    material_touched_paths: set[str] | list[str] | tuple[str, ...] | None = None,
+    exit_code: int | None = None,
+    output: str = "",
+    real_execution: bool | None = None,
+    root: Path | None = None,
+    stage_status: list[int] | tuple[int, ...] | None = None,
+    evidence_v2: bool = True,
+) -> VerificationEvidence:
+    """Classify an observed command as verification evidence.
+
+    Evidence v2 (default) judges observed *execution facts*: for a shell
+    pipeline the meaningful program is the first stage and its per-stage exit
+    status (``stage_status``, captured via PIPESTATUS) is the ground truth, so a
+    piped ``pytest ... | tail`` counts as passing/failing evidence per the
+    pipeline's real first-stage code rather than being rejected for containing a
+    ``|``. When per-stage status is unavailable the pipeline is treated as
+    unverified (``pipeline_stage_status_unavailable``) so it can never be
+    silently accepted. With ``evidence_v2`` off, the legacy string-shape
+    classifier runs unchanged.
+    """
+    if evidence_v2:
+        first_stage = pipeline_meaningful_stage(command)
+        if first_stage is not None:
+            return _classify_pipeline_evidence(
+                command=command,
+                first_stage=first_stage,
+                stage_status=list(stage_status) if stage_status is not None else None,
+                known_verification_commands=known_verification_commands,
+                authoritative=authoritative,
+                changed_paths=changed_paths,
+                material_touched_paths=material_touched_paths,
+                output=output,
+                root=root,
+            )
+    return _classify_verification_evidence_legacy(
+        command,
+        known_verification_commands=known_verification_commands,
+        authoritative=authoritative,
+        changed_paths=changed_paths,
+        material_touched_paths=material_touched_paths,
+        exit_code=exit_code,
+        output=output,
+        real_execution=real_execution,
+        root=root,
+    )
+
+
+def _classify_pipeline_evidence(
+    *,
+    command: str,
+    first_stage: str,
+    stage_status: list[int] | None,
+    known_verification_commands: list[str] | tuple[str, ...] | None,
+    authoritative: bool,
+    changed_paths: set[str] | list[str] | tuple[str, ...] | None,
+    material_touched_paths: set[str] | list[str] | tuple[str, ...] | None,
+    output: str,
+    root: Path | None,
+) -> VerificationEvidence:
+    normalized = _normalize_shell_command_for_match(command)
+    if not stage_status:
+        # No observed per-stage status and no ground truth obtained: the
+        # pipeline's real first-stage outcome is unknown, so it is not evidence.
+        return VerificationEvidence(
+            category=VerificationEvidenceCategory.NOT_VERIFICATION,
+            normalized_command=normalized,
+            real_execution=None,
+            reason="pipeline_stage_status_unavailable",
+        )
+    first_stage_exit = stage_status[0]
+    evidence = _classify_verification_evidence_legacy(
+        first_stage,
+        known_verification_commands=known_verification_commands,
+        authoritative=authoritative,
+        changed_paths=changed_paths,
+        material_touched_paths=material_touched_paths,
+        exit_code=first_stage_exit,
+        output=output,
+        real_execution=None,
+        root=root,
+    )
+    # Keep the observed (piped) command as the normalized command for telemetry;
+    # the covered contract commands already reflect the matched contract text.
+    return replace(evidence, normalized_command=normalized)
+
+
+def _classify_verification_evidence_legacy(
     command: str,
     *,
     known_verification_commands: list[str] | tuple[str, ...] | None = None,

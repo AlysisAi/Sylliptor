@@ -50,7 +50,27 @@ def test_authoritative_vacuous_contract_command_is_not_evidence() -> None:
     assert evidence.reason == "vacuous_verifier"
 
 
-def test_trusted_pipeline_matching_command_is_not_contract_evidence() -> None:
+def test_piped_non_verifier_first_stage_is_not_evidence() -> None:
+    # Evidence v2 judges the pipeline's first stage from observed facts: a
+    # non-verifier first stage does not count, even piped through tail.
+    command = "tool args | tail -n 1"
+
+    evidence = classify_verification_evidence(
+        command,
+        known_verification_commands=[command],
+        authoritative=False,
+        output="ok\n",
+        stage_status=[0, 0],
+    )
+
+    assert evidence.category == VerificationEvidenceCategory.NOT_VERIFICATION
+    assert evidence.allowed_to_satisfy_contract is False
+    assert evidence.covered_verification_commands == ()
+
+
+def test_legacy_classifier_rejects_pipeline_by_string_shape() -> None:
+    # With the kill-switch off, the legacy string-shape classifier rejects any
+    # pipeline as unsafe regardless of observed facts.
     command = "tool args | tail -n 1"
 
     evidence = classify_verification_evidence(
@@ -60,11 +80,10 @@ def test_trusted_pipeline_matching_command_is_not_contract_evidence() -> None:
         exit_code=0,
         output="ok\n",
         real_execution=True,
+        evidence_v2=False,
     )
 
     assert evidence.category == VerificationEvidenceCategory.NOT_VERIFICATION
-    assert evidence.allowed_to_satisfy_contract is False
-    assert evidence.covered_verification_commands == ()
     assert evidence.reason == "unsafe_pipeline"
 
 

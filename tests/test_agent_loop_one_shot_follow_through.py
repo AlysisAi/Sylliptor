@@ -7601,6 +7601,94 @@ def test_one_shot_code_edit_after_verify_requires_rerunning_verification(
     assert exit_code == 0
 
 
+def test_one_shot_prose_cannot_clear_evidence_deficit_and_finalizes_honestly_unverified(
+    tmp_path: Path,
+) -> None:
+    # Edit source, then never run tests: prose-only replies must not clear the
+    # post-edit execution-evidence deficit. After a bounded number of nudges the
+    # run finalizes honestly-unverified with a distinct event and a visible marker.
+    # A real test surface must exist so verification is genuinely expected.
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("print('orig')\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_app.py").write_text(
+        "def test_smoke():\n    assert True\n", encoding="utf-8"
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'demo'\nversion = '0.0.0'\n", encoding="utf-8"
+    )
+    cfg = AppConfig(model="test-model", routing_mode="code_only", verify_commands=["pytest -q"])
+    sessions_dir = tmp_path / "sessions"
+    session_id = "one-shot-honest-unverified"
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=12,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc1",
+                        name="fs_write",
+                        arguments={"path": "src/app.py", "content": "print('changed')\n"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="Everything matches the spec ✅.", tool_calls=[], raw={}),
+            LLMResponse(content="I am confident the change is correct.", tool_calls=[], raw={}),
+            LLMResponse(content="The work is complete.", tool_calls=[], raw={}),
+            LLMResponse(content="Final answer: it is done.", tool_calls=[], raw={}),
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Fix the bug in src/app.py.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    event_types = [event.get("type") for event in events]
+
+    # At least two repair nudges were sent (prose did not clear the deficit).
+    nudges = [
+        event
+        for event in events
+        if event.get("type") == "completion_gate_nudge"
+        and (event.get("payload") or {}).get("stage")
+        in {"verification_not_attempted", "verification_incomplete"}
+    ]
+    assert len(nudges) >= 2
+    # Each such nudge names the concrete missing fact and forbids prose clearing.
+    assert any(
+        "No test execution recorded" in str((event.get("payload") or {}).get("message") or "")
+        for event in nudges
+    )
+
+    # Exhaustion produced the distinct honest-unverified event.
+    assert "one_shot_completion_gate_unverified_finalized" in event_types
+
+    # The acceptance event flags it (no silent swallow).
+    accepted = _latest_completion_gate_acceptance_payload(events)
+    assert accepted.get("honest_unverified") is True
+
+    # The visible final summary carries the UNVERIFIED marker.
+    final_events = [event for event in events if event.get("type") == "final"]
+    assert final_events
+    assert "UNVERIFIED" in str((final_events[-1].get("payload") or {}).get("content") or "")
+
+
 def test_one_shot_multicommand_verification_becomes_stale_after_code_edit(
     tmp_path: Path,
 ) -> None:

@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Added fact-based completion evidence with per-stage pipeline exit status, post-edit
+  verification ordering, bounded evidence repair, and explicit unverified outcomes.
 - Added deterministic route arbitration so writable one-shot repository runs retain their
   tool capabilities and interactive execute-class turns can recover from non-execute routing.
 - Redesigned the `/config` TUI with grouped sections, clearer per-setting summaries,

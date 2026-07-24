@@ -56,6 +56,7 @@ from .verification_evidence import (
     VerificationEvidence,
     VerificationEvidenceCategory,
     classify_verification_evidence,
+    command_is_qualifying_execution_evidence,
 )
 
 if TYPE_CHECKING:
@@ -142,6 +143,17 @@ SUPPLEMENTAL_VERIFICATION_ADVISORY = (
     "Self-written tests verify your interpretation, not the task's. Re-read the "
     "task's exact requirements (output path, format, names, values) and confirm "
     "your deliverable against the spec itself before finalizing."
+)
+# Maximum bounded repair rounds for a post-edit execution-evidence deficit before
+# the gate finalizes honestly-unverified rather than accepting prose in its place.
+EVIDENCE_REPAIR_ROUND_BOUND = 2
+# Visible marker appended to the final summary when the run finalizes without the
+# execution evidence the ordering rule requires (fail honest, never silent).
+HONEST_UNVERIFIED_FINALIZATION_MARKER = (
+    "\n\n---\n"
+    "⚠️ Unverified: I could not obtain a passing test execution after my last "
+    "change to the code within this run. This result is finalized as UNVERIFIED — "
+    "the change has not been confirmed by running the relevant tests."
 )
 _COMPLETION_GATE_PROBLEM_LABELS = {
     "empty_final_response": "empty final response",
@@ -294,6 +306,13 @@ class TurnExecutionState:
     rejected_verification_evidence: list[dict[str, Any]] = field(default_factory=list)
     executed_verification_evidence: list[dict[str, Any]] = field(default_factory=list)
     verification_evidence_generation: int = 0
+    # Ordering rule: the verification-relevant edit generation at the time of the
+    # most recent qualifying execution-evidence event (a real test/execution run,
+    # not a syntax-only or static check). Post-edit execution evidence exists when
+    # this equals the current verification_relevant_edit_generation. Keying on the
+    # verification-relevant generation (not every material edit) means a docs-only
+    # edit after a passing run does not re-open the requirement.
+    last_post_edit_execution_generation: int | None = None
     completion_gate_repair_attempts: int = 0
     completion_gate_no_material_edits_repair_attempts: int = 0
     completion_gate_missing_verify_repair_attempts: int = 0
@@ -406,6 +425,17 @@ class TurnExecutionState:
         self.executed_verification_evidence.append(payload)
         self.executed_verification_evidence[:] = self.executed_verification_evidence[-20:]
 
+    def note_qualifying_execution_evidence(self) -> None:
+        self.last_post_edit_execution_generation = self.verification_relevant_edit_generation
+
+    def has_post_edit_execution_evidence(self) -> bool:
+        return (
+            self.material_edit_count > 0
+            and self.last_post_edit_execution_generation is not None
+            and self.last_post_edit_execution_generation
+            == self.verification_relevant_edit_generation
+        )
+
     def missing_verification_commands(self) -> set[str]:
         return self.expected_verification_commands - self.covered_verification_commands
 
@@ -478,6 +508,8 @@ class TurnExecutionState:
             "rejected_verification_evidence": list(self.rejected_verification_evidence),
             "executed_verification_evidence": list(self.executed_verification_evidence),
             "verification_evidence_generation": self.verification_evidence_generation,
+            "last_post_edit_execution_generation": self.last_post_edit_execution_generation,
+            "post_edit_execution_evidence_present": self.has_post_edit_execution_evidence(),
             "completion_gate_repair_attempts": self.completion_gate_repair_attempts,
             "completion_gate_no_material_edits_repair_attempts": self.completion_gate_no_material_edits_repair_attempts,
             "completion_gate_missing_verify_repair_attempts": self.completion_gate_missing_verify_repair_attempts,
@@ -958,6 +990,7 @@ def _verify_run_evidence_records(
     verification_authoritative: bool,
     material_touched_paths: set[str],
     root: Path,
+    evidence_v2: bool = True,
 ) -> list[VerificationEvidence]:
     command_results = result.get("command_results")
     verification_relevant_touched_paths = _verification_relevant_material_paths(
@@ -987,6 +1020,7 @@ def _verify_run_evidence_records(
                     else None
                 ),
                 root=root,
+                evidence_v2=evidence_v2,
             )
             if (
                 _verification_command_result_is_benign_skip(item)
@@ -1015,6 +1049,7 @@ def _verify_run_evidence_records(
                     exit_code=exit_code,
                     output=_verification_output_text(result),
                     root=root,
+                    evidence_v2=evidence_v2,
                 )
             )
     return records
@@ -1029,10 +1064,18 @@ def _shell_verification_evidence(
     known_verification_commands: list[str] | None,
     verification_authoritative: bool,
     material_touched_paths: set[str],
+    evidence_v2: bool = True,
 ) -> VerificationEvidence:
     exit_code_raw = result.get("exit_code")
     exit_code = exit_code_raw if isinstance(exit_code_raw, int) else None
     command = str(result.get("effective_cmd") or result.get("cmd") or arguments.get("cmd") or "")
+    stage_status_raw = result.get("pipeline_stage_status")
+    stage_status = (
+        [int(item) for item in stage_status_raw]
+        if isinstance(stage_status_raw, list)
+        and all(isinstance(item, int) for item in stage_status_raw)
+        else None
+    )
     return classify_verification_evidence(
         command,
         known_verification_commands=known_verification_commands,
@@ -1042,6 +1085,8 @@ def _shell_verification_evidence(
         exit_code=exit_code,
         output=_verification_output_text(result),
         root=root,
+        stage_status=stage_status,
+        evidence_v2=evidence_v2,
     )
 
 
@@ -1113,6 +1158,39 @@ def _unmasked_shell_verification_command(command: str) -> str:
     return _normalize_shell_command_for_match(analysis_candidate)
 
 
+def _tool_effect_has_qualifying_execution(
+    *,
+    tool_name: str,
+    evidence_records: list[VerificationEvidence],
+    result: dict[str, Any],
+) -> bool:
+    """True when a real test/execution run (pass or fail) is observed.
+
+    Qualifying = a recognized test/execution program that actually executed the
+    code — a passing run (``real_execution is True``) or a genuine failing run
+    (a non-zero exit of a recognized test command). Excludes syntax-only and
+    static checks (ast.parse, py_compile, mypy, ruff check) and non-executions
+    (no-tests collected, vacuous commands). Used only for the ordering rule.
+    """
+    for record in evidence_records:
+        if record.category == VerificationEvidenceCategory.NOT_VERIFICATION:
+            continue
+        if record.real_execution is False:
+            continue
+        if not command_is_qualifying_execution_evidence(record.normalized_command or ""):
+            continue
+        if record.real_execution is True:
+            return True
+        observed_exit_code, _observed_output = _verification_evidence_observation(
+            tool_name=tool_name,
+            evidence=record,
+            result=result,
+        )
+        if observed_exit_code is not None and observed_exit_code != 0:
+            return True
+    return False
+
+
 def _record_tool_effect(
     *,
     root: Path,
@@ -1123,6 +1201,7 @@ def _record_tool_effect(
     result: dict[str, Any],
     known_verification_commands: list[str] | None,
     verification_authoritative: bool = False,
+    evidence_v2: bool = True,
 ) -> None:
     if is_tool_unavailable_result(result):
         return
@@ -1188,6 +1267,7 @@ def _record_tool_effect(
             verification_authoritative=verification_authoritative,
             material_touched_paths=touched_paths,
             root=root,
+            evidence_v2=evidence_v2,
         )
         evidence = _aggregate_verification_evidence(evidence_records)
     elif normalized_tool == "shell_run":
@@ -1199,6 +1279,7 @@ def _record_tool_effect(
             known_verification_commands=known_verification_commands,
             verification_authoritative=verification_authoritative,
             material_touched_paths=touched_paths,
+            evidence_v2=evidence_v2,
         )
         evidence_records = [evidence]
         verification_attempt = evidence.category != VerificationEvidenceCategory.NOT_VERIFICATION
@@ -1207,6 +1288,7 @@ def _record_tool_effect(
         result["verification_evidence_reason"] = evidence.reason
         result["verification_evidence_allowed"] = evidence.allowed_to_satisfy_contract
         result["verification_evidence_supplemental_only"] = evidence.supplemental_only
+        result["evidence_verdict"] = evidence.evidence_verdict
         verification_note = _verification_evidence_note(evidence, result=result)
         if verification_note:
             result["verification_note"] = verification_note
@@ -1266,6 +1348,14 @@ def _record_tool_effect(
             observed_exit_code=observed_exit_code,
             observed_output=observed_output,
         )
+    if evidence_v2 and _tool_effect_has_qualifying_execution(
+        tool_name=normalized_tool,
+        evidence_records=evidence_records,
+        result=result,
+    ):
+        # Ordering rule: stamp that a real execution run happened after the most
+        # recent material edit, so finalization can require post-edit evidence.
+        state.note_qualifying_execution_evidence()
     if normalized_tool == "verify_run":
         _record_verify_run_command_outcomes(
             state=state,
@@ -1340,6 +1430,33 @@ def _completion_gate_blocker_allows_final(
     return state.last_verification_failure_category == FailureCategory.INFRA_UNAVAILABLE.value
 
 
+def _execution_evidence_required_for_turn(
+    *,
+    state: TurnExecutionState,
+    turn_intent: str,
+    blocked: bool,
+    evidence_v2: bool,
+    verification_expected: bool,
+) -> bool:
+    """Ordering rule trigger: an execute turn that mutated a verifiable surface.
+
+    The point of the rule is to catch "edited source, then only ran a syntax
+    check (or nothing), then finalized". It requires that verification is
+    actually applicable for this turn (``verification_expected``) so greenfield
+    workspaces with no test surface are not harassed. Turns with no mutating
+    edits (pure Q&A/analysis/advisory) are exempt, as are non-execute turns and
+    blocker finalizations.
+    """
+    return bool(
+        evidence_v2
+        and verification_expected
+        and str(turn_intent or "") == "execute"
+        and not blocked
+        and state.material_edit_count > 0
+        and _paths_require_verification(state.touched_repo_paths)
+    )
+
+
 def _completion_gate_problems(
     *,
     state: TurnExecutionState,
@@ -1347,7 +1464,16 @@ def _completion_gate_problems(
     blocked: bool,
     verification_expected: bool,
     require_material_edit_evidence: bool = True,
+    evidence_v2: bool = False,
+    turn_intent: str = "",
 ) -> list[str]:
+    execution_evidence_required = _execution_evidence_required_for_turn(
+        state=state,
+        turn_intent=turn_intent,
+        blocked=blocked,
+        evidence_v2=evidence_v2,
+        verification_expected=verification_expected,
+    )
     certificate = evaluate_completion_certificate(
         CompletionCertificateInput(
             contract=state.acceptance_contract,
@@ -1364,6 +1490,8 @@ def _completion_gate_problems(
             missing_verification_commands=state.missing_verification_commands(),
             verification_coverage_stale=state.verification_coverage_is_stale(),
             accepted_verification_evidence=list(state.accepted_verification_evidence),
+            execution_evidence_required=execution_evidence_required,
+            post_edit_execution_evidence_present=state.has_post_edit_execution_evidence(),
         )
     )
     state.latest_completion_certificate = certificate.as_payload()
@@ -1439,6 +1567,7 @@ def _completion_gate_nudge_message(
     explicit_language_override: bool = False,
     one_shot_execution: bool = False,
     live_background_processes: int = 0,
+    execution_evidence_missing_detail: str = "",
 ) -> str:
     _ = (
         prefix_key,
@@ -1448,6 +1577,12 @@ def _completion_gate_nudge_message(
         explicit_language_override,
     )
     problem_set = set(problems)
+    # A post-edit execution-evidence deficit is action-only: the model must run
+    # the tests; a written explanation cannot clear it. Naming the concrete
+    # missing fact keeps successive nudges specific rather than repetitive.
+    evidence_deficit = bool(execution_evidence_missing_detail) and bool(
+        problem_set & {"verification_not_attempted", "verification_incomplete"}
+    )
     lines = ["Finalization check - one pass before you finish:"]
     if "no_material_edits" in problem_set:
         lines.append(
@@ -1474,6 +1609,12 @@ def _completion_gate_nudge_message(
         lines.append(
             "- Expected verification has not been completed. Run it, or state why it does not apply."
         )
+    if evidence_deficit:
+        lines.append(
+            f"- No test execution recorded {execution_evidence_missing_detail}. Run the relevant "
+            "tests now and observe their output and exit code. A written explanation cannot "
+            "clear this - only a new test run can."
+        )
     if all_verification_evidence_self_authored:
         lines.append(f"- {SUPPLEMENTAL_VERIFICATION_ADVISORY}")
     if has_material_edits and diff_review_stale:
@@ -1491,10 +1632,16 @@ def _completion_gate_nudge_message(
         "- Re-read the task statement once and confirm every explicitly named output "
         "(paths, formats, values) exists exactly as requested."
     )
-    lines.append(
-        "Then give your final answer. If you are confident the work is complete as-is, "
-        "finalize - this checklist is advisory."
-    )
+    if evidence_deficit:
+        lines.append(
+            "Run the relevant tests now, then give your final answer once you have observed "
+            "the result."
+        )
+    else:
+        lines.append(
+            "Then give your final answer. If you are confident the work is complete as-is, "
+            "finalize - this checklist is advisory."
+        )
     return "\n".join(lines)
 
 

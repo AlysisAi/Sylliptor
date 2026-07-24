@@ -68,6 +68,12 @@ class CompletionCertificateInput:
     missing_verification_commands: set[str] = field(default_factory=set)
     verification_coverage_stale: bool = False
     accepted_verification_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # Ordering rule (evidence v2): an execute-posture turn that made mutating
+    # edits to a verifiable surface requires a qualifying execution-evidence
+    # event that ran AFTER the last such edit. Independent of whether any named
+    # verification contract exists.
+    execution_evidence_required: bool = False
+    post_edit_execution_evidence_present: bool = False
 
 
 def evaluate_completion_certificate(
@@ -95,6 +101,18 @@ def evaluate_completion_certificate(
         elif certificate_input.missing_verification_commands:
             problems.append("verification_incomplete")
         elif certificate_input.verification_coverage_stale:
+            problems.append("verification_incomplete")
+
+    # Ordering rule: post-edit execution evidence. Applies even when no named
+    # verification contract exists, catching "edited source, then only ran a
+    # syntax check, then finalized". Deduped against the block above.
+    if (
+        certificate_input.execution_evidence_required
+        and not certificate_input.post_edit_execution_evidence_present
+    ):
+        if certificate_input.verification_attempt_count <= 0:
+            problems.append("verification_not_attempted")
+        else:
             problems.append("verification_incomplete")
 
     hard_criteria = _hard_criteria(certificate_input.contract)

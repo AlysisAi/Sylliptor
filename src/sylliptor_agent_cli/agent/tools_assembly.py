@@ -56,6 +56,7 @@ from ..mcp.manager import ForgeTaskScopedMcpManager, McpManager
 from ..mcp.models import ResolvedMcpConfig, ResolvedMcpServer
 from ..model_registry import ModelRegistry
 from ..model_router import ROLE_CODING, resolve_model_for_role
+from ..pipeline_facts import resolve_pipeline_stage_status
 from ..policy import evaluate_shell_command
 from ..runtime_kind import RuntimeKind, normalize_runtime_kind
 from ..safety.subagent_report import sanitize_subagent_report, subagent_report_evidence_text
@@ -168,7 +169,9 @@ from .verification_commands import (
 from .verification_evidence import (
     VerificationEvidence,
     VerificationEvidenceCategory,
+    _evidence_v2_enabled,
     classify_verification_evidence,
+    command_is_qualifying_execution_evidence,
 )
 
 _turn_snapshot = importlib.import_module("sylliptor_agent_cli.agent.turn.snapshot")
@@ -3398,7 +3401,10 @@ def build_tools(
                         "cwd": effective_cwd,
                         "runner": shell_runner,
                     },
-                    optional_kwargs={"timeout_s": shell_timeout_s},
+                    optional_kwargs={
+                        "timeout_s": shell_timeout_s,
+                        "capture_pipeline_status": _evidence_v2_enabled(cfg),
+                    },
                 ),
             )
         finally:
@@ -3412,6 +3418,7 @@ def build_tools(
                         "command": cmd,
                         "cwd": str((result or {}).get("cwd") or effective_cwd or root),
                         "exit_code": int((result or {}).get("exit_code", -1)),
+                        "pipeline_stage_status": (result or {}).get("pipeline_stage_status"),
                         "duration_ms": duration_ms,
                         "mode": "fullaccess",
                     },
@@ -3431,8 +3438,45 @@ def build_tools(
             list(current_selection.commands) if current_selection is not None else []
         )
         shell_exit_code = result.get("exit_code") if isinstance(result, dict) else None
+        evidence_v2 = _evidence_v2_enabled(cfg)
+        shell_effective_cmd = str(result.get("effective_cmd") or result.get("cmd") or cmd)
+
+        def _reexec_first_stage_exit(stage: str) -> int | None:
+            # Bounded ground-truth fallback: when PIPESTATUS could not be observed
+            # (e.g. bash was unavailable), re-run only a recognized test/execution
+            # first stage unpiped, once, to learn its true exit code. Never re-run
+            # an arbitrary side-effecting first stage.
+            if not command_is_qualifying_execution_evidence(stage):
+                return None
+            try:
+                rerun = _call_with_optional_kwargs(
+                    _patchable("shell_run", shell_run),
+                    required_kwargs={
+                        "root": root,
+                        "cmd": stage,
+                        "cwd": effective_cwd,
+                        "runner": shell_runner,
+                    },
+                    optional_kwargs={"timeout_s": shell_timeout_s},
+                )
+            except Exception:  # noqa: BLE001
+                return None
+            code = rerun.get("exit_code") if isinstance(rerun, dict) else None
+            return code if isinstance(code, int) else None
+
+        stage_status = result.get("pipeline_stage_status") if isinstance(result, dict) else None
+        if evidence_v2 and stage_status is None:
+            resolved_status = resolve_pipeline_stage_status(
+                shell_effective_cmd,
+                None,
+                reexec=_reexec_first_stage_exit,
+            )
+            if resolved_status is not None:
+                stage_status = resolved_status
+                result["pipeline_stage_status"] = resolved_status
+                result["pipeline_stage_status_source"] = "reexec"
         shell_evidence = classify_verification_evidence(
-            str(result.get("effective_cmd") or result.get("cmd") or cmd),
+            shell_effective_cmd,
             known_verification_commands=current_effective_verification_commands,
             authoritative=(
                 is_authoritative_verify_command_selection(current_selection)
@@ -3452,11 +3496,14 @@ def build_tools(
                 ]
             ).strip(),
             root=root,
+            stage_status=stage_status if isinstance(stage_status, list) else None,
+            evidence_v2=evidence_v2,
         )
         result["verification_evidence_category"] = shell_evidence.category.value
         result["verification_evidence_reason"] = shell_evidence.reason
         result["verification_evidence_allowed"] = shell_evidence.allowed_to_satisfy_contract
         result["verification_evidence_supplemental_only"] = shell_evidence.supplemental_only
+        result["evidence_verdict"] = shell_evidence.evidence_verdict
         return result
 
     _append_builtin_tool("shell_run", run=_shell)

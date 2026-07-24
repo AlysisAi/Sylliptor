@@ -344,6 +344,9 @@ class AppConfig(BaseModel):
     # Kill-switch for capability arbitration over router verdicts; env override
     # SYLLIPTOR_ROUTE_ARBITRATION=off wins over the config value.
     route_arbitration_enabled: bool = True
+    # Kill-switch for the fact-based completion-evidence classifier (evidence v2);
+    # env override SYLLIPTOR_EVIDENCE_V2=off reverts to legacy string-shape evidence.
+    evidence_v2_enabled: bool = True
     step_budget_policy: str = AUTONOMOUS_STEP_BUDGET_POLICY
     task_max_steps: int = DEFAULT_TASK_MAX_STEPS
     subagent_max_steps: int = DEFAULT_SUBAGENT_MAX_STEPS
@@ -1366,6 +1369,7 @@ _SETTABLE_KEYS: set[str] = {
     "stream",
     "routing_mode",
     "route_arbitration_enabled",
+    "evidence_v2_enabled",
     "step_budget_policy",
     "subagents_enabled",
     "skills_enabled",
@@ -2430,6 +2434,16 @@ def set_config_value(
             cfg.route_arbitration_enabled = False
             return cfg
         raise ConfigError("route_arbitration_enabled must be true/false")
+
+    if key == "evidence_v2_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.evidence_v2_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.evidence_v2_enabled = False
+            return cfg
+        raise ConfigError("evidence_v2_enabled must be true/false")
 
     if key == "step_budget_policy":
         normalized = value.strip().lower()

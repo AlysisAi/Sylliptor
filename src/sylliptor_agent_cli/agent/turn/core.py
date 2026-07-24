@@ -137,12 +137,15 @@ from ..tools_assembly import (
     _tool_event_metadata,
 )
 from ..verification import (
+    EVIDENCE_REPAIR_ROUND_BOUND,
+    HONEST_UNVERIFIED_FINALIZATION_MARKER,
     TurnExecutionState,
     _completion_gate_blocker_allows_final,
     _completion_gate_nudge_message,
     _completion_gate_problem_summary,
     _completion_gate_problems,
     _completion_gate_repair_stage,
+    _execution_evidence_required_for_turn,
     _extract_touched_repo_paths,
     _fresh_executed_evidence_for_claim,
     _live_background_process_finalization_advisory_line,
@@ -153,6 +156,7 @@ from ..verification import (
     _successful_verification_claim_kind,
     _verification_expected_for_turn,
 )
+from ..verification_evidence import _evidence_v2_enabled
 from .events import (
     _emit_assistant_message_events,
     _emit_message_delta_event,
@@ -2193,6 +2197,11 @@ def run_turn(
         if self.one_shot_execution
         else "interactive_completion_gate_nudge_prefix"
     )
+    completion_gate_unverified_event = (
+        "one_shot_completion_gate_unverified_finalized"
+        if self.one_shot_execution
+        else "interactive_completion_gate_unverified_finalized"
+    )
     non_final_progress_detected_event = (
         "one_shot_non_final_progress_detected"
         if self.one_shot_execution
@@ -2242,6 +2251,7 @@ def run_turn(
     last_continuation_nudge_verification_attempt_count = -1
     clarification_advisory_sent = False
     finalization_checklist_sent = False
+    honest_unverified_finalization = False
     blocking_finalization_correctives_sent = 0
     existing_test_edit_violation_count = 0
     existing_test_edit_forced_logged = False
@@ -3714,6 +3724,7 @@ def run_turn(
                     result=result if isinstance(result, dict) else {"error": "invalid_result"},
                     known_verification_commands=known_verification_commands,
                     verification_authoritative=bool(self.verification_authoritative),
+                    evidence_v2=_evidence_v2_enabled(self.cfg),
                 )
                 verified_state_invalidation_note = ""
                 verified_state_invalidation_payload: dict[str, Any] | None = None
@@ -5100,6 +5111,8 @@ def run_turn(
                         final_text=final_text,
                         gate_turn_intent=completion_gate_turn_intent,
                     ),
+                    evidence_v2=_evidence_v2_enabled(self.cfg),
+                    turn_intent=completion_gate_turn_intent,
                 )
                 live_background_processes = _live_background_processes_at_finalization()
                 spec_faithfulness_advisory_needed = bool(
@@ -5279,14 +5292,44 @@ def run_turn(
                         **_acceptance_contract_fields(),
                         **decision_fields,
                     }
-                    accept_open_problems_now = bool(
-                        finalization_checklist_sent
-                        or _step_limit_reached(step)
-                        or (
-                            gate_stage == "no_material_edits"
-                            and _completion_gate_can_accept_after_continuation_nudge()
+                    ordering_evidence_deficit = bool(
+                        _evidence_v2_enabled(self.cfg)
+                        and gate_stage
+                        in {"verification_not_attempted", "verification_incomplete"}
+                        and _execution_evidence_required_for_turn(
+                            state=execution_state,
+                            turn_intent=completion_gate_turn_intent,
+                            blocked=blocked_response_allows_completion,
+                            evidence_v2=True,
+                            verification_expected=verification_expected,
                         )
+                        and not execution_state.has_post_edit_execution_evidence()
                     )
+                    if ordering_evidence_deficit:
+                        # A post-edit execution-evidence deficit is action-only:
+                        # prose cannot clear it, only a new qualifying run can. Nudge
+                        # up to a bound, then finalize honestly-unverified rather than
+                        # silently accept (fail honest).
+                        evidence_repair_rounds = (
+                            execution_state.completion_gate_missing_verify_repair_attempts
+                        )
+                        if (
+                            evidence_repair_rounds >= EVIDENCE_REPAIR_ROUND_BOUND
+                            or _step_limit_reached(step)
+                        ):
+                            accept_open_problems_now = True
+                            honest_unverified_finalization = True
+                        else:
+                            accept_open_problems_now = False
+                    else:
+                        accept_open_problems_now = bool(
+                            finalization_checklist_sent
+                            or _step_limit_reached(step)
+                            or (
+                                gate_stage == "no_material_edits"
+                                and _completion_gate_can_accept_after_continuation_nudge()
+                            )
+                        )
                     if accept_open_problems_now:
                         record_completion_gate_decision(
                             execution_state.completion_gate_controller_state,
@@ -5312,6 +5355,10 @@ def run_turn(
                                 "completion_certificate": dict(
                                     execution_state.latest_completion_certificate
                                 ),
+                                "honest_unverified": honest_unverified_finalization,
+                                "post_edit_execution_evidence_present": (
+                                    execution_state.has_post_edit_execution_evidence()
+                                ),
                                 "state": execution_state.as_payload(),
                                 "content": final_text,
                                 **_turn_intent_payload(
@@ -5322,6 +5369,43 @@ def run_turn(
                                 **decision_fields,
                             },
                         )
+                        if honest_unverified_finalization:
+                            # Fail honest: an evidence deficit that a rerun could have
+                            # resolved was not silently swallowed. Emit a distinct
+                            # event and mark the visible summary (below, at finalize).
+                            self.store.append(
+                                completion_gate_unverified_event,
+                                {
+                                    "step": step,
+                                    "runtime_kind": self.runtime_kind.value,
+                                    "stage": gate_stage,
+                                    "problems": gate_problems,
+                                    "problem_summary": _completion_gate_problem_summary(
+                                        gate_problems
+                                    ),
+                                    "evidence_repair_rounds": (
+                                        execution_state.completion_gate_missing_verify_repair_attempts
+                                    ),
+                                    "evidence_repair_round_bound": EVIDENCE_REPAIR_ROUND_BOUND,
+                                    "material_edit_count": execution_state.material_edit_count,
+                                    "touched_repo_paths": sorted(
+                                        execution_state.touched_repo_paths
+                                    ),
+                                    "completion_certificate": dict(
+                                        execution_state.latest_completion_certificate
+                                    ),
+                                    "content": final_text,
+                                    **_turn_intent_payload(
+                                        completion_gate_turn_intent=completion_gate_turn_intent,
+                                    ),
+                                    **_verification_evidence_fields(),
+                                    **_acceptance_contract_fields(),
+                                },
+                            )
+                            if HONEST_UNVERIFIED_FINALIZATION_MARKER not in (final_text or ""):
+                                final_text = (
+                                    final_text or ""
+                                ) + HONEST_UNVERIFIED_FINALIZATION_MARKER
                     else:
                         self.store.append(
                             completion_gate_failed_event,
@@ -5341,6 +5425,15 @@ def run_turn(
                                 "assistant_message",
                                 {"content": final_text, "message": assistant_message},
                             )
+                        execution_evidence_missing_detail = ""
+                        if ordering_evidence_deficit:
+                            deficit_paths = sorted(execution_state.touched_repo_paths)[:2]
+                            where = (
+                                f"after your edit to {', '.join(deficit_paths)}"
+                                if deficit_paths
+                                else "after your last edit"
+                            )
+                            execution_evidence_missing_detail = f"{where} (step {step})"
                         nudge = _completion_gate_nudge_message(
                             gate_problems,
                             prefix_key=completion_gate_nudge_prefix_key,
@@ -5361,6 +5454,7 @@ def run_turn(
                             explicit_language_override=turn_language_explicit,
                             one_shot_execution=self.one_shot_execution,
                             live_background_processes=live_background_processes,
+                            execution_evidence_missing_detail=execution_evidence_missing_detail,
                         )
                         if _nudge_would_repeat_without_progress(nudge, decision):
                             self.store.append(

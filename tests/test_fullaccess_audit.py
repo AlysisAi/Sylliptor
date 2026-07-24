@@ -110,6 +110,7 @@ def test_fullaccess_allowed_shell_command_writes_audit_record(tmp_path: Path) ->
         "command",
         "cwd",
         "exit_code",
+        "pipeline_stage_status",
         "duration_ms",
         "mode",
     }
@@ -117,6 +118,7 @@ def test_fullaccess_allowed_shell_command_writes_audit_record(tmp_path: Path) ->
     assert payload["command"] == "echo ok"
     assert payload["cwd"] == str(tmp_path.resolve())
     assert payload["exit_code"] == 0
+    assert payload["pipeline_stage_status"] == [0]
     assert isinstance(payload["duration_ms"], int)
     assert payload["duration_ms"] >= 0
     assert payload["mode"] == "fullaccess"

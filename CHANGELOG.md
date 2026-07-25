@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Added `SYLLIPTOR_WEB_TOOLS` as a master switch for all web tools and web-search backends.
 - Honored provider-reported final-answer phases when deciding whether another model turn is needed.
 - Refreshed the ChatGPT subscription model snapshot and allowed model metadata.
 

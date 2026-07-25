@@ -24,7 +24,13 @@ from ..approval_scope import (
 )
 from ..atomic_io import atomic_write_text
 from ..capabilities import get_capability_definition
-from ..config import AppConfig, ConfigError, resolve_role_temperature, resolve_web_search_policy
+from ..config import (
+    AppConfig,
+    ConfigError,
+    resolve_role_temperature,
+    resolve_web_search_policy,
+    resolve_web_tools_enabled,
+)
 from ..context.tool_schema_budgeter import (
     CUSTOM_MCP_SCHEMA_FAMILIES,
     DEFAULT_CUSTOM_MCP_DESCRIPTION_MAX_CHARS,
@@ -2844,8 +2850,14 @@ def build_tools(
         ),
     )
 
+    # Master web-tools switch: when off (config field or SYLLIPTOR_WEB_TOOLS env),
+    # neither web_fetch nor web_search is registered at all — the model never sees
+    # them in its tool list. Required for benchmark/offline integrity.
+    web_tools_enabled = resolve_web_tools_enabled(cfg)
+
     web_search_exposed_in_mode = (
-        _built_in_tool_exposed_in_mode(
+        web_tools_enabled
+        and _built_in_tool_exposed_in_mode(
             tool_name="web_search",
             mode=mode,
             subagent_depth=subagent_depth,
@@ -3103,7 +3115,8 @@ def build_tools(
             result["provenance_classification"] = provenance_classification
         return result
 
-    _append_builtin_tool("web_fetch", run=_web_fetch_tool)
+    if web_tools_enabled:
+        _append_builtin_tool("web_fetch", run=_web_fetch_tool)
 
     if web_search_exposed_in_mode and web_search_status is not None:
         if (

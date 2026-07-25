@@ -384,6 +384,15 @@ class AppConfig(BaseModel):
     )
     experimental_gemini_interactions_enabled: bool = False
     custom_tools_enabled: bool = True
+    web_tools_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master switch for ALL web tools (web_fetch and web_search). When false, "
+            "web tools are never registered in the model's tool list and any runtime "
+            "web call hard-errors. Overridable via SYLLIPTOR_WEB_TOOLS env var; used "
+            "by benchmark/offline runs to guarantee no network-mediated contamination."
+        ),
+    )
     web_search_mode: str = "auto"
     web_search_policy: str = "auto"
     web_search_adapter: str = "auto"
@@ -1885,6 +1894,26 @@ def resolve_web_search_policy(cfg: AppConfig | None) -> str:
     if cfg is None:
         return "auto"
     return _normalize_web_search_policy(getattr(cfg, "web_search_policy", "auto"))
+
+
+_WEB_TOOLS_DISABLED_ENV_VALUES = frozenset({"0", "false", "off", "no", "disabled"})
+
+
+def resolve_web_tools_enabled(cfg: AppConfig | None) -> bool:
+    """Master switch for all web tools (web_fetch AND web_search).
+
+    Precedence: SYLLIPTOR_WEB_TOOLS env var (any of 0/false/off/no/disabled turns
+    web tools off; any other non-empty value turns them on) over the
+    ``web_tools_enabled`` config field. Benchmark/offline harnesses should set
+    ``SYLLIPTOR_WEB_TOOLS=off`` so the process itself guarantees no web tool is
+    exposed or executed, independent of harness-side settings.
+    """
+    env_value = str(env_get("SYLLIPTOR_WEB_TOOLS") or "").strip().lower()
+    if env_value:
+        return env_value not in _WEB_TOOLS_DISABLED_ENV_VALUES
+    if cfg is None:
+        return True
+    return bool(getattr(cfg, "web_tools_enabled", True))
 
 
 def resolve_web_search_enabled(cfg: AppConfig | None) -> bool:

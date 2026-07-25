@@ -340,6 +340,19 @@ def web_fetch(
     max_chars: int = _DEFAULT_MAX_CHARS,
     transport: httpx.BaseTransport | None = None,
 ) -> dict[str, Any]:
+    # Defense-in-depth runtime guard: even if a web_fetch call reaches this layer
+    # through a path that bypassed tool registration (resume/replay, patched tool
+    # tables), the master web-tools switch still hard-blocks execution.
+    # Lazy import to avoid a module-level import cycle with config.
+    from ..config import resolve_web_tools_enabled
+
+    if not resolve_web_tools_enabled(None):
+        raise WebFetchError(
+            "web_fetch is disabled by the web-tools policy "
+            "(SYLLIPTOR_WEB_TOOLS=off / web_tools_enabled=false). "
+            "No network fetch was performed.",
+            recoverable=False,
+        )
     raw_input_url = str(url or "").strip()
     requested_url, _split = _split_url(
         normalize_web_url(raw_input_url)

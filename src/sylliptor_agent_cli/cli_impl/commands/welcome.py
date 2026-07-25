@@ -876,6 +876,10 @@ def _session_build_tools_kwargs(*, session: Any, mode: str) -> dict[str, Any]:
         "console": getattr(session, "console", None),
         "surface": getattr(session, "surface", None),
         "store": session.store,
+        # Carried across tool rebuilds (/mode, /subagent, plan-mode transitions):
+        # dropping it would silently stop tracking the verifier's process groups
+        # for the rest of the session.
+        "process_group_registry": getattr(session, "process_group_registry", None),
         "mode": mode,
         "yes": bool(getattr(session, "yes", False)),
         "cfg": cfg,

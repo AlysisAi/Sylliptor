@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
 import os
@@ -63,6 +64,11 @@ from ..hooks import (
     ResolvedHookConfig,
     load_resolved_hooks_config,
 )
+from ..internal_artifacts import (
+    ArtifactVisibility,
+    mark_message_internal,
+    summary_input_messages,
+)
 from ..llm.base import (
     ChatClient,
     count_input_tokens_if_supported,
@@ -83,6 +89,15 @@ from ..mcp.manager import ForgeTaskScopedMcpManager, McpManager, create_mcp_mana
 from ..model_metadata_policy import ActiveModelRef, evaluate_active_model_metadata_policy
 from ..model_registry import ModelRegistry, resolve_model_provider_key
 from ..model_router import ROLE_CODING, ROLE_COMPACTOR, ROLE_ROUTER, resolve_model_for_role
+from ..process_reaping import (
+    ProcessGroupRegistry,
+    ReapAction,
+    ReapEvent,
+    _process_reaping_enabled,
+    reap_tracked_groups,
+    resolve_reap_decision,
+    survivor_payloads,
+)
 from ..profile_presets import find_preset_for_profile
 from ..profiles import get_active_profile, resolve_effective_base_url
 from ..provider_telemetry import set_provider_telemetry_sink
@@ -125,6 +140,17 @@ from ..verify_gate import (
     verification_selection_payload,
 )
 from ..workspace_binding import WorkspaceBinding
+from ..workspace_provisioning import (
+    ProvisioningAction,
+    ShellCommandRunner,
+    ShellProbeResult,
+    _workspace_provisioning_enabled,
+    detect_declared_test_runner,
+    probe_runner_importable,
+    provision_test_runner,
+    provisioning_already_attempted,
+    resolve_provisioning_decision,
+)
 from .errors import SessionWorkdirError
 from .prompt_context import (
     _build_plugin_activation_index,
@@ -498,8 +524,62 @@ class AgentSession:
     crash_diagnostics: CrashDiagnosticLogger | None = None
     crash_diagnostic_log_path: str | None = None
     agentbox_telemetry: AgentBoxTelemetry | None = None
+    process_group_registry: ProcessGroupRegistry | None = None
+
+    def _reap_tracked_process_groups(self, *, event: ReapEvent) -> None:
+        """Terminate or report the process groups this session's runner started.
+
+        Runs on every turn exit path (success, honest-unverified, error,
+        cancellation) and again at session close. Only groups the runner itself
+        created and recorded are ever signalled; nothing is discovered by name
+        or by scanning the process table.
+        """
+        registry = self.process_group_registry
+        if registry is None:
+            return
+        try:
+            decision = resolve_reap_decision(
+                runtime_kind=self.runtime_kind,
+                event=event,
+                enabled=_process_reaping_enabled(self.cfg),
+            )
+            if decision.action is ReapAction.SKIP:
+                return
+            if decision.action is ReapAction.REPORT:
+                survivors = survivor_payloads(registry)
+                if survivors:
+                    self.store.append(
+                        "process_survivors",
+                        {
+                            "event": str(event),
+                            "runtime_kind": self.runtime_kind.value,
+                            "reason": decision.reason,
+                            "count": len(survivors),
+                            "groups": list(survivors),
+                        },
+                    )
+                return
+            for outcome in reap_tracked_groups(registry):
+                self.store.append(
+                    "process_reaped",
+                    {
+                        "event": str(event),
+                        "runtime_kind": self.runtime_kind.value,
+                        "reason": decision.reason,
+                        **outcome.payload(),
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001 - hygiene must never break the turn
+            try:
+                self.store.append(
+                    "warning",
+                    {"warning": "process_reaping_failed", "error": str(exc)},
+                )
+            except Exception:  # noqa: BLE001 - best-effort diagnostic
+                pass
 
     def close(self, *, reason: str = "session_close") -> None:
+        self._reap_tracked_process_groups(event=ReapEvent.SESSION_CLOSE)
         if self.subagent_depth == 0:
             # Release the process-wide telemetry sink registered for this top-level run.
             set_provider_telemetry_sink(None)
@@ -910,6 +990,8 @@ class AgentSession:
         prior_visible_text: str = "",
         streamed_text_emitted: bool = False,
         final_event_payload: dict[str, Any] | None = None,
+        internal_fallback: bool = False,
+        internal_fallback_kind: str = "",
     ) -> str:
         emitted_text = str(final_text or "").strip()
         emitted_text, rewrite_payload = _rewrite_final_summary_for_language(
@@ -931,17 +1013,46 @@ class AgentSession:
             if PROVIDER_METADATA_KEY in candidate_message:
                 assistant_message = candidate_message
         extra_payload = {"message": assistant_message} if assistant_message is not None else None
-        self._emit_assistant_message_if_changed(
-            text=emitted_text,
-            prior_visible_text=prior_visible_text,
-            extra_payload=extra_payload,
-            streamed_text_emitted=streamed_text_emitted,
-        )
+        if internal_fallback and self.subagent_depth > 0:
+            # A nested run's locally generated stop report is internal state. The
+            # nested surface forwards assistant messages up to the parent's panel,
+            # so emitting it here would render the dump to the user even though the
+            # tool result never carries it. Record it; do not show it.
+            self.store.append(
+                "assistant_message",
+                {"content": emitted_text, "internal_fallback": True},
+            )
+        else:
+            self._emit_assistant_message_if_changed(
+                text=emitted_text,
+                prior_visible_text=prior_visible_text,
+                extra_payload=extra_payload,
+                streamed_text_emitted=streamed_text_emitted,
+            )
         if assistant_message is not None:
+            if internal_fallback:
+                # Today a fallback always arrives with assistant_response=None, so
+                # nothing is appended and this does not fire. It is here because the
+                # invariant is "an internal artifact that enters the transcript is
+                # marked", and that has to hold at the point of entry, not by anyone
+                # remembering to re-check later.
+                mark_message_internal(
+                    assistant_message,
+                    kind=internal_fallback_kind or "forced_final_summary_fallback",
+                )
             self.messages.append(assistant_message)
+        final_payload: dict[str, Any] = {"content": emitted_text}
+        if internal_fallback:
+            # A locally generated stop report, not a model answer. Recorded as a
+            # fact here so the subagent boundary can refuse to hand it to a parent
+            # as a deliverable, without inspecting the text.
+            final_payload["internal_fallback"] = True
+            final_payload["artifact_visibility"] = ArtifactVisibility.INTERNAL.value
+            if internal_fallback_kind:
+                final_payload["internal_fallback_kind"] = internal_fallback_kind
         self.store.append(
             "final",
-            _add_event_diagnostics({"content": emitted_text}, final_event_payload),
+            _add_event_diagnostics(final_payload, final_event_payload),
         )
         return emitted_text
 
@@ -1160,7 +1271,10 @@ class AgentSession:
         normalized_termination_kind = _normalize_forced_summary_termination_kind(
             termination_kind
         ).value
-        request_messages = list(self.messages)
+        # Internal artifacts (a previous turn's locally generated stop report) are
+        # excluded here by marker, so a summary can never be built by re-narrating
+        # one. Marker-based, never a scan of the text.
+        request_messages = summary_input_messages(self.messages)
         latest_assistant_text = str(latest_assistant_text or "").strip()
         if latest_assistant_text:
             request_messages.append({"role": "assistant", "content": latest_assistant_text})
@@ -1249,6 +1363,8 @@ class AgentSession:
         emitted_text = self._emit_final_assistant_text(
             final_text=final_text,
             assistant_response=resp if fallback_reason is None else None,
+            internal_fallback=fallback_reason is not None,
+            internal_fallback_kind=normalized_termination_kind,
             language=language,
             script=script,
             explicit_language_override=explicit_language_override,
@@ -1309,6 +1425,11 @@ class AgentSession:
             # reconstructable from artifacts alone. Re-raise unchanged afterwards.
             self._emit_terminal_error(exc)
             raise
+        finally:
+            # Same reasoning as the boundary above: this is the only per-turn point
+            # that sees normal returns, exceptions, and cancellation, so turn-level
+            # process hygiene belongs here rather than in the loop's success path.
+            self._reap_tracked_process_groups(event=ReapEvent.TURN_FINALIZATION)
 
     def _emit_terminal_error(
         self,
@@ -1335,6 +1456,105 @@ class AgentSession:
                 self.crash_diagnostics.event("terminal_error", dict(fields), durable=True)
             except Exception:  # noqa: BLE001 - best-effort diagnostic event
                 pass
+
+
+def _shell_command_probe(*, shell_runner: Any, root: Path) -> ShellCommandRunner:
+    """Adapt the session's shell runner to the provisioning probe interface.
+
+    Everything provisioning does goes through here, so it inherits the session's
+    sandbox, PATH, and environment -- the same ones the agent's own test command
+    will resolve. A disabled or unbuildable runner yields "could not run", which
+    the decision reads as unknown rather than as a missing package.
+    """
+
+    def _run(command: str, timeout_s: float) -> ShellProbeResult:
+        if shell_runner is None:
+            return ShellProbeResult(exit_code=None, stderr="shell execution is unavailable")
+        try:
+            completed = shell_runner.run(
+                root=root,
+                cwd=root,
+                cmd=command,
+                timeout_s=int(timeout_s),
+            )
+        except Exception as exc:  # noqa: BLE001 - readonly mode, sandbox failure, timeout
+            return ShellProbeResult(exit_code=None, stderr=str(exc))
+        return ShellProbeResult(
+            exit_code=int(getattr(completed, "returncode", 1) or 0),
+            stderr=str(getattr(completed, "stderr", "") or ""),
+        )
+
+    return _run
+
+
+def _pre_provision_declared_test_runner(
+    *,
+    store: SessionStore,
+    root: Path,
+    cfg: AppConfig,
+    runtime_kind: RuntimeKind,
+    subagent_depth: int,
+    shell_runner: Any,
+) -> None:
+    """Close a declared-but-missing test runner gap once, during warmup.
+
+    A top-level autonomous run installs the runner the repo's own config
+    declares; an interactive run only records that the gap exists so the agent
+    or the user can decide. Never raises: startup must survive a broken package
+    index, a disabled shell, or an unreachable sandbox.
+    """
+    try:
+        enabled = _workspace_provisioning_enabled(cfg)
+        declared = detect_declared_test_runner(root) if enabled else None
+        importable: bool | None = None
+        if declared is not None:
+            importable = probe_runner_importable(
+                declared.package,
+                run_command=_shell_command_probe(shell_runner=shell_runner, root=root),
+            )
+        decision = resolve_provisioning_decision(
+            declared=declared,
+            importable=importable,
+            runtime_kind=runtime_kind,
+            enabled=enabled,
+            subagent_depth=subagent_depth,
+            already_attempted=(
+                provisioning_already_attempted(declared.package) if declared is not None else False
+            ),
+        )
+        if decision.action is ProvisioningAction.SKIP:
+            return
+        if decision.action is ProvisioningAction.REPORT_GAP:
+            store.append(
+                "env_gap_detected",
+                {
+                    "package": decision.package,
+                    "trigger_config_file": decision.trigger_config_file,
+                    "runtime_kind": runtime_kind.value,
+                    "reason": decision.reason,
+                },
+            )
+            return
+        outcome = provision_test_runner(
+            decision,
+            run_command=_shell_command_probe(shell_runner=shell_runner, root=root),
+        )
+        if outcome is None:
+            # Another session in this process claimed the one attempt; nothing
+            # happened here, so nothing is reported here.
+            return
+        store.append(
+            "env_provisioned",
+            {**outcome.payload(), "runtime_kind": runtime_kind.value},
+        )
+    except Exception as exc:  # noqa: BLE001 - provisioning must never break startup
+        try:
+            store.append(
+                "warning",
+                {"warning": "workspace_provisioning_failed", "error": str(exc)},
+            )
+        except Exception:  # noqa: BLE001 - best-effort diagnostic
+            pass
 
 
 def create_session(
@@ -1903,25 +2123,42 @@ def create_session(
         )
 
     resolved_sandbox_settings = resolve_shell_sandbox_settings(session_cfg)
+    process_group_registry = ProcessGroupRegistry()
 
     def _sandbox_warning_callback(message: str) -> None:
         store.append("sandbox_warning", {"message": message})
 
+    def _with_process_group_registry(built_runner: Any) -> Any:
+        # Attach the session's registry to whichever runner the (possibly patched)
+        # builder produced. Backends that cannot be reaped by process group -- the
+        # Docker runner tears its container down through the docker CLI instead --
+        # simply do not declare the field and are left untouched.
+        if not dataclasses.is_dataclass(built_runner):
+            return built_runner
+        field_names = {f.name for f in dataclasses.fields(built_runner)}
+        if "process_group_registry" not in field_names:
+            return built_runner
+        return dataclasses.replace(built_runner, process_group_registry=process_group_registry)
+
     def _load_shell_runner_from_resolved_settings() -> Any:
         patched_build_shell_runner = _patchable("build_shell_runner", build_shell_runner)
         if patched_build_shell_runner is not build_shell_runner:
-            return patched_build_shell_runner(
-                cfg=session_cfg,
-                root=root,
+            return _with_process_group_registry(
+                patched_build_shell_runner(
+                    cfg=session_cfg,
+                    root=root,
+                    warning_callback=_sandbox_warning_callback,
+                )
+            )
+        return _with_process_group_registry(
+            _patchable(
+                "build_shell_runner_from_settings",
+                build_shell_runner_from_settings,
+            )(
+                resolved_sandbox_settings,
+                root,
                 warning_callback=_sandbox_warning_callback,
             )
-        return _patchable(
-            "build_shell_runner_from_settings",
-            build_shell_runner_from_settings,
-        )(
-            resolved_sandbox_settings,
-            root,
-            warning_callback=_sandbox_warning_callback,
         )
 
     if mode == "readonly":
@@ -1941,6 +2178,19 @@ def create_session(
                 warning_callback=_sandbox_warning_callback,
             )
         )
+
+    # Warmup: close a declared-but-missing test-runner gap before the model
+    # discovers it by failing a test run. Placed here because it must go through
+    # the session's own shell runner -- the environment the agent's commands
+    # resolve, and the one the operator's sandbox policy governs.
+    _pre_provision_declared_test_runner(
+        store=store,
+        root=workspace_context.workspace_root,
+        cfg=session_cfg,
+        runtime_kind=resolved_runtime_kind,
+        subagent_depth=subagent_depth,
+        shell_runner=runner,
+    )
 
     terminal_manager = TerminalManager(
         runner=bg_runner,
@@ -2015,6 +2265,7 @@ def create_session(
             console=console,
             surface=surface,
             store=store,
+            process_group_registry=process_group_registry,
             mode=mode,
             yes=yes,
             cfg=session_cfg,
@@ -2403,6 +2654,7 @@ def create_session(
                 root=root,
                 runtime_version=f"sylliptor-{__version__}",
             ),
+            process_group_registry=process_group_registry,
         )
         if subagent_depth == 0 and store.enabled:
             # Persist the process's provider/web-search telemetry to the run's artifact

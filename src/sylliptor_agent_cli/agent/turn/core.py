@@ -4663,6 +4663,11 @@ def run_turn(
                 )
                 self._emit_final_assistant_text(
                     final_text=local_summary,
+                    # Same class of artifact as the forced-summary fallback: written
+                    # by the runtime from its own state, not answered by the model.
+                    # Marked so a nested run cannot pass it up as a deliverable.
+                    internal_fallback=True,
+                    internal_fallback_kind="empty_response_anomaly",
                     language=turn_language,
                     script=turn_script,
                     explicit_language_override=turn_language_explicit,

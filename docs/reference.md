@@ -158,6 +158,8 @@ Common keys:
 - `evidence_v2_enabled`
 - `regression_baseline_enabled`
 - `turn_contract_v2_enabled`
+- `process_reaping_enabled`
+- `workspace_provisioning_enabled`
 - `role_models.router`
 - `subagents_enabled`
 - `custom_tools_enabled`

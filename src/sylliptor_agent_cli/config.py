@@ -356,6 +356,14 @@ class AppConfig(BaseModel):
     # but reverts the completion-gate policy (no expectations_unaddressed / advisory
     # completion enforcement). Prompt additions are unconditional either way.
     turn_contract_v2_enabled: bool = True
+    # Kill-switch for reaping agent-started process groups (step 5); env override
+    # SYLLIPTOR_PROCESS_REAPING=off keeps commands in their own process group but
+    # never signals one, restoring the legacy leave-it-running behaviour.
+    process_reaping_enabled: bool = True
+    # Kill-switch for workspace test-runner pre-provisioning (step 5); env override
+    # SYLLIPTOR_WORKSPACE_PROVISIONING=off suppresses both the one-shot install in
+    # autonomous runs and the env_gap_detected telemetry.
+    workspace_provisioning_enabled: bool = True
     step_budget_policy: str = AUTONOMOUS_STEP_BUDGET_POLICY
     task_max_steps: int = DEFAULT_TASK_MAX_STEPS
     subagent_max_steps: int = DEFAULT_SUBAGENT_MAX_STEPS
@@ -1381,6 +1389,8 @@ _SETTABLE_KEYS: set[str] = {
     "evidence_v2_enabled",
     "regression_baseline_enabled",
     "turn_contract_v2_enabled",
+    "process_reaping_enabled",
+    "workspace_provisioning_enabled",
     "step_budget_policy",
     "subagents_enabled",
     "skills_enabled",
@@ -2475,6 +2485,26 @@ def set_config_value(
             cfg.turn_contract_v2_enabled = False
             return cfg
         raise ConfigError("turn_contract_v2_enabled must be true/false")
+
+    if key == "process_reaping_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.process_reaping_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.process_reaping_enabled = False
+            return cfg
+        raise ConfigError("process_reaping_enabled must be true/false")
+
+    if key == "workspace_provisioning_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.workspace_provisioning_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.workspace_provisioning_enabled = False
+            return cfg
+        raise ConfigError("workspace_provisioning_enabled must be true/false")
 
     if key == "step_budget_policy":
         normalized = value.strip().lower()

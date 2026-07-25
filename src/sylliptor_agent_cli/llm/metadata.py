@@ -10,6 +10,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from ..internal_artifacts import INTERNAL_ARTIFACT_MESSAGE_KEY
+
 PROVIDER_METADATA_KEY = "_sylliptor_provider_metadata"
 ROUTE_IDENTITY_PROVIDER_METADATA_KEY = "_route_identity"
 OPENAI_RESPONSES_PROVIDER_METADATA_KEY = "openai_responses"
@@ -384,6 +386,7 @@ def tool_call_metadata_entries(response: Any) -> list[dict[str, Any]]:
 def strip_provider_metadata_from_message(message: dict[str, Any]) -> dict[str, Any]:
     copied = dict(message)
     copied.pop(PROVIDER_METADATA_KEY, None)
+    copied.pop(INTERNAL_ARTIFACT_MESSAGE_KEY, None)
     copied.pop(DEEPSEEK_REASONING_CONTENT_KEY, None)
     copied.pop(OPENROUTER_REASONING_KEY, None)
     copied.pop(OPENROUTER_REASONING_DETAILS_KEY, None)

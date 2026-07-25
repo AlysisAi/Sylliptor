@@ -17,6 +17,7 @@ from typing import Protocol
 from .branding import default_sandbox_docker_image
 from .bwrap_etc import ensure_minimal_etc_dir
 from .config import AppConfig, ConfigError
+from .process_reaping import ProcessGroupRegistry, run_in_tracked_process_group
 from .sandbox_settings import ShellSandboxSettings, resolve_shell_sandbox_settings
 
 _SENSITIVE_ENV_KEYS = {"SYLLIPTOR_API_KEY", "OPENAI_API_KEY"}
@@ -441,6 +442,8 @@ def _bwrap_path_value(path_value: str | None) -> str:
 
 @dataclass(frozen=True)
 class HostShellRunner:
+    process_group_registry: ProcessGroupRegistry | None = None
+
     def run(
         self,
         *,
@@ -449,13 +452,14 @@ class HostShellRunner:
         cmd: str,
         timeout_s: int,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return run_in_tracked_process_group(
             cmd,
             shell=True,
             cwd=str(cwd),
-            capture_output=True,
-            text=True,
             timeout=timeout_s,
+            registry=self.process_group_registry,
+            origin="shell_run:host",
+            command_label=cmd,
         )
 
 
@@ -623,6 +627,7 @@ class BwrapShellRunner:
     network: str = "off"
     clear_env: bool = True
     profile: str = "hardened"
+    process_group_registry: ProcessGroupRegistry | None = None
 
     def run(
         self,
@@ -641,14 +646,14 @@ class BwrapShellRunner:
             profile=self.profile,
             unshare_cgroup=_supports_bwrap_unshare_cgroup(),
         )
-        return subprocess.run(
+        return run_in_tracked_process_group(
             args,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
             cwd=os.fspath(root.resolve()),
             env=run_env,
+            timeout=timeout_s,
+            registry=self.process_group_registry,
+            origin="shell_run:bwrap",
+            command_label=cmd,
         )
 
 
@@ -902,11 +907,18 @@ def build_shell_runner_from_settings(
     settings: ShellSandboxSettings,
     root: Path,
     warning_callback: Callable[[str], None] | None = None,
+    *,
+    process_group_registry: ProcessGroupRegistry | None = None,
 ) -> ShellRunner:
     _ = root.resolve()
 
+    # The Docker backend is deliberately not given the registry: `killpg` on the
+    # `docker run` CLI does not stop the container, so teardown must go through
+    # `_docker_cleanup_container` (which this runner already does on timeout and
+    # on exception). This mirrors DockerBackgroundRunner's "direct" termination
+    # mode.
     if settings.mode == "off":
-        return HostShellRunner()
+        return HostShellRunner(process_group_registry=process_group_registry)
 
     is_linux = platform.system().lower() == "linux"
     has_bwrap = is_linux and shutil.which("bwrap") is not None
@@ -931,6 +943,7 @@ def build_shell_runner_from_settings(
                 network=settings.network,
                 clear_env=settings.clear_env,
                 profile=settings.bwrap_profile,
+                process_group_registry=process_group_registry,
             )
         if has_docker:
             return DockerShellRunner(
@@ -953,6 +966,7 @@ def build_shell_runner_from_settings(
                 network=settings.network,
                 clear_env=settings.clear_env,
                 profile=settings.bwrap_profile,
+                process_group_registry=process_group_registry,
             )
         return fallback_or_error(reason="bwrap backend selected, but bubblewrap is not available")
 

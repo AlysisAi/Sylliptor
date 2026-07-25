@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Added tracked process-group cleanup, reusable workspace provisioning, and containment for
+  incomplete subagent reports so background work and internal artifacts do not leak past a turn.
 - Added turn-contract enforcement and regression baselines so execute-intent turns apply the
   requested change, respect named behavior, and verify against pre-existing failures.
 - Added fact-based completion evidence with per-stage pipeline exit status, post-edit

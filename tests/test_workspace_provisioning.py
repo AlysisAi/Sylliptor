@@ -232,7 +232,6 @@ def test_top_level_autonomous_run_with_missing_runner_provisions(kind: RuntimeKi
         RuntimeKind.FORGE_EXEC,
         RuntimeKind.SWARM_WORKER,
         RuntimeKind.SUBAGENT,
-        RuntimeKind.POWER_CANDIDATE,
     ),
 )
 def test_importable_runner_is_never_touched(kind: RuntimeKind) -> None:
@@ -256,7 +255,7 @@ def test_interactive_run_reports_the_gap_instead_of_installing() -> None:
 
 @pytest.mark.parametrize(
     "kind",
-    (RuntimeKind.SUBAGENT, RuntimeKind.POWER_CANDIDATE, RuntimeKind.CONFLICT_AUTO_RESOLVE),
+    (RuntimeKind.SUBAGENT, RuntimeKind.CONFLICT_AUTO_RESOLVE),
 )
 def test_nested_runtime_kinds_never_install(kind: RuntimeKind) -> None:
     # These can be spawned from an interactive chat. If they installed, the

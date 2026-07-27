@@ -43,7 +43,6 @@ _AUTONOMOUS_KINDS = (
     RuntimeKind.SWARM_WORKER,
     RuntimeKind.SUBAGENT,
     RuntimeKind.CONFLICT_AUTO_RESOLVE,
-    RuntimeKind.POWER_CANDIDATE,
 )
 
 

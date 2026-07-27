@@ -1687,12 +1687,6 @@ def run_turn(
         )
         route_arbitrated = False
         route_arbitration_rule = None
-        # Power Mode's answer-production choice (chat-answer capsule vs repo
-        # swarm) keeps seeing the pre-arbitration route: arbitration provisions
-        # capabilities, it does not re-scope which turns Power Mode treats as
-        # conversational. Without this, an escalated general question would
-        # silently launch the multi-candidate repo swarm.
-        power_mode_shadow_route = route_decision.route
         if route_arbitration_verdict.override and route_arbitration_enabled:
             route_arbitrated = True
             route_arbitration_rule = route_arbitration_verdict.rule
@@ -1924,7 +1918,6 @@ def run_turn(
         route_execution_posture = str(one_shot_turn_intent or "execute")
         route_arbitrated = False
         route_arbitration_rule = None
-        power_mode_shadow_route = "repo"
         self.store.append(
             "language_decision",
             {

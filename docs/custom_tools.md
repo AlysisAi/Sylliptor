@@ -47,10 +47,8 @@ TOOL = {
     "description": "Read one Jira issue by key.",
     "input_schema": {
         "type": "object",
-        "properties": {
-            "issue_key": {"type": "string"}
-        },
-        "required": ["issue_key"]
+        "properties": {"issue_key": {"type": "string"}},
+        "required": ["issue_key"],
     },
     "timeout_s": 15,
     "required_env": ["JIRA_BASE_URL", "JIRA_TOKEN"],
@@ -63,8 +61,8 @@ TOOL = {
         "network_hosts": ["jira.example.com"],
         "filesystem": {"read": "none", "write": "none"},
         "process_spawn": "none",
-        "secret_refs": ["JIRA_TOKEN"]
-    }
+        "secret_refs": ["JIRA_TOKEN"],
+    },
 }
 
 

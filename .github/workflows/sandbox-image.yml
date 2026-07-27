@@ -21,6 +21,11 @@ on:
           - dev
           - base
           - server
+      release_tag:
+        description: Optional existing release image tag to repair from the selected ref.
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -183,7 +188,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+          release_tag="${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || '' }}"
+          if [[ -n "${release_tag}" ]]; then
+            if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "Invalid release tag: ${release_tag}" >&2
+              exit 1
+            fi
+            if ! git ls-remote --exit-code --tags origin "refs/tags/${release_tag}" >/dev/null; then
+              echo "Release tag does not exist: ${release_tag}" >&2
+              exit 1
+            fi
+            version="${release_tag}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME}"
           else
             version="${GITHUB_SHA::12}"
@@ -212,8 +228,10 @@ jobs:
             type=raw,value=${{ matrix.variant }}
             type=sha,format=short,prefix=${{ matrix.variant }}-
             type=ref,event=tag,prefix=${{ matrix.variant }}-
+            type=raw,value=${{ matrix.variant }}-${{ inputs.release_tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' }}
             type=raw,value=latest,enable=${{ matrix.variant == env.DEFAULT_VARIANT }}
             type=ref,event=tag,enable=${{ matrix.variant == env.DEFAULT_VARIANT }}
+            type=raw,value=${{ inputs.release_tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && matrix.variant == env.DEFAULT_VARIANT }}
 
       - name: Build sandbox image
         id: build

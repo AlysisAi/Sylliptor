@@ -65,6 +65,7 @@ ARG NODE_MAJOR=24
 # Keep npm ahead of the NodeSource package's bundled npm when scanner-actionable
 # transitive npm dependencies receive security fixes.
 ARG NPM_VERSION=11.18.0
+ARG NPM_BRACE_EXPANSION_VERSION=5.0.8
 ARG TARGETARCH
 ARG GO_VERSION=1.26.5
 ARG GO_LINUX_AMD64_SHA256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
@@ -105,6 +106,17 @@ RUN install -d -m 0755 /etc/apt/keyrings; \
     echo "APT pin: ${package}=${version}"; \
     apt-get install -y --no-install-recommends "${package}=${version}"; \
     npm install -g "npm@${NPM_VERSION}"; \
+    npm_root="$(npm root -g)"; \
+    npm_override_dir="$(mktemp -d)"; \
+    npm install --prefix "${npm_override_dir}" --no-save --ignore-scripts \
+        "brace-expansion@${NPM_BRACE_EXPANSION_VERSION}"; \
+    rm -rf "${npm_root}/npm/node_modules/brace-expansion"; \
+    cp -a "${npm_override_dir}/node_modules/brace-expansion" \
+        "${npm_root}/npm/node_modules/brace-expansion"; \
+    rm -rf "${npm_override_dir}"; \
+    installed_brace_expansion="$(node -p \
+        "require('${npm_root}/npm/node_modules/brace-expansion/package.json').version")"; \
+    test "${installed_brace_expansion}" = "${NPM_BRACE_EXPANSION_VERSION}"; \
     npm cache clean --force; \
     apt-mark manual "${package}"; \
     rm -rf /var/lib/apt/lists/*

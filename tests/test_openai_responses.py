@@ -533,9 +533,7 @@ def test_chat_normalizes_provider_declared_final_answer_phase() -> None:
                         "type": "message",
                         "role": "assistant",
                         "phase": "final_answer",
-                        "content": [
-                            {"type": "output_text", "text": "The Next.js site is ready."}
-                        ],
+                        "content": [{"type": "output_text", "text": "The Next.js site is ready."}],
                     }
                 ],
             },

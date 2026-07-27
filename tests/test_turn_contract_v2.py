@@ -124,7 +124,9 @@ def test_acceptance_contract_payload_carries_expectations(tmp_path: Path) -> Non
     payload = contract.as_payload()
     assert "expectations" in payload
     assert any(item["kind"] == "expected_output" for item in payload["expectations"])
-    assert all({"id", "kind", "text", "source_quote"} <= set(item) for item in payload["expectations"])
+    assert all(
+        {"id", "kind", "text", "source_quote"} <= set(item) for item in payload["expectations"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +141,13 @@ def _exp(text: str, kind: ExpectationKind = ExpectationKind.EXPECTED_OUTPUT) -> 
 def test_evidence_literal_hit() -> None:
     evidence = match_expectation_evidence(
         [_exp("EXPECTED TOKEN 9")],
-        [{"normalized_command": "pytest x", "output": "saw EXPECTED TOKEN 9 in run", "generation": 2}],
+        [
+            {
+                "normalized_command": "pytest x",
+                "output": "saw EXPECTED TOKEN 9 in run",
+                "generation": 2,
+            }
+        ],
     )
     assert len(evidence) == 1
     assert evidence[0].expectation_id == "exp001"
@@ -157,7 +165,13 @@ def test_evidence_literal_miss() -> None:
 def test_multiline_literal_hit() -> None:
     evidence = match_expectation_evidence(
         [_exp("line one\nline two")],
-        [{"normalized_command": "c", "output": "prefix line one\nline two suffix", "generation": 1}],
+        [
+            {
+                "normalized_command": "c",
+                "output": "prefix line one\nline two suffix",
+                "generation": 1,
+            }
+        ],
     )
     assert len(evidence) == 1
 
@@ -201,7 +215,9 @@ def test_evidence_is_deterministic_first_run_wins() -> None:
 
 def test_assess_confirmed_by_evidence() -> None:
     exp = _exp("TOKEN_X")
-    evidence = match_expectation_evidence([exp], [{"normalized_command": "c", "output": "TOKEN_X", "generation": 1}])
+    evidence = match_expectation_evidence(
+        [exp], [{"normalized_command": "c", "output": "TOKEN_X", "generation": 1}]
+    )
     result = assess_expectations(expectations=[exp], evidence=evidence)
     assert result.confirmed == ("exp001",)
     assert result.unaddressed == ()
@@ -235,7 +251,9 @@ def test_assess_superseded_does_not_block_but_counts() -> None:
 
 def test_assess_not_applicable() -> None:
     exp = _exp("src/foo.py", ExpectationKind.NAMED_LOCUS)
-    dispositions = {"exp001": DispositionRecord("exp001", ExpectationDisposition.NOT_APPLICABLE, "n/a")}
+    dispositions = {
+        "exp001": DispositionRecord("exp001", ExpectationDisposition.NOT_APPLICABLE, "n/a")
+    }
     result = assess_expectations(expectations=[exp], evidence=[], dispositions=dispositions)
     assert result.not_applicable == ("exp001",)
     assert result.unaddressed == ()
@@ -408,7 +426,10 @@ def test_advisory_summary_surfaces_reason_and_explanation() -> None:
 
 
 def test_coerce_advisory_reason_valid_and_invalid() -> None:
-    assert coerce_advisory_reason("out_of_scope_request") == AdvisoryCompletionReason.OUT_OF_SCOPE_REQUEST
+    assert (
+        coerce_advisory_reason("out_of_scope_request")
+        == AdvisoryCompletionReason.OUT_OF_SCOPE_REQUEST
+    )
     assert coerce_advisory_reason("not_a_reason") is None
     assert coerce_advisory_reason(None) is None
 
@@ -518,5 +539,7 @@ def test_unconfirmed_expectations_marker_visible_and_distinct() -> None:
 
 
 def test_advisory_completion_summary_format() -> None:
-    summary = build_advisory_completion_summary(AdvisoryCompletionReason.NO_CHANGE_NEEDED, "already right")
+    summary = build_advisory_completion_summary(
+        AdvisoryCompletionReason.NO_CHANGE_NEEDED, "already right"
+    )
     assert summary.startswith("\n\n---\nNo changes made: no_change_needed — already right")

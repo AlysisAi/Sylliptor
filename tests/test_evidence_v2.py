@@ -73,9 +73,7 @@ def _force_posix_capture(monkeypatch):
 
 def test_plain_command_has_single_element_status(tmp_path: Path) -> None:
     runner = _FakeRunner(returncode=0, stdout="hi\n", stderr="")
-    result = shell_run(
-        root=tmp_path, cmd="echo hi", runner=runner, capture_pipeline_status=True
-    )
+    result = shell_run(root=tmp_path, cmd="echo hi", runner=runner, capture_pipeline_status=True)
     assert result["pipeline_stage_status"] == [0]
     assert result["pipeline_stages"] == ["echo hi"]
     # A plain command is not wrapped.
@@ -112,9 +110,7 @@ def test_multistage_pipeline_captures_all_stages(tmp_path: Path) -> None:
 
 def test_capture_disabled_leaves_plain_status(tmp_path: Path) -> None:
     runner = _FakeRunner(returncode=0, stdout="hi\n", stderr="")
-    result = shell_run(
-        root=tmp_path, cmd="echo hi", runner=runner, capture_pipeline_status=False
-    )
+    result = shell_run(root=tmp_path, cmd="echo hi", runner=runner, capture_pipeline_status=False)
     assert result["pipeline_stage_status"] == [0]
     assert all("command -v bash" not in c for c in runner.commands)
 

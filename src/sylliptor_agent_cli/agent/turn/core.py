@@ -5435,8 +5435,7 @@ def run_turn(
                     }
                     ordering_evidence_deficit = bool(
                         _evidence_v2_enabled(self.cfg)
-                        and gate_stage
-                        in {"verification_not_attempted", "verification_incomplete"}
+                        and gate_stage in {"verification_not_attempted", "verification_incomplete"}
                         and _execution_evidence_required_for_turn(
                             state=execution_state,
                             turn_intent=completion_gate_turn_intent,
@@ -5611,12 +5610,8 @@ def run_turn(
                             # Fail honest: regressions the change introduced that a
                             # bounded action-only repair could not resolve are not
                             # silently accepted. Distinct event + visible marker.
-                            regression_diff_payload = dict(
-                                execution_state.latest_regression_diff
-                            )
-                            regressed_ids = list(
-                                regression_diff_payload.get("regressions") or []
-                            )
+                            regression_diff_payload = dict(execution_state.latest_regression_diff)
+                            regressed_ids = list(regression_diff_payload.get("regressions") or [])
                             regression_baseline_command = str(
                                 regression_diff_payload.get("baseline_command") or ""
                             )
@@ -5660,9 +5655,7 @@ def run_turn(
                             # Fail honest: failures whose relationship to the change
                             # could not be established are finalized as UNATTRIBUTED,
                             # never as silent success.
-                            regression_diff_payload = dict(
-                                execution_state.latest_regression_diff
-                            )
+                            regression_diff_payload = dict(execution_state.latest_regression_diff)
                             unattributed_ids = list(
                                 regression_diff_payload.get("unattributed") or []
                             )
@@ -5703,9 +5696,7 @@ def run_turn(
                             # Fail honest (turn-contract v2): task-named expectations
                             # neither confirmed by observed evidence nor disposed are
                             # finalized as UNCONFIRMED, never as silent success.
-                            assessment_payload = dict(
-                                execution_state.latest_expectation_assessment
-                            )
+                            assessment_payload = dict(execution_state.latest_expectation_assessment)
                             unaddressed_expectation_ids = list(
                                 assessment_payload.get("unaddressed") or []
                             )
@@ -5746,7 +5737,9 @@ def run_turn(
                         if (
                             _turn_contract_v2_enabled(self.cfg)
                             and gate_stage == "no_material_edits"
-                            and (self.one_shot_execution or completion_gate_turn_intent == "execute")
+                            and (
+                                self.one_shot_execution or completion_gate_turn_intent == "execute"
+                            )
                             and not honest_unverified_finalization
                             and not regressions_unresolved_finalization
                             and not unattributed_failures_finalization
@@ -5838,9 +5831,7 @@ def run_turn(
                             one_shot_execution=self.one_shot_execution,
                             live_background_processes=live_background_processes,
                             execution_evidence_missing_detail=execution_evidence_missing_detail,
-                            regression_ids=list(
-                                regression_diff_for_nudge.get("regressions") or []
-                            ),
+                            regression_ids=list(regression_diff_for_nudge.get("regressions") or []),
                             regression_baseline_command=str(
                                 regression_diff_for_nudge.get("baseline_command") or ""
                             ),

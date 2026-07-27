@@ -223,6 +223,8 @@ _UNATTRIBUTED_FAILURES_FINALIZATION_MARKER_PREFIX = (
 def build_unattributed_failures_marker(unattributed_ids: list[str] | tuple[str, ...]) -> str:
     ids = ", ".join(str(item) for item in unattributed_ids if str(item).strip())
     return _UNATTRIBUTED_FAILURES_FINALIZATION_MARKER_PREFIX.format(ids=ids)
+
+
 _COMPLETION_GATE_PROBLEM_LABELS = {
     "empty_final_response": "empty final response",
     "clarification_requested": "clarification requested instead of action",
@@ -669,7 +671,9 @@ class TurnExecutionState:
         """Link expected-output literals to post-edit runs at the current generation."""
         generation = self.verification_relevant_edit_generation
         runs = [
-            run for run in self.post_edit_run_outputs if int(run.get("generation") or 0) >= generation
+            run
+            for run in self.post_edit_run_outputs
+            if int(run.get("generation") or 0) >= generation
         ]
         return match_expectation_evidence(expectations, runs)
 
@@ -798,9 +802,7 @@ class TurnExecutionState:
             },
             "post_edit_test_runs": [run.as_payload() for run in self.post_edit_test_runs],
             "agent_created_paths": sorted(self.agent_created_paths),
-            "last_verification_attempt_was_test_run": (
-                self.last_verification_attempt_was_test_run
-            ),
+            "last_verification_attempt_was_test_run": (self.last_verification_attempt_was_test_run),
             "regression_diff": dict(self.latest_regression_diff),
             "expectation_assessment": dict(self.latest_expectation_assessment),
             "expectation_evidence": list(self.latest_expectation_evidence),
@@ -1654,11 +1656,7 @@ def _record_tool_effect(
             result=result,
         )
 
-    if (
-        status != "failed"
-        and normalized_tool == "fs_write"
-        and result.get("created") is True
-    ):
+    if status != "failed" and normalized_tool == "fs_write" and result.get("created") is True:
         # A brand-new file the agent authored this turn: a failing test in it is
         # signal (agent_authored), not a regression. touched_paths already holds
         # the normalized repo-relative path for fs_write.

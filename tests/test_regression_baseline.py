@@ -640,15 +640,22 @@ def test_gate_unattributed_one_round_policy_surfaces_problem() -> None:
 
 def test_gate_kill_switch_env_and_config(monkeypatch) -> None:
     monkeypatch.delenv("SYLLIPTOR_REGRESSION_BASELINE", raising=False)
-    assert _regression_baseline_enabled(AppConfig(model="x", regression_baseline_enabled=True)) is True
     assert (
-        _regression_baseline_enabled(AppConfig(model="x", regression_baseline_enabled=False)) is False
+        _regression_baseline_enabled(AppConfig(model="x", regression_baseline_enabled=True)) is True
+    )
+    assert (
+        _regression_baseline_enabled(AppConfig(model="x", regression_baseline_enabled=False))
+        is False
     )
     monkeypatch.setenv("SYLLIPTOR_REGRESSION_BASELINE", "off")
-    assert _regression_baseline_enabled(AppConfig(model="x", regression_baseline_enabled=True)) is False
+    assert (
+        _regression_baseline_enabled(AppConfig(model="x", regression_baseline_enabled=True))
+        is False
+    )
     monkeypatch.setenv("SYLLIPTOR_REGRESSION_BASELINE", "on")
     assert (
-        _regression_baseline_enabled(AppConfig(model="x", regression_baseline_enabled=False)) is True
+        _regression_baseline_enabled(AppConfig(model="x", regression_baseline_enabled=False))
+        is True
     )
 
 

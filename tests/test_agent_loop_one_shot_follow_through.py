@@ -1111,9 +1111,10 @@ def test_one_shot_marker_matching_is_accent_insensitive_for_greek() -> None:
     blocker_unaccented = "δεν μπορω να προχωρησω, χρειαζομαι εγκριση."
     assert _assistant_text_has_blocker_marker(blocker_accented) is True
     assert _assistant_text_has_blocker_marker(blocker_unaccented) is True
-    assert _assistant_text_contains_progress_intent(
-        "The project now has a real Next.js site."
-    ) is False
+    assert (
+        _assistant_text_contains_progress_intent("The project now has a real Next.js site.")
+        is False
+    )
 
 
 def test_one_shot_continues_after_non_final_progress_message(tmp_path: Path) -> None:

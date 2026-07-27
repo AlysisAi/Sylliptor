@@ -523,7 +523,9 @@ class RegressionDiffResult:
 
     @property
     def has_failures(self) -> bool:
-        return bool(self.pre_existing or self.regressions or self.unattributed or self.agent_authored)
+        return bool(
+            self.pre_existing or self.regressions or self.unattributed or self.agent_authored
+        )
 
     @property
     def all_failures_benign(self) -> bool:
@@ -560,9 +562,7 @@ def classify_regression_diff(
         for components in (_created_path_components(path) for path in agent_created_paths)
         if components
     ]
-    comparable = (
-        baseline is not None and baseline.usable and post_report.usable_as_baseline
-    )
+    comparable = baseline is not None and baseline.usable and post_report.usable_as_baseline
     baseline_failing = baseline.failing_ids if baseline is not None else frozenset()
 
     pre_existing: list[str] = []
@@ -620,9 +620,7 @@ def aggregate_regression_results(
     pre = [tid for tid in dict.fromkeys(pre_existing) if tid not in authored_set]
     pre_set = set(pre)
     reg = [
-        tid
-        for tid in dict.fromkeys(regressions)
-        if tid not in authored_set and tid not in pre_set
+        tid for tid in dict.fromkeys(regressions) if tid not in authored_set and tid not in pre_set
     ]
     reg_set = set(reg)
     un = [
@@ -630,9 +628,7 @@ def aggregate_regression_results(
         for tid in dict.fromkeys(unattributed)
         if tid not in authored_set and tid not in pre_set and tid not in reg_set
     ]
-    baseline_command = (
-        ", ".join(dict.fromkeys(baseline_commands)) if baseline_commands else None
-    )
+    baseline_command = ", ".join(dict.fromkeys(baseline_commands)) if baseline_commands else None
     return RegressionDiffResult(
         pre_existing=tuple(pre),
         regressions=tuple(reg),

@@ -78,9 +78,7 @@ def shell_run(
 
     def _run(command_text: str) -> tuple[Any, list[int] | None, str]:
         run_cmd = (
-            build_pipeline_status_capture_command(command_text)
-            if wants_capture
-            else command_text
+            build_pipeline_status_capture_command(command_text) if wants_capture else command_text
         )
         completed = runner.run(root=base, cwd=cwd_path, cmd=run_cmd, timeout_s=timeout_s)
         if wants_capture:

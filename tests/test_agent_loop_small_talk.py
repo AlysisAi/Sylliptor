@@ -2781,9 +2781,17 @@ def test_repo_backed_vague_first_turn_requests_use_router_context_for_repo_route
     )
 
 
-def test_repo_backed_conceptual_git_question_stays_on_general_fast_path(
+def test_repo_backed_conceptual_git_question_escalates_on_intent_disagreement(
     tmp_path: Path,
 ) -> None:
+    # "What is a git branch in simple terms?" carries no advisory marker the
+    # turn-intent classifier recognizes, so it classifies as execute-class.
+    # With a non-execute router verdict in a writable repo-backed interactive
+    # session, route arbitration provisions the repo toolset instead of taking
+    # the answer-without-tools fast path: capability present, execution not
+    # mandated — the agent still answers in prose. Advisory-classified
+    # questions keep the fast path (see
+    # test_first_repo_advisory_question_can_finish_without_forced_repo_inspection).
     _init_git_repo(tmp_path)
     cfg = AppConfig(model="test-model", routing_mode="auto", chat_temperature=0.5)
     session = create_session(
@@ -2795,9 +2803,24 @@ def test_repo_backed_conceptual_git_question_stays_on_general_fast_path(
         no_log=False,
         api_key_override="override-key",
         session_log_dir_override=tmp_path / "sessions",
+        verification_enabled=False,
     )
     event_path = session.store.path
-    session.client = _FailClient()  # type: ignore[assignment]
+    repo_client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="I will check the repo state first.",
+                tool_calls=[ToolCall(id="tc1", name="fs_read", arguments={"path": "README.md"})],
+                raw={},
+            ),
+            LLMResponse(
+                content="A git branch is a movable pointer to a commit.",
+                tool_calls=[],
+                raw={},
+            ),
+        ]
+    )
+    session.client = repo_client  # type: ignore[assignment]
     router = _RouterStubClient(
         route="general",
         response_reply="A git branch is a movable pointer to a commit.",
@@ -2811,17 +2834,21 @@ def test_repo_backed_conceptual_git_question_stays_on_general_fast_path(
 
     assert exit_code == 0
     assert router.route_calls == 1
-    assert router.response_calls == 1
+    assert router.response_calls == 0
     route_payload = _session_event_payload(event_path, "route_decision")
     route_context = _route_context_payload(router.last_route_messages)
     assert route_context is not None
     assert route_context["workspace_kind"] == "git_repo"
     assert route_context["stable_grounding_available"] is True
-    assert route_payload["route"] == "general"
-    assert route_payload["execution_posture"] == "advisory_non_execution"
+    assert route_payload["route"] == "repo"
+    assert route_payload["original_route"] == "general"
+    assert route_payload["execution_posture"] == "execute"
     assert route_payload["router_execution_posture"] == "advisory_non_execution"
-    assert route_payload["route_selection_source"] == "router"
+    assert route_payload["route_selection_source"] == "route_arbitration"
+    assert route_payload["arbitrated"] is True
+    assert route_payload["route_arbitration_rule"] == "classifier_disagreement"
     assert route_payload["route_override_reason"] is None
+    assert repo_client.calls >= 1
 
 
 def test_failed_router_model_recovers_via_main_model(tmp_path: Path) -> None:
@@ -2906,9 +2933,13 @@ def test_vague_bugfix_request_stays_on_general_fast_path_outside_repo_session(
     assert router.response_calls == 1
 
 
-def test_repo_backed_bugfix_request_respects_general_router_choice(
+def test_repo_backed_bugfix_request_escalates_over_general_router_choice(
     tmp_path: Path,
 ) -> None:
+    # A bugfix request inside a writable repo-backed interactive session with
+    # an execute-class turn intent must never lose the repo toolset to a
+    # misrouted "general" verdict — that is the "answers like tech support"
+    # failure mode. Route arbitration escalates both route and posture.
     _init_git_repo(tmp_path)
     cfg = AppConfig(model="test-model", routing_mode="auto", chat_temperature=0.5)
     session = create_session(
@@ -2920,9 +2951,24 @@ def test_repo_backed_bugfix_request_respects_general_router_choice(
         no_log=False,
         api_key_override="override-key",
         session_log_dir_override=tmp_path / "sessions",
+        verification_enabled=False,
     )
     event_path = session.store.path
-    session.client = _FailClient()  # type: ignore[assignment]
+    repo_client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="Inspecting the formatter first.",
+                tool_calls=[ToolCall(id="tc1", name="fs_read", arguments={"path": "README.md"})],
+                raw={},
+            ),
+            LLMResponse(
+                content="Fixed the repeated headers and blank bullets.",
+                tool_calls=[],
+                raw={},
+            ),
+        ]
+    )
+    session.client = repo_client  # type: ignore[assignment]
     router = _RouterStubClient(
         route="general",
         execution_posture="execute",
@@ -2940,14 +2986,18 @@ def test_repo_backed_bugfix_request_respects_general_router_choice(
     route_payload = _session_event_payload(event_path, "route_decision")
     assert exit_code == 0
     assert router.route_calls == 1
-    assert router.response_calls == 1
-    assert route_payload["route"] == "general"
+    assert router.response_calls == 0
+    assert route_payload["route"] == "repo"
     assert route_payload["original_route"] == "general"
     assert route_payload["execution_posture"] == "execute"
     assert route_payload["router_execution_posture"] == "execute"
     assert route_payload["router_decision_source"] == "router"
-    assert route_payload["route_selection_source"] == "router"
+    assert route_payload["route_selection_source"] == "route_arbitration"
+    assert route_payload["arbitrated"] is True
+    assert route_payload["route_arbitration_rule"] == "classifier_disagreement"
+    assert route_payload["router_intent_execution_disagreement"] is True
     assert route_payload["route_override_reason"] is None
+    assert repo_client.calls >= 1
 
 
 def test_router_exception_fallback_keeps_vague_repo_improvement_on_repo_path(
@@ -3823,7 +3873,6 @@ def test_first_repo_turn_no_tool_finalization_without_stable_grounding_does_not_
     "instruction",
     [
         "How does the current notes CLI work?",
-        "πώς δουλεύει το notes CLI;",
     ],
 )
 def test_first_repo_advisory_question_can_finish_without_forced_repo_inspection(
@@ -3873,6 +3922,7 @@ def test_first_repo_advisory_question_can_finish_without_forced_repo_inspection(
     assert route_payload["route"] == "repo"
     assert route_payload["execution_posture"] == "advisory_non_execution"
     assert route_payload["router_execution_posture"] == "advisory_non_execution"
+    assert route_payload["arbitrated"] is False
     assert not any(
         event.get("type") == "normal_chat_first_turn_repo_execute_retry"
         for event in read_session_events(event_path)
@@ -3882,6 +3932,67 @@ def test_first_repo_advisory_question_can_finish_without_forced_repo_inspection(
         and "Repo-backed normal chat safeguard" in str(msg.get("content") or "")
         for msg in session.messages
     )
+
+
+def test_first_repo_advisory_question_with_execute_intent_escalates_posture(
+    tmp_path: Path,
+) -> None:
+    # The Greek phrasing "πώς δουλεύει ..." is not in the turn-intent
+    # classifier's advisory marker lists, so the turn classifies as
+    # execute-class. With a repo/advisory router verdict that is a classifier
+    # disagreement: arbitration escalates the posture so execution capability
+    # is never gated by a verdict the intent classifier contradicts.
+    _init_git_repo(tmp_path)
+    cfg = AppConfig(model="test-model", routing_mode="auto")
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=tmp_path / "sessions",
+        verification_enabled=False,
+    )
+    event_path = session.store.path
+    client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="I will read the CLI entrypoint first.",
+                tool_calls=[ToolCall(id="tc1", name="fs_read", arguments={"path": "README.md"})],
+                raw={},
+            ),
+            LLMResponse(
+                content="The notes CLI reads the local repo config and formats terminal output.",
+                tool_calls=[],
+                raw={},
+            ),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+    router = _RouterStubClient(
+        route="repo",
+        execution_posture="advisory_non_execution",
+        response_reply="",
+    )
+    session.router_client = router
+
+    try:
+        exit_code = session.run_turn("πώς δουλεύει το notes CLI;")
+    finally:
+        session.close()
+
+    route_payload = _session_event_payload(event_path, "route_decision")
+    assert exit_code == 0
+    assert router.route_calls == 1
+    assert router.response_calls == 0
+    assert route_payload["route"] == "repo"
+    assert route_payload["execution_posture"] == "execute"
+    assert route_payload["router_execution_posture"] == "advisory_non_execution"
+    assert route_payload["arbitrated"] is True
+    assert route_payload["route_arbitration_rule"] == "classifier_disagreement"
+    assert client.calls >= 1
 
 
 def test_explicit_local_build_request_overrides_general_route_in_plain_dir_session(

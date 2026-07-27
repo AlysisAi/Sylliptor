@@ -191,7 +191,7 @@ def test_codex_subscription_headers_are_destination_allowlisted(monkeypatch) -> 
     assert headers["Authorization"] == "Bearer access-secret"
     assert headers["ChatGPT-Account-Id"] == "account-123"
     assert headers["originator"] == "codex_cli_rs"
-    assert headers["User-Agent"] == "codex_cli_rs/0.144.0"
+    assert headers["User-Agent"] == "codex_cli_rs/0.144.6"
     assert headers["session-id"] == "session-1"
     with pytest.raises(ProviderAuthError, match="non-Codex destination"):
         adapter.authorization_headers("https://example.com/responses")
@@ -318,7 +318,7 @@ def test_codex_model_catalog_uses_codex_compat_version_and_live_metadata(
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.params["client_version"] == "0.144.0"
+        assert request.url.params["client_version"] == "0.144.6"
         return httpx.Response(
             200,
             json={

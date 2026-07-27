@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +49,26 @@ from .prompt_context import (
     _verification_commands_apply_to_paths,
     refresh_session_environment_context_message,
 )
+from .regression_baseline import (
+    EMPTY_REGRESSION_DIFF,
+    BaselineRecord,
+    PostEditTestRun,
+    RegressionDiffResult,
+    aggregate_regression_results,
+    baseline_command_key,
+    classify_regression_diff,
+    command_is_test_runner,
+    parse_test_report,
+)
+from .turn_contract import (
+    AdvisoryCompletion,
+    DispositionRecord,
+    Expectation,
+    ExpectationAssessment,
+    ExpectationEvidence,
+    assess_expectations,
+    match_expectation_evidence,
+)
 from .verification_commands import (
     _matching_effective_verification_commands,
     _normalize_shell_command_for_match,
@@ -56,6 +77,7 @@ from .verification_evidence import (
     VerificationEvidence,
     VerificationEvidenceCategory,
     classify_verification_evidence,
+    command_is_qualifying_execution_evidence,
 )
 
 if TYPE_CHECKING:
@@ -143,6 +165,66 @@ SUPPLEMENTAL_VERIFICATION_ADVISORY = (
     "task's exact requirements (output path, format, names, values) and confirm "
     "your deliverable against the spec itself before finalizing."
 )
+# One-shot advisory emitted at the first verification-relevant edit when no
+# baseline exists for any known verification-contract command. Advisory only -
+# it never blocks the edit; it teaches the baseline-first protocol so failures
+# can later be attributed to the change vs pre-existing breakage.
+REGRESSION_BASELINE_PRE_EDIT_ADVISORY = (
+    "Baseline advisory: this is your first change to a verifiable surface and no "
+    "pre-edit test run is recorded. To let me tell failures your change causes "
+    "apart from ones already present in the repo, run the relevant test command "
+    "(your verification command) once before further edits. Advisory only - this "
+    "does not block your edit."
+)
+# Maximum bounded repair rounds for a post-edit execution-evidence deficit before
+# the gate finalizes honestly-unverified rather than accepting prose in its place.
+EVIDENCE_REPAIR_ROUND_BOUND = 2
+# Visible marker appended to the final summary when the run finalizes without the
+# execution evidence the ordering rule requires (fail honest, never silent).
+HONEST_UNVERIFIED_FINALIZATION_MARKER = (
+    "\n\n---\n"
+    "⚠️ Unverified: I could not obtain a passing test execution after my last "
+    "change to the code within this run. This result is finalized as UNVERIFIED — "
+    "the change has not been confirmed by running the relevant tests."
+)
+# Visible marker appended when the run finalizes with regressions the change
+# introduced that a bounded action-only repair could not resolve (fail honest).
+# Distinct wording from the unverified marker; leads with "REGRESSIONS UNRESOLVED".
+_REGRESSIONS_UNRESOLVED_FINALIZATION_MARKER_PREFIX = (
+    "\n\n---\n"
+    "⛔ REGRESSIONS UNRESOLVED: {ids}. These tests passed in the pre-edit baseline "
+    "of `{baseline}` and fail after my change; I could not make them pass within "
+    "this run. This result is finalized with KNOWN REGRESSIONS my change introduced."
+)
+
+
+def build_regressions_unresolved_marker(
+    regressed_ids: list[str] | tuple[str, ...],
+    *,
+    baseline_command: str = "",
+) -> str:
+    ids = ", ".join(str(item) for item in regressed_ids if str(item).strip())
+    baseline = str(baseline_command or "").strip() or "the baseline command"
+    return _REGRESSIONS_UNRESOLVED_FINALIZATION_MARKER_PREFIX.format(ids=ids, baseline=baseline)
+
+
+# Visible marker appended when the run finalizes with test failures whose
+# relationship to the change could not be established (no comparable baseline).
+# Distinct wording again; leads with "UNATTRIBUTED FAILURES".
+_UNATTRIBUTED_FAILURES_FINALIZATION_MARKER_PREFIX = (
+    "\n\n---\n"
+    "⚠️ UNATTRIBUTED FAILURES: {ids}. These tests fail after my change, but I have "
+    "no comparable pre-edit baseline for the same command to determine whether my "
+    "change caused them. This result is finalized with their cause UNATTRIBUTED — "
+    "neither confirmed pre-existing nor confirmed a regression."
+)
+
+
+def build_unattributed_failures_marker(unattributed_ids: list[str] | tuple[str, ...]) -> str:
+    ids = ", ".join(str(item) for item in unattributed_ids if str(item).strip())
+    return _UNATTRIBUTED_FAILURES_FINALIZATION_MARKER_PREFIX.format(ids=ids)
+
+
 _COMPLETION_GATE_PROBLEM_LABELS = {
     "empty_final_response": "empty final response",
     "clarification_requested": "clarification requested instead of action",
@@ -150,6 +232,9 @@ _COMPLETION_GATE_PROBLEM_LABELS = {
     "verification_not_attempted": "verification not attempted",
     "verification_incomplete": "verification coverage incomplete",
     "verification_failed": "verification failing",
+    "regressions_detected": "regressions introduced",
+    "unattributed_failures": "failures not yet attributed",
+    "expectations_unaddressed": "task expectations unaddressed",
     "acceptance_criteria_unverified": "acceptance criteria unverified",
     "acceptance_criteria_failed": "acceptance criteria failed",
     "acceptance_evidence_insufficient": "acceptance evidence insufficient",
@@ -294,10 +379,45 @@ class TurnExecutionState:
     rejected_verification_evidence: list[dict[str, Any]] = field(default_factory=list)
     executed_verification_evidence: list[dict[str, Any]] = field(default_factory=list)
     verification_evidence_generation: int = 0
+    # Ordering rule: the verification-relevant edit generation at the time of the
+    # most recent qualifying execution-evidence event (a real test/execution run,
+    # not a syntax-only or static check). Post-edit execution evidence exists when
+    # this equals the current verification_relevant_edit_generation. Keying on the
+    # verification-relevant generation (not every material edit) means a docs-only
+    # edit after a passing run does not re-open the requirement.
+    last_post_edit_execution_generation: int | None = None
     completion_gate_repair_attempts: int = 0
     completion_gate_no_material_edits_repair_attempts: int = 0
     completion_gate_missing_verify_repair_attempts: int = 0
     completion_gate_failed_verify_repair_attempts: int = 0
+    completion_gate_regression_repair_attempts: int = 0
+    completion_gate_unattributed_repair_attempts: int = 0
+    completion_gate_expectations_repair_attempts: int = 0
+    # Baseline-first regression protocol (step 3). Baselines are parsed per-test
+    # outcomes of runs recorded before the first verification-relevant edit
+    # (generation 0), keyed by the normalized executed command. Post-edit runs
+    # are compared against the same-command baseline at the completion gate.
+    test_baselines: dict[str, BaselineRecord] = field(default_factory=dict)
+    post_edit_test_runs: list[PostEditTestRun] = field(default_factory=list)
+    agent_created_paths: set[str] = field(default_factory=set)
+    regression_baseline_pre_edit_nudge_sent: bool = False
+    # True when the most recent verification attempt executed a test-runner
+    # command (pytest/unittest). Combined with an all-pre-existing/agent-authored
+    # diff, this lets the gate clear a non-contract test failure (the sympy-12489
+    # model) without masking a failing non-test command.
+    last_verification_attempt_was_test_run: bool = False
+    latest_regression_diff: dict[str, Any] = field(default_factory=dict)
+    pending_regression_capture_events: list[dict[str, Any]] = field(default_factory=list)
+    # Turn-contract v2 (step 4). ``post_edit_run_outputs`` are bounded observed
+    # outputs of post-edit runs, the fact surface the expected-output evidence
+    # linker substring-matches contract literals against. ``recorded_*`` hold any
+    # agent-declared dispositions / advisory-completion reason (unpopulated in this
+    # release; the gate synthesizes mechanically — see turn_contract.py).
+    post_edit_run_outputs: list[dict[str, Any]] = field(default_factory=list)
+    recorded_expectation_dispositions: dict[str, DispositionRecord] = field(default_factory=dict)
+    recorded_advisory_completion: AdvisoryCompletion | None = None
+    latest_expectation_assessment: dict[str, Any] = field(default_factory=dict)
+    latest_expectation_evidence: list[dict[str, Any]] = field(default_factory=list)
     completion_gate_controller_state: CompletionGateControllerState = field(
         default_factory=CompletionGateControllerState
     )
@@ -406,6 +526,184 @@ class TurnExecutionState:
         self.executed_verification_evidence.append(payload)
         self.executed_verification_evidence[:] = self.executed_verification_evidence[-20:]
 
+    def note_qualifying_execution_evidence(self) -> None:
+        self.last_post_edit_execution_generation = self.verification_relevant_edit_generation
+
+    def has_post_edit_execution_evidence(self) -> bool:
+        return (
+            self.material_edit_count > 0
+            and self.last_post_edit_execution_generation is not None
+            and self.last_post_edit_execution_generation
+            == self.verification_relevant_edit_generation
+        )
+
+    def note_agent_created_path(self, path: str) -> None:
+        cleaned = str(path or "").strip()
+        if cleaned:
+            self.agent_created_paths.add(cleaned)
+
+    def has_baseline_for_any(self, commands: list[str] | tuple[str, ...] | set[str] | None) -> bool:
+        """True when a usable baseline exists for any of ``commands``."""
+        for command in commands or []:
+            record = self.test_baselines.get(baseline_command_key(str(command)))
+            if record is not None and record.usable:
+                return True
+        return False
+
+    def note_test_execution(
+        self,
+        *,
+        command: str,
+        report: Any,
+        timestamp: str = "",
+    ) -> None:
+        """Record a parsed test run as a baseline (gen 0) or a post-edit run.
+
+        A run recorded before any verification-relevant edit (generation 0) with
+        a usable parse is a baseline for its normalized command; a later run is a
+        post-edit run. Unparseable pre-edit output is noted for telemetry but can
+        never serve as a baseline.
+        """
+        command_key = baseline_command_key(command)
+        if not command_key:
+            return
+        generation = self.verification_relevant_edit_generation
+        if generation == 0:
+            if report.usable_as_baseline:
+                record = BaselineRecord(
+                    command=str(command),
+                    command_key=command_key,
+                    report=report,
+                    edit_generation=0,
+                    timestamp=timestamp,
+                )
+                self.test_baselines[command_key] = record
+                self.pending_regression_capture_events.append(
+                    {
+                        "kind": "baseline",
+                        "command": str(command),
+                        "command_key": command_key,
+                        "edit_generation": 0,
+                        "report": report.as_payload(),
+                    }
+                )
+            else:
+                self.pending_regression_capture_events.append(
+                    {
+                        "kind": "baseline_unusable",
+                        "command": str(command),
+                        "command_key": command_key,
+                        "edit_generation": 0,
+                        "report": report.as_payload(),
+                    }
+                )
+            return
+        run = PostEditTestRun(
+            command=str(command),
+            command_key=command_key,
+            report=report,
+            generation=generation,
+        )
+        self.post_edit_test_runs.append(run)
+        self.post_edit_test_runs[:] = self.post_edit_test_runs[-40:]
+        self.pending_regression_capture_events.append(
+            {
+                "kind": "post_edit",
+                "command": str(command),
+                "command_key": command_key,
+                "generation": generation,
+                "report": report.as_payload(),
+            }
+        )
+
+    def current_post_edit_test_runs(self) -> list[PostEditTestRun]:
+        """Post-edit runs recorded after the last verification-relevant edit."""
+        return [
+            run
+            for run in self.post_edit_test_runs
+            if run.generation == self.verification_relevant_edit_generation
+        ]
+
+    def compute_regression_diff(self, *, enabled: bool) -> RegressionDiffResult:
+        """Aggregate the same-command diff over current post-edit runs.
+
+        Pure attribution: each current-generation post-edit run is compared only
+        against a baseline of the same normalized command. With ``enabled`` off,
+        returns the empty diff (legacy gate policy).
+        """
+        if not enabled:
+            self.latest_regression_diff = {}
+            return EMPTY_REGRESSION_DIFF
+        results = [
+            classify_regression_diff(
+                post_report=run.report,
+                baseline=self.test_baselines.get(run.command_key),
+                agent_created_paths=self.agent_created_paths,
+            )
+            for run in self.current_post_edit_test_runs()
+        ]
+        aggregate = aggregate_regression_results(results)
+        self.latest_regression_diff = aggregate.as_payload()
+        return aggregate
+
+    def note_post_edit_run_output(self, *, command: str, output: str, generation: int) -> None:
+        """Record a bounded post-edit run output for expectation evidence linking.
+
+        Only runs after a verification-relevant edit (generation > 0) are captured;
+        each output is bounded and the buffer is capped, so evidence matching stays
+        cheap and never balloons a long turn's state.
+        """
+        text = str(output or "")
+        if not text:
+            return
+        self.post_edit_run_outputs.append(
+            {
+                "normalized_command": _normalize_shell_command_for_match(str(command or "")),
+                "output": text[:8000],
+                "generation": int(generation),
+            }
+        )
+        self.post_edit_run_outputs[:] = self.post_edit_run_outputs[-30:]
+
+    def current_expectation_evidence(
+        self, expectations: list[Expectation]
+    ) -> list[ExpectationEvidence]:
+        """Link expected-output literals to post-edit runs at the current generation."""
+        generation = self.verification_relevant_edit_generation
+        runs = [
+            run
+            for run in self.post_edit_run_outputs
+            if int(run.get("generation") or 0) >= generation
+        ]
+        return match_expectation_evidence(expectations, runs)
+
+    def compute_expectation_assessment(
+        self, *, enabled: bool, turn_intent: str
+    ) -> ExpectationAssessment:
+        """Assess task expectations mechanically at the gate (turn-contract v2).
+
+        Confirmed = an expected-output literal observed in a post-edit run, or a
+        named locus that was edited, or an explicit recorded disposition; the rest
+        are unaddressed. With the feature disabled, on a non-execute turn, or when
+        the contract names no expectations, returns the empty assessment.
+        """
+        contract = self.acceptance_contract
+        expectations = list(contract.expectations) if contract is not None else []
+        if not enabled or str(turn_intent or "") != "execute" or not expectations:
+            self.latest_expectation_assessment = {}
+            self.latest_expectation_evidence = []
+            return ExpectationAssessment()
+        evidence = self.current_expectation_evidence(expectations)
+        assessment = assess_expectations(
+            expectations=expectations,
+            evidence=evidence,
+            edited_loci=self.touched_repo_paths,
+            dispositions=self.recorded_expectation_dispositions,
+        )
+        self.latest_expectation_assessment = assessment.as_payload()
+        self.latest_expectation_evidence = [item.as_payload() for item in evidence]
+        return assessment
+
     def missing_verification_commands(self) -> set[str]:
         return self.expected_verification_commands - self.covered_verification_commands
 
@@ -436,6 +734,12 @@ class TurnExecutionState:
             return self.completion_gate_missing_verify_repair_attempts
         if stage == "verification_failed":
             return self.completion_gate_failed_verify_repair_attempts
+        if stage == "regressions_detected":
+            return self.completion_gate_regression_repair_attempts
+        if stage == "unattributed_failures":
+            return self.completion_gate_unattributed_repair_attempts
+        if stage == "expectations_unaddressed":
+            return self.completion_gate_expectations_repair_attempts
         return self.completion_gate_repair_attempts
 
     def increment_repair_attempts_for_stage(self, stage: str) -> None:
@@ -448,6 +752,12 @@ class TurnExecutionState:
             self.completion_gate_missing_verify_repair_attempts += 1
         elif stage == "verification_failed":
             self.completion_gate_failed_verify_repair_attempts += 1
+        elif stage == "regressions_detected":
+            self.completion_gate_regression_repair_attempts += 1
+        elif stage == "unattributed_failures":
+            self.completion_gate_unattributed_repair_attempts += 1
+        elif stage == "expectations_unaddressed":
+            self.completion_gate_expectations_repair_attempts += 1
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -478,10 +788,29 @@ class TurnExecutionState:
             "rejected_verification_evidence": list(self.rejected_verification_evidence),
             "executed_verification_evidence": list(self.executed_verification_evidence),
             "verification_evidence_generation": self.verification_evidence_generation,
+            "last_post_edit_execution_generation": self.last_post_edit_execution_generation,
+            "post_edit_execution_evidence_present": self.has_post_edit_execution_evidence(),
             "completion_gate_repair_attempts": self.completion_gate_repair_attempts,
             "completion_gate_no_material_edits_repair_attempts": self.completion_gate_no_material_edits_repair_attempts,
             "completion_gate_missing_verify_repair_attempts": self.completion_gate_missing_verify_repair_attempts,
             "completion_gate_failed_verify_repair_attempts": self.completion_gate_failed_verify_repair_attempts,
+            "completion_gate_regression_repair_attempts": self.completion_gate_regression_repair_attempts,
+            "completion_gate_unattributed_repair_attempts": self.completion_gate_unattributed_repair_attempts,
+            "completion_gate_expectations_repair_attempts": self.completion_gate_expectations_repair_attempts,
+            "test_baselines": {
+                key: record.as_payload() for key, record in sorted(self.test_baselines.items())
+            },
+            "post_edit_test_runs": [run.as_payload() for run in self.post_edit_test_runs],
+            "agent_created_paths": sorted(self.agent_created_paths),
+            "last_verification_attempt_was_test_run": (self.last_verification_attempt_was_test_run),
+            "regression_diff": dict(self.latest_regression_diff),
+            "expectation_assessment": dict(self.latest_expectation_assessment),
+            "expectation_evidence": list(self.latest_expectation_evidence),
+            "advisory_completion": (
+                self.recorded_advisory_completion.as_payload()
+                if self.recorded_advisory_completion is not None
+                else None
+            ),
             "completion_gate_controller": self.completion_gate_controller_state.as_payload(),
             "completion_gate_last_decision_kind": self.completion_gate_controller_state.last_decision_kind,
             "completion_certificate": dict(self.latest_completion_certificate),
@@ -958,6 +1287,7 @@ def _verify_run_evidence_records(
     verification_authoritative: bool,
     material_touched_paths: set[str],
     root: Path,
+    evidence_v2: bool = True,
 ) -> list[VerificationEvidence]:
     command_results = result.get("command_results")
     verification_relevant_touched_paths = _verification_relevant_material_paths(
@@ -987,6 +1317,7 @@ def _verify_run_evidence_records(
                     else None
                 ),
                 root=root,
+                evidence_v2=evidence_v2,
             )
             if (
                 _verification_command_result_is_benign_skip(item)
@@ -1015,6 +1346,7 @@ def _verify_run_evidence_records(
                     exit_code=exit_code,
                     output=_verification_output_text(result),
                     root=root,
+                    evidence_v2=evidence_v2,
                 )
             )
     return records
@@ -1029,10 +1361,18 @@ def _shell_verification_evidence(
     known_verification_commands: list[str] | None,
     verification_authoritative: bool,
     material_touched_paths: set[str],
+    evidence_v2: bool = True,
 ) -> VerificationEvidence:
     exit_code_raw = result.get("exit_code")
     exit_code = exit_code_raw if isinstance(exit_code_raw, int) else None
     command = str(result.get("effective_cmd") or result.get("cmd") or arguments.get("cmd") or "")
+    stage_status_raw = result.get("pipeline_stage_status")
+    stage_status = (
+        [int(item) for item in stage_status_raw]
+        if isinstance(stage_status_raw, list)
+        and all(isinstance(item, int) for item in stage_status_raw)
+        else None
+    )
     return classify_verification_evidence(
         command,
         known_verification_commands=known_verification_commands,
@@ -1042,6 +1382,8 @@ def _shell_verification_evidence(
         exit_code=exit_code,
         output=_verification_output_text(result),
         root=root,
+        stage_status=stage_status,
+        evidence_v2=evidence_v2,
     )
 
 
@@ -1113,6 +1455,161 @@ def _unmasked_shell_verification_command(command: str) -> str:
     return _normalize_shell_command_for_match(analysis_candidate)
 
 
+def _tool_effect_has_qualifying_execution(
+    *,
+    tool_name: str,
+    evidence_records: list[VerificationEvidence],
+    result: dict[str, Any],
+) -> bool:
+    """True when a real test/execution run (pass or fail) is observed.
+
+    Qualifying = a recognized test/execution program that actually executed the
+    code — a passing run (``real_execution is True``) or a genuine failing run
+    (a non-zero exit of a recognized test command). Excludes syntax-only and
+    static checks (ast.parse, py_compile, mypy, ruff check) and non-executions
+    (no-tests collected, vacuous commands). Used only for the ordering rule.
+    """
+    for record in evidence_records:
+        if record.category == VerificationEvidenceCategory.NOT_VERIFICATION:
+            continue
+        if record.real_execution is False:
+            continue
+        if not command_is_qualifying_execution_evidence(record.normalized_command or ""):
+            continue
+        if record.real_execution is True:
+            return True
+        observed_exit_code, _observed_output = _verification_evidence_observation(
+            tool_name=tool_name,
+            evidence=record,
+            result=result,
+        )
+        if observed_exit_code is not None and observed_exit_code != 0:
+            return True
+    return False
+
+
+def _regression_capture_timestamp() -> str:
+    try:
+        return datetime.now(timezone.utc).isoformat()
+    except Exception:  # noqa: BLE001 - a telemetry timestamp must never crash a turn
+        return ""
+
+
+def _iter_executed_test_commands(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+) -> list[tuple[str, str]]:
+    """Yield ``(command, output)`` pairs for executed test-runner commands.
+
+    Only commands whose meaningful first stage is pytest or unittest/Django are
+    returned — the runners the parsers understand. Other qualifying executions
+    (validation scripts, linters) emit no per-test ids and are out of scope.
+    """
+    pairs: list[tuple[str, str]] = []
+    if tool_name == "shell_run":
+        command = str(
+            result.get("effective_cmd") or result.get("cmd") or arguments.get("cmd") or ""
+        )
+        if command and command_is_test_runner(command):
+            pairs.append((command, _verification_output_text(result)))
+        return pairs
+    if tool_name == "verify_run":
+        command_results = result.get("command_results")
+        if isinstance(command_results, list):
+            for item in command_results:
+                if not isinstance(item, dict):
+                    continue
+                command = str(item.get("command") or item.get("effective_command") or "")
+                if command and command_is_test_runner(command):
+                    pairs.append((command, _verification_output_text(item)))
+    return pairs
+
+
+def _capture_regression_test_runs(
+    *,
+    state: TurnExecutionState,
+    tool_name: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    timestamp = _regression_capture_timestamp()
+    for command, output in _iter_executed_test_commands(
+        tool_name=tool_name,
+        arguments=arguments,
+        result=result,
+    ):
+        report = parse_test_report(output)
+        state.note_test_execution(command=command, report=report, timestamp=timestamp)
+
+
+def _capture_expectation_run_outputs(
+    *,
+    state: TurnExecutionState,
+    tool_name: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    """Capture bounded observed outputs of post-edit runs (turn-contract v2).
+
+    The expected-output evidence linker substring-matches contract literals against
+    these outputs. Capture is unconditional telemetry (never kill-switched) and
+    only records runs after a verification-relevant edit — pre-edit output can never
+    confirm a post-edit expectation.
+    """
+    generation = state.verification_relevant_edit_generation
+    if generation <= 0:
+        return
+    if tool_name == "shell_run":
+        command = str(
+            result.get("effective_cmd") or result.get("cmd") or arguments.get("cmd") or ""
+        )
+        output = _verification_output_text(result)
+        if command and output:
+            state.note_post_edit_run_output(command=command, output=output, generation=generation)
+    elif tool_name == "verify_run":
+        command_results = result.get("command_results")
+        if isinstance(command_results, list):
+            for item in command_results:
+                if not isinstance(item, dict):
+                    continue
+                command = str(item.get("command") or item.get("effective_command") or "")
+                output = _verification_output_text(item)
+                if command and output:
+                    state.note_post_edit_run_output(
+                        command=command, output=output, generation=generation
+                    )
+        else:
+            output = _verification_output_text(result)
+            commands = result.get("commands")
+            command = (
+                ", ".join(str(item) for item in commands if item)
+                if isinstance(commands, list)
+                else ""
+            )
+            if output:
+                state.note_post_edit_run_output(
+                    command=command or "verify_run", output=output, generation=generation
+                )
+
+
+def _verification_attempt_executed_test_runner(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+) -> bool:
+    """True when the recorded verification attempt ran a test-runner command."""
+    return bool(
+        _iter_executed_test_commands(
+            tool_name=tool_name,
+            arguments=arguments,
+            result=result,
+        )
+    )
+
+
 def _record_tool_effect(
     *,
     root: Path,
@@ -1123,6 +1620,7 @@ def _record_tool_effect(
     result: dict[str, Any],
     known_verification_commands: list[str] | None,
     verification_authoritative: bool = False,
+    evidence_v2: bool = True,
 ) -> None:
     if is_tool_unavailable_result(result):
         return
@@ -1158,6 +1656,13 @@ def _record_tool_effect(
             result=result,
         )
 
+    if status != "failed" and normalized_tool == "fs_write" and result.get("created") is True:
+        # A brand-new file the agent authored this turn: a failing test in it is
+        # signal (agent_authored), not a regression. touched_paths already holds
+        # the normalized repo-relative path for fs_write.
+        for created_path in touched_paths:
+            state.note_agent_created_path(created_path)
+
     if status != "failed" and normalized_tool in _MATERIAL_EDIT_TOOL_NAMES:
         state.note_material_edit()
         state.material_edit_tools.add(normalized_tool)
@@ -1188,6 +1693,7 @@ def _record_tool_effect(
             verification_authoritative=verification_authoritative,
             material_touched_paths=touched_paths,
             root=root,
+            evidence_v2=evidence_v2,
         )
         evidence = _aggregate_verification_evidence(evidence_records)
     elif normalized_tool == "shell_run":
@@ -1199,6 +1705,7 @@ def _record_tool_effect(
             known_verification_commands=known_verification_commands,
             verification_authoritative=verification_authoritative,
             material_touched_paths=touched_paths,
+            evidence_v2=evidence_v2,
         )
         evidence_records = [evidence]
         verification_attempt = evidence.category != VerificationEvidenceCategory.NOT_VERIFICATION
@@ -1207,6 +1714,7 @@ def _record_tool_effect(
         result["verification_evidence_reason"] = evidence.reason
         result["verification_evidence_allowed"] = evidence.allowed_to_satisfy_contract
         result["verification_evidence_supplemental_only"] = evidence.supplemental_only
+        result["evidence_verdict"] = evidence.evidence_verdict
         verification_note = _verification_evidence_note(evidence, result=result)
         if verification_note:
             result["verification_note"] = verification_note
@@ -1224,6 +1732,27 @@ def _record_tool_effect(
         verification_authoritative=verification_authoritative,
         evidence_category=evidence.category.value,
         evidence_allowed=evidence.allowed_to_satisfy_contract,
+    )
+    # Baseline-first regression protocol (step 3): capture parsed per-test
+    # outcomes for baseline/attribution. Runs for every executed test-runner
+    # command regardless of the evidence classifier's verdict (so an
+    # unobservable-pipeline run still contributes what its output shows), and
+    # regardless of the kill-switch (capture is telemetry; only the gate policy
+    # is gated).
+    _capture_regression_test_runs(
+        state=state,
+        tool_name=normalized_tool,
+        arguments=arguments,
+        result=result,
+    )
+    # Turn-contract v2 (step 4): capture post-edit run output for the expected-output
+    # evidence linker. Like the regression capture above, this is unconditional
+    # telemetry (only the gate policy is kill-switched).
+    _capture_expectation_run_outputs(
+        state=state,
+        tool_name=normalized_tool,
+        arguments=arguments,
+        result=result,
     )
     if normalized_tool == "shell_run" and not verification_attempt:
         raw_command = str(
@@ -1266,6 +1795,22 @@ def _record_tool_effect(
             observed_exit_code=observed_exit_code,
             observed_output=observed_output,
         )
+    if evidence_v2 and _tool_effect_has_qualifying_execution(
+        tool_name=normalized_tool,
+        evidence_records=evidence_records,
+        result=result,
+    ):
+        # Ordering rule: stamp that a real execution run happened after the most
+        # recent material edit, so finalization can require post-edit evidence.
+        state.note_qualifying_execution_evidence()
+    # Baseline-first regression protocol (step 3): remember whether this
+    # verification attempt ran a test-runner command, so the gate can clear a
+    # non-contract all-pre-existing test failure without masking a non-test one.
+    state.last_verification_attempt_was_test_run = _verification_attempt_executed_test_runner(
+        tool_name=normalized_tool,
+        arguments=arguments,
+        result=result,
+    )
     if normalized_tool == "verify_run":
         _record_verify_run_command_outcomes(
             state=state,
@@ -1340,6 +1885,33 @@ def _completion_gate_blocker_allows_final(
     return state.last_verification_failure_category == FailureCategory.INFRA_UNAVAILABLE.value
 
 
+def _execution_evidence_required_for_turn(
+    *,
+    state: TurnExecutionState,
+    turn_intent: str,
+    blocked: bool,
+    evidence_v2: bool,
+    verification_expected: bool,
+) -> bool:
+    """Ordering rule trigger: an execute turn that mutated a verifiable surface.
+
+    The point of the rule is to catch "edited source, then only ran a syntax
+    check (or nothing), then finalized". It requires that verification is
+    actually applicable for this turn (``verification_expected``) so greenfield
+    workspaces with no test surface are not harassed. Turns with no mutating
+    edits (pure Q&A/analysis/advisory) are exempt, as are non-execute turns and
+    blocker finalizations.
+    """
+    return bool(
+        evidence_v2
+        and verification_expected
+        and str(turn_intent or "") == "execute"
+        and not blocked
+        and state.material_edit_count > 0
+        and _paths_require_verification(state.touched_repo_paths)
+    )
+
+
 def _completion_gate_problems(
     *,
     state: TurnExecutionState,
@@ -1347,7 +1919,38 @@ def _completion_gate_problems(
     blocked: bool,
     verification_expected: bool,
     require_material_edit_evidence: bool = True,
+    evidence_v2: bool = False,
+    turn_intent: str = "",
+    regression_baseline_enabled: bool = False,
+    turn_contract_v2_enabled: bool = False,
 ) -> list[str]:
+    expectation_assessment = state.compute_expectation_assessment(
+        enabled=turn_contract_v2_enabled,
+        turn_intent=turn_intent,
+    )
+    execution_evidence_required = _execution_evidence_required_for_turn(
+        state=state,
+        turn_intent=turn_intent,
+        blocked=blocked,
+        evidence_v2=evidence_v2,
+        verification_expected=verification_expected,
+    )
+    regression_diff = state.compute_regression_diff(enabled=regression_baseline_enabled)
+    # Let attribution supersede a non-contract "last attempt failed" block only
+    # when that last attempt was itself a test run AND the diff attributes at
+    # least one failure as pre-existing/regression/unattributed. The test-run
+    # guard stops an all-benign earlier run from masking a failing non-test
+    # command; the "not agent-authored-only" guard keeps a failing repro the agent
+    # just wrote (agent-authored only) blocking as a generic verification failure.
+    regression_attribution_supersedes_last_failure = bool(
+        regression_baseline_enabled
+        and state.last_verification_attempt_was_test_run
+        and (
+            regression_diff.regressions
+            or regression_diff.unattributed
+            or regression_diff.pre_existing
+        )
+    )
     certificate = evaluate_completion_certificate(
         CompletionCertificateInput(
             contract=state.acceptance_contract,
@@ -1364,6 +1967,18 @@ def _completion_gate_problems(
             missing_verification_commands=state.missing_verification_commands(),
             verification_coverage_stale=state.verification_coverage_is_stale(),
             accepted_verification_evidence=list(state.accepted_verification_evidence),
+            execution_evidence_required=execution_evidence_required,
+            post_edit_execution_evidence_present=state.has_post_edit_execution_evidence(),
+            regression_baseline_enabled=regression_baseline_enabled,
+            regressions=regression_diff.regressions,
+            unattributed_failures=regression_diff.unattributed,
+            pre_existing_failures=regression_diff.pre_existing,
+            agent_authored_failures=regression_diff.agent_authored,
+            regression_attribution_supersedes_last_failure=(
+                regression_attribution_supersedes_last_failure
+            ),
+            turn_contract_v2_enabled=turn_contract_v2_enabled,
+            expectations_unaddressed=expectation_assessment.unaddressed,
         )
     )
     state.latest_completion_certificate = certificate.as_payload()
@@ -1382,12 +1997,23 @@ def _completion_gate_problem_summary(problems: list[str]) -> str:
 def _completion_gate_repair_stage(problems: list[str]) -> str:
     if "no_material_edits" in problems:
         return "no_material_edits"
+    # Regressions are the most specific, most actionable verification failure:
+    # named tests that passed pre-edit and now fail. Rank them ahead of the
+    # generic verification_failed so the repair nudge names them concretely.
+    if "regressions_detected" in problems:
+        return "regressions_detected"
     if "verification_failed" in problems:
         return "verification_failed"
     if "verification_incomplete" in problems:
         return "verification_incomplete"
     if "verification_not_attempted" in problems:
         return "verification_not_attempted"
+    if "unattributed_failures" in problems:
+        return "unattributed_failures"
+    # Turn-contract v2: task-named expectations rank below verification/regression
+    # deficits (broken behavior is more urgent) but above acceptance-criteria stages.
+    if "expectations_unaddressed" in problems:
+        return "expectations_unaddressed"
     if "acceptance_criteria_failed" in problems or "unexpected_scope_changes" in problems:
         return "acceptance_failed"
     if (
@@ -1439,6 +2065,11 @@ def _completion_gate_nudge_message(
     explicit_language_override: bool = False,
     one_shot_execution: bool = False,
     live_background_processes: int = 0,
+    execution_evidence_missing_detail: str = "",
+    regression_ids: list[str] | None = None,
+    regression_baseline_command: str = "",
+    unattributed_ids: list[str] | None = None,
+    expectation_details: list[str] | None = None,
 ) -> str:
     _ = (
         prefix_key,
@@ -1448,6 +2079,21 @@ def _completion_gate_nudge_message(
         explicit_language_override,
     )
     problem_set = set(problems)
+    # A post-edit execution-evidence deficit is action-only: the model must run
+    # the tests; a written explanation cannot clear it. Naming the concrete
+    # missing fact keeps successive nudges specific rather than repetitive.
+    evidence_deficit = bool(execution_evidence_missing_detail) and bool(
+        problem_set & {"verification_not_attempted", "verification_incomplete"}
+    )
+    # Regressions are action-only in the same way: only making the named tests
+    # pass again clears the deficit; prose cannot. Unattributed failures need a
+    # fact (a rerun of the baseline-known command) to be attributed.
+    regression_deficit = "regressions_detected" in problem_set
+    unattributed_deficit = "unattributed_failures" in problem_set
+    # Turn-contract v2: task-named expectations neither confirmed nor disposed. Each
+    # is addressed by editing the named locus or producing (and running) the expected
+    # output — prose alone cannot clear it.
+    expectation_deficit = "expectations_unaddressed" in problem_set
     lines = ["Finalization check - one pass before you finish:"]
     if "no_material_edits" in problem_set:
         lines.append(
@@ -1474,6 +2120,38 @@ def _completion_gate_nudge_message(
         lines.append(
             "- Expected verification has not been completed. Run it, or state why it does not apply."
         )
+    if evidence_deficit:
+        lines.append(
+            f"- No test execution recorded {execution_evidence_missing_detail}. Run the relevant "
+            "tests now and observe their output and exit code. A written explanation cannot "
+            "clear this - only a new test run can."
+        )
+    if regression_deficit and regression_ids:
+        baseline = str(regression_baseline_command or "").strip() or "the baseline command"
+        lines.append(
+            "- Regressions your change introduced: "
+            + ", ".join(str(item) for item in regression_ids)
+            + f". These tests passed in the pre-edit baseline of `{baseline}` and now fail. "
+            "Fix them and re-run so they pass again. A written explanation cannot clear this - "
+            "only making the tests pass can."
+        )
+    if unattributed_deficit and unattributed_ids:
+        lines.append(
+            "- Failures with no comparable pre-edit baseline (cannot tell if your change caused "
+            "them): "
+            + ", ".join(str(item) for item in unattributed_ids)
+            + ". Re-run the exact command you have a baseline for (or run it now to establish "
+            "one) so these can be attributed, or state their relationship to your change with "
+            "evidence."
+        )
+    if expectation_deficit and expectation_details:
+        lines.append(
+            "- Task expectations not yet addressed: "
+            + "; ".join(str(item) for item in expectation_details)
+            + ". The task named these concretely. Either make your change satisfy each one "
+            "(edit the named locus, or produce the expected output and run the command so it "
+            "is observed), or explicitly state why the expectation no longer applies."
+        )
     if all_verification_evidence_self_authored:
         lines.append(f"- {SUPPLEMENTAL_VERIFICATION_ADVISORY}")
     if has_material_edits and diff_review_stale:
@@ -1491,10 +2169,16 @@ def _completion_gate_nudge_message(
         "- Re-read the task statement once and confirm every explicitly named output "
         "(paths, formats, values) exists exactly as requested."
     )
-    lines.append(
-        "Then give your final answer. If you are confident the work is complete as-is, "
-        "finalize - this checklist is advisory."
-    )
+    if evidence_deficit or regression_deficit or unattributed_deficit or expectation_deficit:
+        lines.append(
+            "Run the relevant tests now, then give your final answer once you have observed "
+            "the result."
+        )
+    else:
+        lines.append(
+            "Then give your final answer. If you are confident the work is complete as-is, "
+            "finalize - this checklist is advisory."
+        )
     return "\n".join(lines)
 
 

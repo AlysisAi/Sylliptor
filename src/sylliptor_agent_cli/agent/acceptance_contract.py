@@ -18,6 +18,12 @@ from ..verification_command_analysis import (
     CheckerEntrypointFingerprint,
     analyze_verification_command,
 )
+from .turn_contract import (
+    MAX_EXPECTATIONS,
+    MIN_EXPECTED_OUTPUT_LITERAL_LEN,
+    Expectation,
+    ExpectationKind,
+)
 from .verification_commands import _matching_effective_verification_commands
 
 
@@ -233,6 +239,10 @@ class AcceptanceContract:
     snapshot: AcceptanceWorkspaceSnapshot = field(default_factory=AcceptanceWorkspaceSnapshot)
     allowed_output_paths: set[str] = field(default_factory=set)
     path_refs: list[AcceptancePathRef] = field(default_factory=list)
+    # Turn-contract v2 (step 4): concrete, checkable expectations extracted from the
+    # task text (expected-output literals, named loci, named behaviors). Empty is
+    # valid; the completion gate demands a disposition per expectation.
+    expectations: list[Expectation] = field(default_factory=list)
 
     def next_evidence_id(self) -> str:
         return f"ev{len(self.evidence) + 1:03d}"
@@ -314,6 +324,7 @@ class AcceptanceContract:
             "snapshot": self.snapshot.as_payload(),
             "allowed_output_paths": sorted(self.allowed_output_paths),
             "path_refs": [path_ref.as_payload() for path_ref in self.path_refs],
+            "expectations": [expectation.as_payload() for expectation in self.expectations],
             "status_counts": self.status_counts(),
             "problems": self.problem_names(),
             "failure_summaries": self.failure_summaries()[:10],
@@ -628,6 +639,7 @@ def build_acceptance_contract(
         snapshot=snapshot,
         allowed_output_paths=allowed_output_paths,
         path_refs=path_refs,
+        expectations=extract_task_expectations(texts=texts, path_refs=path_refs),
     )
 
 
@@ -1212,6 +1224,116 @@ def _extract_explicit_commands(texts: list[str]) -> list[str]:
 
 def extract_explicit_acceptance_commands(*texts: str) -> list[str]:
     return _extract_explicit_commands([str(text or "") for text in texts if str(text or "")])
+
+
+# ---------------------------------------------------------------------------
+# Turn-contract v2 (step 4): expectation extraction.
+#
+# A zero-new-regex projection of the derivation's EXISTING extracted signals into
+# the contract-v2 expectations schema. Backtick literals the task shows as desired
+# output become ``expected_output`` expectations; files the task points at as the
+# fix site become ``named_locus`` expectations. This adds no new NL/keyword/regex
+# heuristic over task text — it reuses ``_BACKTICK_COMMAND_RE``, the existing
+# command/path classifiers, and the already-computed path refs. Precision over
+# recall: capped, deduped, and limited to signals a later mechanical check can
+# confirm (an ``expected_output`` literal observed in a run, or an edited locus).
+# ---------------------------------------------------------------------------
+
+# A named locus is a file the task tells us to create or modify. UNKNOWN_REFERENCE
+# is deliberately excluded: the role classifier cannot tell "fix the bug in X"
+# (an edit site) from "count the lines in X" (a read-only input), so treating every
+# bare file mention as an edit target would spuriously demand editing inputs.
+# Precision over recall — a REQUIRED_OUTPUT path is unambiguously an edit target.
+_EXPECTATION_LOCUS_ROLES = {
+    AcceptancePathRole.REQUIRED_OUTPUT,
+}
+
+
+def _expectation_span_is_path_like(span: str) -> bool:
+    # A forward slash is the path separator used throughout; a bare backslash is
+    # NOT treated as a path signal because LaTeX/math literals (``\dagger``) — a
+    # common expected_output shape — carry backslashes. Windows-style ``dir\file``
+    # paths still resolve via the explicit-artifact-path extension check below.
+    token = span.strip().strip("`'\"")
+    if "/" in token:
+        return True
+    return _looks_like_explicit_artifact_path(token)
+
+
+def _expectation_span_is_symbol_like(span: str) -> bool:
+    token = span.strip()
+    if not token or any(char.isspace() for char in token):
+        return False
+    core = token[:-2] if token.endswith("()") else token
+    parts = [part for part in core.split(".") if part]
+    return bool(parts) and all(part.isidentifier() for part in parts)
+
+
+def _expectation_source_window(text: str, start: int, end: int) -> str:
+    window = str(text or "")[max(0, start - 60) : end + 60]
+    return " ".join(window.split())[:280]
+
+
+def extract_task_expectations(
+    *,
+    texts: list[str],
+    path_refs: list[AcceptancePathRef],
+) -> list[Expectation]:
+    """Extract concrete, checkable expectations from the task text (contract v2).
+
+    Empty is valid (many tasks name no such literal or locus). Deterministic.
+    """
+    expectations: list[Expectation] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(kind: ExpectationKind, raw_text: str, source_quote: str) -> None:
+        text = str(raw_text or "").strip()
+        if not text:
+            return
+        key = (kind.value, " ".join(text.split()).casefold())
+        if key in seen:
+            return
+        seen.add(key)
+        expectations.append(
+            Expectation(
+                expectation_id=f"exp{len(expectations) + 1:03d}",
+                kind=kind,
+                text=text,
+                source_quote=" ".join(str(source_quote or "").split())[:280],
+            )
+        )
+
+    # named_locus: files the task points at as the fix site / subject of the change
+    # (a create/modify target or a bare reference — not a read-only input, a
+    # preservation target, or a checker path, which editing would not confirm).
+    for path_ref in path_refs:
+        if path_ref.role not in _EXPECTATION_LOCUS_ROLES:
+            continue
+        locus = path_ref.workspace_relative_path or path_ref.display_path
+        _add(ExpectationKind.NAMED_LOCUS, locus, path_ref.clause)
+
+    # expected_output: inline backtick literals shown as desired output — excluding
+    # commands (already command criteria), paths (already loci) and bare identifiers
+    # (code references, never runtime output).
+    for text in texts:
+        for match in _BACKTICK_COMMAND_RE.finditer(str(text or "")):
+            span = match.group(1).strip()
+            if len(span) < MIN_EXPECTED_OUTPUT_LITERAL_LEN:
+                continue
+            context = str(text)[max(0, match.start() - 80) : match.start()]
+            if _looks_like_command(span, context=context):
+                continue
+            if _expectation_span_is_path_like(span):
+                continue
+            if _expectation_span_is_symbol_like(span):
+                continue
+            _add(
+                ExpectationKind.EXPECTED_OUTPUT,
+                span,
+                _expectation_source_window(text, match.start(), match.end()),
+            )
+
+    return expectations[:MAX_EXPECTATIONS]
 
 
 def _extract_thresholds(texts: list[str]) -> list[AcceptanceThreshold]:

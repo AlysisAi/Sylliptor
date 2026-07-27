@@ -1636,6 +1636,17 @@ def web_search(
     client_factory: Callable[..., OpenAIResponsesClient] = OpenAIResponsesClient,
     session_id: str | None = None,
 ) -> dict[str, Any]:
+    # Defense-in-depth runtime guard mirroring web_fetch: the master web-tools
+    # switch blocks execution even if registration gating was bypassed.
+    from ..config import resolve_web_tools_enabled
+
+    if not resolve_web_tools_enabled(cfg):
+        raise WebSearchError(
+            "web_search is disabled by the web-tools policy "
+            "(SYLLIPTOR_WEB_TOOLS=off / web_tools_enabled=false). "
+            "No network request was performed.",
+            recoverable=False,
+        )
     validated_query = _validate_query(query)
     validated_allowed_domains = _validate_allowed_domains(allowed_domains)
     validated_max_sources = _validate_max_sources(max_sources)

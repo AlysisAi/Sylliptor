@@ -6,6 +6,7 @@ ANTHROPIC_DEPRECATED_SAMPLING_PARAMETERS = "anthropic_sampling_parameters_deprec
 GEMINI_3_DEFAULT_TEMPERATURE = "gemini_3_default_temperature"
 DEEPSEEK_THINKING_TEMPERATURE_UNSUPPORTED = "deepseek_thinking_temperature_unsupported"
 QWEN_QVQ_DEFAULT_TEMPERATURE = "qwen_qvq_default_temperature"
+KIMI_FIXED_TEMPERATURE = "kimi_fixed_temperature"
 
 _CLAUDE_OPUS_VERSION_RE = re.compile(r"claude[-_.]opus[-_.](?P<major>\d+)(?:[-_.](?P<minor>\d+))?")
 _CLAUDE_SONNET_VERSION_RE = re.compile(
@@ -14,6 +15,7 @@ _CLAUDE_SONNET_VERSION_RE = re.compile(
 _GEMINI_3_RE = re.compile(r"(?:^|[/.:_-])gemini[-_.]?3(?:[-_.]|$)")
 _DEEPSEEK_V4_RE = re.compile(r"(?:^|[/.:_-])deepseek[-_.]v?4(?:[-_.]|$)")
 _QWEN_QVQ_RE = re.compile(r"(?:^|[/.:_-])qvq(?:[-_.]|$)")
+_CURRENT_KIMI_RE = re.compile(r"(?:^|[/.:_-])kimi[-_.]?k(?:3|2[-_.]?(?:6|7))(?:[-_.]|$)")
 
 
 def documented_temperature_omit_reason(
@@ -54,6 +56,8 @@ def documented_temperature_omit_reason(
         return QWEN_QVQ_DEFAULT_TEMPERATURE
 
     normalized_provider = str(provider_key or "").strip().casefold()
+    if normalized_provider == "moonshot" and _CURRENT_KIMI_RE.search(normalized_model):
+        return KIMI_FIXED_TEMPERATURE
     if (
         normalized_provider == "deepseek"
         and thinking_enabled is not False
@@ -68,6 +72,7 @@ __all__ = [
     "ANTHROPIC_DEPRECATED_SAMPLING_PARAMETERS",
     "DEEPSEEK_THINKING_TEMPERATURE_UNSUPPORTED",
     "GEMINI_3_DEFAULT_TEMPERATURE",
+    "KIMI_FIXED_TEMPERATURE",
     "QWEN_QVQ_DEFAULT_TEMPERATURE",
     "documented_temperature_omit_reason",
 ]

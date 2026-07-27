@@ -1,12 +1,12 @@
 {
-  "client_version": "0.144.0",
+  "client_version": "0.144.6",
   "endpoint": "https://chatgpt.com/backend-api/codex/models",
-  "fetched_at_utc": "2026-07-11T13:47:30Z",
-  "input_sha256": "5537417f270222e326397566202e7673687a0ff207503264c495fd664c805555",
+  "fetched_at_utc": "2026-07-20T03:29:25Z",
+  "input_sha256": "0fd6974d614c0263cceb2525b43e64605441c9dcc259b83d0b8f62aa15d59b63",
   "models": [
     {
-      "context_window_tokens": 372000,
-      "default_reasoning_effort": "medium",
+      "context_window_tokens": 272000,
+      "default_reasoning_effort": "low",
       "description": "Latest frontier agentic coding model.",
       "id": "gpt-5.6-sol",
       "input_modalities": [
@@ -44,7 +44,7 @@
       ]
     },
     {
-      "context_window_tokens": 372000,
+      "context_window_tokens": 272000,
       "default_reasoning_effort": "medium",
       "description": "Balanced agentic coding model for everyday work.",
       "id": "gpt-5.6-terra",
@@ -83,7 +83,7 @@
       ]
     },
     {
-      "context_window_tokens": 372000,
+      "context_window_tokens": 272000,
       "default_reasoning_effort": "medium",
       "description": "Fast and affordable agentic coding model.",
       "id": "gpt-5.6-luna",
@@ -129,68 +129,6 @@
       "label": "GPT-5.5",
       "max_output_tokens": null,
       "priority": 7,
-      "reasoning_efforts": [
-        {
-          "description": "Fast responses with lighter reasoning",
-          "id": "low"
-        },
-        {
-          "description": "Balances speed and reasoning depth for everyday tasks",
-          "id": "medium"
-        },
-        {
-          "description": "Greater reasoning depth for complex problems",
-          "id": "high"
-        },
-        {
-          "description": "Extra high reasoning depth for complex problems",
-          "id": "xhigh"
-        }
-      ]
-    },
-    {
-      "context_window_tokens": 272000,
-      "default_reasoning_effort": "medium",
-      "description": "Strong model for everyday coding.",
-      "id": "gpt-5.4",
-      "input_modalities": [
-        "text",
-        "image"
-      ],
-      "label": "GPT-5.4",
-      "max_output_tokens": null,
-      "priority": 16,
-      "reasoning_efforts": [
-        {
-          "description": "Fast responses with lighter reasoning",
-          "id": "low"
-        },
-        {
-          "description": "Balances speed and reasoning depth for everyday tasks",
-          "id": "medium"
-        },
-        {
-          "description": "Greater reasoning depth for complex problems",
-          "id": "high"
-        },
-        {
-          "description": "Extra high reasoning depth for complex problems",
-          "id": "xhigh"
-        }
-      ]
-    },
-    {
-      "context_window_tokens": 272000,
-      "default_reasoning_effort": "medium",
-      "description": "Small, fast, and cost-efficient model for simpler coding tasks.",
-      "id": "gpt-5.4-mini",
-      "input_modalities": [
-        "text",
-        "image"
-      ],
-      "label": "GPT-5.4-Mini",
-      "max_output_tokens": null,
-      "priority": 23,
       "reasoning_efforts": [
         {
           "description": "Fast responses with lighter reasoning",

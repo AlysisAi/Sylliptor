@@ -1391,6 +1391,217 @@ def test_deepseek_reasoning_content_round_trips_for_tool_calls() -> None:
     assert second.content == "ok"
 
 
+def test_kimi_k3_uses_documented_request_shape_and_round_trips_reasoning() -> None:
+    calls: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        assert "temperature" not in body
+        assert "thinking" not in body
+        assert "enable_thinking" not in body
+        assert body["reasoning_effort"] == "max"
+        assert body["prompt_cache_key"] == "stable-session"
+        if len(calls) == 1:
+            assert body["tool_choice"] == "required"
+            assert body["max_completion_tokens"] == 4096
+            assert "max_tokens" not in body
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "Public answer.",
+                                "reasoning_content": "opaque kimi continuation state",
+                            }
+                        }
+                    ]
+                },
+            )
+
+        assistant_wire = body["messages"][1]
+        assert PROVIDER_METADATA_KEY not in assistant_wire
+        assert assistant_wire["reasoning_content"] == "opaque kimi continuation state"
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.moonshot.ai/v1",
+        api_key="test",
+        model="kimi-k3",
+        prompt_cache_key="stable-session",
+        enable_thinking=False,
+        reasoning_effort="high",
+        transport=httpx.MockTransport(handler),
+    )
+    first = client.chat(
+        messages=[{"role": "user", "content": "reason"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ],
+        tool_choice="required",
+        max_tokens=4096,
+    )
+    assert first.provider_metadata is not None
+    assert first.provider_metadata["moonshot"] == {
+        "reasoning_content": "opaque kimi continuation state"
+    }
+    assistant_message = attach_provider_metadata_to_assistant_message(
+        {"role": "assistant", "content": first.content},
+        first,
+    )
+
+    second = client.chat(
+        messages=[
+            {"role": "user", "content": "reason"},
+            assistant_message,
+            {"role": "user", "content": "continue"},
+        ],
+        tools=[],
+    )
+    assert second.content == "ok"
+
+
+def test_kimi_k27_omits_forced_tool_choice_because_thinking_is_always_on() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert "temperature" not in body
+        assert "reasoning_effort" not in body
+        assert "thinking" not in body
+        assert "tool_choice" not in body
+        assert body["tools"]
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.moonshot.cn/v1",
+        api_key="test",
+        model="kimi-k2.7-code",
+        enable_thinking=False,
+        reasoning_trace_adapter="none",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "use a tool"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ],
+        tool_choice="required",
+    )
+    assert response.content == "ok"
+
+
+@pytest.mark.parametrize(
+    ("enable_thinking", "expected_thinking", "expects_tool_choice"),
+    [
+        (None, None, False),
+        (True, {"type": "enabled"}, False),
+        (False, {"type": "disabled"}, True),
+    ],
+)
+def test_kimi_k26_tool_choice_tracks_optional_thinking_mode(
+    enable_thinking: bool | None,
+    expected_thinking: dict[str, str] | None,
+    expects_tool_choice: bool,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        if expected_thinking is None:
+            assert "thinking" not in body
+        else:
+            assert body["thinking"] == expected_thinking
+        assert ("tool_choice" in body) is expects_tool_choice
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.moonshot.ai/v1",
+        api_key="test",
+        model="kimi-k2.6",
+        enable_thinking=enable_thinking,
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "use a tool"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ],
+        tool_choice="required",
+    )
+    assert response.content == "ok"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_kimi_top_level_cached_tokens_are_normalized(stream: bool) -> None:
+    usage = {
+        "prompt_tokens": 120,
+        "completion_tokens": 10,
+        "total_tokens": 130,
+        "cached_tokens": 80,
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        if not stream:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": usage,
+                },
+            )
+        body = (
+            "data: "
+            + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "reasoning_content": "opaque stream state",
+                                "content": "ok",
+                            }
+                        }
+                    ]
+                }
+            )
+            + "\n\ndata: "
+            + json.dumps({"choices": [], "usage": usage})
+            + "\n\ndata: [DONE]\n\n"
+        )
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    client = OpenAICompatClient(
+        base_url="https://api.moonshot.ai/v1",
+        api_key="test",
+        model="kimi-k3",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[],
+        stream=stream,
+    )
+
+    assert response.usage is not None
+    assert response.usage.cache_read_input_tokens == 80
+    assert response.usage.cached_prompt_tokens == 80
+    assert response.usage.input_tokens_uncached == 40
+    if stream:
+        assert response.provider_metadata is not None
+        assert response.provider_metadata["moonshot"] == {
+            "reasoning_content": "opaque stream state"
+        }
+
+
 def test_qwen_streamed_reasoning_round_trips_opaquely_for_tool_calls() -> None:
     calls: list[dict[str, object]] = []
     reasoning_deltas: list[str] = []

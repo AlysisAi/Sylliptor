@@ -40,6 +40,7 @@ from sylliptor_agent_cli.agent_loop import (
 )
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse, ToolCall
+from sylliptor_agent_cli.llm.types import AssistantResponsePhase
 from sylliptor_agent_cli.session_store import read_session_events
 from sylliptor_agent_cli.surface.noop_surface import NoopSurface
 from sylliptor_agent_cli.tools.availability import WEB_UNAVAILABLE_OBSERVATION
@@ -1110,6 +1111,10 @@ def test_one_shot_marker_matching_is_accent_insensitive_for_greek() -> None:
     blocker_unaccented = "δεν μπορω να προχωρησω, χρειαζομαι εγκριση."
     assert _assistant_text_has_blocker_marker(blocker_accented) is True
     assert _assistant_text_has_blocker_marker(blocker_unaccented) is True
+    assert (
+        _assistant_text_contains_progress_intent("The project now has a real Next.js site.")
+        is False
+    )
 
 
 def test_one_shot_continues_after_non_final_progress_message(tmp_path: Path) -> None:
@@ -1186,6 +1191,122 @@ def test_one_shot_continues_after_non_final_progress_message(tmp_path: Path) -> 
     assert "one_shot_non_final_progress_detected" in event_types
     assert "continuation_nudge" in event_types
     assert "one_shot_completion_gate_incomplete_after_retries" not in event_types
+
+
+def test_provider_declared_final_answer_is_not_reclassified_from_nextjs_text(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(model="test-model", routing_mode="code_only")
+    sessions_dir = tmp_path / "sessions"
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=4,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=False,
+        verification_enabled=False,
+        session_log_dir_override=sessions_dir,
+        session_id_override="structured-final-phase",
+    )
+    final_text = "The project now has a real Next.js site and is ready to host locally."
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content=final_text,
+                tool_calls=[],
+                raw={},
+                assistant_phase=AssistantResponsePhase.FINAL_ANSWER,
+            )
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Inspect the repository and report what you find.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert session.client.calls == 1  # type: ignore[attr-defined]
+    events = list(read_session_events(sessions_dir / "structured-final-phase.jsonl"))
+    event_types = [event.get("type") for event in events]
+    assert "interactive_non_final_progress_detected" not in event_types
+    assert "continuation_nudge" not in event_types
+    assert "empty_model_response_model_control_anomaly" not in event_types
+
+
+def test_provider_declared_final_after_failed_service_tool_avoids_model_control(
+    tmp_path: Path,
+) -> None:
+    cfg = AppConfig(model="test-model", routing_mode="code_only")
+    sessions_dir = tmp_path / "sessions"
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=6,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=False,
+        verification_enabled=False,
+        session_log_dir_override=sessions_dir,
+        session_id_override="structured-final-after-service-failure",
+    )
+    session.tools["shell_service_start"] = ToolDef(
+        name="shell_service_start",
+        description="Start a durable local service.",
+        parameters={"type": "object", "properties": {}},
+        run=lambda _args: {"error": "Durable service tools are unavailable in this session."},
+    )
+    session.tool_list = [tool.as_openai_tool() for tool in session.tools.values()]
+    final_text = (
+        "I couldn't expose the Next.js site because the service runtime is unavailable. "
+        "Run npm run dev locally, then open http://localhost:3000."
+    )
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="Starting the Next.js development server.",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-service",
+                        name="shell_service_start",
+                        arguments={"cmd": "npm run dev"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(
+                content=final_text,
+                tool_calls=[],
+                raw={},
+                assistant_phase=AssistantResponsePhase.FINAL_ANSWER,
+            ),
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Host the website locally now.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert session.client.calls == 2  # type: ignore[attr-defined]
+    events = list(
+        read_session_events(sessions_dir / "structured-final-after-service-failure.jsonl")
+    )
+    event_types = [event.get("type") for event in events]
+    assert "tool_result" in event_types
+    assert "interactive_non_final_progress_detected" not in event_types
+    assert "continuation_nudge" not in event_types
+    assert "completion_gate_nudge" not in event_types
+    assert "empty_model_response_model_control_anomaly" not in event_types
+    assert "empty_model_response_anomaly_incomplete_after_retries" not in event_types
+    final_events = [event for event in events if event.get("type") == "final"]
+    assert final_events[-1]["payload"]["content"] == final_text
 
 
 def test_one_shot_plan_only_then_final_records_single_continuation_intervention(
@@ -2169,7 +2290,10 @@ def test_one_shot_non_final_progress_accepts_second_final_after_single_nudge(
     ]
     assert not [event for event in events if event.get("type") == "forced_final_summary_requested"]
     assert surface.errors == []
-    assert surface.final_messages[-1] == repeated_progress_text
+    # Turn-contract v2: a zero-edit execute turn now finalizes with a visible
+    # advisory-completion suffix (apply-don't-advise). The model text is preserved.
+    assert surface.final_messages[-1].startswith(repeated_progress_text)
+    assert "No changes made:" in surface.final_messages[-1]
 
 
 def test_non_final_progress_second_response_is_accepted_even_if_tool_markup(
@@ -2216,7 +2340,10 @@ def test_non_final_progress_second_response_is_accepted_even_if_tool_markup(
     events = list(read_session_events(sessions_dir / "one-shot-forced-summary-tool-markup.jsonl"))
     assert any(event.get("type") == "continuation_nudge" for event in events)
     assert not [event for event in events if event.get("type") == "forced_final_summary_fallback"]
-    assert surface.final_messages[-1] == raw_tool_markup
+    # Turn-contract v2: zero-edit execute turn gets a visible advisory-completion
+    # suffix; the raw tool-markup text is preserved as the leading content.
+    assert surface.final_messages[-1].startswith(raw_tool_markup)
+    assert "No changes made:" in surface.final_messages[-1]
 
 
 def test_one_shot_non_final_progress_accepts_after_single_nudge_without_forced_summary(
@@ -2276,7 +2403,10 @@ def test_one_shot_non_final_progress_accepts_after_single_nudge_without_forced_s
     ]
     assert not [event for event in events if event.get("type") == "forced_final_summary_requested"]
     assert surface.errors == []
-    assert surface.final_messages[-1] == latest_progress_text
+    # Turn-contract v2: a zero-edit execute turn now finalizes with a visible
+    # advisory-completion suffix (apply-don't-advise). The model text is preserved.
+    assert surface.final_messages[-1].startswith(latest_progress_text)
+    assert "No changes made:" in surface.final_messages[-1]
 
 
 def test_one_shot_completion_gate_rejects_empty_final_response(tmp_path: Path) -> None:
@@ -3855,7 +3985,12 @@ def test_one_shot_completion_gate_no_material_edits_accepts_after_checklist(
     assert "no_material_edits" in set(payload.get("problems") or [])
     assert not surface.errors
     assert not any(event.get("type") == "forced_final_summary_requested" for event in events)
-    assert surface.final_messages[-1] == latest_final_text
+    # Turn-contract v2: this execute turn claimed completion but made zero material
+    # edits, so the gate appends a visible advisory-completion suffix (the P-A
+    # protection) and records an advisory_completion event. The model text is kept.
+    assert surface.final_messages[-1].startswith(latest_final_text)
+    assert "No changes made:" in surface.final_messages[-1]
+    assert any(event.get("type") == "advisory_completion" for event in events)
 
 
 def test_one_shot_completion_gate_rejects_failing_verification(tmp_path: Path) -> None:
@@ -7479,6 +7614,94 @@ def test_one_shot_code_edit_after_verify_requires_rerunning_verification(
         session.close()
 
     assert exit_code == 0
+
+
+def test_one_shot_prose_cannot_clear_evidence_deficit_and_finalizes_honestly_unverified(
+    tmp_path: Path,
+) -> None:
+    # Edit source, then never run tests: prose-only replies must not clear the
+    # post-edit execution-evidence deficit. After a bounded number of nudges the
+    # run finalizes honestly-unverified with a distinct event and a visible marker.
+    # A real test surface must exist so verification is genuinely expected.
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("print('orig')\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_app.py").write_text(
+        "def test_smoke():\n    assert True\n", encoding="utf-8"
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'demo'\nversion = '0.0.0'\n", encoding="utf-8"
+    )
+    cfg = AppConfig(model="test-model", routing_mode="code_only", verify_commands=["pytest -q"])
+    sessions_dir = tmp_path / "sessions"
+    session_id = "one-shot-honest-unverified"
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=12,
+        no_log=False,
+        api_key_override="override-key",
+        one_shot_execution=True,
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    session.client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc1",
+                        name="fs_write",
+                        arguments={"path": "src/app.py", "content": "print('changed')\n"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="Everything matches the spec ✅.", tool_calls=[], raw={}),
+            LLMResponse(content="I am confident the change is correct.", tool_calls=[], raw={}),
+            LLMResponse(content="The work is complete.", tool_calls=[], raw={}),
+            LLMResponse(content="Final answer: it is done.", tool_calls=[], raw={}),
+        ]
+    )  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Fix the bug in src/app.py.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    event_types = [event.get("type") for event in events]
+
+    # At least two repair nudges were sent (prose did not clear the deficit).
+    nudges = [
+        event
+        for event in events
+        if event.get("type") == "completion_gate_nudge"
+        and (event.get("payload") or {}).get("stage")
+        in {"verification_not_attempted", "verification_incomplete"}
+    ]
+    assert len(nudges) >= 2
+    # Each such nudge names the concrete missing fact and forbids prose clearing.
+    assert any(
+        "No test execution recorded" in str((event.get("payload") or {}).get("message") or "")
+        for event in nudges
+    )
+
+    # Exhaustion produced the distinct honest-unverified event.
+    assert "one_shot_completion_gate_unverified_finalized" in event_types
+
+    # The acceptance event flags it (no silent swallow).
+    accepted = _latest_completion_gate_acceptance_payload(events)
+    assert accepted.get("honest_unverified") is True
+
+    # The visible final summary carries the UNVERIFIED marker.
+    final_events = [event for event in events if event.get("type") == "final"]
+    assert final_events
+    assert "UNVERIFIED" in str((final_events[-1].get("payload") or {}).get("content") or "")
 
 
 def test_one_shot_multicommand_verification_becomes_stale_after_code_edit(

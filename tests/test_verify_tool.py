@@ -41,6 +41,53 @@ def _cp(
     )
 
 
+class _FakePopen:
+    """Popen stand-in that answers from a ``subprocess.run``-shaped fake.
+
+    A host runner given the session's process-group registry needs a live handle
+    to record the pgid, so it uses ``Popen`` rather than ``subprocess.run``.
+    Tests that fake command execution have to cover that path too, or the fake is
+    simply bypassed and the real command runs. ``pid = 0`` is refused by the
+    registry, so nothing is tracked and no signal can ever be sent from a test.
+    """
+
+    def __init__(self, fake_run, args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        self._completed = fake_run(args, **kwargs)
+        self.pid = 0
+        self.returncode = int(getattr(self._completed, "returncode", 0) or 0)
+
+    def __enter__(self) -> _FakePopen:
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        return (
+            str(getattr(self._completed, "stdout", "") or ""),
+            str(getattr(self._completed, "stderr", "") or ""),
+        )
+
+    def poll(self) -> int:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        return None
+
+
+def _patch_host_execution(monkeypatch: pytest.MonkeyPatch, fake_run) -> None:  # type: ignore[no-untyped-def]
+    """Route both host-execution paths through ``fake_run``."""
+    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda args, **kwargs: _FakePopen(fake_run, args, **kwargs),
+    )
+
+
 def _host_verify_cfg(cfg: AppConfig | None = None) -> AppConfig:
     effective = clone_cfg(cfg or AppConfig(model="test-model"))
     extra_fields = dict(effective.extra_fields)
@@ -137,7 +184,7 @@ def test_verify_run_uses_configured_commands_and_writes_artifact(
             return _cp(returncode=0, stdout="tests ok\n")
         return _cp(returncode=1, stderr="lint failed\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["pytest -q", "ruff check ."]
@@ -211,7 +258,7 @@ def test_verify_run_treats_pytest_exit_5_no_tests_as_skipped_pass(
         (tmp_path / ".pytest_cache").mkdir()
         return _cp(returncode=5, stdout="custom plugin suppressed the collection summary\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["pytest -q"]
@@ -236,7 +283,7 @@ def test_verify_run_respects_session_log_dir_override_outside_root(
     def fake_run(_cmd, **_kwargs):  # type: ignore[no-untyped-def]
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -272,7 +319,7 @@ def test_verify_run_logs_real_external_artifact_path_in_session_events(
     def fake_run(_cmd, **_kwargs):  # type: ignore[no-untyped-def]
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -443,7 +490,7 @@ def test_interactive_pathless_non_python_tasks_do_not_inherit_generic_pytest_fal
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -567,7 +614,7 @@ def test_interactive_neutral_config_paths_keep_repo_grounded_invalidation(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -953,7 +1000,7 @@ def test_interactive_pathless_js_repo_with_repo_native_tests_keeps_authoritative
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1036,7 +1083,7 @@ def test_interactive_mixed_workspace_repo_native_commands_remain_authoritative(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1127,7 +1174,7 @@ def test_interactive_mixed_workspace_explicit_targets_keep_task_specific_selecti
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1189,7 +1236,7 @@ def test_interactive_repo_native_verification_selection_stays_authoritative(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1242,7 +1289,7 @@ def test_interactive_explicit_verify_override_wins_and_survives_task_refresh(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1306,7 +1353,7 @@ def test_verify_run_allows_override_commands(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["pytest -q"]
@@ -1339,7 +1386,7 @@ def test_verify_run_splits_simple_chained_override_commands(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     tools = _build_tools(tmp_path)
 
@@ -1360,7 +1407,7 @@ def test_verify_run_splits_chained_override_before_contract_matching(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     tools = _build_tools(
         tmp_path,
@@ -1428,7 +1475,7 @@ def test_verify_run_allows_targeted_override_against_effective_contract(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["pytest -q"]
@@ -1468,7 +1515,7 @@ def test_verify_run_allows_targeted_pytest_variants_against_effective_contract(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["pytest -q"]
@@ -1495,7 +1542,7 @@ def test_verify_run_marks_go_no_tests_to_run_as_skipped_verification(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\texample/pkg\t0.002s [no tests to run]\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["go test ./..."]
@@ -1527,7 +1574,7 @@ def test_verify_run_marks_go_no_test_files_as_skipped_verification(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="?   \texample/pkg\t[no test files]\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["go test ./..."]
@@ -1562,7 +1609,7 @@ def test_verify_run_accepts_mixed_go_package_output_with_real_execution(
             stdout=("?   \texample/pkg1\t[no test files]\nok  \texample/pkg2\t0.002s\n"),
         )
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["go test ./..."]
@@ -1595,7 +1642,7 @@ def test_verify_run_marks_unittest_zero_tests_as_skipped_verification(
             stderr="----------------------------------------------------------------------\nRan 0 tests in 0.000s\n\nOK\n",
         )
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["python -m unittest discover -s tests"]
@@ -1634,7 +1681,7 @@ def test_verify_run_marks_maven_zero_tests_as_skipped_verification(
             ),
         )
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["mvn test"]
@@ -1660,7 +1707,7 @@ def test_verify_run_classifies_missing_wrapper_as_infra_unavailable(
         assert str(cmd) == "./gradlew test"
         return _cp(returncode=127, stderr="/bin/bash: ./gradlew: No such file or directory\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["./gradlew test"]
@@ -1687,7 +1734,7 @@ def test_verify_run_allows_exact_unknown_family_command_within_contract(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["ruby -Ilib:test test/**/*_test.rb"]
@@ -1714,7 +1761,7 @@ def test_verify_run_expands_recursive_globs_portably(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="1 runs, 1 assertions, 0 failures\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["ruby -Ilib:test test/**/*_test.rb"]
@@ -1836,7 +1883,7 @@ def test_verify_run_rejects_divergent_override_in_managed_session(
     def fake_run(_cmd, **_kwargs):  # type: ignore[no-untyped-def]
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["pytest -q"]
@@ -1863,7 +1910,7 @@ def test_verify_run_allows_identical_override_in_managed_session(
         calls.append(str(cmd))
         return _cp(returncode=0, stdout="ok\n")
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     cfg = AppConfig(model="test-model")
     cfg.verify_commands = ["pytest -q"]
@@ -1989,7 +2036,7 @@ def test_verify_run_truncates_output_preview_but_keeps_full_artifact(
     def fake_run(_cmd, **_kwargs):  # type: ignore[no-untyped-def]
         return _cp(returncode=0, stdout=big_output)
 
-    monkeypatch.setattr(verify_gate_mod.subprocess, "run", fake_run)
+    _patch_host_execution(monkeypatch, fake_run)
 
     tools = _build_tools(tmp_path)
     result = tools["verify_run"].run({"commands": ["pytest -q"]})

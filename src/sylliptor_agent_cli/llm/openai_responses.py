@@ -38,6 +38,7 @@ from .request_plan import LLMRequestPlan, RequestCachePlan
 from .request_shape import build_request_shape_report
 from .streaming import SSEFrame, iter_sse_frames, parse_sse_json_frame
 from .types import (
+    AssistantResponsePhase,
     InputTokenCount,
     LLMError,
     LLMResponse,
@@ -388,6 +389,7 @@ def _response_with_request_plan_metadata(
         usage=response.usage,
         provider_metadata=provider_metadata,
         reasoning=response.reasoning,
+        assistant_phase=response.assistant_phase,
     )
 
 
@@ -529,6 +531,26 @@ def _extract_answer_text(data: dict[str, Any]) -> str:
         if isinstance(text, str):
             text_parts.append(text)
     return "".join(text_parts)
+
+
+def _assistant_response_phase(data: dict[str, Any]) -> AssistantResponsePhase | None:
+    """Normalize a provider-declared assistant phase without inferring from prose."""
+
+    output = data.get("output")
+    if not isinstance(output, list):
+        return None
+    for item in reversed(output):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "") != "message":
+            continue
+        if str(item.get("role") or "") != "assistant":
+            continue
+        try:
+            return AssistantResponsePhase(str(item.get("phase") or "").strip())
+        except ValueError:
+            return None
+    return None
 
 
 def _extract_citations(data: dict[str, Any]) -> list[WebSearchCitation]:
@@ -2358,6 +2380,7 @@ class OpenAIResponsesClient:
             usage=_parse_usage(data.get("usage")),
             provider_metadata=_responses_provider_metadata(data),
             reasoning=reasoning,
+            assistant_phase=_assistant_response_phase(data),
         )
 
     def web_search(

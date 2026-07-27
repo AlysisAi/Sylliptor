@@ -26,7 +26,6 @@ _ONE_SHOT_NON_FINAL_PROGRESS_MARKERS = (
     "i will",
     "i'll",
     "ill",
-    "next",
     "then i will",
     "let me",
     "plan:",

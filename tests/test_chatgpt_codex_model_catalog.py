@@ -53,13 +53,21 @@ def test_subscription_snapshot_is_distinct_from_api_catalog() -> None:
     ]
 
 
-def test_subscription_snapshot_contains_current_live_capacity_tiers() -> None:
+def test_subscription_snapshot_contains_current_visible_capacity_tiers() -> None:
     models = {model.id: model for model in load_chatgpt_codex_static_models()}
 
-    assert models["gpt-5.6-sol"].context_window_tokens == 372_000
-    assert models["gpt-5.6-terra"].context_window_tokens == 372_000
-    assert models["gpt-5.6-luna"].context_window_tokens == 372_000
-    assert models["gpt-5.4"].context_window_tokens == 272_000
+    assert set(models) == {
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.3-codex-spark",
+    }
+    assert models["gpt-5.6-sol"].context_window_tokens == 272_000
+    assert models["gpt-5.6-sol"].default_reasoning_effort == "low"
+    assert models["gpt-5.6-terra"].context_window_tokens == 272_000
+    assert models["gpt-5.6-luna"].context_window_tokens == 272_000
+    assert models["gpt-5.5"].context_window_tokens == 272_000
     assert models["gpt-5.3-codex-spark"].context_window_tokens == 128_000
     assert models["gpt-5.3-codex-spark"].input_modalities == ("text",)
 
@@ -77,7 +85,7 @@ def test_registry_uses_subscription_snapshot_when_live_catalog_is_offline(monkey
         lambda _provider_id: _OfflineSubscriptionAdapter(),
     )
 
-    meta = ModelRegistry(cfg=_subscription_cfg("gpt-5.5")).get("gpt-5.5")
+    meta = ModelRegistry(cfg=_subscription_cfg("gpt-5.6-sol")).get("gpt-5.6-sol")
 
     assert meta.context_window_tokens == 272_000
     assert meta.max_output_tokens == 8_192
@@ -162,7 +170,7 @@ def test_subscription_refresh_script_writes_sanitized_deterministic_snapshot(
             "--input",
             str(input_path),
             "--client-version",
-            "0.144.0",
+            "0.144.6",
             "--fetched-at",
             "2026-07-11T12:00:00Z",
         ]
@@ -170,6 +178,7 @@ def test_subscription_refresh_script_writes_sanitized_deterministic_snapshot(
 
     assert result == 0
     payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["client_version"] == "0.144.6"
     assert payload["source"] == CHATGPT_CODEX_SUBSCRIPTION_CATALOG_SOURCE
     assert payload["usage"] == "capacity_and_capability_fallback_only_not_entitlement"
     assert payload["input_sha256"] == hashlib.sha256(input_path.read_bytes()).hexdigest()

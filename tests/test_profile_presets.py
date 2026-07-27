@@ -325,6 +325,16 @@ def test_launch_provider_presets_use_supported_chat_models() -> None:
         assert all(model in preset.suggested_model_descriptions for model in models)
 
 
+def test_moonshot_presets_keep_k2_web_search_and_legacy_alias() -> None:
+    for key in ("moonshot", "moonshot-cn"):
+        preset = get_preset(key)
+
+        assert preset is not None
+        assert preset.suggested_models[0] == "kimi-k2.7-code"
+        assert preset.web_search_model == "kimi-k2.6"
+        assert canonical_model_alias_for_preset(preset, "kimi-k2") == "kimi-k2.6"
+
+
 def test_deepseek_preset_does_not_offer_legacy_or_retired_aliases() -> None:
     preset = get_preset("deepseek")
 

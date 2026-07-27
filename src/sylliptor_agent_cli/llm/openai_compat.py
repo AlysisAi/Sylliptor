@@ -97,6 +97,7 @@ _DEEPSEEK_PROVIDER_KEY = "deepseek"
 _OPENROUTER_PROVIDER_KEY = "openrouter"
 _QWEN_PROVIDER_KEY = "qwen"
 _GEMINI_PROVIDER_KEY = "gemini"
+_MOONSHOT_PROVIDER_KEY = "moonshot"
 _GEMINI_EXTRA_CONTENT_KEY = "extra_content"
 _OPENAI_STYLE_REASONING_EFFORT_PROVIDERS = frozenset({"openai", "azure", "mistral"})
 _REASONING_PROVIDER_BY_ADAPTER: dict[str, str] = {
@@ -104,6 +105,7 @@ _REASONING_PROVIDER_BY_ADAPTER: dict[str, str] = {
     "openrouter_reasoning": _OPENROUTER_PROVIDER_KEY,
     "dashscope_thinking": _QWEN_PROVIDER_KEY,
     "mistral_thinking": _MISTRAL_PROVIDER_KEY,
+    "moonshot_reasoning": _MOONSHOT_PROVIDER_KEY,
 }
 _GEMINI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 _DEFAULT_ACCEPT_ENCODING = "identity"
@@ -383,6 +385,8 @@ def _provider_key_from_base_url(base_url: str | None) -> str | None:
         return "gemini"
     if host == "api.mistral.ai" or host.endswith(".mistral.ai"):
         return "mistral"
+    if host in {"api.moonshot.ai", "api.moonshot.cn"}:
+        return _MOONSHOT_PROVIDER_KEY
     if host == "api.x.ai" or host == "x.ai" or host.endswith(".x.ai"):
         return "xai"
     return None
@@ -446,6 +450,10 @@ def _is_mistral_provider(provider_key: str | None) -> bool:
     return _normalize_provider_key(provider_key) == _MISTRAL_PROVIDER_KEY
 
 
+def _is_moonshot_provider(provider_key: str | None) -> bool:
+    return _normalize_provider_key(provider_key) == _MOONSHOT_PROVIDER_KEY
+
+
 def _uses_reasoning_effort(provider_key: str | None) -> bool:
     return _normalize_provider_key(provider_key) in _OPENAI_STYLE_REASONING_EFFORT_PROVIDERS
 
@@ -453,6 +461,23 @@ def _uses_reasoning_effort(provider_key: str | None) -> bool:
 def _model_name_parts(model: str | None) -> set[str]:
     normalized = str(model or "").strip().casefold()
     return {part for part in re.split(r"[^a-z0-9]+", normalized) if part}
+
+
+_KIMI_K3_RE = re.compile(r"(?:^|[/.:_-])kimi[-_.]?k3(?:[-_.]|$)")
+_KIMI_K27_RE = re.compile(r"(?:^|[/.:_-])kimi[-_.]?k2[-_.]?7(?:[-_.]|$)")
+_KIMI_K26_RE = re.compile(r"(?:^|[/.:_-])kimi[-_.]?k2[-_.]?6(?:[-_.]|$)")
+
+
+def _is_kimi_k3_model(model: str | None) -> bool:
+    return _KIMI_K3_RE.search(str(model or "").strip().casefold()) is not None
+
+
+def _is_kimi_k27_model(model: str | None) -> bool:
+    return _KIMI_K27_RE.search(str(model or "").strip().casefold()) is not None
+
+
+def _is_kimi_k26_model(model: str | None) -> bool:
+    return _KIMI_K26_RE.search(str(model or "").strip().casefold()) is not None
 
 
 def _gemini_model_allows_none_reasoning_effort(model: str | None) -> bool:
@@ -550,6 +575,17 @@ def _qwen_reasoning_provider_metadata(reasoning_content: str) -> dict[str, Any] 
     }
 
 
+def _moonshot_reasoning_provider_metadata(reasoning_content: str) -> dict[str, Any] | None:
+    reasoning = str(reasoning_content or "")
+    if not reasoning:
+        return None
+    return {
+        _MOONSHOT_PROVIDER_KEY: {
+            _DEEPSEEK_REASONING_CONTENT_KEY: reasoning,
+        }
+    }
+
+
 def _is_mistral_thinking_chunk(value: Any) -> bool:
     return isinstance(value, dict) and str(value.get("type") or "").casefold() == "thinking"
 
@@ -636,6 +672,11 @@ def _provider_metadata_for_reasoning(
     if _is_dashscope_provider(provider_key):
         reasoning = message.get(_DEEPSEEK_REASONING_CONTENT_KEY)
         return _qwen_reasoning_provider_metadata(reasoning if isinstance(reasoning, str) else "")
+    if _is_moonshot_provider(provider_key):
+        reasoning = message.get(_DEEPSEEK_REASONING_CONTENT_KEY)
+        return _moonshot_reasoning_provider_metadata(
+            reasoning if isinstance(reasoning, str) else ""
+        )
     if _is_openrouter_provider(provider_key):
         reasoning = message.get(_OPENROUTER_REASONING_KEY)
         reasoning_details = message.get(_OPENROUTER_REASONING_DETAILS_KEY)
@@ -679,6 +720,16 @@ def _qwen_reasoning_from_provider_metadata(metadata: Any) -> str:
     if not isinstance(qwen, dict):
         return ""
     reasoning = qwen.get(_DEEPSEEK_REASONING_CONTENT_KEY)
+    return reasoning if isinstance(reasoning, str) else ""
+
+
+def _moonshot_reasoning_from_provider_metadata(metadata: Any) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    moonshot = metadata.get(_MOONSHOT_PROVIDER_KEY)
+    if not isinstance(moonshot, dict):
+        return ""
+    reasoning = moonshot.get(_DEEPSEEK_REASONING_CONTENT_KEY)
     return reasoning if isinstance(reasoning, str) else ""
 
 
@@ -813,6 +864,10 @@ def _message_for_transport(
             copied[_OPENROUTER_REASONING_KEY] = reasoning
         if reasoning_details:
             copied[_OPENROUTER_REASONING_DETAILS_KEY] = reasoning_details
+    elif _is_moonshot_provider(reasoning_provider_key):
+        reasoning = _moonshot_reasoning_from_provider_metadata(metadata)
+        if reasoning:
+            copied[_DEEPSEEK_REASONING_CONTENT_KEY] = reasoning
     elif _is_mistral_provider(reasoning_provider_key):
         content = _mistral_content_from_provider_metadata(metadata)
         if content:
@@ -982,6 +1037,8 @@ def _parse_usage(raw: Any) -> LLMUsage | None:
     completion_i = _as_non_negative_int(completion)
     total_i = _as_non_negative_int(total)
     cached_prompt_tokens_raw = raw.get("cached_prompt_tokens")
+    if cached_prompt_tokens_raw is None:
+        cached_prompt_tokens_raw = raw.get("cached_tokens")
     prompt_tokens_details = raw.get("prompt_tokens_details")
     if cached_prompt_tokens_raw is None and isinstance(prompt_tokens_details, dict):
         cached_prompt_tokens_raw = prompt_tokens_details.get("cached_tokens")
@@ -1739,7 +1796,7 @@ class OpenAICompatClient:
         )
         documented_temperature_reason = documented_temperature_omit_reason(
             self.model,
-            provider_key=reasoning_provider_key,
+            provider_key=transport_provider_key,
             thinking_enabled=deepseek_thinking_enabled,
         )
         temperature_key = self._temperature_compat_key(transport_provider_key)
@@ -1815,7 +1872,23 @@ class OpenAICompatClient:
         # MiMo, DashScope/Qwen, Zhipu GLM). OpenAI/Gemini-style reasoning accept a
         # forced choice, so those branches leave this False.
         thinking_active = False
-        if _is_dashscope_provider(reasoning_provider_key):
+        if _is_moonshot_provider(transport_provider_key):
+            if _is_kimi_k3_model(self.model):
+                # K3 always reasons and currently accepts only the maximum effort.
+                payload["reasoning_effort"] = "max"
+            elif _is_kimi_k27_model(self.model):
+                # K2.7 thinking is always enabled and cannot be disabled.
+                thinking_active = True
+            elif _is_kimi_k26_model(self.model):
+                thinking_enabled = self.enable_thinking
+                if thinking_enabled is None:
+                    thinking_enabled = _reasoning_effort_enables_thinking(self.reasoning_effort)
+                # The API defaults K2.6 to thinking; preserve that default while
+                # still accounting for its forced-tool restriction.
+                thinking_active = thinking_enabled is not False
+                if thinking_enabled is not None:
+                    payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
+        elif _is_dashscope_provider(reasoning_provider_key):
             enable_thinking = self.enable_thinking
             if enable_thinking is None:
                 enable_thinking = _reasoning_effort_enables_thinking(self.reasoning_effort)
@@ -1870,7 +1943,12 @@ class OpenAICompatClient:
         if response_format:
             payload["response_format"] = response_format
         if max_tokens is not None:
-            payload["max_tokens"] = int(max_tokens)
+            output_limit_field = (
+                "max_completion_tokens"
+                if _is_moonshot_provider(transport_provider_key)
+                else "max_tokens"
+            )
+            payload[output_limit_field] = int(max_tokens)
         if stream:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}

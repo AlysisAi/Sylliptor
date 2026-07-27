@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-07-27
+
+### Added
+
+- Added tracked process-group cleanup, reusable workspace provisioning, and containment for
+  incomplete subagent reports so background work and internal artifacts do not leak past a turn.
+- Added turn-contract enforcement and regression baselines so execute-intent turns apply the
+  requested change, respect named behavior, and verify against pre-existing failures.
+- Added fact-based completion evidence with per-stage pipeline exit status, post-edit
+  verification ordering, bounded evidence repair, and explicit unverified outcomes.
+- Added deterministic route arbitration so writable one-shot repository runs retain their
+  tool capabilities and interactive execute-class turns can recover from non-execute routing.
+- Added first-class Moonshot/Kimi runtime support for K3, K2.7 Code, K2.7 Code Highspeed,
+  and K2.6, including model metadata, reasoning continuation, and cache affinity.
+
+### Fixed
+
+- Added `SYLLIPTOR_WEB_TOOLS` as a master switch for all web tools and web-search backends.
+- Honored provider-reported final-answer phases when deciding whether another model turn is needed.
+- Refreshed the ChatGPT subscription model snapshot and allowed model metadata.
+
 ## [0.11.1] - 2026-07-20
 
 ### Added
@@ -22,7 +43,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Reworked Advanced role overrides into per-role editors with clear-to-inherit support for
   subagent and Forge model selections.
 - Made cache status and API-key storage descriptions easier to understand in the config UI.
-
 ### Fixed
 
 - Saving `/config` before the first chat message now updates the pending session and footer

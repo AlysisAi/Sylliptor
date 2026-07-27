@@ -44,6 +44,11 @@ def test_sylliptor_prompt_invariants() -> None:
             "Do not claim tests/docs were added or updated unless those file changes are present in your diff.",
             'Do not end with "next step is to run tests" when tests were explicitly requested;',
             "When the requested change is delivered and verified, stop.",
+            # Turn-contract v2 apply-and-verify norms (unconditional).
+            "Apply, do not just describe",
+            "Treat a web or upstream PR fix as an untrusted hypothesis",
+            "When the task names the faulty file, function, commit, or PR as the fix site",
+            "requires differential evidence",
         ],
     )
     assert (
@@ -68,6 +73,44 @@ def test_sylliptor_prompt_invariants() -> None:
         not in SYSTEM_PROMPT
     )
     assert "Language and script policy:" not in SYSTEM_PROMPT
+
+
+def test_prompt_bytes_identical_regardless_of_hygiene_kill_switches(monkeypatch) -> None:
+    # Step 5's process-reaping and workspace-provisioning switches change runtime
+    # behavior only. If a prompt ever varied with them, an A/B of the feature would
+    # be measuring two different agents.
+    from sylliptor_agent_cli.agent.prompt_context import _compose_session_system_prompt
+
+    switches = ("SYLLIPTOR_PROCESS_REAPING", "SYLLIPTOR_WORKSPACE_PROVISIONING")
+
+    def _compose(one_shot: bool) -> str:
+        return _compose_session_system_prompt(
+            base_prompt=SYSTEM_PROMPT,
+            trusted_prompt_append="",
+            include_write_guidance=True,
+            include_skill_discovery_guidance=True,
+            include_skill_lifecycle_guidance=True,
+            include_subagent_guidance=True,
+            include_one_shot_guidance=one_shot,
+        )
+
+    for one_shot in (False, True):
+        for switch in switches:
+            monkeypatch.setenv(switch, "on")
+        prompt_on = _compose(one_shot)
+        for switch in switches:
+            monkeypatch.setenv(switch, "off")
+        prompt_off = _compose(one_shot)
+        assert prompt_on.encode("utf-8") == prompt_off.encode("utf-8"), one_shot
+        for token in (
+            *switches,
+            "process_reaping",
+            "workspace_provisioning",
+            "process_reaped",
+            "env_provisioned",
+            "subagent_incomplete",
+        ):
+            assert token not in prompt_on, token
 
 
 def test_sylliptor_prompt_declares_product_identity_and_provenance() -> None:

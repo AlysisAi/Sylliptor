@@ -40,6 +40,13 @@ class ReasoningOutputKind(StrEnum):
     PROVIDER_REASONING = "provider_reasoning"
 
 
+class AssistantResponsePhase(StrEnum):
+    """Provider-declared lifecycle phase for assistant-visible output."""
+
+    COMMENTARY = "commentary"
+    FINAL_ANSWER = "final_answer"
+
+
 @dataclass(frozen=True)
 class ReasoningOutput:
     """Normalized reasoning material returned alongside an assistant answer."""
@@ -153,3 +160,4 @@ class LLMResponse:
     usage: LLMUsage | None = None
     provider_metadata: dict[str, Any] | None = None
     reasoning: tuple[ReasoningOutput, ...] = ()
+    assistant_phase: AssistantResponsePhase | None = None

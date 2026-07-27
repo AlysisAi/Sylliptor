@@ -64,6 +64,9 @@ AUTHORITATIVE_RESPONSE_PRESETS = {
     "gemini",
     "gemini-compat",
     "gemini-native",
+    "moonshot",
+    "kimi-code",
+    "moonshot-cn",
 }
 
 

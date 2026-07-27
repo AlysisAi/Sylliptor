@@ -408,7 +408,7 @@ def test_managed_execution_startup_headroom_reduces_first_request_below_trigger(
         "model_metadata_overrides": {
             "models": {
                 "managed-8k": {
-                    "context_window_tokens": 8192,
+                    "context_window_tokens": 11264,
                     "max_output_tokens": 1024,
                     "supports_vision": False,
                 }
@@ -456,13 +456,22 @@ def test_managed_execution_startup_headroom_reduces_first_request_below_trigger(
         managed_execution_startup_headroom=True,
         leading_sections=[
             "## Execution Knowledge\n"
-            + "Carry forward the exact forge execution contract and reporting invariants.\n" * 16
+            + "Carry forward the exact forge execution contract and reporting invariants.\n" * 64
         ],
     )
 
     payload = bundle.to_budget_artifact_payload()
 
-    assert payload["startup_headroom_adjustment_applied"] is True
+    assert payload["startup_headroom_adjustment_applied"] is True, {
+        key: payload.get(key)
+        for key in (
+            "initial_request_token_estimate",
+            "initial_request_token_estimate_before_adjustment",
+            "startup_target_tokens",
+            "startup_headroom_tokens",
+            "startup_headroom_adjustment_reason",
+        )
+    }
     assert payload["initial_request_token_estimate_before_adjustment"] is not None
     assert (
         payload["initial_request_token_estimate_before_adjustment"]

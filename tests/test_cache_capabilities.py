@@ -3,6 +3,7 @@ from __future__ import annotations
 from sylliptor_agent_cli.llm.cache_capabilities import (
     CACHE_CONTROL_FIELD,
     CACHE_STRATEGY_ANTHROPIC_CACHE_CONTROL,
+    CACHE_STRATEGY_IMPLICIT_PROVIDER,
     CACHE_STRATEGY_MISTRAL_PROMPT_CACHE_KEY,
     CACHE_STRATEGY_NONE,
     CACHE_STRATEGY_OPENAI_PROMPT_CACHE,
@@ -294,6 +295,28 @@ def test_mistral_preset_emits_prompt_cache_key_only() -> None:
     assert capability.strategy == CACHE_STRATEGY_MISTRAL_PROMPT_CACHE_KEY
     assert capability.source == "preset"
     assert capability.emits_request_fields is True
+    assert capability.emitted_fields == (PROMPT_CACHE_KEY_FIELD,)
+    assert capability.trusted_usage_fields == ("cache_read_input_tokens",)
+
+
+def test_moonshot_preset_emits_cache_affinity_key_and_trusts_read_usage() -> None:
+    preset = get_preset("moonshot")
+    assert preset is not None
+
+    capability = resolve_effective_cache_capability(
+        provider_key="moonshot",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+        model="kimi-k3",
+        transport_capabilities=get_provider_protocol_capabilities(
+            provider_key="moonshot",
+            protocol=OPENAI_COMPAT_PROTOCOL,
+        ),
+        preset_cache_capability=preset.cache_capability,
+    )
+
+    assert capability.enabled is True
+    assert capability.status == "enabled"
+    assert capability.strategy == CACHE_STRATEGY_IMPLICIT_PROVIDER
     assert capability.emitted_fields == (PROMPT_CACHE_KEY_FIELD,)
     assert capability.trusted_usage_fields == ("cache_read_input_tokens",)
 

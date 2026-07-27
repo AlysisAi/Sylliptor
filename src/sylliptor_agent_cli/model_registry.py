@@ -81,6 +81,49 @@ _DEPRECATED_MODEL_CAPABILITIES_WARNING = (
 _FALLBACK_WARNING = (
     "Using fallback context/max_output; set model_metadata_overrides for best performance."
 )
+OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE = "official_provider_model_catalog"
+_OFFICIAL_PROVIDER_MODEL_METADATA: dict[str, dict[str, dict[str, Any]]] = {
+    "moonshot": {
+        "kimi-k3": {
+            "context_window_tokens": 1_048_576,
+            # K3 can use the full context for output, but 131,072 is the API's
+            # normal completion allowance and therefore the useful local reserve.
+            "max_output_tokens": 131_072,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "input_cost_per_token": 0.000003,
+            "output_cost_per_token": 0.000015,
+            "cache_read_input_cost_per_token": 0.0000003,
+        },
+        "kimi-k2.7-code": {
+            "context_window_tokens": 262_144,
+            "max_output_tokens": 32_768,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "input_cost_per_token": 0.00000095,
+            "output_cost_per_token": 0.000004,
+            "cache_read_input_cost_per_token": 0.00000019,
+        },
+        "kimi-k2.7-code-highspeed": {
+            "context_window_tokens": 262_144,
+            "max_output_tokens": 32_768,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "input_cost_per_token": 0.0000019,
+            "output_cost_per_token": 0.000008,
+            "cache_read_input_cost_per_token": 0.00000038,
+        },
+        "kimi-k2.6": {
+            "context_window_tokens": 262_144,
+            "max_output_tokens": 32_768,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "input_cost_per_token": 0.00000095,
+            "output_cost_per_token": 0.000004,
+            "cache_read_input_cost_per_token": 0.00000016,
+        },
+    }
+}
 _BUILT_IN_MODEL_METADATA: dict[str, dict[str, Any]] = {
     "deepseek-v4-flash": {
         "context_window_tokens": 1_000_000,
@@ -651,6 +694,44 @@ class ModelRegistry:
             layer.field_sources[field_name] = f"{source}:included"
         return layer
 
+    def _resolve_official_provider_layer(self, requested_model: str) -> _LayerData:
+        layer = _LayerData(name=OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE)
+        provider_key, route_base_url = self._provider_route_identity()
+        normalized_provider = str(provider_key or "").strip().lower()
+        provider_models = _OFFICIAL_PROVIDER_MODEL_METADATA.get(normalized_provider)
+        if provider_models is None:
+            return layer
+        model_match = _lookup_model_override(
+            mapping=provider_models,
+            requested_model=requested_model,
+            label=f"{OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE}.{normalized_provider}",
+            warnings=layer.warnings,
+        )
+        if model_match is None:
+            return layer
+
+        model_key, payload = model_match
+        payload = dict(payload)
+        if normalized_provider == "moonshot":
+            try:
+                route_host = (urlsplit(route_base_url).hostname or "").rstrip(".").lower()
+            except ValueError:
+                route_host = ""
+            if route_host != "api.moonshot.ai":
+                # The verified prices are Moonshot's global USD rates. Capacity
+                # and capabilities also apply to China, but those prices do not.
+                for field_name in _FLOAT_FIELDS:
+                    payload.pop(field_name, None)
+        source = f"{OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE}:{normalized_provider}"
+        layer.model_name = model_key
+        layer.raw_metadata = {
+            **payload,
+            "provider": normalized_provider,
+            "catalog_source": OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE,
+        }
+        self._apply_user_scope(layer=layer, source=source, payload=payload)
+        return layer
+
     def _resolve_builtin_layer(self, requested_model: str) -> _LayerData:
         layer = _LayerData(name="built_in")
         model_match = _lookup_model_override(
@@ -696,6 +777,7 @@ class ModelRegistry:
             if include_provider_auth
             else _LayerData(name="provider_auth")
         )
+        official_provider_layer = self._resolve_official_provider_layer(requested)
         bundled_catalog_layer = self._resolve_bundled_model_catalog_layer(requested)
         built_in_layer = self._resolve_builtin_layer(requested)
         learned_layer = self._resolve_learned_layer(requested)
@@ -703,6 +785,7 @@ class ModelRegistry:
             env_layer,
             user_layer,
             provider_auth_layer,
+            official_provider_layer,
             bundled_catalog_layer,
             built_in_layer,
             learned_layer,
@@ -812,6 +895,7 @@ class ModelRegistry:
         self.last_source = overall_source
 
         raw_metadata = dict(bundled_catalog_layer.raw_metadata)
+        raw_metadata.update(official_provider_layer.raw_metadata)
         raw_metadata.update(provider_auth_layer.raw_metadata)
         return ModelMeta(
             model_name=resolved_model_name,
@@ -906,6 +990,8 @@ def _provider_key_from_base_url(base_url: str | None) -> str | None:
         return "gemini"
     if hostname == "api.mistral.ai" or hostname.endswith(".mistral.ai"):
         return "mistral"
+    if hostname in {"api.moonshot.ai", "api.moonshot.cn"}:
+        return "moonshot"
     if hostname == "api.x.ai" or hostname == "x.ai" or hostname.endswith(".x.ai"):
         return "xai"
     parts = [

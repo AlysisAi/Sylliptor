@@ -590,6 +590,130 @@ def _local_materialization_route_override_reason(
     return None
 
 
+_ROUTE_ARBITRATION_RULE_ONE_SHOT_PROVISIONING = "one_shot_provisioning"
+_ROUTE_ARBITRATION_RULE_CLASSIFIER_DISAGREEMENT = "classifier_disagreement"
+
+
+_NON_EXECUTE_ROUTER_POSTURES = frozenset({"advisory_non_execution", "plan_or_analysis_only"})
+
+
+@dataclass(frozen=True)
+class _RouteArbitrationVerdict:
+    rule: str | None
+    route: str
+    execution_posture: str
+
+    @property
+    def override(self) -> bool:
+        return self.rule is not None
+
+
+def _route_arbitration_enabled(cfg: AppConfig | Any | None) -> bool:
+    env_value = env_get("SYLLIPTOR_ROUTE_ARBITRATION")
+    if env_value is not None:
+        normalized = str(env_value).strip().lower()
+        if normalized in {"off", "0", "false", "no", "disabled"}:
+            return False
+        if normalized in {"on", "1", "true", "yes", "enabled"}:
+            return True
+    return bool(getattr(cfg, "route_arbitration_enabled", True))
+
+
+def _router_intent_execution_disagreement(
+    *,
+    route: str,
+    execution_posture: str,
+    classified_turn_intent: str,
+) -> bool:
+    """Whether the router's verdict and the turn-intent classifier disagree on execution.
+
+    The router verdict counts as execute-class only for route="repo" with
+    execution_posture="execute"; every other combination leaves the turn without
+    repository execution capability. Logged on every routed turn so the raw
+    router error rate stays measurable even when no arbitration override fires.
+    """
+
+    router_execute_verdict = (
+        str(route or "").strip().lower() == "repo"
+        and str(execution_posture or "").strip().lower() == "execute"
+    )
+    intent_execute = str(classified_turn_intent or "").strip().lower() == "execute"
+    return router_execute_verdict != intent_execute
+
+
+def _arbitrate_route_capability(
+    *,
+    route: str,
+    execution_posture: str,
+    classified_turn_intent: str,
+    workspace_is_repo_backed: bool,
+    workspace_writable: bool,
+    interactive: bool,
+    decision_source: str = "router",
+) -> _RouteArbitrationVerdict:
+    """Arbitrate capability provisioning from classifier outputs and runtime facts.
+
+    Routing decides which capabilities are provisioned, not what the agent must
+    do: an escalated turn may still legitimately end in a prose answer. Tools
+    wrongly absent is unrecoverable; tools present but unused is free. The
+    decision consumes ONLY existing classifier outputs and runtime facts —
+    never the raw user text.
+
+    Rule "one_shot_provisioning": in non-interactive runs bound to a writable
+    repo-backed workspace, the repo toolset is always provisioned; a non-repo
+    router verdict must not select the answer-without-tools path (nobody reads
+    advisory prose mid-run). The router posture is preserved as style/telemetry
+    context — non-interactive posture resolution already follows the turn-intent
+    classifier, not the router.
+
+    Rule "classifier_disagreement": in interactive runs bound to a writable
+    repo-backed workspace, a non-execute router verdict (route "general"/"tool",
+    or route "repo" with an advisory/plan posture) is escalated to
+    repo/execute when the turn-intent classifier says the turn is
+    execute-class. When both classifiers agree the turn is advisory/plan, the
+    verdict is respected unchanged, which preserves normal Q&A. Route "chat" is
+    deliberately outside this rule: the turn-intent classifier defaults to
+    "execute" on social turns it has no signal for, so escalating chat verdicts
+    would send every greeting in a repo workspace through the repo loop.
+    Fallback-sourced verdicts (decision_source "fallback"/"fallback_contextual")
+    are also outside this rule: they were already derived from the turn-intent
+    classifier plus deterministic workspace context, so there is no independent
+    router verdict to arbitrate against.
+    """
+
+    normalized_route = str(route or "").strip().lower()
+    normalized_posture = str(execution_posture or "").strip().lower()
+    no_override = _RouteArbitrationVerdict(
+        rule=None,
+        route=normalized_route,
+        execution_posture=normalized_posture,
+    )
+    if not (workspace_is_repo_backed and workspace_writable):
+        return no_override
+    if not interactive:
+        if normalized_route != "repo":
+            return _RouteArbitrationVerdict(
+                rule=_ROUTE_ARBITRATION_RULE_ONE_SHOT_PROVISIONING,
+                route="repo",
+                execution_posture=normalized_posture,
+            )
+        return no_override
+    if str(decision_source or "").strip().lower().startswith("fallback"):
+        return no_override
+    if str(classified_turn_intent or "").strip().lower() != "execute":
+        return no_override
+    router_verdict_non_execute = normalized_route in {"general", "tool"} or (
+        normalized_route == "repo" and normalized_posture in _NON_EXECUTE_ROUTER_POSTURES
+    )
+    if not router_verdict_non_execute:
+        return no_override
+    return _RouteArbitrationVerdict(
+        rule=_ROUTE_ARBITRATION_RULE_CLASSIFIER_DISAGREEMENT,
+        route="repo",
+        execution_posture="execute",
+    )
+
+
 def _normalize_routing_mode(raw: str | None) -> str:
     normalized = str(raw or "").strip().lower()
     if normalized in _ROUTING_MODES:

@@ -341,6 +341,29 @@ class AppConfig(BaseModel):
     chat_temperature: float = 0.7
     stream: bool = True
     routing_mode: str = "auto"  # auto|code_only
+    # Kill-switch for capability arbitration over router verdicts; env override
+    # SYLLIPTOR_ROUTE_ARBITRATION=off wins over the config value.
+    route_arbitration_enabled: bool = True
+    # Kill-switch for the fact-based completion-evidence classifier (evidence v2);
+    # env override SYLLIPTOR_EVIDENCE_V2=off reverts to legacy string-shape evidence.
+    evidence_v2_enabled: bool = True
+    # Kill-switch for the baseline-first regression protocol (step 3); env override
+    # SYLLIPTOR_REGRESSION_BASELINE=off keeps capture/telemetry but reverts the
+    # completion-gate policy to legacy (no regression/unattributed attribution).
+    regression_baseline_enabled: bool = True
+    # Kill-switch for turn-contract v2 (step 4: apply-don't-advise + spec literalism);
+    # env override SYLLIPTOR_TURN_CONTRACT_V2=off keeps expectation extraction/telemetry
+    # but reverts the completion-gate policy (no expectations_unaddressed / advisory
+    # completion enforcement). Prompt additions are unconditional either way.
+    turn_contract_v2_enabled: bool = True
+    # Kill-switch for reaping agent-started process groups (step 5); env override
+    # SYLLIPTOR_PROCESS_REAPING=off keeps commands in their own process group but
+    # never signals one, restoring the legacy leave-it-running behaviour.
+    process_reaping_enabled: bool = True
+    # Kill-switch for workspace test-runner pre-provisioning (step 5); env override
+    # SYLLIPTOR_WORKSPACE_PROVISIONING=off suppresses both the one-shot install in
+    # autonomous runs and the env_gap_detected telemetry.
+    workspace_provisioning_enabled: bool = True
     step_budget_policy: str = AUTONOMOUS_STEP_BUDGET_POLICY
     task_max_steps: int = DEFAULT_TASK_MAX_STEPS
     subagent_max_steps: int = DEFAULT_SUBAGENT_MAX_STEPS
@@ -361,6 +384,15 @@ class AppConfig(BaseModel):
     )
     experimental_gemini_interactions_enabled: bool = False
     custom_tools_enabled: bool = True
+    web_tools_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master switch for ALL web tools (web_fetch and web_search). When false, "
+            "web tools are never registered in the model's tool list and any runtime "
+            "web call hard-errors. Overridable via SYLLIPTOR_WEB_TOOLS env var; used "
+            "by benchmark/offline runs to guarantee no network-mediated contamination."
+        ),
+    )
     web_search_mode: str = "auto"
     web_search_policy: str = "auto"
     web_search_adapter: str = "auto"
@@ -1362,6 +1394,12 @@ _SETTABLE_KEYS: set[str] = {
     "chat_temperature",
     "stream",
     "routing_mode",
+    "route_arbitration_enabled",
+    "evidence_v2_enabled",
+    "regression_baseline_enabled",
+    "turn_contract_v2_enabled",
+    "process_reaping_enabled",
+    "workspace_provisioning_enabled",
     "step_budget_policy",
     "subagents_enabled",
     "skills_enabled",
@@ -1856,6 +1894,26 @@ def resolve_web_search_policy(cfg: AppConfig | None) -> str:
     if cfg is None:
         return "auto"
     return _normalize_web_search_policy(getattr(cfg, "web_search_policy", "auto"))
+
+
+_WEB_TOOLS_DISABLED_ENV_VALUES = frozenset({"0", "false", "off", "no", "disabled"})
+
+
+def resolve_web_tools_enabled(cfg: AppConfig | None) -> bool:
+    """Master switch for all web tools (web_fetch AND web_search).
+
+    Precedence: SYLLIPTOR_WEB_TOOLS env var (any of 0/false/off/no/disabled turns
+    web tools off; any other non-empty value turns them on) over the
+    ``web_tools_enabled`` config field. Benchmark/offline harnesses should set
+    ``SYLLIPTOR_WEB_TOOLS=off`` so the process itself guarantees no web tool is
+    exposed or executed, independent of harness-side settings.
+    """
+    env_value = str(env_get("SYLLIPTOR_WEB_TOOLS") or "").strip().lower()
+    if env_value:
+        return env_value not in _WEB_TOOLS_DISABLED_ENV_VALUES
+    if cfg is None:
+        return True
+    return bool(getattr(cfg, "web_tools_enabled", True))
 
 
 def resolve_web_search_enabled(cfg: AppConfig | None) -> bool:
@@ -2416,6 +2474,66 @@ def set_config_value(
             raise ConfigError("routing_mode must be one of: auto, code_only")
         cfg.routing_mode = v
         return cfg
+
+    if key == "route_arbitration_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.route_arbitration_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.route_arbitration_enabled = False
+            return cfg
+        raise ConfigError("route_arbitration_enabled must be true/false")
+
+    if key == "evidence_v2_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.evidence_v2_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.evidence_v2_enabled = False
+            return cfg
+        raise ConfigError("evidence_v2_enabled must be true/false")
+
+    if key == "regression_baseline_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.regression_baseline_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.regression_baseline_enabled = False
+            return cfg
+        raise ConfigError("regression_baseline_enabled must be true/false")
+
+    if key == "turn_contract_v2_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.turn_contract_v2_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.turn_contract_v2_enabled = False
+            return cfg
+        raise ConfigError("turn_contract_v2_enabled must be true/false")
+
+    if key == "process_reaping_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.process_reaping_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.process_reaping_enabled = False
+            return cfg
+        raise ConfigError("process_reaping_enabled must be true/false")
+
+    if key == "workspace_provisioning_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.workspace_provisioning_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.workspace_provisioning_enabled = False
+            return cfg
+        raise ConfigError("workspace_provisioning_enabled must be true/false")
 
     if key == "step_budget_policy":
         normalized = value.strip().lower()

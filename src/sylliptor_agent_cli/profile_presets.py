@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 from .llm.cache_capabilities import (
     CACHE_STRATEGY_ANTHROPIC_CACHE_CONTROL,
     CACHE_STRATEGY_GEMINI_EXPLICIT_CACHED_CONTENT,
+    CACHE_STRATEGY_IMPLICIT_PROVIDER,
     CACHE_STRATEGY_MISTRAL_PROMPT_CACHE_KEY,
     CACHE_STRATEGY_OPENAI_PROMPT_CACHE,
     CACHE_STRATEGY_OPENROUTER_STICKY_SESSION,
@@ -174,6 +175,19 @@ _QWEN_DIAGNOSTIC_CACHE_CAPABILITY = CacheCapabilitySpec(
     notes=(
         "Diagnostic-only in auto mode; Qwen cache_control content markers mutate "
         "message shape and require request-shape gating.",
+    ),
+    source="preset",
+)
+_MOONSHOT_AUTOMATIC_CACHE_CAPABILITY = CacheCapabilitySpec(
+    strategy=CACHE_STRATEGY_IMPLICIT_PROVIDER,
+    enabled=True,
+    supports_prompt_cache_key=True,
+    reports_cache_read_tokens=True,
+    usage_schema=CACHE_USAGE_SCHEMA_PROVIDER,
+    emits_request_fields=True,
+    notes=(
+        "Moonshot caches matching prompt prefixes automatically; prompt_cache_key keeps a "
+        "session on a stable cache-affinity route.",
     ),
     source="preset",
 )
@@ -849,6 +863,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         # kimi-k3 cannot disable thinking, which Kimi's $web_search tool requires,
         # so provider-hosted search stays pinned to kimi-k2.6.
         web_search_model="kimi-k2.6",
+        cache_capability=_MOONSHOT_AUTOMATIC_CACHE_CAPABILITY,
         setup_warning=(
             "Moonshot API keys are region-scoped; use a key from the international "
             "platform (platform.kimi.ai) with this endpoint."
@@ -930,6 +945,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         # kimi-k3 cannot disable thinking, which Kimi's $web_search tool requires,
         # so provider-hosted search stays pinned to kimi-k2.6.
         web_search_model="kimi-k2.6",
+        cache_capability=_MOONSHOT_AUTOMATIC_CACHE_CAPABILITY,
         setup_warning=(
             "Moonshot API keys are region-scoped; use a key from the mainland-China "
             "platform (platform.moonshot.cn) with this endpoint."

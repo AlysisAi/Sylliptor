@@ -210,9 +210,10 @@ def test_interactive_bootstrap_payload_stays_bounded(tmp_path: Path) -> None:
     try:
         messages_json = json.dumps(session.messages, ensure_ascii=True)
         tools_json = json.dumps(session.tool_list, ensure_ascii=True)
-        # Bound rebased after immutable-test and execution-evidence guidance grew
-        # the interactive prompt; keep ~5% headroom over the measured size.
-        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 7200
+        # Budget tripwire, not a correctness bound. Rebased after the turn-contract
+        # v2 apply-and-verify norms were added to the base prompt; keep ~5% headroom
+        # over the measured size (7440).
+        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 7800
     finally:
         session.close()
 
@@ -283,9 +284,10 @@ def test_one_shot_bootstrap_payload_stays_bounded(tmp_path: Path) -> None:
     try:
         messages_json = json.dumps(session.messages, ensure_ascii=True)
         tools_json = json.dumps(session.tool_list, ensure_ascii=True)
-        # Bound rebased after repo-map/test-discovery schemas and execution-evidence
-        # guidance grew the one-shot prompt; keep ~5% headroom over the measured size.
-        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 8100
+        # Budget tripwire, not a correctness bound. Rebased after the turn-contract
+        # v2 apply-and-verify norms were added to the base prompt; keep ~5% headroom
+        # over the measured size (8176).
+        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 8600
     finally:
         session.close()
 
@@ -363,6 +365,58 @@ def test_create_session_auto_prompt_cache_key_is_workspace_scoped(tmp_path: Path
             assert router_client.prompt_cache_key != session.client.prompt_cache_key
     finally:
         session.close()
+
+
+def test_create_session_kimi_auto_cache_key_is_resume_stable_and_session_scoped(
+    tmp_path: Path,
+) -> None:
+    _fake_git_repo(tmp_path)
+    cfg = AppConfig(
+        model="kimi-k3",
+        base_url="https://api.moonshot.ai/v1",
+        web_search_mode="off",
+        prompt_cache_mode="auto",
+    )
+
+    first = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=1,
+        no_log=True,
+        api_key_override="override-key",
+        session_id_override="cache-session-1",
+    )
+    resumed = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=1,
+        no_log=True,
+        api_key_override="override-key",
+        session_id_override="cache-session-1",
+    )
+    different = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=1,
+        no_log=True,
+        api_key_override="override-key",
+        session_id_override="cache-session-2",
+    )
+    try:
+        assert first.client.prompt_cache_key is not None
+        assert resumed.client.prompt_cache_key is not None
+        assert first.client.prompt_cache_key == resumed.client.prompt_cache_key
+        assert first.client.prompt_cache_key != different.client.prompt_cache_key
+    finally:
+        first.close()
+        resumed.close()
+        different.close()
 
 
 def test_route_context_payload_stays_compact_and_structured(tmp_path: Path) -> None:

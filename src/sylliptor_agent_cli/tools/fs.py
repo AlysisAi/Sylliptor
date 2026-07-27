@@ -157,9 +157,17 @@ def fs_read_lines(
 
 def fs_write(*, root: Path, path: str, content: str) -> dict[str, Any]:
     p = _resolve_under_root(root, path)
+    existed_before = p.exists()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
-    return {"path": path, "bytes": len(content.encode("utf-8"))}
+    # ``created`` distinguishes a brand-new file from an overwrite. Regression
+    # attribution uses it to mark a failing test the agent just authored this
+    # turn as signal (agent_authored) rather than a regression.
+    return {
+        "path": path,
+        "bytes": len(content.encode("utf-8")),
+        "created": not existed_before,
+    }
 
 
 def fs_mkdir(

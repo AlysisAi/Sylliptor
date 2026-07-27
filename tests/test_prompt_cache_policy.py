@@ -85,6 +85,23 @@ def test_auto_prompt_cache_key_is_role_scoped(tmp_path: Path) -> None:
     assert coding.prompt_cache_key != router.prompt_cache_key
 
 
+def test_auto_prompt_cache_key_is_stable_per_session_and_changes_between_sessions(
+    tmp_path: Path,
+) -> None:
+    common = dict(
+        workspace_root=tmp_path,
+        role="coding",
+        profile_name="moonshot",
+    )
+
+    first = build_prompt_cache_namespace(**common, session_id="session-123")
+    resumed = build_prompt_cache_namespace(**common, session_id="session-123")
+    second = build_prompt_cache_namespace(**common, session_id="session-456")
+
+    assert first == resumed
+    assert first != second
+
+
 def test_auto_prompt_cache_policy_requires_namespace_for_openai_auto_key() -> None:
     policy = resolve_prompt_cache_policy(
         cfg=AppConfig(prompt_cache_mode="auto"),

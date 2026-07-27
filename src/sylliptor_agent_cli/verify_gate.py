@@ -29,6 +29,7 @@ from .failure_category import (
     is_infra_unavailable_error,
 )
 from .file_classification import SOURCE_EXTENSIONS_BY_LANGUAGE
+from .process_reaping import ProcessGroupRegistry
 from .repo_scan import RepoScanResult, scan_workspace
 from .sandbox_runner import HostShellRunner, build_shell_runner_from_settings
 from .sandbox_settings import resolve_shell_sandbox_settings
@@ -2723,6 +2724,7 @@ def run_task_verification(
     artifact_path: Path,
     cfg: AppConfig | None = None,
     timeout_s: float = 900,
+    process_group_registry: ProcessGroupRegistry | None = None,
 ) -> VerifyRunResult:
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     results: list[VerifyCommandResult] = []
@@ -2733,7 +2735,13 @@ def run_task_verification(
     ]
     effective_cfg = cfg or AppConfig(model="")
     verify_sandbox_mode = resolve_verify_sandbox_mode(effective_cfg)
-    runner = HostShellRunner() if verify_sandbox_mode == "off" else None
+    # The verifier's own commands are tracked too: a verify_run that hits its
+    # timeout orphans workers exactly the way an agent-started test run does.
+    runner = (
+        HostShellRunner(process_group_registry=process_group_registry)
+        if verify_sandbox_mode == "off"
+        else None
+    )
     runner_build_error: str | None = None
     failure_category: FailureCategory | None = None
     pytest_cache_path = root / ".pytest_cache"
@@ -2744,7 +2752,10 @@ def run_task_verification(
                 base_settings = resolve_shell_sandbox_settings(effective_cfg)
                 verify_settings = replace(base_settings, mode=verify_sandbox_mode)
                 runner = build_shell_runner_from_settings(
-                    verify_settings, root, warning_callback=None
+                    verify_settings,
+                    root,
+                    warning_callback=None,
+                    process_group_registry=process_group_registry,
                 )
             except (ConfigError, VerifyError) as e:
                 runner_build_error = str(e)

@@ -826,6 +826,8 @@ def _transport_projection_fields(protocol: str) -> tuple[str, ...]:
 
 def _strategy_projection_fields(strategy: str) -> tuple[str, ...]:
     normalized = str(strategy or "").strip().lower()
+    if normalized == CACHE_STRATEGY_IMPLICIT_PROVIDER:
+        return (PROMPT_CACHE_KEY_FIELD,)
     if normalized in {
         CACHE_STRATEGY_OPENAI_PROMPT_CACHE,
     }:

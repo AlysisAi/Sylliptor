@@ -173,6 +173,13 @@ _REASONING_TRACE_CAPABILITIES_BY_ADAPTER: dict[str, ReasoningTraceCapability] = 
         supports_buffered=True,
         continuation_state="sensitive",
     ),
+    "moonshot_reasoning": ReasoningTraceCapability(
+        adapter="moonshot_reasoning",
+        output_kind=ReasoningOutputKind.PROVIDER_REASONING,
+        supports_streaming=True,
+        supports_buffered=True,
+        continuation_state="sensitive",
+    ),
 }
 
 SUPPORTED_REASONING_TRACE_ADAPTERS: frozenset[str] = frozenset(
@@ -188,6 +195,7 @@ _REASONING_TRACE_ADAPTERS_BY_PROTOCOL: dict[str, frozenset[str]] = {
             "deepseek_reasoning",
             "dashscope_thinking",
             "mistral_thinking",
+            "moonshot_reasoning",
         }
     ),
     OPENAI_RESPONSES_PROTOCOL: frozenset({"auto", "none", "openai_responses_summary"}),
@@ -203,6 +211,7 @@ _OPENAI_COMPAT_REASONING_ADAPTER_BY_PROVIDER: dict[str, str] = {
     "qwen": "dashscope_thinking",
     "dashscope": "dashscope_thinking",
     "mistral": "mistral_thinking",
+    "moonshot": "moonshot_reasoning",
 }
 
 
@@ -431,6 +440,30 @@ PROVIDER_PROTOCOL_CAPABILITIES: tuple[ProviderProtocolCapabilities, ...] = (
         default_web_search_adapter="gemini_grounding",
         unsupported_parameters=("reasoning_effort:xhigh",),
         quirks=("Current Gemini chat path uses Google's OpenAI-compatible v1beta endpoint.",),
+    ),
+    ProviderProtocolCapabilities(
+        provider_key="moonshot",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+        reasoning_trace=ReasoningTraceCapability(
+            adapter="moonshot_reasoning",
+            output_kind=ReasoningOutputKind.PROVIDER_REASONING,
+            supports_streaming=True,
+            supports_buffered=True,
+            continuation_state="sensitive",
+        ),
+        usage_contract=UsageContract(
+            response_usage_confidence=UsageConfidence.AUTHORITATIVE,
+            input_token_count_strategy="openai_compat_provider_payload",
+        ),
+        supports_streaming=True,
+        supports_tool_calling=True,
+        supports_structured_outputs=True,
+        supports_provider_hosted_web_search_adapter=True,
+        default_web_search_adapter="moonshot_kimi",
+        cache_strategy="implicit_provider",
+        supports_prompt_cache_key=True,
+        reports_cache_read_tokens=True,
+        quirks=("Kimi reasoning_content must be retained when assistant messages are replayed.",),
     ),
     ProviderProtocolCapabilities(
         provider_key="gemini",

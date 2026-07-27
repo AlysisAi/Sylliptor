@@ -520,6 +520,32 @@ def test_chat_maps_messages_tools_response_format_and_reasoning() -> None:
     assert response.usage.input_tokens_uncached == 6
 
 
+def test_chat_normalizes_provider_declared_final_answer_phase() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_final_phase",
+                "model": "gpt-5.5",
+                "output_text": "The Next.js site is ready.",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "The Next.js site is ready."}],
+                    }
+                ],
+            },
+        )
+
+    response = _client(httpx.MockTransport(handler)).chat(
+        messages=[{"role": "user", "content": "Check the site."}]
+    )
+
+    assert response.assistant_phase == "final_answer"
+
+
 def test_chat_requests_reasoning_summary_without_overriding_explicit_effort() -> None:
     captured: dict[str, object] = {}
 
@@ -1065,6 +1091,7 @@ def test_chat_streaming_emits_text_deltas_and_preserves_metadata() -> None:
         "type": "message",
         "id": "msg_stream",
         "role": "assistant",
+        "phase": "final_answer",
         "content": [{"type": "output_text", "text": "Hello stream."}],
     }
 
@@ -1161,6 +1188,7 @@ def test_chat_streaming_emits_text_deltas_and_preserves_metadata() -> None:
 
     assert captured["stream"] is True
     assert response.content == "Hello stream."
+    assert response.assistant_phase == "final_answer"
     assert deltas == ["Hello ", "stream."]
     assert response.usage is not None
     assert response.usage.total_tokens == 8

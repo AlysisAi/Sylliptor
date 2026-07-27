@@ -22,8 +22,15 @@ from ..approval_scope import (
     exact_file_set_scope,
     exact_verify_command_set_scope,
 )
+from ..atomic_io import atomic_write_text
 from ..capabilities import get_capability_definition
-from ..config import AppConfig, ConfigError, resolve_role_temperature, resolve_web_search_policy
+from ..config import (
+    AppConfig,
+    ConfigError,
+    resolve_role_temperature,
+    resolve_web_search_policy,
+    resolve_web_tools_enabled,
+)
 from ..context.tool_schema_budgeter import (
     CUSTOM_MCP_SCHEMA_FAMILIES,
     DEFAULT_CUSTOM_MCP_DESCRIPTION_MAX_CHARS,
@@ -52,11 +59,20 @@ from ..execution_deadline import (
 )
 from ..extensions.activation import ActivationDecision
 from ..extensions.models import normalize_extension_id
+from ..internal_artifacts import (
+    INTERNAL_FALLBACK_SOURCE,
+    SUBAGENT_INCOMPLETE_ERROR_CODE,
+    SubagentIncompleteStatus,
+    resolve_incomplete_reason,
+    subagent_report_is_internal,
+)
 from ..mcp.manager import ForgeTaskScopedMcpManager, McpManager
 from ..mcp.models import ResolvedMcpConfig, ResolvedMcpServer
 from ..model_registry import ModelRegistry
 from ..model_router import ROLE_CODING, resolve_model_for_role
+from ..pipeline_facts import resolve_pipeline_stage_status
 from ..policy import evaluate_shell_command
+from ..process_reaping import ProcessGroupRegistry
 from ..runtime_kind import RuntimeKind, normalize_runtime_kind
 from ..safety.subagent_report import sanitize_subagent_report, subagent_report_evidence_text
 from ..session_store import SessionStore
@@ -168,7 +184,9 @@ from .verification_commands import (
 from .verification_evidence import (
     VerificationEvidence,
     VerificationEvidenceCategory,
+    _evidence_v2_enabled,
     classify_verification_evidence,
+    command_is_qualifying_execution_evidence,
 )
 
 _turn_snapshot = importlib.import_module("sylliptor_agent_cli.agent.turn.snapshot")
@@ -209,15 +227,21 @@ def _call_with_optional_kwargs(
 _AUTHORITATIVE_SUBAGENT_FINAL_TEXT_SOURCES = frozenset({"store_final", "surface_assistant_done"})
 
 
-def _latest_subagent_store_final_text(sub_session: Any) -> tuple[str, bool]:
+def _latest_subagent_store_final_text(sub_session: Any) -> tuple[str, bool, dict[str, Any]]:
+    """Last recorded final answer of a child session, plus its ``final`` payload.
+
+    The payload is returned so the caller can tell a real final report from a
+    locally generated stop report using the recorded ``internal_fallback`` fact,
+    rather than by inspecting the text.
+    """
     child_store = getattr(sub_session, "store", None)
     events_snapshot = getattr(child_store, "events_snapshot", None)
     if not callable(events_snapshot):
-        return "", False
+        return "", False, {}
     try:
         events = events_snapshot()
     except Exception:  # noqa: BLE001 - result capture should fall back instead of failing.
-        return "", False
+        return "", False, {}
     for event in reversed(events if isinstance(events, list) else []):
         if not isinstance(event, dict) or str(event.get("type") or "") != "final":
             continue
@@ -226,8 +250,8 @@ def _latest_subagent_store_final_text(sub_session: Any) -> tuple[str, bool]:
             continue
         text = str(payload.get("content") or "").strip()
         if text:
-            return text, True
-    return "", True
+            return text, True, payload
+    return "", True, {}
 
 
 def _latest_subagent_message_text(sub_session: Any) -> str:
@@ -247,8 +271,14 @@ def _resolve_subagent_final_text(
     sub_session: Any,
     subagent_surface: NestedSubagentSurface,
 ) -> tuple[str, str]:
-    store_text, store_checked = _latest_subagent_store_final_text(sub_session)
+    store_text, store_checked, store_payload = _latest_subagent_store_final_text(sub_session)
     if store_text:
+        if bool(store_payload.get("internal_fallback")):
+            # The child ran out of deadline or steps and the runtime wrote a local
+            # stop report from its own transcript. That is internal state, not a
+            # deliverable; the caller converts it into a structured incomplete
+            # status instead of passing the prose up.
+            return store_text, INTERNAL_FALLBACK_SOURCE
         return store_text, "store_final"
     if not store_checked:
         surface_text = str(subagent_surface.last_assistant_message_done or "").strip()
@@ -258,6 +288,54 @@ def _resolve_subagent_final_text(
     if message_text:
         return message_text, "assistant_message"
     return "", "missing"
+
+
+def _subagent_termination_kind(sub_session: Any) -> str:
+    """Termination kind the child recorded when it stopped, or ``""``."""
+    child_store = getattr(sub_session, "store", None)
+    events_snapshot = getattr(child_store, "events_snapshot", None)
+    if not callable(events_snapshot):
+        return ""
+    try:
+        events = events_snapshot()
+    except Exception:  # noqa: BLE001 - diagnostics must not break result handling
+        return ""
+    for event in reversed(events if isinstance(events, list) else []):
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("type") or "") != "forced_final_summary_fallback":
+            continue
+        payload = event.get("payload")
+        if isinstance(payload, dict):
+            return str(payload.get("termination_kind") or "").strip()
+    return ""
+
+
+def _persist_internal_subagent_report(
+    *,
+    store: Any,
+    subagent_session_id: str,
+    report_text: str,
+) -> str:
+    """Write the child's stop report to the session store as an internal artifact.
+
+    Returns the artifact locator, or ``""`` when artifacts are not being
+    persisted (``--no-log``). The report stays available for debugging without
+    ever transiting the parent's transcript.
+    """
+    if not report_text.strip():
+        return ""
+    if not bool(getattr(store, "artifact_persistence_enabled", False)):
+        return ""
+    try:
+        layout = store.session_artifact_layout
+        session_key = subagent_session_id or "unknown"
+        artifact_path = layout.artifact_fs_path("subagent_incomplete", f"{session_key}.md")
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(artifact_path, report_text)
+        return layout.locator_for_path(artifact_path)
+    except Exception:  # noqa: BLE001 - a missing artifact must not break containment
+        return ""
 
 
 def _subagent_final_report_problem(*, text: str, source: str) -> str | None:
@@ -828,6 +906,7 @@ def build_tools(
     allow_write_globs: list[str] | None = None,
     non_interactive: bool = False,
     shell_runner: Any | None = None,
+    process_group_registry: ProcessGroupRegistry | None = None,
     terminal_manager: TerminalManager | None = None,
     durable_service_manager: DurableServiceManager | None = None,
     verification_enabled: bool = True,
@@ -1797,6 +1876,7 @@ def build_tools(
 
         final_text = ""
         final_text_source = "missing"
+        internal_report_text = ""
         report_safety_payload = sanitize_subagent_report("").metadata()
         usage_payload: dict[str, Any] = {}
         artifact_success_event_types: set[str] = set()
@@ -1900,6 +1980,9 @@ def build_tools(
                 sub_session=sub_session,
                 subagent_surface=subagent_surface,
             )
+            internal_report_text = (
+                final_text if subagent_report_is_internal(final_text_source) else ""
+            )
             sanitized_report = sanitize_subagent_report(final_text)
             final_text = sanitized_report.text
             report_safety_payload = sanitized_report.metadata()
@@ -1966,6 +2049,88 @@ def build_tools(
                         "error": str(e),
                     },
                 )
+
+        if internal_report_text:
+            # The child produced a runtime stop report, not a deliverable. The
+            # report is kept as an internal artifact and the parent is handed a
+            # structured status to act on, so half-finished internal state can
+            # never present itself as finished work.
+            _try_replay_subagent_usage_once()
+            elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
+            incomplete_status = SubagentIncompleteStatus(
+                subagent=definition.name,
+                reason=resolve_incomplete_reason(
+                    termination_kind=_subagent_termination_kind(sub_session),
+                    deadline_exhausted=child_execution_deadline.is_exhausted(),
+                ),
+                steps_used=subagent_surface.steps_completed,
+                # The budget the child was given, not what happened to be left when
+                # the parent looked: a record that says "step_budget_exhausted,
+                # deadline_s: 899.9" reads as a contradiction.
+                deadline_s=child_execution_deadline.configured_duration_seconds,
+                deadline_remaining_s=child_execution_deadline.remaining_seconds(),
+                report_artifact=_persist_internal_subagent_report(
+                    store=store,
+                    subagent_session_id=subagent_session_id,
+                    report_text=internal_report_text,
+                ),
+                subagent_session_id=subagent_session_id,
+                elapsed_ms=elapsed_ms,
+            )
+            store.append("subagent_incomplete", incomplete_status.telemetry_payload())
+            store.append(
+                "subagent_end",
+                {
+                    "name": definition.name,
+                    "subagent_session_id": subagent_session_id,
+                    "status": "incomplete",
+                    "failure_category": "incomplete",
+                    "error_code": SUBAGENT_INCOMPLETE_ERROR_CODE,
+                    "error": incomplete_status.message,
+                    "exit_code": exit_code,
+                    "usage": usage_payload,
+                    "elapsed_ms": elapsed_ms,
+                    "steps_completed": subagent_surface.steps_completed,
+                    "deadline_exhausted": child_execution_deadline.is_exhausted(),
+                    "deadline_prevented_launch": False,
+                    **_child_deadline_telemetry_fields(),
+                    "report_safety": report_safety_payload,
+                },
+            )
+            subagent_surface.on_subagent_end(
+                SubagentEndEvent(
+                    name=definition.name,
+                    mode=resolved_mode,
+                    status="failed",
+                    elapsed_ms=elapsed_ms,
+                    steps_completed=subagent_surface.steps_completed,
+                    subagent_session_id=subagent_session_id,
+                    error=incomplete_status.message,
+                )
+            )
+            if crash_diagnostics is not None:
+                crash_diagnostics.event(
+                    "subagent_completed",
+                    {
+                        "subagent": definition.name,
+                        "subagent_session_id": subagent_session_id,
+                        "status": "incomplete",
+                        "failure_category": "incomplete",
+                        "error_code": SUBAGENT_INCOMPLETE_ERROR_CODE,
+                        "exit_code": exit_code,
+                        "duration_ms": elapsed_ms,
+                        "steps_completed": subagent_surface.steps_completed,
+                        **_child_deadline_telemetry_fields(),
+                    },
+                )
+            return {
+                **incomplete_status.tool_result(),
+                "usage": usage_payload,
+                "steps_completed": subagent_surface.steps_completed,
+                "deadline_exhausted": child_execution_deadline.is_exhausted(),
+                "deadline_prevented_launch": False,
+                "report_safety": report_safety_payload,
+            }
 
         if exit_code != 0:
             _try_replay_subagent_usage_once()
@@ -2685,8 +2850,14 @@ def build_tools(
         ),
     )
 
+    # Master web-tools switch: when off (config field or SYLLIPTOR_WEB_TOOLS env),
+    # neither web_fetch nor web_search is registered at all — the model never sees
+    # them in its tool list. Required for benchmark/offline integrity.
+    web_tools_enabled = resolve_web_tools_enabled(cfg)
+
     web_search_exposed_in_mode = (
-        _built_in_tool_exposed_in_mode(
+        web_tools_enabled
+        and _built_in_tool_exposed_in_mode(
             tool_name="web_search",
             mode=mode,
             subagent_depth=subagent_depth,
@@ -2944,7 +3115,8 @@ def build_tools(
             result["provenance_classification"] = provenance_classification
         return result
 
-    _append_builtin_tool("web_fetch", run=_web_fetch_tool)
+    if web_tools_enabled:
+        _append_builtin_tool("web_fetch", run=_web_fetch_tool)
 
     if web_search_exposed_in_mode and web_search_status is not None:
         if (
@@ -3265,7 +3437,10 @@ def build_tools(
                     "artifact_path": artifact_path,
                     "cfg": effective_cfg,
                 },
-                optional_kwargs={"timeout_s": verify_timeout_s},
+                optional_kwargs={
+                    "timeout_s": verify_timeout_s,
+                    "process_group_registry": process_group_registry,
+                },
             ),
         )
         payload = verify_run_result_to_payload(root=root, result=result)
@@ -3398,7 +3573,10 @@ def build_tools(
                         "cwd": effective_cwd,
                         "runner": shell_runner,
                     },
-                    optional_kwargs={"timeout_s": shell_timeout_s},
+                    optional_kwargs={
+                        "timeout_s": shell_timeout_s,
+                        "capture_pipeline_status": _evidence_v2_enabled(cfg),
+                    },
                 ),
             )
         finally:
@@ -3412,6 +3590,7 @@ def build_tools(
                         "command": cmd,
                         "cwd": str((result or {}).get("cwd") or effective_cwd or root),
                         "exit_code": int((result or {}).get("exit_code", -1)),
+                        "pipeline_stage_status": (result or {}).get("pipeline_stage_status"),
                         "duration_ms": duration_ms,
                         "mode": "fullaccess",
                     },
@@ -3431,8 +3610,45 @@ def build_tools(
             list(current_selection.commands) if current_selection is not None else []
         )
         shell_exit_code = result.get("exit_code") if isinstance(result, dict) else None
+        evidence_v2 = _evidence_v2_enabled(cfg)
+        shell_effective_cmd = str(result.get("effective_cmd") or result.get("cmd") or cmd)
+
+        def _reexec_first_stage_exit(stage: str) -> int | None:
+            # Bounded ground-truth fallback: when PIPESTATUS could not be observed
+            # (e.g. bash was unavailable), re-run only a recognized test/execution
+            # first stage unpiped, once, to learn its true exit code. Never re-run
+            # an arbitrary side-effecting first stage.
+            if not command_is_qualifying_execution_evidence(stage):
+                return None
+            try:
+                rerun = _call_with_optional_kwargs(
+                    _patchable("shell_run", shell_run),
+                    required_kwargs={
+                        "root": root,
+                        "cmd": stage,
+                        "cwd": effective_cwd,
+                        "runner": shell_runner,
+                    },
+                    optional_kwargs={"timeout_s": shell_timeout_s},
+                )
+            except Exception:  # noqa: BLE001
+                return None
+            code = rerun.get("exit_code") if isinstance(rerun, dict) else None
+            return code if isinstance(code, int) else None
+
+        stage_status = result.get("pipeline_stage_status") if isinstance(result, dict) else None
+        if evidence_v2 and stage_status is None:
+            resolved_status = resolve_pipeline_stage_status(
+                shell_effective_cmd,
+                None,
+                reexec=_reexec_first_stage_exit,
+            )
+            if resolved_status is not None:
+                stage_status = resolved_status
+                result["pipeline_stage_status"] = resolved_status
+                result["pipeline_stage_status_source"] = "reexec"
         shell_evidence = classify_verification_evidence(
-            str(result.get("effective_cmd") or result.get("cmd") or cmd),
+            shell_effective_cmd,
             known_verification_commands=current_effective_verification_commands,
             authoritative=(
                 is_authoritative_verify_command_selection(current_selection)
@@ -3452,11 +3668,14 @@ def build_tools(
                 ]
             ).strip(),
             root=root,
+            stage_status=stage_status if isinstance(stage_status, list) else None,
+            evidence_v2=evidence_v2,
         )
         result["verification_evidence_category"] = shell_evidence.category.value
         result["verification_evidence_reason"] = shell_evidence.reason
         result["verification_evidence_allowed"] = shell_evidence.allowed_to_satisfy_contract
         result["verification_evidence_supplemental_only"] = shell_evidence.supplemental_only
+        result["evidence_verdict"] = shell_evidence.evidence_verdict
         return result
 
     _append_builtin_tool("shell_run", run=_shell)

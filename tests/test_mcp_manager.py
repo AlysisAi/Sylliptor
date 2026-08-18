@@ -2047,6 +2047,310 @@ def test_mcp_manager_closes_live_stdio_clients(
     assert process.poll() is not None
 
 
+def test_mcp_manager_live_server_disable_enable_and_restart_keep_stable_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture_payload = {
+        "tools_pages": [
+            [
+                {
+                    "name": "echo",
+                    "inputSchema": {"type": "object", "properties": {}, "required": []},
+                }
+            ]
+        ],
+        "tool_call_results": {
+            "echo": {
+                "isError": False,
+                "content": [{"type": "text", "text": "ok"}],
+            }
+        },
+    }
+    manager = _load_manager(
+        tmp_path,
+        monkeypatch,
+        fixture_payload,
+        runtime_kind=RuntimeKind.INTERACTIVE_CHAT,
+    )
+    try:
+        [binding] = manager.tool_bindings
+        original_process = binding.client.transport.process
+        initial = manager.server_lifecycle_status(server_id="alpha")
+
+        assert initial["session_id"] == "sid"
+        assert initial["connection_state"] == "connected"
+        assert initial["generation"] == 1
+        assert binding.run({})["content_summary"] == "text(2 chars)"
+
+        disabled = manager.disable_server(server_id="alpha")
+        assert disabled["changed"] is True
+        assert disabled["connection_state"] == "disabled"
+        assert original_process.poll() is not None
+        with pytest.raises(RuntimeError, match="disabled for this session"):
+            binding.run({})
+
+        enabled = manager.enable_server(server_id="alpha")
+        assert enabled["changed"] is True
+        assert enabled["connection_state"] == "connected"
+        assert enabled["generation"] == 2
+        assert binding.run({})["content_summary"] == "text(2 chars)"
+
+        restarted = manager.restart_server(server_id="alpha")
+        assert restarted["changed"] is True
+        assert restarted["connection_state"] == "connected"
+        assert restarted["generation"] == 3
+        assert binding.run({})["content_summary"] == "text(2 chars)"
+    finally:
+        manager.close()
+
+
+def test_mcp_manager_restart_rejects_changed_frozen_tool_catalog_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _load_manager(
+        tmp_path,
+        monkeypatch,
+        {
+            "tools_pages": [
+                [
+                    {
+                        "name": "echo",
+                        "inputSchema": {"type": "object", "properties": {}, "required": []},
+                    }
+                ]
+            ],
+            "tool_call_results": {
+                "echo": {
+                    "isError": False,
+                    "content": [{"type": "text", "text": "old"}],
+                }
+            },
+        },
+        runtime_kind=RuntimeKind.INTERACTIVE_CHAT,
+    )
+    try:
+        [binding] = manager.tool_bindings
+        _write_json(
+            tmp_path / "fixture-server.json",
+            {
+                "tools_pages": [
+                    [
+                        {
+                            "name": "replacement",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {},
+                                "required": [],
+                            },
+                        }
+                    ]
+                ]
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="tool catalog changed"):
+            manager.restart_server(server_id="alpha")
+
+        status = manager.server_lifecycle_status(server_id="alpha")
+        assert status["connection_state"] == "connected"
+        assert status["generation"] == 1
+        assert binding.run({})["content_summary"] == "text(3 chars)"
+    finally:
+        manager.close()
+
+
+def test_mcp_manager_status_detects_dead_stdio_process_and_enable_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _load_manager(
+        tmp_path,
+        monkeypatch,
+        {
+            "tools_pages": [
+                [
+                    {
+                        "name": "echo",
+                        "inputSchema": {"type": "object", "properties": {}, "required": []},
+                    }
+                ]
+            ]
+        },
+        runtime_kind=RuntimeKind.INTERACTIVE_CHAT,
+    )
+    try:
+        [binding] = manager.tool_bindings
+        process = binding.client.transport.process
+        assert process is not None
+        process.terminate()
+        process.wait(timeout=5)
+
+        disconnected = manager.server_lifecycle_status(server_id="alpha")
+        assert disconnected["enabled"] is True
+        assert disconnected["connected"] is False
+        assert disconnected["connection_state"] == "disconnected"
+
+        recovered = manager.enable_server(server_id="alpha")
+        assert recovered["connected"] is True
+        assert recovered["connection_state"] == "connected"
+        assert recovered["generation"] == 2
+        assert binding.run({})["is_error"] is False
+    finally:
+        manager.close()
+
+
+def test_mcp_manager_uses_one_lease_when_prompts_materialize_before_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _load_manager(
+        tmp_path,
+        monkeypatch,
+        {
+            "capabilities": {"tools": {}, "prompts": {}},
+            "tools_pages": [
+                [
+                    {
+                        "name": "echo",
+                        "inputSchema": {"type": "object", "properties": {}, "required": []},
+                    }
+                ]
+            ],
+            "tool_call_results": {
+                "echo": {
+                    "isError": False,
+                    "content": [{"type": "text", "text": "ok"}],
+                }
+            },
+            "prompts_pages": [[{"name": "review_pr"}]],
+        },
+        runtime_kind=RuntimeKind.INTERACTIVE_CHAT,
+        server_overrides={"prompts_mode": "listed_get_only"},
+    )
+    prompt_process = None
+    try:
+        assert manager.list_prompts(server_id="alpha")["returned_count"] == 1
+        prompt_process = manager._prompt_clients_by_server_id["alpha"].transport.process
+
+        [binding] = manager.tool_bindings
+        assert binding.client.transport.process is prompt_process
+        assert len(manager._client_leases_by_server_id["alpha"]) == 1
+
+        restarted = manager.restart_server(server_id="alpha")
+        assert restarted["generation"] == 2
+        assert binding.run({})["content_summary"] == "text(2 chars)"
+        prompt = manager.get_prompt(server_id="alpha", prompt_name="review_pr")
+        assert prompt["message_count"] == 1
+    finally:
+        manager.close()
+    assert prompt_process is not None
+    assert prompt_process.poll() is not None
+
+
+def test_mcp_manager_disable_before_catalog_materialization_stays_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _load_manager(
+        tmp_path,
+        monkeypatch,
+        {
+            "tools_pages": [
+                [
+                    {
+                        "name": "echo",
+                        "inputSchema": {"type": "object", "properties": {}, "required": []},
+                    }
+                ]
+            ]
+        },
+        runtime_kind=RuntimeKind.INTERACTIVE_CHAT,
+    )
+    try:
+        initial = manager.server_lifecycle_status(server_id="alpha")
+        assert initial["connection_state"] == "not_materialized"
+        assert manager.disable_server(server_id="alpha")["connection_state"] == "disabled"
+
+        [binding] = manager.tool_bindings
+        status = manager.server_lifecycle_status(server_id="alpha")
+        assert status["connection_state"] == "disabled"
+        assert len(manager._client_leases_by_server_id["alpha"]) == 1
+        snapshot = manager.catalog_snapshot_metadata()
+        assert snapshot["server_catalogs"][0]["tools_snapshot_stale"] is False
+        with pytest.raises(RuntimeError, match="disabled for this session"):
+            binding.run({})
+
+        assert manager.enable_server(server_id="alpha")["connection_state"] == "connected"
+        assert binding.run({})["is_error"] is False
+    finally:
+        manager.close()
+
+
+def test_mcp_manager_validated_restart_clears_closed_transport_stale_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _load_manager(
+        tmp_path,
+        monkeypatch,
+        {
+            "tools_pages": [
+                [
+                    {
+                        "name": "echo",
+                        "inputSchema": {"type": "object", "properties": {}, "required": []},
+                    }
+                ]
+            ],
+            "send_tools_list_changed_after_call": True,
+        },
+        runtime_kind=RuntimeKind.INTERACTIVE_CHAT,
+    )
+    try:
+        [binding] = manager.tool_bindings
+        binding.run({})
+        assert manager.catalog_snapshot_metadata()["tool_stale_server_ids"] == ["alpha"]
+
+        manager.restart_server(server_id="alpha")
+        snapshot = manager.catalog_snapshot_metadata()
+        assert snapshot["tool_stale_server_ids"] == []
+        assert snapshot["server_catalogs"][0]["tools_snapshot_stale"] is False
+    finally:
+        manager.close()
+
+
+def test_mcp_manager_restart_rejects_catalog_change_notification_during_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture_path = tmp_path / "fixture-server.json"
+    manager = _load_manager(
+        tmp_path,
+        monkeypatch,
+        {
+            "tools_pages": [
+                [
+                    {
+                        "name": "echo",
+                        "inputSchema": {"type": "object", "properties": {}, "required": []},
+                    }
+                ]
+            ]
+        },
+        runtime_kind=RuntimeKind.INTERACTIVE_CHAT,
+    )
+    try:
+        [binding] = manager.tool_bindings
+        original_process = binding.client.transport.process
+        replacement_config = json.loads(fixture_path.read_text(encoding="utf-8"))
+        replacement_config["send_tools_list_changed_after_list"] = True
+        _write_json(fixture_path, replacement_config)
+
+        with pytest.raises(RuntimeError, match="catalog change while reconnecting"):
+            manager.restart_server(server_id="alpha")
+
+        assert binding.client.transport.process is original_process
+        assert original_process.poll() is None
+        assert binding.run({})["is_error"] is False
+    finally:
+        manager.close()
+
+
 def test_agent_session_close_closes_mcp_manager_before_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

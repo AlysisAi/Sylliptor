@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-18
+
+### Added
+
+- Added evidence-driven turn completion, blocker reporting, and stronger recovery for
+  Forge and parallel subagent workflows.
+- Added Code, Architect, Ask, and Debug personas, along with clearer TUI status,
+  planning, cancellation, and deadline handling.
+- Added provider-neutral Terminal-Bench and Harbor adapters with reproducible,
+  security-conscious benchmark execution.
+- Added browser-assisted Sylliptor Pro login to setup and `/config`, including hosted
+  model discovery and migration from retired trial model IDs.
+
+### Improved
+
+- Improved provider authentication, model discovery, tool use, and usage accounting
+  across OpenAI, Anthropic, and Gemini integrations.
+- Improved context compaction, read caching, verification repair, and process cleanup
+  for longer-running agent sessions.
+- Hardened release validation with exact tag/version checks, pinned build tooling,
+  deterministic source and wheel builds, dependency auditing, SBOMs, and provenance
+  attestations.
+
+### Fixed
+
+- Strengthened secret redaction, filesystem boundaries, protected-path handling, and
+  sensitive tool-output controls.
+- Removed development-only research prompts and reports that were accidentally
+  included in the v0.11.2 public repository, and scrubbed local machine metadata from
+  test fixtures.
+
 ## [0.11.2] - 2026-07-27
 
 ### Added

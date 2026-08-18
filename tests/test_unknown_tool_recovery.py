@@ -21,7 +21,6 @@ class _FakeClient:
         adapter="test_safe_summary",
         output_kind=ReasoningOutputKind.SUMMARY,
         supports_streaming=True,
-        supports_buffered=True,
     )
 
     def __init__(

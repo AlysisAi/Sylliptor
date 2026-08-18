@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -280,7 +282,7 @@ def _cleanup_workspace_path(path: Path) -> None:
     if not path.exists():
         return
     if path.is_dir():
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(path, onerror=_retry_readonly_removal)
     else:
         try:
             path.unlink()
@@ -288,6 +290,20 @@ def _cleanup_workspace_path(path: Path) -> None:
             pass
     if path.exists():
         raise GitOpsError(f"failed to cleanup workspace path {path}")
+
+
+def _retry_readonly_removal(
+    remove: Any,
+    path: str,
+    exc_info: tuple[type[BaseException], BaseException, Any],
+) -> None:
+    """Retry a Windows removal after clearing Git's read-only file attribute."""
+
+    error = exc_info[1]
+    if not isinstance(error, PermissionError):
+        raise error
+    os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    remove(path)
 
 
 def _failed_cleanup_marker_path(*, worktree_path: Path) -> Path:
@@ -904,8 +920,8 @@ class SnapshotSwarmBackend:
         if not prepared_workspace.worktree_path.exists():
             return []
         try:
-            shutil.rmtree(prepared_workspace.worktree_path)
-        except OSError as e:
+            _cleanup_workspace_path(prepared_workspace.worktree_path)
+        except (GitOpsError, OSError) as e:
             return [f"snapshot cleanup failed: {e}"]
         return []
 
@@ -922,8 +938,8 @@ class SnapshotSwarmBackend:
         if not candidate_workspace.worktree_path.exists():
             return []
         try:
-            shutil.rmtree(candidate_workspace.worktree_path)
-        except OSError as e:
+            _cleanup_workspace_path(candidate_workspace.worktree_path)
+        except (GitOpsError, OSError) as e:
             return [f"snapshot candidate cleanup failed: {e}"]
         return []
 

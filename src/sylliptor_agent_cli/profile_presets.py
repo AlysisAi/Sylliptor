@@ -60,8 +60,8 @@ FIRST_PARTY_NATIVE_PRESET_KEYS: tuple[str, ...] = (
     "gemini",
 )
 FIRST_CLASS_SETUP_PRESET_KEYS: tuple[str, ...] = (
-    # "sylliptor" (hosted MiMo) deliberately absent: while no campaign is
-    # running it must not lead the picker — it sorts last among providers.
+    # The Sylliptor account is handled as a browser-login connection rather
+    # than an API-key provider preset.
     *FIRST_PARTY_NATIVE_PRESET_KEYS,
 )
 FIRST_PARTY_COMPATIBILITY_PRESET_KEYS: tuple[str, ...] = (
@@ -72,6 +72,9 @@ FIRST_PARTY_COMPATIBILITY_PRESET_KEYS: tuple[str, ...] = (
 LEGACY_NATIVE_ALIAS_PRESET_KEYS: tuple[str, ...] = ("anthropic-native", "gemini-native")
 LOCAL_PROFILE_PRESET_KEYS: tuple[str, ...] = ("ollama", "lm-studio", "vllm")
 _CUSTOM_PRESET_KEY = "custom"
+# Account-gated hosted presets (`sylliptor login`, no API key). Kept off the
+# primary provider picker while no hosted campaign is running.
+_ACCOUNT_GATED_PRESET_KEYS: tuple[str, ...] = ("sylliptor",)
 _CONVERSION_PRESET_BY_FAMILY: dict[str, dict[str, str]] = {
     "openai": {"native": "openai-responses", "compatibility": "openai"},
     "anthropic": {"native": "anthropic", "compatibility": "anthropic-compat"},
@@ -107,10 +110,24 @@ _OPENAI_PROMPT_CACHE_CAPABILITY = CacheCapabilitySpec(
     supports_prompt_cache_key=True,
     supports_prompt_cache_retention=True,
     reports_cache_read_tokens=True,
+    reports_cache_write_tokens=True,
     usage_schema=CACHE_USAGE_SCHEMA_OPENAI,
     min_cacheable_tokens=1024,
     source="preset",
 )
+
+
+def _cache_minimum(tokens: int) -> CacheCapabilitySpec:
+    """A scoped override that only narrows the minimum cacheable prefix."""
+
+    return CacheCapabilitySpec(min_cacheable_tokens=tokens, source="preset")
+
+
+# Anthropic's minimum cacheable prefix is per-model and does not move
+# monotonically with the version number: the 5-generation flagships halved the
+# floor to 512 while Opus 4.6/4.5 and Haiku 4.5 still need 4096. A prefix under
+# the floor is silently not cached, so the write premium buys nothing — the
+# floor is what makes the request-shape report say so instead of guessing.
 _ANTHROPIC_CACHE_CONTROL_CAPABILITY = CacheCapabilitySpec(
     strategy=CACHE_STRATEGY_ANTHROPIC_CACHE_CONTROL,
     enabled=True,
@@ -118,6 +135,17 @@ _ANTHROPIC_CACHE_CONTROL_CAPABILITY = CacheCapabilitySpec(
     reports_cache_read_tokens=True,
     reports_cache_write_tokens=True,
     usage_schema=CACHE_USAGE_SCHEMA_ANTHROPIC,
+    min_cacheable_tokens=1024,
+    model_family_overrides=(
+        ("claude-opus-5", _cache_minimum(512)),
+        ("claude-fable-5", _cache_minimum(512)),
+        ("claude-mythos-5", _cache_minimum(512)),
+        ("claude-mythos-preview", _cache_minimum(2048)),
+        ("claude-opus-4-7", _cache_minimum(2048)),
+        ("claude-opus-4-6", _cache_minimum(4096)),
+        ("claude-opus-4-5", _cache_minimum(4096)),
+        ("claude-haiku-4-5", _cache_minimum(4096)),
+    ),
     source="preset",
 )
 _GEMINI_EXPLICIT_CACHED_CONTENT_CAPABILITY = CacheCapabilitySpec(
@@ -191,6 +219,18 @@ _MOONSHOT_AUTOMATIC_CACHE_CAPABILITY = CacheCapabilitySpec(
     ),
     source="preset",
 )
+_ZAI_CODING_PLAN_CACHE_CAPABILITY = CacheCapabilitySpec(
+    strategy=CACHE_STRATEGY_IMPLICIT_PROVIDER,
+    enabled=True,
+    reports_cache_read_tokens=True,
+    usage_schema=CACHE_USAGE_SCHEMA_PROVIDER,
+    emits_request_fields=False,
+    notes=(
+        "Z.AI Coding Plan caches matching prompt prefixes automatically and reports "
+        "cached-input usage; Sylliptor emits no provider-specific cache fields.",
+    ),
+    source="preset",
+)
 
 
 def preset_protocol_kind(preset: ProfilePreset) -> str:
@@ -208,7 +248,7 @@ def preset_protocol_summary(preset: ProfilePreset) -> str:
 def preset_selection_label(preset: ProfilePreset) -> str:
     """Return a setup/config label that keeps protocol details out of the primary choice."""
     if preset.key == "sylliptor":
-        return "Sylliptor MiMo (Xiaomi) - Sylliptor account"
+        return "Sylliptor Pro (hosted models) - requires login"
     if preset.key == "openai-responses":
         return "OpenAI - Native Responses"
     if preset.key in {"anthropic", "anthropic-native"}:
@@ -235,8 +275,9 @@ def _advanced_only_preset_keys() -> frozenset[str]:
     native first-party APIs *and* the third-party API/gateway endpoints — and is
     surfaced directly so users are not limited to the big-three brands. Only the
     OpenAI-compatible duplicates of the native first-party providers, local
-    endpoints (Ollama/LM Studio/vLLM), the manual custom-URL entry, and the
-    one-release legacy aliases stay behind the advanced picker.
+    endpoints (Ollama/LM Studio/vLLM), the manual custom-URL entry, the
+    one-release legacy aliases, and the account-gated Sylliptor preset stay
+    behind the advanced picker.
     """
     return frozenset(
         {
@@ -244,6 +285,7 @@ def _advanced_only_preset_keys() -> frozenset[str]:
             *FIRST_PARTY_COMPATIBILITY_PRESET_KEYS,
             *LOCAL_PROFILE_PRESET_KEYS,
             *LEGACY_NATIVE_ALIAS_PRESET_KEYS,
+            *_ACCOUNT_GATED_PRESET_KEYS,
         }
     )
 
@@ -252,12 +294,12 @@ def provider_selection_presets() -> list[ProfilePreset]:
     """Presets shown directly on the primary provider picker.
 
     Native first-party providers lead — the best defaults for new users —
-    followed by every other hosted provider in registration order. The hosted
-    MiMo preset stays available but sorts last while no campaign is running.
-    Compatibility duplicates, local endpoints, the custom-URL entry, and
-    one-release legacy aliases are the only presets held back for the advanced
-    picker, so the user sees the full range of hosted providers up front
-    instead of just OpenAI/Anthropic/Gemini.
+    followed by every other hosted provider in registration order.
+    Compatibility duplicates, local endpoints, the custom-URL entry,
+    one-release legacy aliases, and the account-gated Sylliptor preset are
+    the only presets held back for the advanced picker, so the user sees the
+    full range of hosted providers up front instead of just
+    OpenAI/Anthropic/Gemini.
     """
     by_key = PRESET_BY_KEY
     advanced = _advanced_only_preset_keys()
@@ -268,19 +310,16 @@ def provider_selection_presets() -> list[ProfilePreset]:
         for preset in PROFILE_PRESETS
         if preset.key not in advanced and preset.key not in leading_keys
     ]
-    ordered = [*leading, *rest]
-    # Stable sort: everything keeps its order, the hosted MiMo entry moves last.
-    ordered.sort(key=lambda preset: preset.key == "sylliptor")
-    return ordered
+    return [*leading, *rest]
 
 
 def advanced_provider_selection_presets() -> list[ProfilePreset]:
-    """Return the compatibility, local, custom, and legacy alias presets.
+    """Return the compatibility, local, custom, legacy alias, and account-gated presets.
 
     These are exactly the presets held off the primary provider picker: the
     OpenAI-compatible duplicates of the native first-party providers, local
-    endpoints (Ollama/LM Studio/vLLM), the manual custom-URL entry, and the
-    one-release legacy aliases.
+    endpoints (Ollama/LM Studio/vLLM), the manual custom-URL entry, the
+    one-release legacy aliases, and the account-gated Sylliptor preset.
     """
     by_key = PRESET_BY_KEY
     first_party_compat = [
@@ -289,38 +328,11 @@ def advanced_provider_selection_presets() -> list[ProfilePreset]:
     local = [by_key[key] for key in LOCAL_PROFILE_PRESET_KEYS if key in by_key]
     custom = [by_key[_CUSTOM_PRESET_KEY]] if _CUSTOM_PRESET_KEY in by_key else []
     aliases = [by_key[key] for key in LEGACY_NATIVE_ALIAS_PRESET_KEYS if key in by_key]
-    return [*first_party_compat, *local, *custom, *aliases]
+    account_gated = [by_key[key] for key in _ACCOUNT_GATED_PRESET_KEYS if key in by_key]
+    return [*first_party_compat, *local, *custom, *aliases, *account_gated]
 
 
 PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
-    ProfilePreset(
-        key="sylliptor",
-        provider_key="sylliptor",
-        label="Sylliptor MiMo (Xiaomi)",
-        protocol="openai_compat",
-        # The hosted proxy. It authenticates the user's access_key, enforces the
-        # free-trial window, and forwards to OpenRouter with the Xiaomi BYOK key
-        # server-side. The login flow overrides this from sylliptor_cloud at
-        # runtime (env-configurable), so this literal is just the default.
-        base_url="https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1",
-        api_key_env=None,
-        # The models the trial offers. Live availability is discovered from the
-        # proxy's /v1/models allowlist at runtime; this static list is the offline
-        # fallback and the menu shown before a model is chosen.
-        suggested_models=("mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2.5"),
-        suggested_model_descriptions={
-            "mimo-v2.5-pro": "default - flagship reasoning, coding & agents (1M context)",
-            "mimo-v2-flash": "faster & lighter (256K context)",
-            "mimo-v2.5": "omni - text + image understanding (1M context)",
-        },
-        validation_model="mimo-v2.5-pro",
-        # Migrate the legacy bare "mimo" placeholder up to the flagship model.
-        model_aliases={"mimo": "mimo-v2.5-pro"},
-        web_search_adapter=OPENROUTER_WEB_ADAPTER,
-        cache_capability=_OPENROUTER_STICKY_SESSION_CACHE_CAPABILITY,
-        setup_warning=("Requires a Sylliptor account — run `sylliptor login` to connect."),
-        notes="Hosted MiMo via your Sylliptor account. Authenticate with `sylliptor login`.",
-    ),
     ProfilePreset(
         key="openai",
         provider_key="openai",
@@ -347,7 +359,6 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         model_aliases={
             "gpt-5.6": "gpt-5.6-sol",
             "gpt-5-nano": "gpt-5.4-nano",
-            "gpt-5-5": "gpt-5.5",
             # 2026-07-23 shutdowns from OpenAI's deprecations page: codex and
             # chat-latest ids remap to the still-callable gpt-5.5 tier.
             "gpt-5-codex": "gpt-5.5",
@@ -394,7 +405,6 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         model_aliases={
             "gpt-5.6": "gpt-5.6-sol",
             "gpt-5-nano": "gpt-5.4-nano",
-            "gpt-5-5": "gpt-5.5",
             # 2026-07-23 shutdowns from OpenAI's deprecations page: codex and
             # chat-latest ids remap to the still-callable gpt-5.5 tier.
             "gpt-5-codex": "gpt-5.5",
@@ -422,17 +432,19 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         api_key_env="ANTHROPIC_API_KEY",
         suggested_models=(
             "claude-sonnet-5",
-            "claude-opus-4-8",
+            "claude-opus-5",
             "claude-fable-5",
             "claude-haiku-4-5",
+            "claude-opus-4-8",
             "claude-opus-4-7",
         ),
         suggested_model_descriptions={
             "claude-sonnet-5": "default - 1M context, best speed/intelligence mix",
-            "claude-opus-4-8": "advanced - complex agentic coding, 1M context",
+            "claude-opus-5": "advanced - agentic coding + deep reasoning, 1M ctx",
             "claude-fable-5": "reasoning - adaptive thinking always on, 1M ctx",
             "claude-haiku-4-5": "fast - 200K context, lowest cost tier",
-            "claude-opus-4-7": "fallback - previous-generation opus, 1M context",
+            "claude-opus-4-8": "fallback - previous-generation opus, 1M context",
+            "claude-opus-4-7": "legacy - prior opus generation, 1M context",
         },
         model_aliases={
             # claude-sonnet-4-6 moved to Anthropic's Legacy table; Sonnet 5 is
@@ -465,17 +477,19 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         api_key_env="ANTHROPIC_API_KEY",
         suggested_models=(
             "claude-sonnet-5",
-            "claude-opus-4-8",
+            "claude-opus-5",
             "claude-fable-5",
             "claude-haiku-4-5",
+            "claude-opus-4-8",
             "claude-opus-4-7",
         ),
         suggested_model_descriptions={
             "claude-sonnet-5": "default - 1M context, best speed/intelligence mix",
-            "claude-opus-4-8": "advanced - complex agentic coding, 1M context",
+            "claude-opus-5": "advanced - agentic coding + deep reasoning, 1M ctx",
             "claude-fable-5": "reasoning - adaptive thinking always on, 1M ctx",
             "claude-haiku-4-5": "fast - 200K context, lowest cost tier",
-            "claude-opus-4-7": "fallback - previous-generation opus, 1M context",
+            "claude-opus-4-8": "fallback - previous-generation opus, 1M context",
+            "claude-opus-4-7": "legacy - prior opus generation, 1M context",
         },
         model_aliases={
             # claude-sonnet-4-6 moved to Anthropic's Legacy table; Sonnet 5 is
@@ -511,17 +525,19 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         api_key_env="ANTHROPIC_API_KEY",
         suggested_models=(
             "claude-sonnet-5",
-            "claude-opus-4-8",
+            "claude-opus-5",
             "claude-fable-5",
             "claude-haiku-4-5",
+            "claude-opus-4-8",
             "claude-opus-4-7",
         ),
         suggested_model_descriptions={
             "claude-sonnet-5": "default - 1M context, best speed/intelligence mix",
-            "claude-opus-4-8": "advanced - complex agentic coding, 1M context",
+            "claude-opus-5": "advanced - agentic coding + deep reasoning, 1M ctx",
             "claude-fable-5": "reasoning - adaptive thinking always on, 1M ctx",
             "claude-haiku-4-5": "fast - 200K context, lowest cost tier",
-            "claude-opus-4-7": "fallback - previous-generation opus, 1M context",
+            "claude-opus-4-8": "fallback - previous-generation opus, 1M context",
+            "claude-opus-4-7": "legacy - prior opus generation, 1M context",
         },
         model_aliases={
             # claude-sonnet-4-6 moved to Anthropic's Legacy table; Sonnet 5 is
@@ -553,34 +569,27 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         base_url="https://generativelanguage.googleapis.com/v1beta",
         api_key_env="GEMINI_API_KEY",
         suggested_models=(
-            "gemini-3.5-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
             "gemini-3.1-pro-preview",
-            "gemini-3.1-flash-lite",
-            "gemini-3-flash-preview",
         ),
         suggested_model_descriptions={
-            "gemini-3.5-flash": "default - 1M context, agentic coding driver",
-            "gemini-3.1-pro-preview": "advanced - hardest tasks, no free tier",
-            "gemini-3.1-flash-lite": "fast - lowest-cost tier, 1M context",
-            "gemini-3-flash-preview": "fallback - mid-price flash, 1M context",
+            "gemini-3.7-flash": "default - newest GA coding and agentic model, 1M",
+            "gemini-3.6-flash": "fallback - production GA flash model, 1M context",
+            "gemini-3.5-flash-lite": "economy - lowest-cost GA tier, 1M context",
+            "gemini-3.1-pro-preview": "advanced - pro reasoning preview, 1M context",
         },
         model_aliases={
-            # All three gemini-2.5-* ids shut down 2026-10-16; 2.0 ids already
-            # shut down 2026-06-01. Remaps follow Google's deprecations page.
-            "gemini-2.5-pro": "gemini-3.1-pro-preview",
-            "gemini-2.5-flash": "gemini-3.5-flash",
-            "gemini-2.5-flash-lite": "gemini-3.1-flash-lite",
-            "gemini-2.5-flash-latest": "gemini-3.5-flash",
-            "gemini-2.0-flash": "gemini-3.5-flash",
+            # Only shut-down or invalid legacy ids are rewritten. Active stable
+            # ids and provider-managed *-latest aliases pass through unchanged.
+            "gemini-2.0-flash": "gemini-3.6-flash",
             "gemini-2.0-flash-lite": "gemini-3.1-flash-lite",
             "gemini-3.1-preview": "gemini-3.1-pro-preview",
             "gemini-3-pro-preview": "gemini-3.1-pro-preview",
             "gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
-            "gemini-flash-latest": "gemini-3.5-flash",
-            "gemini-flash-lite-latest": "gemini-3.1-flash-lite",
-            "gemini-pro-latest": "gemini-3.1-pro-preview",
         },
-        validation_model="gemini-3.1-flash-lite",
+        validation_model="gemini-3.5-flash-lite",
         web_search_adapter=GEMINI_GROUNDING_ADAPTER,
         cache_capability=_GEMINI_EXPLICIT_CACHED_CONTENT_CAPABILITY,
         setup_warning=(
@@ -601,34 +610,27 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         api_key_env="GEMINI_API_KEY",
         suggested_models=(
-            "gemini-3.5-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
             "gemini-3.1-pro-preview",
-            "gemini-3.1-flash-lite",
-            "gemini-3-flash-preview",
         ),
         suggested_model_descriptions={
-            "gemini-3.5-flash": "default - 1M context, agentic coding driver",
-            "gemini-3.1-pro-preview": "advanced - hardest tasks, no free tier",
-            "gemini-3.1-flash-lite": "fast - lowest-cost tier, 1M context",
-            "gemini-3-flash-preview": "fallback - mid-price flash, 1M context",
+            "gemini-3.7-flash": "default - newest GA coding and agentic model, 1M",
+            "gemini-3.6-flash": "fallback - production GA flash model, 1M context",
+            "gemini-3.5-flash-lite": "economy - lowest-cost GA tier, 1M context",
+            "gemini-3.1-pro-preview": "advanced - pro reasoning preview, 1M context",
         },
         model_aliases={
-            # All three gemini-2.5-* ids shut down 2026-10-16; 2.0 ids already
-            # shut down 2026-06-01. Remaps follow Google's deprecations page.
-            "gemini-2.5-pro": "gemini-3.1-pro-preview",
-            "gemini-2.5-flash": "gemini-3.5-flash",
-            "gemini-2.5-flash-lite": "gemini-3.1-flash-lite",
-            "gemini-2.5-flash-latest": "gemini-3.5-flash",
-            "gemini-2.0-flash": "gemini-3.5-flash",
+            # Only shut-down or invalid legacy ids are rewritten. Active stable
+            # ids and provider-managed *-latest aliases pass through unchanged.
+            "gemini-2.0-flash": "gemini-3.6-flash",
             "gemini-2.0-flash-lite": "gemini-3.1-flash-lite",
             "gemini-3.1-preview": "gemini-3.1-pro-preview",
             "gemini-3-pro-preview": "gemini-3.1-pro-preview",
             "gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
-            "gemini-flash-latest": "gemini-3.5-flash",
-            "gemini-flash-lite-latest": "gemini-3.1-flash-lite",
-            "gemini-pro-latest": "gemini-3.1-pro-preview",
         },
-        validation_model="gemini-3.1-flash-lite",
+        validation_model="gemini-3.5-flash-lite",
         web_search_adapter=GEMINI_GROUNDING_ADAPTER,
         setup_warning=(
             "Gemini OpenAI compatibility is served from v1beta; use the gemini preset for "
@@ -643,34 +645,27 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         base_url="https://generativelanguage.googleapis.com/v1beta",
         api_key_env="GEMINI_API_KEY",
         suggested_models=(
-            "gemini-3.5-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
             "gemini-3.1-pro-preview",
-            "gemini-3.1-flash-lite",
-            "gemini-3-flash-preview",
         ),
         suggested_model_descriptions={
-            "gemini-3.5-flash": "default - 1M context, agentic coding driver",
-            "gemini-3.1-pro-preview": "advanced - hardest tasks, no free tier",
-            "gemini-3.1-flash-lite": "fast - lowest-cost tier, 1M context",
-            "gemini-3-flash-preview": "fallback - mid-price flash, 1M context",
+            "gemini-3.7-flash": "default - newest GA coding and agentic model, 1M",
+            "gemini-3.6-flash": "fallback - production GA flash model, 1M context",
+            "gemini-3.5-flash-lite": "economy - lowest-cost GA tier, 1M context",
+            "gemini-3.1-pro-preview": "advanced - pro reasoning preview, 1M context",
         },
         model_aliases={
-            # All three gemini-2.5-* ids shut down 2026-10-16; 2.0 ids already
-            # shut down 2026-06-01. Remaps follow Google's deprecations page.
-            "gemini-2.5-pro": "gemini-3.1-pro-preview",
-            "gemini-2.5-flash": "gemini-3.5-flash",
-            "gemini-2.5-flash-lite": "gemini-3.1-flash-lite",
-            "gemini-2.5-flash-latest": "gemini-3.5-flash",
-            "gemini-2.0-flash": "gemini-3.5-flash",
+            # Only shut-down or invalid legacy ids are rewritten. Active stable
+            # ids and provider-managed *-latest aliases pass through unchanged.
+            "gemini-2.0-flash": "gemini-3.6-flash",
             "gemini-2.0-flash-lite": "gemini-3.1-flash-lite",
             "gemini-3.1-preview": "gemini-3.1-pro-preview",
             "gemini-3-pro-preview": "gemini-3.1-pro-preview",
             "gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
-            "gemini-flash-latest": "gemini-3.5-flash",
-            "gemini-flash-lite-latest": "gemini-3.1-flash-lite",
-            "gemini-pro-latest": "gemini-3.1-pro-preview",
         },
-        validation_model="gemini-3.1-flash-lite",
+        validation_model="gemini-3.5-flash-lite",
         web_search_adapter=GEMINI_GROUNDING_ADAPTER,
         cache_capability=_GEMINI_EXPLICIT_CACHED_CONTENT_CAPABILITY,
         setup_warning=(
@@ -707,6 +702,47 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         ),
     ),
     ProfilePreset(
+        key="nvidia",
+        provider_key="nvidia",
+        label="NVIDIA NIM (Hosted)",
+        protocol="openai_compat",
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key_env="NVIDIA_API_KEY",
+        suggested_models=(
+            "nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-nano-30b-a3b",
+            "deepseek-ai/deepseek-v4-pro",
+            "deepseek-ai/deepseek-v4-flash",
+        ),
+        suggested_model_descriptions={
+            "nvidia/nemotron-3-super-120b-a12b": (
+                "default - balanced agentic reasoning, 1M context"
+            ),
+            "nvidia/nemotron-3-ultra-550b-a55b": (
+                "advanced - frontier agentic reasoning, 1M context"
+            ),
+            "nvidia/nemotron-3-nano-30b-a3b": (
+                "fast - efficient reasoning and tool use, 262K hosted context"
+            ),
+            "deepseek-ai/deepseek-v4-pro": (
+                "third-party model hosted by NVIDIA - advanced agentic reasoning"
+            ),
+            "deepseek-ai/deepseek-v4-flash": (
+                "third-party model hosted by NVIDIA - fast agentic reasoning"
+            ),
+        },
+        validation_model="nvidia/nemotron-3-nano-30b-a3b",
+        setup_warning=(
+            "NVIDIA hosted Free Endpoints are rate-limited development endpoints for "
+            "prototyping; availability is not a production SLA and may vary by account."
+        ),
+        notes=(
+            "Hosted NVIDIA NIM OpenAI-compatible API. The live catalog includes models "
+            "from NVIDIA and third parties; reasoning controls are model-specific."
+        ),
+    ),
+    ProfilePreset(
         key="qwen-intl",
         provider_key="qwen",
         label="Alibaba Qwen / DashScope (Intl)",
@@ -715,6 +751,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         api_key_env="DASHSCOPE_API_KEY",
         suggested_models=(
             "qwen3.7-plus",
+            "qwen3.8-max",
             "qwen3.7-max",
             "qwen3-coder-plus",
             "qwen3-coder-next",
@@ -723,7 +760,8 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         ),
         suggested_model_descriptions={
             "qwen3.7-plus": "default - 1M context, balanced cost",
-            "qwen3.7-max": "advanced - flagship, 1M context",
+            "qwen3.8-max": "advanced - newest multimodal flagship, 1M context",
+            "qwen3.7-max": "fallback - previous flagship, 1M context",
             "qwen3-coder-plus": "coding - 1M context, long-repo work",
             "qwen3-coder-next": "agentic - newest coder, 256K context",
             "qwen3.6-flash": "fast - lower-latency, 1M context",
@@ -818,6 +856,38 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         validation_model="glm-4.7-flash",
         web_search_adapter=ZHIPU_WEB_SEARCH_ADAPTER,
         web_search_model="glm-5.1",
+    ),
+    ProfilePreset(
+        key="zai-coding-plan",
+        provider_key="zai_coding_plan",
+        label="Z.AI GLM Coding Plan",
+        protocol="openai_compat",
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        api_key_env="ZAI_API_KEY",
+        suggested_models=(
+            "glm-5.3",
+            "glm-5-turbo",
+            "glm-4.7",
+        ),
+        suggested_model_descriptions={
+            "glm-5.3": "default - latest agentic coding model, 1M context",
+            "glm-5-turbo": "fast - lower-credit agent model, 200K context",
+            "glm-4.7": "fallback - lowest-credit plan model, 200K context",
+        },
+        # GLM-4.7 consumes fewer plan credits than GLM-5.3 and is available on
+        # every Coding Plan tier, so use it for the initial credential probe.
+        validation_model="glm-4.7",
+        cache_capability=_ZAI_CODING_PLAN_CACHE_CAPABILITY,
+        setup_warning=(
+            "Requires a Z.AI GLM Coding Plan key; general pay-as-you-go and "
+            "open.bigmodel.cn keys use different endpoints. Z.AI limits plan benefits "
+            "to supported coding tools, so verify Sylliptor eligibility for your account."
+        ),
+        notes=(
+            "Subscription Coding Plan endpoint, not the general Z.AI or China Zhipu API. "
+            "All plan tiers currently offer GLM-5.3, GLM-5-Turbo, and GLM-4.7; "
+            "GLM-5.2/5.1 requests are routed by the server to GLM-5.3."
+        ),
     ),
     ProfilePreset(
         key="moonshot",
@@ -1095,7 +1165,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         base_url="https://api.mistral.ai/v1",
         api_key_env="MISTRAL_API_KEY",
         suggested_models=(
-            "mistral-medium-2604",
+            "mistral-medium-3-5",
             "mistral-large-2512",
             "mistral-small-2603",
             "codestral-2508",
@@ -1104,34 +1174,33 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         suggested_model_descriptions={
             # codestral is FIM/completion-oriented with ~4K max output — routers
             # should prefer the default for multi-file agentic patch turns.
-            "mistral-medium-2604": "default - agentic and coding flagship, 256K",
+            "mistral-medium-3-5": "default - agentic and coding flagship, 256K",
             "mistral-large-2512": "advanced - mistral large 3, 675B MoE, 256K",
             "mistral-small-2603": "fast - mistral small 4, low latency",
             "codestral-2508": "coding - FIM and completion, 4K max output",
             "ministral-8b-2512": "economy - small tool-capable model",
         },
         model_aliases={
-            # Dated snapshots are the stable pins; name/-latest forms remap onto
-            # them. devstral + magistral retire 2026-07-31 (replacements per
-            # Mistral's own legacy-models replacement column).
-            "mistral-medium-3-5": "mistral-medium-2604",
-            "mistral-medium-3": "mistral-medium-2604",
-            "mistral-medium-latest": "mistral-medium-2604",
-            "mistral-medium-2508": "mistral-medium-2604",
-            "mistral-medium-2505": "mistral-medium-2604",
+            # Mistral documents mistral-medium-3-5 as the primary API id. Keep
+            # the former Sylliptor default as a compatibility alias, while the
+            # provider-managed -latest alias passes through unchanged.
+            "mistral-medium-2604": "mistral-medium-3-5",
+            "mistral-medium-3": "mistral-medium-3-5",
+            "mistral-medium-2508": "mistral-medium-3-5",
+            "mistral-medium-2505": "mistral-medium-3-5",
             "mistral-small-latest": "mistral-small-2603",
             "mistral-small-2506": "mistral-small-2603",
             "mistral-large-latest": "mistral-large-2512",
-            "mistral-large-2411": "mistral-medium-2604",
+            "mistral-large-2411": "mistral-medium-3-5",
             "mistral-large-2407": "mistral-large-2512",
             "codestral-latest": "codestral-2508",
-            "devstral-2512": "mistral-medium-2604",
-            "devstral-latest": "mistral-medium-2604",
-            "devstral-medium-latest": "mistral-medium-2604",
-            "devstral-medium-2507": "mistral-medium-2604",
+            "devstral-2512": "mistral-medium-3-5",
+            "devstral-latest": "mistral-medium-3-5",
+            "devstral-medium-latest": "mistral-medium-3-5",
+            "devstral-medium-2507": "mistral-medium-3-5",
             "devstral-small-2507": "mistral-small-2603",
-            "labs-devstral-small-2512": "mistral-medium-2604",
-            "magistral-medium-latest": "mistral-medium-2604",
+            "labs-devstral-small-2512": "mistral-medium-3-5",
+            "magistral-medium-latest": "mistral-medium-3-5",
             "magistral-small-latest": "mistral-small-2603",
             "ministral-8b-latest": "ministral-8b-2512",
             "open-mistral-nemo-2407": "ministral-8b-2512",
@@ -1149,6 +1218,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         base_url="https://api.x.ai/v1",
         api_key_env="XAI_API_KEY",
         suggested_models=(
+            "grok-4.6",
             "grok-4.5",
             "grok-build-0.1",
             "grok-4.3",
@@ -1158,7 +1228,8 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         suggested_model_descriptions={
             # grok-build-0.1 is served from us-east-1/us-west-2 only. Max output
             # is unpublished for the 4.20 family — clamp conservatively.
-            "grok-4.5": "default - flagship coding and agentic work",
+            "grok-4.6": "default - newest flagship for coding and agents, 500K",
+            "grok-4.5": "fallback - previous flagship for coding and agents",
             "grok-build-0.1": "coding - agentic engineering model, 256K",
             "grok-4.3": "advanced - 1M context window",
             "grok-4.20-0309-reasoning": "reasoning - dedicated snapshot, 1M context",
@@ -1186,7 +1257,7 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
         setup_warning=(
             "Retired slugs (grok-4, grok-4-fast, grok-3, grok-code-fast-1) shut down "
             "fully 2026-08-15 and are billed at grok-4.3 rates until then; migrate "
-            "pinned configs explicitly. Ids use dots, not dashes (grok-4.5)."
+            "pinned configs explicitly. Ids use dots, not dashes (grok-4.6)."
         ),
     ),
     ProfilePreset(
@@ -1254,10 +1325,6 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
             "openai/gpt-5.6-luna": "fast - cost-efficient gpt-5.6 tier",
             "z-ai/glm-5.2": "economy - cheap 1M-context tool caller",
             "deepseek/deepseek-v4-pro": "agentic - reasoning MoE, 1M context",
-        },
-        model_aliases={
-            "gpt-5-5": "openai/gpt-5.5",
-            "gpt-5.5": "openai/gpt-5.5",
         },
         validation_model="deepseek/deepseek-v4-flash",
         web_search_adapter=OPENROUTER_WEB_ADAPTER,
@@ -1363,6 +1430,40 @@ PROFILE_PRESETS: tuple[ProfilePreset, ...] = (
             "accounts/fireworks/models/glm-5p1": "accounts/fireworks/models/glm-5p2",
         },
         validation_model="accounts/fireworks/models/deepseek-v4-flash",
+    ),
+    # Account-gated hosted preset — registered after the hosted third-party
+    # vendors so listings that read PROFILE_PRESETS order do not headline it.
+    ProfilePreset(
+        key="sylliptor",
+        provider_key="sylliptor",
+        label="Sylliptor Pro",
+        protocol="openai_compat",
+        # The Sylliptor hosted proxy (`llm` Supabase Edge Function). It
+        # authenticates the user's slk_ key, meters the free daily allowance /
+        # Pro credits server-side, and forwards to DeepSeek. The login flow
+        # overrides this from sylliptor_cloud at runtime (env-configurable), so
+        # this literal is just the default.
+        base_url="https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1",
+        api_key_env=None,
+        # The models the subscription offers. Live availability is discovered
+        # from the gateway's /v1/models at runtime; this static list is the
+        # offline fallback and the menu shown before a model is chosen.
+        suggested_models=("deepseek-v4-flash", "deepseek-v4-pro"),
+        suggested_model_descriptions={
+            "deepseek-v4-flash": "default - fast high-volume coding (1M context, free daily allowance)",
+            "deepseek-v4-pro": "flagship - deeper reasoning (1M context, requires Sylliptor Pro)",
+        },
+        validation_model="deepseek-v4-flash",
+        # Migrate ids from the retired Xiaomi MiMo trial to the Pro default so
+        # old sessions keep working after upgrade.
+        model_aliases={
+            "mimo": "deepseek-v4-flash",
+            "mimo-v2.5-pro": "deepseek-v4-flash",
+            "mimo-v2-flash": "deepseek-v4-flash",
+            "mimo-v2.5": "deepseek-v4-flash",
+        },
+        setup_warning=("Requires a Sylliptor Pro subscription — run `sylliptor login` to connect."),
+        notes="Hosted models via your Sylliptor Pro subscription. Authenticate with `sylliptor login`.",
     ),
     ProfilePreset(
         key="ollama",

@@ -14,6 +14,7 @@ from sylliptor_agent_cli.server.app import (
     _agent_entrypoint_prefix,
     _append_common_agent_args,
     _build_forge_exec_job_command,
+    _build_forge_swarm_job_command,
     _build_run_job_command,
     _create_run_from_upload,
     _validate_forge_exec_task_id,
@@ -23,7 +24,7 @@ from sylliptor_agent_cli.server.settings import ServerSettings
 from sylliptor_agent_cli.server.store import ServerStoreError
 
 
-def _settings(*, worker_backend: str) -> ServerSettings:
+def _settings(*, worker_backend: str, worker_machine_events: bool = True) -> ServerSettings:
     return ServerSettings(
         host="127.0.0.1",
         port=7070,
@@ -38,6 +39,7 @@ def _settings(*, worker_backend: str) -> ServerSettings:
         default_base_url=None,
         allow_client_model=True,
         allow_client_base_url=False,
+        worker_machine_events=worker_machine_events,
     )
 
 
@@ -208,6 +210,70 @@ def test_build_forge_exec_job_command_preserves_fullaccess_mode_flag() -> None:
     )
     mode_idx = command.index("--mode")
     assert command[mode_idx + 1] == "fullaccess"
+
+
+def _forge_exec_command(*, worker_machine_events: bool) -> list[str]:
+    return _build_forge_exec_job_command(
+        settings=_settings(
+            worker_backend="bwrap",
+            worker_machine_events=worker_machine_events,
+        ),
+        req=ForgeExecRequest(
+            task_id="T01",
+            mode="auto",
+            yes=True,
+            model="ignored",
+            base_url=None,
+            temperature=None,
+        ),
+        model="gpt-test",
+        base_url=None,
+    )
+
+
+def _forge_swarm_command(*, worker_machine_events: bool) -> list[str]:
+    return _build_forge_swarm_job_command(
+        settings=_settings(
+            worker_backend="bwrap",
+            worker_machine_events=worker_machine_events,
+        ),
+        req=ForgeSwarmRequest(
+            mode="auto",
+            yes=True,
+            model="ignored",
+            base_url=None,
+            temperature=None,
+        ),
+        model="gpt-test",
+        base_url=None,
+    )
+
+
+def test_forge_job_commands_request_machine_events_by_default() -> None:
+    assert "--machine" in _forge_exec_command(worker_machine_events=True)
+    assert "--machine" in _forge_swarm_command(worker_machine_events=True)
+
+
+def test_forge_job_commands_omit_machine_flag_when_disabled() -> None:
+    assert "--machine" not in _forge_exec_command(worker_machine_events=False)
+    assert "--machine" not in _forge_swarm_command(worker_machine_events=False)
+
+
+def test_run_job_command_stays_human_readable() -> None:
+    command = _build_run_job_command(
+        settings=_settings(worker_backend="bwrap"),
+        req=RunJobRequest(
+            instruction="do the thing",
+            mode="auto",
+            yes=True,
+            model="ignored",
+            base_url=None,
+            temperature=None,
+        ),
+        model="gpt-test",
+        base_url=None,
+    )
+    assert "--machine" not in command
 
 
 def test_create_app_smoke_openapi_generation(tmp_path: Path) -> None:

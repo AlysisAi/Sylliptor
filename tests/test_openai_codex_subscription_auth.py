@@ -17,6 +17,7 @@ from sylliptor_agent_cli.llm.protocols import (
 from sylliptor_agent_cli.mcp import token_store as token_store_mod
 from sylliptor_agent_cli.provider_auth.base import ProviderAuthError, ProviderLoginRequiredError
 from sylliptor_agent_cli.provider_auth.openai_codex import (
+    SESSION_EXPIRED_DETAIL,
     OpenAICodexSubscriptionAuth,
 )
 from sylliptor_agent_cli.provider_auth.store import (
@@ -300,6 +301,67 @@ def test_codex_refresh_invalid_grant_requires_login(monkeypatch) -> None:  # typ
 
     with pytest.raises(ProviderLoginRequiredError, match="session expired"):
         adapter.authorization_headers("https://chatgpt.com/backend-api/codex/responses")
+
+
+def test_codex_account_status_reports_an_expired_session_as_data(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A status probe answers; only the model transport raises."""
+
+    stored = ProviderTokenRecord(
+        access_token="expired",
+        refresh_token="refresh",
+        expires_at=time.time() - 1,
+        account_label="dev@example.test",
+    )
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.provider_auth.openai_codex.load_provider_token",
+        lambda _provider_id: stored,
+    )
+    adapter = OpenAICodexSubscriptionAuth(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(400, json={"error": "invalid_grant"})
+        )
+    )
+
+    status = adapter.account_status()
+
+    assert status.connected is False
+    assert status.verified is True
+    assert status.detail == SESSION_EXPIRED_DETAIL
+    assert status.account_label == "dev@example.test"
+
+
+def test_codex_account_status_survives_an_unreadable_credential_store(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A spawned process that cannot reach the keyring must still get an answer."""
+
+    def _unreadable(_provider_id: str) -> ProviderTokenRecord:
+        raise ProviderAuthError("Could not read the encrypted provider credential store.")
+
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.provider_auth.openai_codex.load_provider_token",
+        _unreadable,
+    )
+
+    status = OpenAICodexSubscriptionAuth().account_status()
+
+    assert status.connected is False
+    assert status.verified is False
+    assert status.detail == "Could not read the encrypted provider credential store."
+
+
+def test_codex_account_status_survives_an_unexpected_store_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def _explode(_provider_id: str) -> ProviderTokenRecord:
+        raise MemoryError("simulated")
+
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.provider_auth.openai_codex.load_provider_token",
+        _explode,
+    )
+
+    status = OpenAICodexSubscriptionAuth().account_status()
+
+    assert status.connected is False
+    assert status.verified is False
+    assert "MemoryError" in str(status.detail)
 
 
 def test_codex_model_catalog_uses_codex_compat_version_and_live_metadata(

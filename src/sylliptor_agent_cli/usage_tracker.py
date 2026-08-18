@@ -12,7 +12,7 @@ from statistics import median
 from typing import Any
 
 from .llm.metadata import strip_provider_metadata_from_message
-from .llm.types import UsageConfidence, UsageContract, UsageSource
+from .llm.types import BillingMode, CostSource, UsageConfidence, UsageContract, UsageSource
 from .model_registry import ModelMeta, ModelRegistry
 from .provider_telemetry import base_url_host
 from .request_estimation import (
@@ -43,10 +43,13 @@ class UsageRecord:
     output_cost_per_token: float | None
     cost_usd: float | None
     usage_source: str
+    billing_mode: str = BillingMode.METERED_API.value
+    cost_source: str = CostSource.UNKNOWN.value
+    provider_cost_usd: float | None = None
     usage_source_detail: str = UsageSource.LOCAL_ESTIMATE.value
     usage_confidence: str = UsageConfidence.ESTIMATED.value
     output_includes_reasoning: bool = True
-    usage_schema_version: int = 5
+    usage_schema_version: int = 6
     provider_key: str | None = None
     protocol: str | None = None
     base_url_host: str | None = None
@@ -63,6 +66,7 @@ class UsageRecord:
     cached_prompt_tokens: int | None = None
     uncached_prompt_tokens: int | None = None
     input_tokens_uncached: int | None = None
+    input_tokens_uncached_derived: bool = False
     cache_read_input_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
     cache_creation_5m_input_tokens: int | None = None
@@ -98,6 +102,9 @@ class UsageRecord:
             "cache_creation_1h_input_cost_per_token": (self.cache_creation_1h_input_cost_per_token),
             "reasoning_output_cost_per_token": self.reasoning_output_cost_per_token,
             "cost_usd": self.cost_usd,
+            "billing_mode": self.billing_mode,
+            "cost_source": self.cost_source,
+            "provider_cost_usd": self.provider_cost_usd,
             "usage_source": self.usage_source,
             "usage_source_detail": self.usage_source_detail,
             "usage_confidence": self.usage_confidence,
@@ -113,6 +120,7 @@ class UsageRecord:
             "cached_prompt_tokens": self.cached_prompt_tokens,
             "uncached_prompt_tokens": self.uncached_prompt_tokens,
             "input_tokens_uncached": self.input_tokens_uncached,
+            "input_tokens_uncached_derived": self.input_tokens_uncached_derived,
             "cache_read_input_tokens": self.cache_read_input_tokens,
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
             "cache_creation_5m_input_tokens": self.cache_creation_5m_input_tokens,
@@ -257,6 +265,11 @@ class _ModelUsageTotals:
     known_cost_usd: float = 0.0
     known_cost_calls: int = 0
     unknown_cost_count: int = 0
+    provider_reported_cost_calls: int = 0
+    catalog_estimated_cost_calls: int = 0
+    subscription_calls: int = 0
+    included_calls: int = 0
+    local_calls: int = 0
     api_usage_calls: int = 0
     estimate_usage_calls: int = 0
     authoritative_usage_calls: int = 0
@@ -268,6 +281,10 @@ class _ModelUsageTotals:
     cache_creation_input_tokens: int = 0
     cache_creation_5m_input_tokens: int = 0
     cache_creation_1h_input_tokens: int = 0
+    input_tokens_uncached_reported_calls: int = 0
+    input_tokens_uncached_derived_calls: int = 0
+    cache_read_reported_calls: int = 0
+    cache_creation_reported_calls: int = 0
     reasoning_tokens: int = 0
     cache_cost_pricing_missing_calls: int = 0
     estimated_bootstrap_prompt_tokens: int = 0
@@ -548,6 +565,11 @@ def usage_context_from_client_response(
                 else UsageConfidence.REPORTED
             )
         )
+    contract_billing_mode = getattr(usage_contract, "billing_mode", BillingMode.METERED_API)
+    billing_mode_value = str(
+        getattr(contract_billing_mode, "value", contract_billing_mode)
+        or BillingMode.METERED_API.value
+    )
     return {
         "provider_key": _safe_label(getattr(client, "provider_key", None)),
         "protocol": _protocol_from_client(client),
@@ -561,6 +583,7 @@ def usage_context_from_client_response(
         "api_usage_confidence": usage_contract.response_usage_confidence.value,
         "api_usage_source_detail": UsageSource.PROVIDER_RESPONSE.value,
         "api_output_includes_reasoning": (usage_contract.normalized_output_includes_reasoning),
+        "billing_mode": billing_mode_value,
     }
 
 
@@ -650,6 +673,7 @@ def parse_rate(value: Any) -> float | None:
 class _CostComputation:
     cost_usd: float | None
     cache_cost_pricing_missing: bool
+    cost_source: CostSource = CostSource.UNKNOWN
 
 
 def _usage_cost_usd(
@@ -726,7 +750,11 @@ def _usage_cost_usd(
 
     if cache_pricing_missing:
         return _CostComputation(cost_usd=None, cache_cost_pricing_missing=True)
-    return _CostComputation(cost_usd=cost, cache_cost_pricing_missing=False)
+    return _CostComputation(
+        cost_usd=cost,
+        cache_cost_pricing_missing=False,
+        cost_source=CostSource.CATALOG_ESTIMATE,
+    )
 
 
 def build_usage_record(
@@ -744,11 +772,13 @@ def build_usage_record(
     api_usage: Any | None = None,
     api_cached_prompt_tokens: int | None = None,
     api_input_tokens_uncached: int | None = None,
+    api_input_tokens_uncached_derived: bool | None = None,
     api_cache_read_input_tokens: int | None = None,
     api_cache_creation_input_tokens: int | None = None,
     api_cache_creation_5m_input_tokens: int | None = None,
     api_cache_creation_1h_input_tokens: int | None = None,
     api_reasoning_tokens: int | None = None,
+    api_provider_cost_usd: float | None = None,
     api_raw_provider_usage: dict[str, Any] | None = None,
     tool_list: list[dict[str, Any]] | None = None,
     pinned_prefix_len: int = 0,
@@ -764,6 +794,7 @@ def build_usage_record(
     api_usage_confidence: str = UsageConfidence.REPORTED.value,
     api_usage_source_detail: str = UsageSource.PROVIDER_RESPONSE.value,
     api_output_includes_reasoning: bool = True,
+    billing_mode: str = BillingMode.METERED_API.value,
 ) -> UsageRecord:
     prompt_tokens_authoritative = (
         bool(api_usage_counts_authoritative)
@@ -815,6 +846,10 @@ def build_usage_record(
             api_cached_prompt_tokens = getattr(api_usage, "cached_prompt_tokens", None)
         if api_input_tokens_uncached is None:
             api_input_tokens_uncached = getattr(api_usage, "input_tokens_uncached", None)
+            if api_input_tokens_uncached_derived is None:
+                api_input_tokens_uncached_derived = bool(
+                    getattr(api_usage, "input_tokens_uncached_derived", False)
+                )
         if api_cache_read_input_tokens is None:
             api_cache_read_input_tokens = getattr(api_usage, "cache_read_input_tokens", None)
         if api_cache_creation_input_tokens is None:
@@ -837,6 +872,8 @@ def build_usage_record(
             )
         if api_reasoning_tokens is None:
             api_reasoning_tokens = getattr(api_usage, "reasoning_tokens", None)
+        if api_provider_cost_usd is None:
+            api_provider_cost_usd = getattr(api_usage, "provider_cost_usd", None)
         if api_raw_provider_usage is None:
             api_raw_provider_usage = getattr(api_usage, "raw_provider_usage", None)
 
@@ -946,6 +983,7 @@ def build_usage_record(
         if creation_parts:
             cache_creation_input_tokens = sum(creation_parts)
     input_tokens_uncached = _safe_int(api_input_tokens_uncached)
+    input_tokens_uncached_derived = bool(api_input_tokens_uncached_derived)
     reasoning_tokens = _safe_int(api_reasoning_tokens)
     raw_provider_usage = (
         copy.deepcopy(api_raw_provider_usage) if isinstance(api_raw_provider_usage, dict) else None
@@ -957,6 +995,7 @@ def build_usage_record(
         cache_creation_5m_input_tokens = None
         cache_creation_1h_input_tokens = None
         input_tokens_uncached = None
+        input_tokens_uncached_derived = False
 
     cached_prompt_tokens = cache_read_input_tokens
     uncached_prompt_tokens: int | None = None
@@ -970,6 +1009,7 @@ def build_usage_record(
         cache_creation = cache_creation_input_tokens or 0
         if cached_read > 0 or cache_creation > 0:
             input_tokens_uncached = max(0, prompt_tokens - cached_read - cache_creation)
+            input_tokens_uncached_derived = True
     prompt_estimate_error_tokens, prompt_estimate_error_ratio = _prompt_estimate_calibration(
         api_prompt_tokens=(None if prompt_measurement_is_local else raw_api_prompt_tokens),
         estimated_prompt_tokens=fallback_prompt_estimate_tokens,
@@ -1024,23 +1064,40 @@ def build_usage_record(
         response_meta,
         "reasoning_output_cost_per_token",
     )
-    cost = _usage_cost_usd(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        input_tokens_uncached=input_tokens_uncached,
-        cache_read_input_tokens=cache_read_input_tokens,
-        cache_creation_input_tokens=cache_creation_input_tokens,
-        cache_creation_5m_input_tokens=cache_creation_5m_input_tokens,
-        cache_creation_1h_input_tokens=cache_creation_1h_input_tokens,
-        reasoning_tokens=reasoning_tokens,
-        input_rate=input_rate,
-        output_rate=output_rate,
-        cache_read_input_rate=cache_read_input_rate,
-        cache_creation_input_rate=cache_creation_input_rate,
-        cache_creation_5m_input_rate=cache_creation_5m_input_rate,
-        cache_creation_1h_input_rate=cache_creation_1h_input_rate,
-        reasoning_output_rate=reasoning_output_rate,
-    )
+    safe_billing_mode = str(billing_mode or "").strip().lower()
+    if safe_billing_mode not in {item.value for item in BillingMode}:
+        safe_billing_mode = BillingMode.UNKNOWN.value
+    provider_cost_usd = _safe_float(api_provider_cost_usd)
+    if safe_billing_mode == BillingMode.SUBSCRIPTION.value:
+        cost = _CostComputation(None, False, CostSource.SUBSCRIPTION)
+    elif safe_billing_mode == BillingMode.INCLUDED.value:
+        cost = _CostComputation(None, False, CostSource.INCLUDED)
+    elif safe_billing_mode == BillingMode.LOCAL.value:
+        cost = _CostComputation(None, False, CostSource.LOCAL)
+    elif provider_cost_usd is not None and provider_cost_usd >= 0:
+        cost = _CostComputation(
+            cost_usd=provider_cost_usd,
+            cache_cost_pricing_missing=False,
+            cost_source=CostSource.PROVIDER_REPORTED,
+        )
+    else:
+        cost = _usage_cost_usd(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            input_tokens_uncached=input_tokens_uncached,
+            cache_read_input_tokens=cache_read_input_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_creation_5m_input_tokens=cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens=cache_creation_1h_input_tokens,
+            reasoning_tokens=reasoning_tokens,
+            input_rate=input_rate,
+            output_rate=output_rate,
+            cache_read_input_rate=cache_read_input_rate,
+            cache_creation_input_rate=cache_creation_input_rate,
+            cache_creation_5m_input_rate=cache_creation_5m_input_rate,
+            cache_creation_1h_input_rate=cache_creation_1h_input_rate,
+            reasoning_output_rate=reasoning_output_rate,
+        )
     safe_request_mode = _safe_label(request_mode) or (
         str(safe_request_plan.get("input_mode"))
         if safe_request_plan and safe_request_plan.get("input_mode")
@@ -1053,7 +1110,7 @@ def build_usage_record(
     )
 
     return UsageRecord(
-        usage_schema_version=5,
+        usage_schema_version=6,
         timestamp=now_iso(),
         role=role,
         requested_model=requested_model,
@@ -1069,6 +1126,9 @@ def build_usage_record(
         cache_creation_1h_input_cost_per_token=cache_creation_1h_input_rate,
         reasoning_output_cost_per_token=reasoning_output_rate,
         cost_usd=cost.cost_usd,
+        billing_mode=safe_billing_mode,
+        cost_source=cost.cost_source.value,
+        provider_cost_usd=provider_cost_usd,
         usage_source=usage_source,
         usage_source_detail=usage_source_detail,
         usage_confidence=usage_confidence,
@@ -1084,6 +1144,7 @@ def build_usage_record(
         cached_prompt_tokens=cached_prompt_tokens,
         uncached_prompt_tokens=uncached_prompt_tokens,
         input_tokens_uncached=input_tokens_uncached,
+        input_tokens_uncached_derived=input_tokens_uncached_derived,
         cache_read_input_tokens=cache_read_input_tokens,
         cache_creation_input_tokens=cache_creation_input_tokens,
         cache_creation_5m_input_tokens=cache_creation_5m_input_tokens,
@@ -1118,10 +1179,21 @@ class UsageSummary:
             totals.completion_tokens += record.completion_tokens
             totals.total_tokens += record.total_tokens
             if record.cost_usd is None:
-                totals.unknown_cost_count += 1
+                if record.cost_source == CostSource.SUBSCRIPTION.value:
+                    totals.subscription_calls += 1
+                elif record.cost_source == CostSource.INCLUDED.value:
+                    totals.included_calls += 1
+                elif record.cost_source == CostSource.LOCAL.value:
+                    totals.local_calls += 1
+                else:
+                    totals.unknown_cost_count += 1
             else:
                 totals.known_cost_usd += float(record.cost_usd)
                 totals.known_cost_calls += 1
+                if record.cost_source == CostSource.PROVIDER_REPORTED.value:
+                    totals.provider_reported_cost_calls += 1
+                elif record.cost_source == CostSource.CATALOG_ESTIMATE.value:
+                    totals.catalog_estimated_cost_calls += 1
             if record.usage_source == "api":
                 totals.api_usage_calls += 1
             else:
@@ -1149,6 +1221,15 @@ class UsageSummary:
             totals.input_tokens_uncached += max(0, record.input_tokens_uncached or 0)
             totals.cache_read_input_tokens += max(0, record.cache_read_input_tokens or 0)
             totals.cache_creation_input_tokens += max(0, record.cache_creation_input_tokens or 0)
+            if record.input_tokens_uncached is not None:
+                if record.input_tokens_uncached_derived:
+                    totals.input_tokens_uncached_derived_calls += 1
+                else:
+                    totals.input_tokens_uncached_reported_calls += 1
+            if record.cache_read_input_tokens is not None:
+                totals.cache_read_reported_calls += 1
+            if record.cache_creation_input_tokens is not None:
+                totals.cache_creation_reported_calls += 1
             totals.cache_creation_5m_input_tokens += max(
                 0,
                 record.cache_creation_5m_input_tokens or 0,
@@ -1253,6 +1334,13 @@ class UsageSummary:
                 if payload.get("cost_usd") is not None
                 else None
             ),
+            billing_mode=str(payload.get("billing_mode") or BillingMode.METERED_API.value),
+            cost_source=str(payload.get("cost_source") or CostSource.UNKNOWN.value),
+            provider_cost_usd=(
+                _safe_float(payload.get("provider_cost_usd"))
+                if payload.get("provider_cost_usd") is not None
+                else None
+            ),
             usage_source=str(payload.get("usage_source") or "estimate"),
             usage_source_detail=str(
                 payload.get("usage_source_detail")
@@ -1282,6 +1370,7 @@ class UsageSummary:
             cached_prompt_tokens=_safe_int(payload.get("cached_prompt_tokens")),
             uncached_prompt_tokens=_safe_int(payload.get("uncached_prompt_tokens")),
             input_tokens_uncached=_safe_int(payload.get("input_tokens_uncached")),
+            input_tokens_uncached_derived=bool(payload.get("input_tokens_uncached_derived")),
             cache_read_input_tokens=(
                 _safe_int(payload.get("cache_read_input_tokens"))
                 if payload.get("cache_read_input_tokens") is not None
@@ -1334,6 +1423,11 @@ class UsageSummary:
                         ),
                         "known_cost_calls": totals.known_cost_calls,
                         "unknown_cost_count": totals.unknown_cost_count,
+                        "provider_reported_cost_calls": totals.provider_reported_cost_calls,
+                        "catalog_estimated_cost_calls": totals.catalog_estimated_cost_calls,
+                        "subscription_calls": totals.subscription_calls,
+                        "included_calls": totals.included_calls,
+                        "local_calls": totals.local_calls,
                         "api_usage_calls": totals.api_usage_calls,
                         "estimate_usage_calls": totals.estimate_usage_calls,
                         "authoritative_usage_calls": totals.authoritative_usage_calls,
@@ -1366,6 +1460,14 @@ class UsageSummary:
                         "cache_creation_input_tokens": totals.cache_creation_input_tokens,
                         "cache_creation_5m_input_tokens": (totals.cache_creation_5m_input_tokens),
                         "cache_creation_1h_input_tokens": (totals.cache_creation_1h_input_tokens),
+                        "input_tokens_uncached_reported_calls": (
+                            totals.input_tokens_uncached_reported_calls
+                        ),
+                        "input_tokens_uncached_derived_calls": (
+                            totals.input_tokens_uncached_derived_calls
+                        ),
+                        "cache_read_reported_calls": totals.cache_read_reported_calls,
+                        "cache_creation_reported_calls": totals.cache_creation_reported_calls,
                         "reasoning_tokens": totals.reasoning_tokens,
                         "cache_cost_pricing_missing_calls": (
                             totals.cache_cost_pricing_missing_calls
@@ -1407,6 +1509,15 @@ class UsageSummary:
             known_cost = sum(v.known_cost_usd for v in self._by_model.values())
             known_cost_calls = sum(v.known_cost_calls for v in self._by_model.values())
             unknown_cost_calls = sum(v.unknown_cost_count for v in self._by_model.values())
+            provider_reported_cost_calls = sum(
+                v.provider_reported_cost_calls for v in self._by_model.values()
+            )
+            catalog_estimated_cost_calls = sum(
+                v.catalog_estimated_cost_calls for v in self._by_model.values()
+            )
+            subscription_calls = sum(v.subscription_calls for v in self._by_model.values())
+            included_calls = sum(v.included_calls for v in self._by_model.values())
+            local_calls = sum(v.local_calls for v in self._by_model.values())
             api_usage_calls = sum(v.api_usage_calls for v in self._by_model.values())
             estimate_usage_calls = sum(v.estimate_usage_calls for v in self._by_model.values())
             authoritative_usage_calls = sum(
@@ -1428,6 +1539,18 @@ class UsageSummary:
             )
             cache_creation_1h_input_tokens = sum(
                 v.cache_creation_1h_input_tokens for v in self._by_model.values()
+            )
+            input_tokens_uncached_reported_calls = sum(
+                v.input_tokens_uncached_reported_calls for v in self._by_model.values()
+            )
+            input_tokens_uncached_derived_calls = sum(
+                v.input_tokens_uncached_derived_calls for v in self._by_model.values()
+            )
+            cache_read_reported_calls = sum(
+                v.cache_read_reported_calls for v in self._by_model.values()
+            )
+            cache_creation_reported_calls = sum(
+                v.cache_creation_reported_calls for v in self._by_model.values()
             )
             reasoning_tokens = sum(v.reasoning_tokens for v in self._by_model.values())
             cache_cost_pricing_missing_calls = sum(
@@ -1489,6 +1612,11 @@ class UsageSummary:
                 "known_cost_usd": known_cost,
                 "known_cost_calls": known_cost_calls,
                 "unknown_cost_calls": unknown_cost_calls,
+                "provider_reported_cost_calls": provider_reported_cost_calls,
+                "catalog_estimated_cost_calls": catalog_estimated_cost_calls,
+                "subscription_calls": subscription_calls,
+                "included_calls": included_calls,
+                "local_calls": local_calls,
                 "api_usage_calls": api_usage_calls,
                 "estimate_usage_calls": estimate_usage_calls,
                 "authoritative_usage_calls": authoritative_usage_calls,
@@ -1514,6 +1642,10 @@ class UsageSummary:
                 "cache_creation_input_tokens": cache_creation_input_tokens,
                 "cache_creation_5m_input_tokens": cache_creation_5m_input_tokens,
                 "cache_creation_1h_input_tokens": cache_creation_1h_input_tokens,
+                "input_tokens_uncached_reported_calls": input_tokens_uncached_reported_calls,
+                "input_tokens_uncached_derived_calls": input_tokens_uncached_derived_calls,
+                "cache_read_reported_calls": cache_read_reported_calls,
+                "cache_creation_reported_calls": cache_creation_reported_calls,
                 "reasoning_tokens": reasoning_tokens,
                 "cache_cost_pricing_missing_calls": cache_cost_pricing_missing_calls,
                 "request_token_estimate": {

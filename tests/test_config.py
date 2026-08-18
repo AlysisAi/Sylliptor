@@ -53,6 +53,7 @@ from sylliptor_agent_cli.profiles import (
     add_profile,
     get_active_profile,
     get_profile,
+    resolve_effective_base_url,
     set_active_profile,
 )
 from sylliptor_agent_cli.step_budget import (
@@ -301,13 +302,13 @@ def test_set_model_alias_switches_to_matching_provider_profile(
     )
     set_active_profile(cfg, "anthropic")
 
-    set_config_value(cfg, "model", "gpt-5-5")
+    set_config_value(cfg, "model", "gpt-5-6-terra")
 
     profile = get_active_profile(cfg)
     assert profile.name == "default"
     assert cfg.base_url == "https://api.openai.com/v1"
-    assert cfg.model == "gpt-5.5"
-    assert profile.default_model == "gpt-5.5"
+    assert cfg.model == "gpt-5.6-terra"
+    assert profile.default_model == "gpt-5.6-terra"
 
 
 def test_set_model_alias_keeps_active_gateway_profile(
@@ -317,13 +318,13 @@ def test_set_model_alias_keeps_active_gateway_profile(
     cfg = load_config()
     set_config_value(cfg, "base_url", "https://openrouter.ai/api/v1")
 
-    set_config_value(cfg, "model", "gpt-5-5")
+    set_config_value(cfg, "model", "gpt-5-6-terra")
 
     profile = get_active_profile(cfg)
     assert profile.name == "openrouter"
     assert cfg.base_url == "https://openrouter.ai/api/v1"
-    assert cfg.model == "openai/gpt-5.5"
-    assert profile.default_model == "openai/gpt-5.5"
+    assert cfg.model == "openai/gpt-5.6-terra"
+    assert profile.default_model == "openai/gpt-5.6-terra"
 
 
 def test_set_model_canonicalizes_active_provider_numeric_alias(
@@ -360,8 +361,8 @@ def test_set_model_canonicalizes_legacy_numeric_separator_alias(
 
     profile = get_active_profile(cfg)
     assert profile.name == "mistral"
-    assert cfg.model == "mistral-medium-2604"
-    assert profile.default_model == "mistral-medium-2604"
+    assert cfg.model == "mistral-medium-3-5"
+    assert profile.default_model == "mistral-medium-3-5"
 
 
 @pytest.mark.parametrize(
@@ -471,7 +472,7 @@ def test_load_config_repairs_known_model_provider_mismatch(
         json.dumps(
             {
                 "base_url": "https://api.anthropic.com/v1/",
-                "model": "gpt-5-5",
+                "model": "gpt-5-6-terra",
                 "active_profile": "anthropic",
                 "profiles": {
                     "anthropic": {
@@ -479,7 +480,7 @@ def test_load_config_repairs_known_model_provider_mismatch(
                         "base_url": "https://api.anthropic.com/v1/",
                         "api_key_env": "ANTHROPIC_API_KEY",
                         "extra_headers": {},
-                        "default_model": "gpt-5-5",
+                        "default_model": "gpt-5-6-terra",
                         "web_search_adapter": "auto",
                         "web_search_model": "",
                         "notes": "",
@@ -494,10 +495,107 @@ def test_load_config_repairs_known_model_provider_mismatch(
 
     assert cfg.extra_fields["active_profile"] == "openai"
     assert cfg.base_url == "https://api.openai.com/v1"
-    assert cfg.model == "gpt-5.5"
+    assert cfg.model == "gpt-5.6-terra"
     profile = get_profile(cfg, "openai")
     assert profile is not None
-    assert profile.default_model == "gpt-5.5"
+    assert profile.default_model == "gpt-5.6-terra"
+
+
+def test_load_config_keeps_explicit_custom_profile_with_preset_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    direct_base_url = "https://token-plan-ams.xiaomimimo.com/v1"
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "base_url": direct_base_url,
+                "model": "mimo-v2.5-pro",
+                "active_profile": "mimo",
+                "profiles": {
+                    "sylliptor": {
+                        "protocol": "openai_compat",
+                        "base_url": (
+                            "https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1"
+                        ),
+                        "extra_headers": {},
+                        "default_model": "mimo-v2.5-pro",
+                        "web_search_adapter": "openrouter",
+                        "web_search_model": "",
+                        "notes": "Hosted MiMo trial.",
+                    },
+                    "mimo": {
+                        "protocol": "openai_compat",
+                        "base_url": direct_base_url,
+                        "extra_headers": {},
+                        "default_model": "mimo-v2.5-pro",
+                        "web_search_adapter": "auto",
+                        "web_search_model": "",
+                        "notes": "Direct Xiaomi endpoint.",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_config()
+
+    assert cfg.extra_fields["active_profile"] == "mimo"
+    assert cfg.model == "mimo-v2.5-pro"
+    profile = get_active_profile(cfg)
+    assert profile.name == "mimo"
+    assert resolve_effective_base_url(cfg=cfg, profile=profile) == direct_base_url
+
+
+def test_load_config_preset_active_profile_model_autoalign_preserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "base_url": "https://api.openai.com/v1",
+                "model": "claude-sonnet-4-6",
+                "active_profile": "openai",
+                "profiles": {
+                    "openai": {
+                        "protocol": "openai_compat",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key_env": "OPENAI_API_KEY",
+                        "extra_headers": {},
+                        "default_model": "claude-sonnet-4-6",
+                        "web_search_adapter": "auto",
+                        "web_search_model": "",
+                        "notes": "",
+                    },
+                    "anthropic": {
+                        "protocol": "anthropic_messages",
+                        "base_url": "https://api.anthropic.com/v1",
+                        "api_key_env": "ANTHROPIC_API_KEY",
+                        "extra_headers": {},
+                        "default_model": "claude-sonnet-4-6",
+                        "web_search_adapter": "anthropic_messages",
+                        "web_search_model": "claude-sonnet-4-6",
+                        "notes": "",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_config()
+
+    assert cfg.extra_fields["active_profile"] == "anthropic"
+    assert cfg.model == "claude-sonnet-5"
+    profile = get_active_profile(cfg)
+    assert profile.name == "anthropic"
+    assert profile.base_url == "https://api.anthropic.com/v1"
 
 
 def test_clear_persisted_api_key_removes_credentials_file(

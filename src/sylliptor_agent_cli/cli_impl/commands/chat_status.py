@@ -5,6 +5,7 @@ from __future__ import annotations
 from .cli_common import *
 from .update import _cached_update_status_summary
 from ...config import resolve_web_search_policy
+from ...personas import normalize_persona, persona_modes_enabled
 from ...llm_error_display import classify_llm_error_display, friendly_llm_error_message
 from ...llm.protocols import OPENAI_COMPAT_PROTOCOL, get_provider_protocol_capabilities
 from ...profiles import get_active_profile, resolve_effective_base_url
@@ -104,6 +105,14 @@ def _print_chat_status(
     table.add_column("setting")
     table.add_column("value", overflow="fold")
     table.add_row("mode", _chat_mode_status_label(mode))
+    if persona_modes_enabled(getattr(session, "cfg", None)):
+        table.add_row(
+            "persona",
+            normalize_persona(
+                getattr(session, "persona", "code"),
+                getattr(session, "persona_registry", None),
+            ),
+        )
     table.add_row("trace", _chat_trace_level(session))
     table.add_row("model", str(model))
     table.add_row("protocol", active_protocol)
@@ -293,6 +302,20 @@ def _chat_status_panel_spec(*, session: Any, pending_images: list[str]) -> dict[
 
     session_rows: list[tuple[str, str, str]] = [
         ("mode", _chat_mode_status_label(mode), "accent"),
+        *(
+            [
+                (
+                    "persona",
+                    normalize_persona(
+                        getattr(session, "persona", "code"),
+                        getattr(session, "persona_registry", None),
+                    ),
+                    "accent",
+                )
+            ]
+            if persona_modes_enabled(getattr(session, "cfg", None))
+            else []
+        ),
         ("model", str(model), "accent"),
         ("trace", _chat_trace_level(session), "plain"),
         ("session", str(getattr(getattr(session, "store", None), "session_id", "-")), "dim"),
@@ -477,7 +500,8 @@ def _print_chat_usage(*, console: Console, session: Any) -> None:
         return
     table = _Table(title="Usage")
     table.add_column("model")
-    table.add_column("input", justify="right")
+    table.add_column("input total", justify="right")
+    table.add_column("uncached", justify="right")
     table.add_column("cache read", justify="right")
     table.add_column("cache write", justify="right")
     table.add_column("output", justify="right")
@@ -485,42 +509,68 @@ def _print_chat_usage(*, console: Console, session: Any) -> None:
     table.add_column("cost", justify="right")
     table.add_column("source", justify="right")
     for row in rows:
-        unknown_count = int(row.get("unknown_cost_count") or 0)
-        cost_display = _format_usage_cost_for_display(
-            known_cost=_known_cost_value(row),
-            unknown_calls=unknown_count,
-        )
+        cost_display = _format_usage_billing_for_display(row)
         table.add_row(
             str(row.get("model") or "-"),
             _format_exact_token_count(row.get("prompt_tokens")),
-            _format_exact_token_count(row.get("cache_read_input_tokens")),
-            _format_exact_token_count(row.get("cache_creation_input_tokens")),
+            _format_reported_token_total(
+                row,
+                token_key="input_tokens_uncached",
+                reported_calls_key="input_tokens_uncached_reported_calls",
+                derived_calls_key="input_tokens_uncached_derived_calls",
+            ),
+            _format_reported_token_total(
+                row,
+                token_key="cache_read_input_tokens",
+                reported_calls_key="cache_read_reported_calls",
+            ),
+            _format_reported_token_total(
+                row,
+                token_key="cache_creation_input_tokens",
+                reported_calls_key="cache_creation_reported_calls",
+            ),
             _format_exact_token_count(row.get("completion_tokens")),
             _format_exact_token_count(row.get("total_tokens")),
             cost_display,
             _format_usage_source_for_display(row),
         )
     totals = summary.totals()
-    total_cost = _format_usage_cost_for_display(
-        known_cost=_known_cost_value(totals),
-        unknown_calls=int(totals.get("unknown_cost_calls") or 0),
-    )
+    total_cost = _format_usage_billing_for_display(totals)
     unknown_total = int(totals.get("unknown_cost_calls") or 0)
     table.add_row(
         "TOTAL",
         _format_exact_token_count(totals.get("prompt_tokens")),
-        _format_exact_token_count(totals.get("cache_read_input_tokens")),
-        _format_exact_token_count(totals.get("cache_creation_input_tokens")),
+        _format_reported_token_total(
+            totals,
+            token_key="input_tokens_uncached",
+            reported_calls_key="input_tokens_uncached_reported_calls",
+            derived_calls_key="input_tokens_uncached_derived_calls",
+        ),
+        _format_reported_token_total(
+            totals,
+            token_key="cache_read_input_tokens",
+            reported_calls_key="cache_read_reported_calls",
+        ),
+        _format_reported_token_total(
+            totals,
+            token_key="cache_creation_input_tokens",
+            reported_calls_key="cache_creation_reported_calls",
+        ),
         _format_exact_token_count(totals.get("completion_tokens")),
         _format_exact_token_count(totals.get("total_tokens")),
         total_cost,
         _format_usage_source_for_display(totals),
     )
     console.print(table)
+    console.print(
+        "[dim]Processed tokens are cumulative input + output across calls; they are not the "
+        "current context-window size. Cache read/write are input subdivisions and appear only "
+        "when the provider reports them. A ~ dollar amount is a catalog estimate, not an invoice.[/dim]"
+    )
     if unknown_total > 0:
         console.print(
             "[yellow]Total cost is partial:[/yellow] "
-            f"{unknown_total} call(s) unmetered because pricing metadata is missing."
+            f"{unknown_total} call(s) have unknown cost because pricing metadata is missing."
         )
     cache_cost_unknown = int(totals.get("cache_cost_pricing_missing_calls") or 0)
     if cache_cost_unknown > 0:

@@ -2,17 +2,14 @@ from __future__ import annotations
 
 import base64
 import copy
-import hashlib
-import inspect
 import json
-import math
 import mimetypes
 import re
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, cast
+from typing import Any
 
 import httpx
 
@@ -21,7 +18,6 @@ from .assets.plan_binding import parse_task_asset_briefing, serialize_task_asset
 from .assets.planner_context import PlannerAssetsBundle, build_planner_assets_bundle
 from .assets.planner_tools import PLANNER_ASSET_TOOLS, PlannerAssetToolRunner
 from .assets.surface import AssetSurface, build_asset_surface, run_paths_support_asset_surface
-from .branding import env_get
 from .config import (
     AppConfig,
     ConfigError,
@@ -54,7 +50,20 @@ from .model_metadata_policy import (
     evaluate_active_model_metadata_policy,
 )
 from .model_registry import ModelRegistry
-from .model_router import PREFER_CONTEXT_FORGE, ROLE_PLANNER, ROLE_ROUTER, resolve_model_for_role
+from .model_router import ROLE_PLANNER, resolve_model_for_role
+from .plan_repair import (
+    TERMINAL_FAILED,
+    TERMINAL_FORCED_DRAFT,
+    TERMINAL_HOST_REPAIRED,
+    TERMINAL_VALIDATED,
+    PlannerRepairReport,
+    execution_readiness_errors,
+    host_repaired_field_paths,
+    payload_awaits_clarification,
+    plan_update_proposes_task_work,
+    repair_retry_instruction,
+    resolve_plan_repair_policy,
+)
 from .planning_constraints import (
     PLANNING_CONSTRAINTS_KEY,
     merge_latest_planning_scope_constraints,
@@ -93,7 +102,7 @@ from .task_readiness import (
     task_requires_runnable_file_scope as _task_requires_runnable_file_scope,
 )
 from .task_scope import extract_repo_path_hints
-from .usage_tracker import build_usage_record
+from .usage_tracker import build_usage_record, usage_context_from_client_response
 
 PLANNER_SYSTEM_PROMPT = """You are PLANNER - a senior engineering lead responsible for producing actionable forge plan updates.
 
@@ -203,54 +212,9 @@ Examples
 - User: "drop TOML entirely and use APP_TIMEOUT_SECONDS instead" -> assistant_message concise summary; plan_update supersedes/removes TOML planned work, removes TOML requirements, and adds scoped env-var replacement tasks.
 """
 
-PLANNER_ROUTER_SYSTEM_PROMPT = """You classify one Forge planner turn before the planner model is allowed to update the plan.
-
-Return STRICT JSON only (no markdown), exactly one object with:
-- route: choose exactly ONE route from: planning, clarification_answer, small_talk, off_topic, command_like, language_override_only.
-- confidence: number from 0.0 to 1.0.
-- reason: short stable reason.
-- reply: required only for routes other than planning and clarification_answer. The reply must be short, user-facing, written in the same language and script as latest_user_message, and must not fall back to English.
-
-Route contract:
-- route="planning": the latest user message provides or changes the project goal, requirements,
-  constraints, task list, implementation direction, acceptance criteria, scope, files, tests, or
-  execution plan.
-- route="clarification_answer": the host says the planner is awaiting clarification and the latest
-  message plausibly answers the pending planner questions, even if it is short.
-- route="small_talk": greetings, thanks, or casual talk without planning content.
-- route="off_topic": questions or requests that do not belong in a Forge planning conversation.
-- route="command_like": the latest message is a CLI/Forge command, for example starts with `/`
-  or `:`, and should be handled by the command layer rather than the planner.
-- route="language_override_only": the latest message only asks for a reply language/script and does
-  not include planning content.
-
-Decision rules:
-- Classify only the latest user message. Use transcript/context only for continuity.
-- If awaiting_clarification=true and latest_user_message is non-empty and not a slash-command,
-  choose clarification_answer unless the message clearly introduces new planning content.
-- Do not infer planning intent from the existence of a repo alone.
-- If the message contains both a language override and planning content, use planning or
-  clarification_answer, not language_override_only.
-- If genuinely uncertain between planning and non-planning, choose planning so the guarded planner
-  and host validation can inspect the content.
-- Keep reason short and stable; do not include private chain of thought.
-
-Examples:
-- Context: {"awaiting_clarification":false,"latest_user_message":"Φτιάξε tests για auth_flow αλλά κράτα το AuthClient API ίδιο"} -> {"route":"planning","confidence":0.94,"reason":"implementation_and_test_request"}
-- Context: {"awaiting_clarification":true,"latest_user_message":"Use PostgreSQL and keep the API stable."} -> {"route":"clarification_answer","confidence":0.91,"reason":"answers_pending_planner_question"}
-- Context: {"awaiting_clarification":false,"latest_user_message":"مرحبا"} -> {"route":"small_talk","confidence":0.9,"reason":"greeting_without_planning_content","reply":"مرحبا. اكتب هدف التخطيط أو التغيير الذي تريد تنفيذه."}
-- Context: {"awaiting_clarification":false,"latest_user_message":"/execute plan"} -> {"route":"command_like","confidence":0.98,"reason":"slash_command_for_command_layer","reply":"Run that command directly in the Forge prompt."}
-- Context: {"awaiting_clarification":false,"latest_user_message":"请以后用中文回复"} -> {"route":"language_override_only","confidence":0.88,"reason":"language_request_without_planning_content","reply":"可以。请告诉我你想规划什么任务。"}
-- Context: {"awaiting_clarification":false,"latest_user_message":"Спасибо"} -> {"route":"small_talk","confidence":0.86,"reason":"thanks_without_planning_content","reply":"Пожалуйста. Напишите, что нужно спланировать или изменить."}
-"""
-
 _PLANNER_STRUCTURED_TEMPERATURE = 0.2
 _JSON_RETRY_TEMPERATURE = 0.5
 _PLANNER_TRANSIENT_REQUEST_MAX_ATTEMPTS = 2
-_PLANNER_ROUTER_MAX_PARSE_ATTEMPTS = 2
-_PLANNER_ROUTER_CONFIDENCE_THRESHOLD_DEFAULT = 0.7
-_PLANNER_ROUTER_CONFIDENCE_THRESHOLD_KEY = "planner_router_confidence_threshold"
-_PLANNER_ROUTER_CONFIDENCE_THRESHOLD_ENV = "SYLLIPTOR_PLANNER_ROUTER_CONFIDENCE_THRESHOLD"
 _RETRYABLE_LLM_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
 _RETRYABLE_LLM_REQUEST_ERROR_MARKERS = (
     "connection aborted",
@@ -272,16 +236,6 @@ class PlannerPayloadError(RuntimeError):
     pass
 
 
-PlannerIntentRoute = Literal[
-    "planning",
-    "clarification_answer",
-    "small_talk",
-    "off_topic",
-    "command_like",
-    "language_override_only",
-]
-
-
 @dataclass(frozen=True)
 class PlannerTurnResult:
     assistant_message: str
@@ -290,37 +244,12 @@ class PlannerTurnResult:
     error: str | None = None
     failure_category: FailureCategory | str | None = None
     request_retry_count: int = 0
-    intent_route: PlannerIntentRoute = "planning"
-    intent_reason: str = ""
-    route: PlannerIntentRoute = "planning"
-    confidence: float = 0.0
-    source: str = "not_applicable"
-    fallback_reason: str | None = None
-    parse_attempts: int = 0
-    request_retries: int = 0
     model: str = ""
-    planner_invoked: bool = True
-    planner_router_event: dict[str, Any] | None = None
     schema_failures: list[dict[str, Any]] = field(default_factory=list)
     usage_events: list[dict[str, Any]] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class PlannerIntentDecision:
-    route: PlannerIntentRoute
-    reason: str
-    planning_relevant: bool
-    confidence: float = 0.0
-    source: str = "router"
-    reply: str = ""
-
-
-@dataclass(frozen=True)
-class PlannerRouterRunResult:
-    decision: PlannerIntentDecision | None
-    error: str | None = None
-    parse_attempts: int = 0
-    request_retries: int = 0
+    # What the validate-and-repair loop did to get here. Always populated, so a
+    # caller can tell a model-authored payload from a salvaged one.
+    repair: PlannerRepairReport = field(default_factory=PlannerRepairReport)
 
 
 @dataclass(frozen=True)
@@ -388,63 +317,6 @@ _KNOWN_NON_SOURCE_TOP_LEVEL_DIRS = frozenset(
 OpenAICompatClient = _OpenAICompatClient
 
 
-def _planner_router_user_message_hash(user_text: str) -> str:
-    normalized = str(user_text or "").strip()
-    return hashlib.sha256(normalized.encode("utf-8", errors="surrogatepass")).hexdigest()
-
-
-def _planner_router_event_payload(
-    *,
-    route: str,
-    confidence: float,
-    source: str,
-    model: str | None,
-    fallback_reason: str | None,
-    parse_attempts: int,
-    request_retries: int,
-    planner_invoked: bool,
-    user_text: str,
-) -> dict[str, Any]:
-    clamped_confidence = _coerce_clamped_float(confidence, default=0.0)
-    return {
-        "route": str(route or "planning"),
-        "confidence": clamped_confidence,
-        "source": str(source or "router"),
-        "model": str(model or ""),
-        "fallback_reason": fallback_reason,
-        "parse_attempts": max(0, int(parse_attempts or 0)),
-        "request_retries": max(0, int(request_retries or 0)),
-        "planner_invoked": bool(planner_invoked),
-        "user_message_hash": _planner_router_user_message_hash(user_text),
-    }
-
-
-def _coerce_clamped_float(value: Any, *, default: float) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        parsed = default
-    if not math.isfinite(parsed):
-        parsed = default
-    return max(0.0, min(1.0, parsed))
-
-
-def _planner_router_confidence_threshold(cfg: AppConfig) -> float:
-    env_value = str(env_get(_PLANNER_ROUTER_CONFIDENCE_THRESHOLD_ENV) or "").strip()
-    if env_value:
-        return _coerce_clamped_float(
-            env_value,
-            default=_PLANNER_ROUTER_CONFIDENCE_THRESHOLD_DEFAULT,
-        )
-    cfg_value = None
-    if isinstance(cfg.extra_fields, dict):
-        cfg_value = cfg.extra_fields.get(_PLANNER_ROUTER_CONFIDENCE_THRESHOLD_KEY)
-    return _coerce_clamped_float(
-        cfg_value,
-        default=_PLANNER_ROUTER_CONFIDENCE_THRESHOLD_DEFAULT,
-    )
-
-
 def _strip_json_fence(raw: str) -> str:
     text = str(raw or "").strip()
     if not text.startswith("```"):
@@ -477,184 +349,6 @@ def _extract_balanced_json_object(raw: str) -> str | None:
     return None
 
 
-def _extract_json_object(raw: str) -> str | None:
-    return _extract_balanced_json_object(raw)
-
-
-def _planner_non_planning_result(
-    decision: PlannerIntentDecision,
-    *,
-    model: str = "",
-    fallback_reason: str | None = None,
-    parse_attempts: int = 0,
-    request_retries: int = 0,
-    planner_router_event: dict[str, Any] | None = None,
-) -> PlannerTurnResult:
-    if decision.planning_relevant:
-        return _planner_error(
-            "Planner router returned an invalid non-planning result.",
-            error=f"planner_router_unexpected_planning_route: {decision.route}",
-            intent_route=decision.route,
-            intent_reason=decision.reason,
-            route=decision.route,
-            confidence=decision.confidence,
-            source=decision.source,
-            fallback_reason=fallback_reason,
-            parse_attempts=parse_attempts,
-            request_retries=request_retries,
-            model=model,
-            planner_invoked=False,
-            planner_router_event=planner_router_event,
-        )
-    message = str(decision.reply or "").strip()
-    if not message:
-        return _planner_error(
-            "Planner router returned a non-planning route without a reply.",
-            error=f"planner_router_missing_reply: {decision.route}",
-            intent_route=decision.route,
-            intent_reason=decision.reason,
-            route=decision.route,
-            confidence=decision.confidence,
-            source=decision.source,
-            fallback_reason=fallback_reason,
-            parse_attempts=parse_attempts,
-            request_retries=request_retries,
-            model=model,
-            planner_invoked=False,
-            planner_router_event=planner_router_event,
-        )
-    return PlannerTurnResult(
-        assistant_message=message,
-        questions=[],
-        plan_update=None,
-        intent_route=decision.route,
-        intent_reason=decision.reason,
-        route=decision.route,
-        confidence=decision.confidence,
-        source=decision.source,
-        fallback_reason=fallback_reason,
-        parse_attempts=parse_attempts,
-        request_retries=request_retries,
-        model=model,
-        planner_invoked=False,
-        planner_router_event=planner_router_event,
-    )
-
-
-def _planner_router_context_prompt(
-    *,
-    plan: dict[str, Any],
-    transcript_tail: list[dict[str, Any]],
-    user_text: str,
-    awaiting_clarification: bool,
-    pending_questions: list[str] | None,
-    workspace_context: dict[str, Any] | None,
-) -> str:
-    del workspace_context
-    tasks = plan.get("tasks") if isinstance(plan, dict) else None
-    plan_task_count = len(tasks) if isinstance(tasks, list) else 0
-    recent_transcript_tail = [
-        {
-            "role": entry["role"],
-            "content": _truncate_text(entry["content"], 800),
-        }
-        for entry in _normalize_transcript_tail(transcript_tail)[-4:]
-    ]
-    payload: dict[str, Any] = {
-        "awaiting_clarification": bool(awaiting_clarification),
-        "latest_user_message": _truncate_text(str(user_text or ""), 4000),
-        "pending_questions": [
-            _truncate_text(str(item), 500) for item in pending_questions or [] if str(item).strip()
-        ][:3],
-        "plan_goal_one_line": _truncate_text(
-            str(plan.get("project_goal") or "") if isinstance(plan, dict) else "",
-            500,
-        ),
-        "plan_task_count": plan_task_count,
-        "recent_transcript_tail": recent_transcript_tail,
-    }
-    return (
-        "Classify this Forge planner turn from the host context JSON below.\n"
-        f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
-    )
-
-
-def _parse_planner_intent_decision(raw: str) -> tuple[PlannerIntentDecision | None, str | None]:
-    payload_raw = _extract_json_object(raw)
-    if payload_raw is None:
-        return None, "router_response_missing_json_object"
-    try:
-        payload = json.loads(payload_raw)
-    except json.JSONDecodeError as e:
-        return None, f"router_response_invalid_json: {e}"
-    if not isinstance(payload, dict):
-        return None, "router_response_must_be_object"
-
-    route_raw = str(payload.get("route") or "").strip().lower()
-    if route_raw not in {
-        "planning",
-        "clarification_answer",
-        "small_talk",
-        "off_topic",
-        "command_like",
-        "language_override_only",
-    }:
-        return None, f"router_response_invalid_route: {route_raw or '(empty)'}"
-    confidence = _coerce_clamped_float(payload.get("confidence"), default=0.0)
-    reason = str(payload.get("reason") or route_raw).strip()[:160]
-    reply = str(payload.get("reply") or "").strip()
-    if route_raw not in {"planning", "clarification_answer"} and not reply:
-        return None, f"router_response_missing_reply: {route_raw}"
-    route = cast(PlannerIntentRoute, route_raw)
-    return (
-        PlannerIntentDecision(
-            route=route,
-            reason=reason or route_raw,
-            planning_relevant=route_raw in {"planning", "clarification_answer"},
-            confidence=confidence,
-            source="router",
-            reply=reply,
-        ),
-        None,
-    )
-
-
-def _call_supports_kwarg(callable_obj: Any, name: str) -> bool:
-    signature = inspect.signature(callable_obj)
-    parameters = signature.parameters
-    if name in parameters:
-        return True
-    return any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-
-
-def _chat_kwargs_for_signature(callable_obj: Any, **kwargs: Any) -> dict[str, Any]:
-    return {key: value for key, value in kwargs.items() if _call_supports_kwarg(callable_obj, key)}
-
-
-def _planner_router_chat(
-    *,
-    client: Any,
-    messages: list[dict[str, Any]],
-    temperature: float | None,
-) -> Any:
-    chat = client.chat
-    optional_kwargs = _chat_kwargs_for_signature(
-        chat,
-        stream=False,
-        temperature=temperature,
-    )
-    if temperature is None:
-        optional_kwargs.pop("temperature", None)
-    try:
-        return chat(messages=messages, **optional_kwargs)
-    except LLMError as e:
-        if "temperature" in optional_kwargs and _is_unsupported_temperature_error(e):
-            retry_kwargs = dict(optional_kwargs)
-            retry_kwargs.pop("temperature", None)
-            return chat(messages=messages, **retry_kwargs)
-        raise
-
-
 def _planner_response_tool_calls(response: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for tool_call in list(getattr(response, "tool_calls", []) or []):
@@ -675,9 +369,19 @@ def _planner_usage_event_payload(
     request_messages: list[dict[str, Any]],
     response: Any,
     registry: ModelRegistry,
+    client: ChatClient | None = None,
 ) -> dict[str, Any] | None:
     try:
         usage = getattr(response, "usage", None)
+        usage_context = (
+            usage_context_from_client_response(
+                client=client,
+                response=response,
+                operation="forge_planner",
+            )
+            if client is not None
+            else {}
+        )
         usage_record = build_usage_record(
             role=role,
             requested_model=requested_model,
@@ -701,100 +405,11 @@ def _planner_usage_event_payload(
             # (billed at 1.0x instead of the cache-write rate).
             api_usage=usage,
             registry=registry,
+            **usage_context,
         )
     except Exception:
         return None
     return usage_record.to_payload()
-
-
-def _run_planner_intent_router(
-    *,
-    client: Any,
-    plan: dict[str, Any],
-    transcript_tail: list[dict[str, Any]],
-    user_text: str,
-    awaiting_clarification: bool,
-    pending_questions: list[str] | None,
-    workspace_context: dict[str, Any] | None,
-) -> PlannerRouterRunResult:
-    user_prompt = _planner_router_context_prompt(
-        plan=plan,
-        transcript_tail=transcript_tail,
-        user_text=user_text,
-        awaiting_clarification=awaiting_clarification,
-        pending_questions=pending_questions,
-        workspace_context=workspace_context,
-    )
-    messages = [
-        {"role": "system", "content": PLANNER_ROUTER_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
-    request_retries = 0
-    parse_attempts = 0
-    parse_error: str | None = None
-    previous_content = ""
-
-    for parse_index in range(_PLANNER_ROUTER_MAX_PARSE_ATTEMPTS):
-        request_messages = messages
-        temperature = 0.0
-        request_error_prefix = "planner_router_request_failed"
-        if parse_index > 0:
-            request_messages = [
-                {"role": "system", "content": PLANNER_ROUTER_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"{user_prompt}\n\n"
-                        "The previous router response did not match the required JSON contract.\n"
-                        f"Validation error: {parse_error or 'unknown'}\n"
-                        f"Previous response: {previous_content[:2000]}\n"
-                        "Return exactly one valid router JSON object now."
-                    ),
-                },
-            ]
-            temperature = _JSON_RETRY_TEMPERATURE
-            request_error_prefix = "planner_router_repair_request_failed"
-
-        request_attempt = 0
-        while True:
-            try:
-                response = _planner_router_chat(
-                    client=client,
-                    messages=request_messages,
-                    temperature=temperature,
-                )
-                break
-            except LLMError as e:
-                if (
-                    request_attempt < _PLANNER_TRANSIENT_REQUEST_MAX_ATTEMPTS - 1
-                    and _is_retryable_planner_request_error(e)
-                ):
-                    request_attempt += 1
-                    request_retries += 1
-                    continue
-                return PlannerRouterRunResult(
-                    decision=None,
-                    error=f"{request_error_prefix}: {e}",
-                    parse_attempts=parse_attempts,
-                    request_retries=request_retries,
-                )
-
-        previous_content = str(getattr(response, "content", "") or "").strip()
-        parse_attempts += 1
-        decision, parse_error = _parse_planner_intent_decision(previous_content)
-        if decision is not None:
-            return PlannerRouterRunResult(
-                decision=decision,
-                parse_attempts=parse_attempts,
-                request_retries=request_retries,
-            )
-
-    return PlannerRouterRunResult(
-        decision=None,
-        error=parse_error or "planner_router_invalid_response",
-        parse_attempts=parse_attempts,
-        request_retries=request_retries,
-    )
 
 
 def _explicit_task_id_hints(text: str) -> list[str]:
@@ -1848,6 +1463,18 @@ def _apply_repo_grounding_fallback(
         return validated
 
     user_asked_locator = _user_text_requests_repo_locator(user_text)
+    # Only ground a plan when the USER's latest message actually asks for repository
+    # work. A planner clarifying question that merely mentions files/modules/the
+    # codebase is not, on its own, grounds to fabricate a task for a conversational
+    # turn (e.g. "can you help me" / "who are you"); keep the planner's reply and
+    # questions instead of synthesizing a spurious repository-locator task.
+    user_requests_repo_work = (
+        user_asked_locator
+        or _has_mutating_task_action_clause(user_text)
+        or _contains_mutating_task_signal(user_text)
+    )
+    if not user_requests_repo_work:
+        return validated
     if not planner_asked_locator and not user_asked_locator:
         return validated
     if not _workspace_has_existing_repo_context(workspace_context):
@@ -1961,6 +1588,64 @@ def _greenfield_scaffold_plan_fallback(
         ]
     }
     return fallback
+
+
+def _force_draft_plan_fallback(
+    *,
+    validated: dict[str, Any],
+    plan: dict[str, Any],
+    user_text: str,
+    workspace_context: dict[str, Any] | None,
+    clarification_rounds: int,
+) -> dict[str, Any] | None:
+    """Turn a stuck clarification loop into a concrete draft plan.
+
+    Reuses the fallbacks the grounding path already trusts, but without their
+    "is this request clearly repository work?" gate: by the time this runs the
+    planner has had its clarifying rounds and spent them, so the useful move is
+    a draft the user can correct rather than another question.
+
+    Returns ``None`` when there is nothing concrete to draft -- with no request
+    text and no workspace to ground against, an invented task would be worse
+    than the question.
+    """
+    request_text = str(user_text or "").strip()
+    if not request_text:
+        return None
+
+    if _workspace_context_is_greenfield(workspace_context):
+        draft = _greenfield_scaffold_plan_fallback(
+            validated=validated,
+            user_text=request_text,
+            workspace_context=workspace_context,
+        )
+    elif _workspace_has_existing_repo_context(workspace_context):
+        draft = _apply_repo_grounding_fallback(
+            validated=validated,
+            plan=plan,
+            user_text=request_text,
+            workspace_context=workspace_context,
+        )
+        if not draft.get("plan_update"):
+            # The grounding path declined (it only mutates when the request reads
+            # as repository work); a read-only locator task is still a concrete
+            # next step and cannot damage anything.
+            draft = _repo_locator_report_fallback(validated=validated, user_text=request_text)
+    else:
+        draft = _repo_locator_report_fallback(validated=validated, user_text=request_text)
+
+    if not draft.get("plan_update"):
+        return None
+
+    rounds_word = "round" if clarification_rounds == 1 else "rounds"
+    draft = dict(draft)
+    draft["questions"] = []
+    draft["assistant_message"] = (
+        f"After {clarification_rounds} clarification {rounds_word} without a plan, I drafted "
+        "one from what you have told me so far. Review and correct it -- it is saved as a "
+        "draft, not as an execution-ready plan.\n\n" + str(draft.get("assistant_message") or "")
+    ).strip()
+    return draft
 
 
 def _repo_locator_report_fallback(
@@ -2747,21 +2432,11 @@ def _planner_error(
     error: str,
     request_retry_count: int = 0,
     failure_category: FailureCategory | str | None = FailureCategory.PLANNER_FAILED,
-    intent_route: PlannerIntentRoute = "planning",
-    intent_reason: str = "",
-    route: PlannerIntentRoute | None = None,
-    confidence: float = 0.0,
-    source: str = "not_applicable",
-    fallback_reason: str | None = None,
-    parse_attempts: int = 0,
-    request_retries: int = 0,
     model: str = "",
-    planner_invoked: bool = True,
-    planner_router_event: dict[str, Any] | None = None,
     schema_failures: list[dict[str, Any]] | None = None,
     usage_events: list[dict[str, Any]] | None = None,
+    repair: PlannerRepairReport | None = None,
 ) -> PlannerTurnResult:
-    result_route = route or intent_route
     return PlannerTurnResult(
         assistant_message=message,
         questions=[],
@@ -2769,19 +2444,12 @@ def _planner_error(
         error=error,
         failure_category=failure_category_value(failure_category),
         request_retry_count=request_retry_count,
-        intent_route=intent_route,
-        intent_reason=intent_reason,
-        route=result_route,
-        confidence=confidence,
-        source=source,
-        fallback_reason=fallback_reason,
-        parse_attempts=parse_attempts,
-        request_retries=request_retries,
         model=model,
-        planner_invoked=planner_invoked,
-        planner_router_event=planner_router_event,
         schema_failures=list(schema_failures or []),
         usage_events=list(usage_events or []),
+        repair=repair
+        if repair is not None
+        else PlannerRepairReport(terminal_state=TERMINAL_FAILED),
     )
 
 
@@ -3128,13 +2796,55 @@ def _retry_schema_prompt(*, validation_error: str, previous_response: str) -> st
 def _planner_retry_user_prompt(
     *,
     base_prompt: str,
-    validation_error: str,
     previous_response: str,
+    validation_error: str = "",
+    validation_errors: list[str] | None = None,
+    attempt: int | None = None,
+    max_attempts: int | None = None,
+    kind: str = "schema",
 ) -> str:
+    """Build the correction prompt for one repair attempt.
+
+    Without ``attempt``/``max_attempts`` this is the original single-retry prompt,
+    unchanged. With them it also carries the attempt number and the strictness
+    rung for that attempt, so a model that ignored the polite ask gets a blunter
+    one rather than the same words again.
+    """
+    errors = [str(item).strip() for item in (validation_errors or []) if str(item).strip()]
+    if not errors and str(validation_error or "").strip():
+        errors = [str(validation_error).strip()]
+    primary_error = errors[0] if errors else "schema mismatch"
+
+    if attempt is None or max_attempts is None:
+        return (
+            f"{base_prompt}\n\n"
+            "Schema repair follow-up:\n"
+            f"{_retry_schema_prompt(validation_error=primary_error, previous_response=previous_response)}"
+        )
+
+    if kind == "execution_readiness":
+        # The payload was well-formed; calling this a schema failure would be a
+        # lie and would point the model at the wrong thing to fix.
+        escalation = repair_retry_instruction(
+            attempt=attempt,
+            max_attempts=max_attempts,
+            validation_errors=errors,
+            previous_response=previous_response,
+            kind=kind,
+        )
+        return f"{base_prompt}\n\nExecution-readiness repair follow-up:\n{escalation}"
+
+    escalation = repair_retry_instruction(
+        attempt=attempt,
+        max_attempts=max_attempts,
+        validation_errors=errors,
+        kind=kind,
+    )
     return (
         f"{base_prompt}\n\n"
         "Schema repair follow-up:\n"
-        f"{_retry_schema_prompt(validation_error=validation_error, previous_response=previous_response)}"
+        f"{_retry_schema_prompt(validation_error=primary_error, previous_response=previous_response)}"
+        f"\n\n{escalation}"
     )
 
 
@@ -3256,6 +2966,159 @@ def _parse_repair_validate(content: str) -> tuple[dict[str, Any] | None, str | N
             return None, str(repaired_error)
 
 
+def _parse_validate_strict(content: str) -> tuple[dict[str, Any] | None, str | None, Any]:
+    """Parse and validate with no host-side repair.
+
+    Returns ``(validated, error, raw_payload)``. The raw payload is handed back
+    even when validation fails so the exhausted-retries path can still attempt a
+    recorded host repair on it.
+    """
+    try:
+        payload = _parse_json_payload(content)
+    except json.JSONDecodeError as e:
+        return None, f"response is not valid JSON: {e}", None
+
+    try:
+        return _validate_planner_payload(payload), None, payload
+    except PlannerPayloadError as e:
+        return None, str(e), payload
+
+
+def _host_repair_planner_payload(
+    payload: Any,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """Last-resort host repair of a payload the model never got right.
+
+    Returns ``(validated, error, repaired_field_paths)``. The field paths are the
+    difference between what the model sent and what the host had to make of it,
+    so the result can be labelled instead of passed off as model-authored.
+    """
+    repaired = _repair_planner_payload(payload)
+    if repaired is None:
+        return None, "planner payload could not be repaired host-side", []
+    try:
+        validated = _validate_planner_payload(repaired)
+    except PlannerPayloadError as e:
+        return None, str(e), []
+    return validated, None, host_repaired_field_paths(raw=payload, repaired=repaired)
+
+
+def _new_execution_readiness_errors(
+    *,
+    baseline: list[str],
+    current: list[str],
+) -> list[str]:
+    """Readiness failures this planner turn introduced, ignoring pre-existing ones.
+
+    Holding the planner responsible for tasks it never touched would make an
+    already-broken plan un-repairable: every retry would report the same
+    inherited failures and the budget would burn without progress.
+    """
+    known = set(baseline)
+    return [item for item in current if item not in known]
+
+
+def _proposed_task_add_count(plan_update: Any) -> int:
+    entries = plan_update.get("tasks_add") if isinstance(plan_update, dict) else None
+    if not isinstance(entries, list):
+        return 0
+    return sum(1 for item in entries if isinstance(item, dict))
+
+
+def _dropped_task_add_error(
+    *,
+    proposed: int,
+    apply_result: PlanApplyResult,
+) -> str | None:
+    """Report task additions host-side sanitisation threw away.
+
+    Applying a plan update silently skips tasks that fail its own readiness
+    checks. From the outside that looks like the planner did nothing: the turn
+    reports success and the plan is unchanged. Counting what was proposed
+    against what landed turns that silence into something the model can fix.
+    """
+    if proposed <= 0:
+        return None
+    kept = max(len(apply_result.added_task_ids) - len(apply_result.synthesized_task_ids), 0)
+    dropped = proposed - kept
+    if dropped <= 0:
+        return None
+    noun = "task" if dropped == 1 else "tasks"
+    detail = "; ".join(str(warning) for warning in apply_result.warnings[:3])
+    message = f"DROPPED {dropped} of {proposed} proposed tasks_add {noun} as not execution-ready"
+    return f"{message}: {detail}" if detail else message
+
+
+def _unknown_task_update_error(*, plan: dict[str, Any], plan_update: Any) -> str | None:
+    """Report task updates aimed at ids the plan does not have.
+
+    Unlike a no-op patch, an update naming a task that does not exist can never
+    land, so counting these cannot produce a false positive.
+    """
+    patches = plan_update.get("tasks_update") if isinstance(plan_update, dict) else None
+    if not isinstance(patches, list):
+        return None
+    known = {
+        str(task.get("id") or "").strip()
+        for task in plan.get("tasks") or []
+        if isinstance(task, dict)
+    }
+    unknown = [
+        str(patch.get("id") or "").strip()
+        for patch in patches
+        if isinstance(patch, dict) and str(patch.get("id") or "").strip() not in known
+    ]
+    unknown = [task_id for task_id in dict.fromkeys(unknown) if task_id]
+    if not unknown:
+        return None
+    return "DROPPED tasks_update entries for task ids that do not exist in the plan: " + ", ".join(
+        unknown[:8]
+    )
+
+
+def _planner_update_readiness_errors(
+    *,
+    plan: dict[str, Any],
+    plan_update: Any,
+    baseline: list[str],
+    user_text: str,
+    workspace_context: dict[str, Any] | None,
+) -> list[str]:
+    """Execution-readiness failures the proposed update would introduce."""
+    if not plan_update_proposes_task_work(plan_update):
+        # Clarifying turns and goal/requirement edits propose nothing to execute;
+        # the acceptance rules have nothing to say about them.
+        return []
+    simulated_plan = copy.deepcopy(plan)
+    try:
+        apply_result = apply_guarded_planner_plan_update(
+            simulated_plan,
+            copy.deepcopy(plan_update),
+            latest_user_text=user_text,
+            workspace_context=workspace_context,
+        )
+    except Exception:  # noqa: BLE001 - a preview must never break the planner turn
+        return []
+
+    errors: list[str] = []
+    dropped_error = _dropped_task_add_error(
+        proposed=_proposed_task_add_count(plan_update),
+        apply_result=apply_result,
+    )
+    if dropped_error is not None:
+        errors.append(dropped_error)
+    unknown_update_error = _unknown_task_update_error(plan=plan, plan_update=plan_update)
+    if unknown_update_error is not None:
+        errors.append(unknown_update_error)
+    errors.extend(
+        _new_execution_readiness_errors(
+            baseline=baseline,
+            current=execution_readiness_errors(simulated_plan),
+        )
+    )
+    return errors
+
+
 def _planner_question_repair_prompt(
     *,
     plan: dict[str, Any],
@@ -3335,19 +3198,11 @@ def run_planner_turn(
     prefer_context: str = "default",
     awaiting_clarification: bool | None = None,
     pending_questions: list[str] | None = None,
+    clarification_rounds: int = 0,
     run_paths: Any | None = None,
     asset_surface: AssetSurface | None = None,
     prebuilt_assets_bundle: PlannerAssetsBundle | None = None,
 ) -> PlannerTurnResult:
-    normalized_pending_questions = [
-        str(item).strip() for item in pending_questions or [] if str(item).strip()
-    ]
-    derived_awaiting_clarification = (
-        bool(normalized_pending_questions)
-        if awaiting_clarification is None
-        else bool(awaiting_clarification)
-    )
-    router_enabled = prefer_context == PREFER_CONTEXT_FORGE
     try:
         planner_model = resolve_model_for_role(
             cfg=cfg,
@@ -3360,20 +3215,6 @@ def run_planner_turn(
             "Planner assistant is unavailable because no model is configured.",
             error=str(e),
         )
-    router_model = ""
-    router_fallback_reason: str | None = None
-    if router_enabled:
-        try:
-            router_model = resolve_model_for_role(
-                cfg=cfg,
-                role=ROLE_ROUTER,
-                plan=plan,
-                prefer_context=prefer_context,
-            )
-        except ConfigError as e:
-            router_fallback_reason = f"planner_router_model_unavailable: {e}"
-        if not router_model and router_fallback_reason is None:
-            router_fallback_reason = "planner_router_model_unavailable: empty model"
 
     try:
         api_key = resolve_model_access_api_key(cfg, override=api_key_override)
@@ -3398,18 +3239,6 @@ def run_planner_turn(
         )
     for warning_message in planner_metadata_policy_result.warning_messages:
         warnings.warn(warning_message, stacklevel=2)
-    if router_enabled and router_model and router_fallback_reason is None:
-        try:
-            router_metadata_policy_result = evaluate_active_model_metadata_policy(
-                cfg=cfg,
-                registry=registry,
-                active_models=[ActiveModelRef(role=ROLE_ROUTER, model_name=router_model)],
-            )
-        except ModelMetadataPolicyError as e:
-            router_fallback_reason = f"planner_router_metadata_unavailable: {e}"
-        else:
-            for warning_message in router_metadata_policy_result.warning_messages:
-                warnings.warn(warning_message, stacklevel=2)
 
     planner_assets_bundle = prebuilt_assets_bundle
     surface = asset_surface
@@ -3446,97 +3275,6 @@ def run_planner_turn(
                 error=f"{exc.__class__.__name__}: {exc}",
             )
 
-    intent_decision = PlannerIntentDecision(
-        route="planning",
-        reason="planner_router_not_enabled_for_context",
-        planning_relevant=True,
-        source="not_applicable",
-    )
-    router_confidence_threshold = _planner_router_confidence_threshold(cfg)
-    router_parse_attempts = 0
-    router_request_retries = 0
-    router_observed_decision: PlannerIntentDecision | None = None
-    planner_router_event: dict[str, Any] | None = None
-    if router_enabled and router_fallback_reason:
-        intent_decision = PlannerIntentDecision(
-            route="planning",
-            reason=router_fallback_reason,
-            planning_relevant=True,
-            confidence=0.0,
-            source="router_fail_open",
-        )
-    elif router_enabled:
-        router_client = _make_planner_llm_client(
-            cfg=cfg,
-            api_key=api_key,
-            model=router_model,
-            timeout_s=resolve_llm_timeout_s(cfg),
-            transport=transport,
-        )
-        router_result = _run_planner_intent_router(
-            client=router_client,
-            plan=plan,
-            transcript_tail=transcript_tail,
-            user_text=user_text,
-            awaiting_clarification=derived_awaiting_clarification,
-            pending_questions=normalized_pending_questions,
-            workspace_context=workspace_context,
-        )
-        router_parse_attempts = router_result.parse_attempts
-        router_request_retries = router_result.request_retries
-        router_decision = router_result.decision
-        if router_decision is None:
-            router_fallback_reason = router_result.error or "planner_router_failed"
-            intent_decision = PlannerIntentDecision(
-                route="planning",
-                reason=router_fallback_reason,
-                planning_relevant=True,
-                confidence=0.0,
-                source="router_fail_open",
-            )
-        else:
-            intent_decision = router_decision
-            router_observed_decision = router_decision
-            if (
-                not intent_decision.planning_relevant
-                and intent_decision.route != "command_like"
-                and intent_decision.confidence < router_confidence_threshold
-            ):
-                router_fallback_reason = (
-                    "planner_router_low_confidence_non_planning: "
-                    f"{intent_decision.route} confidence={intent_decision.confidence:.3f} "
-                    f"threshold={router_confidence_threshold:.3f}"
-                )
-                intent_decision = PlannerIntentDecision(
-                    route="planning",
-                    reason=router_fallback_reason,
-                    planning_relevant=True,
-                    confidence=intent_decision.confidence,
-                    source="router_low_confidence_fallback",
-                )
-    if router_enabled:
-        event_decision = router_observed_decision or intent_decision
-        planner_router_event = _planner_router_event_payload(
-            route=event_decision.route,
-            confidence=event_decision.confidence,
-            source=event_decision.source,
-            model=router_model,
-            fallback_reason=router_fallback_reason,
-            parse_attempts=router_parse_attempts,
-            request_retries=router_request_retries,
-            planner_invoked=bool(intent_decision.planning_relevant),
-            user_text=user_text,
-        )
-        if not intent_decision.planning_relevant:
-            return _planner_non_planning_result(
-                intent_decision,
-                model=router_model,
-                fallback_reason=router_fallback_reason,
-                parse_attempts=router_parse_attempts,
-                request_retries=router_request_retries,
-                planner_router_event=planner_router_event,
-            )
-
     def _planner_error_after_router(
         message: str,
         *,
@@ -3544,25 +3282,17 @@ def run_planner_turn(
         request_retry_count: int = 0,
         failure_category: FailureCategory | str | None = FailureCategory.PLANNER_FAILED,
         schema_failures: list[dict[str, Any]] | None = None,
+        repair: PlannerRepairReport | None = None,
     ) -> PlannerTurnResult:
         return _planner_error(
             message,
             error=error,
             request_retry_count=request_retry_count,
             failure_category=failure_category,
-            intent_route=intent_decision.route,
-            intent_reason=intent_decision.reason,
-            route=intent_decision.route,
-            confidence=intent_decision.confidence,
-            source=intent_decision.source,
-            fallback_reason=router_fallback_reason,
-            parse_attempts=router_parse_attempts,
-            request_retries=router_request_retries,
-            model=router_model if router_enabled else "",
-            planner_invoked=True,
-            planner_router_event=planner_router_event,
+            model=planner_model,
             schema_failures=schema_failures,
             usage_events=usage_events,
+            repair=repair,
         )
 
     client = _make_planner_llm_client(
@@ -3642,6 +3372,7 @@ def run_planner_turn(
                 request_messages=request_messages,
                 response=response,
                 registry=registry,
+                client=client,
             )
             if usage_payload is not None:
                 usage_events.append(usage_payload)
@@ -3656,6 +3387,7 @@ def run_planner_turn(
                         request_messages=request_messages,
                         response=response,
                         registry=registry,
+                        client=client,
                     )
                     if usage_payload is not None:
                         usage_events.append(usage_payload)
@@ -3727,21 +3459,99 @@ def run_planner_turn(
             request_retry_count=total_request_retries,
         )
 
+    # ------------------------------------------------------------------
+    # Validate-and-repair loop.
+    #
+    # A payload that fails strict validation, or that would produce a plan
+    # execution rejects, is sent back to the model with the exact errors and a
+    # blunter instruction each round. Host-side repair is the last resort, not
+    # the first, and when it runs it is recorded rather than hidden.
+    # ------------------------------------------------------------------
+    repair_policy = resolve_plan_repair_policy(cfg)
+    max_attempts = max(repair_policy.max_payload_attempts, 1)
+    readiness_baseline = execution_readiness_errors(plan) if repair_policy.enabled else []
+
     schema_failures: list[dict[str, Any]] = []
-    validated, validation_error = _parse_repair_validate(content)
-    if validated is None:
-        schema_failures.append(
-            {
-                "attempt": 1,
-                "reason_code": "planner_schema_validation_failed",
-                "error": validation_error or "schema_mismatch",
-            }
-        )
+    validated: dict[str, Any] | None = None
+    attempt = 1
+    attempt_content = content
+    last_payload: Any = None
+    last_errors: list[str] = []
+    last_error_kind = "schema"
+    schema_retries = 0
+    readiness_retries = 0
+    unresolved_readiness_errors: list[str] = []
+
+    while True:
+        if repair_policy.enabled:
+            candidate, validation_error, raw_payload = _parse_validate_strict(attempt_content)
+        else:
+            # Kill-switch: the legacy shape repaired host-side on the first parse
+            # and never recorded it. Keep that exactly, so reverting is a revert.
+            candidate, validation_error = _parse_repair_validate(attempt_content)
+            raw_payload = None
+        if raw_payload is not None:
+            last_payload = raw_payload
+
+        if candidate is not None:
+            readiness_errors = (
+                _planner_update_readiness_errors(
+                    plan=plan,
+                    plan_update=candidate.get("plan_update"),
+                    baseline=readiness_baseline,
+                    user_text=user_text,
+                    workspace_context=workspace_context,
+                )
+                if repair_policy.enabled
+                else []
+            )
+            if not readiness_errors:
+                validated = candidate
+                unresolved_readiness_errors = []
+                break
+            unresolved_readiness_errors = readiness_errors
+            last_errors = readiness_errors
+            last_error_kind = "execution_readiness"
+            schema_failures.append(
+                {
+                    "attempt": attempt,
+                    "reason_code": "planner_execution_readiness_failed",
+                    "error": "; ".join(readiness_errors[:5]),
+                }
+            )
+        else:
+            last_errors = [validation_error or "schema_mismatch"]
+            last_error_kind = "schema"
+            schema_failures.append(
+                {
+                    "attempt": attempt,
+                    "reason_code": "planner_schema_validation_failed",
+                    "error": validation_error or "schema_mismatch",
+                }
+            )
+
+        if attempt >= max_attempts:
+            # Budget spent. A payload that validated but is not execution-ready is
+            # still usable work: keep it and let it be saved as a draft rather than
+            # discarding a whole planner turn over acceptance rules.
+            if candidate is not None:
+                validated = candidate
+            break
+
+        attempt += 1
+        if last_error_kind == "execution_readiness":
+            readiness_retries += 1
+        else:
+            schema_retries += 1
+
         retry_messages = _planner_request_messages(
             user_content=_planner_retry_user_prompt(
                 base_prompt=base_user_prompt,
-                validation_error=validation_error or "schema mismatch",
-                previous_response=content,
+                previous_response=attempt_content,
+                validation_errors=last_errors,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                kind=last_error_kind,
             ),
             image_paths=inline_image_paths,
         )
@@ -3759,37 +3569,61 @@ def run_planner_turn(
                 request_retry_count=total_request_retries,
                 failure_category=_planner_failure_category_for_llm_error(e),
                 schema_failures=schema_failures,
+                repair=PlannerRepairReport(
+                    terminal_state=TERMINAL_FAILED,
+                    attempts=attempt,
+                    max_attempts=max_attempts,
+                    schema_retries=schema_retries,
+                    readiness_retries=readiness_retries,
+                    execution_readiness_errors=list(unresolved_readiness_errors),
+                    validation_errors=list(last_errors),
+                ),
             )
         retry_content = (retry_resp.content or "").strip()
         if not retry_content:
+            # Re-asking a model that just answered with nothing produces nothing;
+            # stop spending attempts and go to the host-side last resort.
             schema_failures.append(
                 {
-                    "attempt": 2,
+                    "attempt": attempt,
                     "reason_code": "planner_schema_empty_retry_response",
-                    "error": validation_error or "empty_retry_response",
+                    "error": "empty_retry_response",
                 }
             )
+            break
+        attempt_content = retry_content
+
+    host_repaired = False
+    host_repaired_fields: list[str] = []
+    if validated is None:
+        repaired, repair_error, repaired_fields = _host_repair_planner_payload(last_payload)
+        if repaired is None:
             return _planner_error_after_router(
                 "Planner assistant JSON did not match schema; no plan updates were applied.",
-                error=validation_error or "empty_retry_response",
+                error=last_errors[0] if last_errors else (repair_error or "schema_mismatch"),
                 request_retry_count=total_request_retries,
                 schema_failures=schema_failures,
+                repair=PlannerRepairReport(
+                    terminal_state=TERMINAL_FAILED,
+                    attempts=attempt,
+                    max_attempts=max_attempts,
+                    schema_retries=schema_retries,
+                    readiness_retries=readiness_retries,
+                    execution_readiness_errors=list(unresolved_readiness_errors),
+                    validation_errors=list(last_errors),
+                ),
             )
-        validated, validation_error = _parse_repair_validate(retry_content)
-        if validated is None:
-            schema_failures.append(
-                {
-                    "attempt": 2,
-                    "reason_code": "planner_schema_validation_failed",
-                    "error": validation_error or "schema_mismatch",
-                }
-            )
-            return _planner_error_after_router(
-                "Planner assistant JSON did not match schema; no plan updates were applied.",
-                error=validation_error or "schema_mismatch",
-                request_retry_count=total_request_retries,
-                schema_failures=schema_failures,
-            )
+        validated = repaired
+        host_repaired = True
+        host_repaired_fields = repaired_fields
+        schema_failures.append(
+            {
+                "attempt": attempt,
+                "reason_code": "planner_payload_host_repaired",
+                "error": "; ".join(last_errors[:3]) or "schema_mismatch",
+                "host_repaired_fields": list(repaired_fields),
+            }
+        )
 
     validated_questions = [
         item for item in validated.get("questions") or [] if isinstance(item, str) and item.strip()
@@ -3843,6 +3677,29 @@ def run_planner_turn(
         user_text=user_text,
         workspace_context=workspace_context,
     )
+
+    # A planner that keeps asking instead of drafting never reaches a terminal
+    # state on its own. Past the cap, produce a concrete draft from the same
+    # fallbacks the grounding path uses and let the user correct a real plan.
+    forced_draft = False
+    prior_clarification_rounds = max(int(clarification_rounds or 0), 0)
+    if (
+        repair_policy.enabled
+        and repair_policy.max_clarification_rounds > 0
+        and prior_clarification_rounds >= repair_policy.max_clarification_rounds
+        and payload_awaits_clarification(validated)
+    ):
+        forced = _force_draft_plan_fallback(
+            validated=validated,
+            plan=plan,
+            user_text=user_text,
+            workspace_context=workspace_context,
+            clarification_rounds=prior_clarification_rounds,
+        )
+        if forced is not None:
+            validated = forced
+            forced_draft = True
+
     if surface is not None:
         asset_reference_error = _planner_plan_update_asset_reference_error(
             validated.get("plan_update"),
@@ -3853,26 +3710,46 @@ def run_planner_turn(
                 "Planner referenced an unknown asset; no plan updates were applied.",
                 error=asset_reference_error,
                 request_retry_count=total_request_retries,
+                repair=PlannerRepairReport(
+                    terminal_state=TERMINAL_FAILED,
+                    attempts=attempt,
+                    max_attempts=max_attempts,
+                    schema_retries=schema_retries,
+                    readiness_retries=readiness_retries,
+                    host_repaired=host_repaired,
+                    host_repaired_fields=list(host_repaired_fields),
+                    clarification_rounds=prior_clarification_rounds,
+                ),
             )
+
+    if forced_draft:
+        terminal_state = TERMINAL_FORCED_DRAFT
+    elif host_repaired:
+        terminal_state = TERMINAL_HOST_REPAIRED
+    else:
+        terminal_state = TERMINAL_VALIDATED
 
     return PlannerTurnResult(
         assistant_message=validated["assistant_message"],
         questions=validated["questions"],
         plan_update=validated["plan_update"],
         request_retry_count=total_request_retries,
-        intent_route=intent_decision.route,
-        intent_reason=intent_decision.reason,
-        route=intent_decision.route,
-        confidence=intent_decision.confidence,
-        source=intent_decision.source,
-        fallback_reason=router_fallback_reason,
-        parse_attempts=router_parse_attempts,
-        request_retries=router_request_retries,
-        model=router_model if router_enabled else "",
-        planner_invoked=True,
-        planner_router_event=planner_router_event,
+        model=planner_model,
         schema_failures=schema_failures,
         usage_events=usage_events,
+        repair=PlannerRepairReport(
+            terminal_state=terminal_state,
+            attempts=attempt,
+            max_attempts=max_attempts,
+            schema_retries=schema_retries,
+            readiness_retries=readiness_retries,
+            host_repaired=host_repaired,
+            host_repaired_fields=list(host_repaired_fields),
+            execution_readiness_errors=list(unresolved_readiness_errors),
+            clarification_rounds=prior_clarification_rounds,
+            forced_draft=forced_draft,
+            validation_errors=list(last_errors) if (host_repaired or forced_draft) else [],
+        ),
     )
 
 

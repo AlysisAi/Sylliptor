@@ -1019,8 +1019,8 @@ def test_chat_forge_plain_entry_does_not_resume_session_local_run_across_workspa
         console=first_console,
         forge_state=forge_state,
     )
-    original_run_id = forge_state.paths.run_id if forge_state.paths is not None else ""
-    assert original_run_id
+    original_run_dir = forge_state.paths.run_dir if forge_state.paths is not None else None
+    assert original_run_dir is not None
 
     back_result = chat_impl_mod._handle_forge_chat_command_impl(
         cli_mod,
@@ -1040,7 +1040,9 @@ def test_chat_forge_plain_entry_does_not_resume_session_local_run_across_workspa
     )
     assert forge_state.paths is not None
     assert forge_state.paths.root == repo_b.resolve()
-    assert forge_state.paths.run_id != original_run_id
+    # Counter-based run ids are workspace-scoped, so two workspaces may share an
+    # id like "001-vulcan"; the run directory is what must differ.
+    assert forge_state.paths.run_dir != original_run_dir
     assert (
         "Started a fresh Forge run because this chat moved to a different workspace."
         in second_console_file.getvalue()
@@ -1771,7 +1773,7 @@ def test_plan_mode_approval_loop_finishes_surface_activity_before_action_prompt(
     assert result is None
 
 
-def test_plan_mode_approval_loop_can_use_host_action_prompt(tmp_path: Path, monkeypatch) -> None:
+def test_plan_mode_approval_loop_can_use_tui_action_prompt(tmp_path: Path, monkeypatch) -> None:
     buffer = io.StringIO()
     console = Console(file=buffer, force_terminal=False, width=120)
     captured: dict[str, Any] = {}
@@ -3246,7 +3248,6 @@ def test_forge_planner_recovers_after_transient_request_retry_without_duplicate_
     captured: dict[str, Any] = {
         "plan_ref": None,
         "paths": None,
-        "router_calls": 0,
         "planner_calls": 0,
     }
 
@@ -3303,16 +3304,6 @@ def test_forge_planner_recovers_after_transient_request_retry_without_duplicate_
             pass
 
         def chat(self, **kwargs):  # type: ignore[no-untyped-def]
-            messages = kwargs.get("messages") or []
-            system_prompt = str(messages[0].get("content") if messages else "")
-            if "Forge planner turn" in system_prompt:
-                captured["router_calls"] += 1
-                payload = {
-                    "route": "planning",
-                    "confidence": 0.99,
-                    "reason": "test_planning_request",
-                }
-                return SimpleNamespace(content=json.dumps(payload))
             captured["planner_calls"] += 1
             if captured["planner_calls"] == 1:
                 raise LLMError("LLM request failed: ReadTimeout")
@@ -3351,7 +3342,6 @@ def test_forge_planner_recovers_after_transient_request_retry_without_duplicate_
     assert "Recovered planner response." in result.output
     assert "Applied planner update to plan." in result.output
     assert "Planner request recovered after 1 transient retry." in result.output
-    assert captured["router_calls"] == 1
     assert captured["planner_calls"] == 3
     plan_ref = captured["plan_ref"] or {}
     assert len(plan_ref["tasks"]) == 1
@@ -3425,9 +3415,6 @@ def test_forge_small_talk_routes_through_planner_when_assistant_on(
             questions=[],
             plan_update=None,
             error=None,
-            intent_route="small_talk",
-            intent_reason="social_greeting",
-            planner_router_event={"route": "small_talk", "fallback_reason": None},
         )
 
     monkeypatch.setattr(cli_mod, "create_session", lambda **_kwargs: _DummySession())
@@ -3509,9 +3496,6 @@ def test_forge_greek_small_talk_routes_through_planner_when_assistant_on(
             questions=[],
             plan_update=None,
             error=None,
-            intent_route="small_talk",
-            intent_reason="social_greeting",
-            planner_router_event={"route": "small_talk", "fallback_reason": None},
         )
 
     monkeypatch.setattr(cli_mod, "create_session", lambda **_kwargs: _DummySession())
@@ -5015,9 +4999,6 @@ def test_forge_router_offtopic_result_leaves_plan_unchanged(tmp_path: Path, monk
             questions=[],
             plan_update=None,
             error=None,
-            intent_route="off_topic",
-            intent_reason="meta_question",
-            planner_router_event={"route": "off_topic", "fallback_reason": None},
         )
 
     monkeypatch.setattr(cli_mod, "create_session", lambda **_kwargs: _DummySession())
@@ -5039,9 +5020,6 @@ def test_forge_router_offtopic_result_leaves_plan_unchanged(tmp_path: Path, monk
     paths = captured["paths"]
     assert paths is not None
     assert "no plan_update proposed" in paths.planner_summary_path.read_text(encoding="utf-8")
-    assert "Planner router classified turn as off_topic" in paths.notes_path.read_text(
-        encoding="utf-8"
-    )
 
 
 def test_forge_clarification_follow_up_accepts_terse_planning_answer(

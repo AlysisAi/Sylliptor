@@ -92,13 +92,11 @@ def test_run_config_menu_raw_picker_sequence_persists_expected_changes(
     save_config(cfg)
     _patch_console(monkeypatch)
 
-    actions = iter(["profile", "router", "save"])
+    actions = iter(["profile", "save"])
     picker_answers = iter(
         [
             "switch",
             "anthropic",
-            config_menu_mod._INHERIT_DEFAULT_MODEL_VALUE,
-            "auto",
         ]
     )
     prompt = PromptScript([])
@@ -120,32 +118,11 @@ def test_run_config_menu_raw_picker_sequence_persists_expected_changes(
 
     assert result.saved is True
     assert saved_cfg.extra_fields["active_profile"] == "anthropic"
-    assert saved_cfg.routing_mode == "auto"
+    # routing_mode is a deprecated no-op field: the menu no longer exposes or
+    # rewrites it, so the seeded value survives the save untouched.
+    assert saved_cfg.routing_mode == "code_only"
     assert saved_cfg.step_budget_policy == "limited"
     assert saved_cfg.task_max_steps == AppConfig().task_max_steps
-
-
-def test_router_section_esc_on_router_model_picker_returns_without_next_prompts(
-    monkeypatch,
-) -> None:
-    output = io.StringIO()
-    console = Console(file=output, force_terminal=False, color_system=None, width=120)
-    state = config_menu_mod.ConfigMenuState.from_cfg(AppConfig(model="old"))
-    picker_calls: list[str] = []
-
-    def fake_picker(**kwargs: Any) -> str | None:
-        picker_calls.append(str(kwargs["title"]))
-        return None
-
-    def fail_prompt(*_args: Any, **_kwargs: Any) -> str:
-        raise AssertionError("Routing text prompts should not run after Esc")
-
-    monkeypatch.setattr(config_menu_mod, "_run_config_picker", fake_picker)
-    monkeypatch.setattr(config_menu_mod.typer, "prompt", fail_prompt)
-
-    config_menu_mod._run_router_section(state, console)
-
-    assert picker_calls == ["Router Model"]
 
 
 def test_top_level_live_menu_renders_unknown_key_message(monkeypatch, tmp_path: Path) -> None:

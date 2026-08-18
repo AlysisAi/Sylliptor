@@ -14,6 +14,7 @@ import httpx
 
 from ..error_text import sanitize_error_text_for_output
 from ..provider_telemetry import ProviderCallTelemetryRecorder
+from ..reasoning_contracts import WIRE_THINKING_LEVEL, reasoning_contract_for
 from ..request_estimation import estimate_provider_payload_tokens
 from ..token_budget import estimate_tokens
 from ..web_search_adapters import AUTO_WEB_SEARCH_ADAPTER, GEMINI_GROUNDING_ADAPTER
@@ -62,7 +63,6 @@ _WEB_SEARCH_MODES_ALLOWING_GEMINI_GROUNDING = frozenset({"auto", "native"})
 _INCLUDE_SERVER_SIDE_TOOL_INVOCATIONS = "includeServerSideToolInvocations"
 _TOOL_CALL_PROVIDER_METADATA_KEY = TOOL_CALL_PROVIDER_METADATA_KEY
 _DUMMY_IMPORTED_FUNCTION_CALL_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
-_GEMINI_THINKING_LEVELS = frozenset({"minimal", "low", "high"})
 _GEMINI_EXPLICIT_CACHE_MIN_TOKENS = 1024
 _GEMINI_EXPLICIT_CACHE_MAX_ENTRIES = 8
 _GEMINI_EXPLICIT_CACHE_REFRESH_FRACTION = 0.10
@@ -948,6 +948,32 @@ def _reasoning_outputs_from_parts(parts: list[Any]) -> tuple[ReasoningOutput, ..
     return tuple(outputs)
 
 
+def _gemini_function_call_id(function_call: dict[str, Any], index: int) -> str:
+    return str(function_call.get("id") or f"call_{index}").strip()
+
+
+def _candidate_content_with_normalized_function_call_ids(
+    content: dict[str, Any],
+) -> dict[str, Any]:
+    copied = copy.deepcopy(content)
+    parts = copied.get("parts")
+    if not isinstance(parts, list):
+        return copied
+    for index, part in enumerate(parts):
+        if not isinstance(part, dict):
+            continue
+        function_call = part.get("functionCall")
+        if not isinstance(function_call, dict):
+            continue
+        name = str(function_call.get("name") or "").strip()
+        if not name:
+            continue
+        call_id = _gemini_function_call_id(function_call, index)
+        if call_id:
+            function_call["id"] = call_id
+    return copied
+
+
 def _parse_tool_calls(parts: list[Any]) -> list[ToolCall]:
     tool_calls: list[ToolCall] = []
     for index, part in enumerate(parts):
@@ -959,7 +985,7 @@ def _parse_tool_calls(parts: list[Any]) -> list[ToolCall]:
         name = str(function_call.get("name") or "").strip()
         if not name:
             continue
-        call_id = str(function_call.get("id") or f"call_{index}").strip()
+        call_id = _gemini_function_call_id(function_call, index)
         raw_args = function_call.get("args")
         args = dict(raw_args) if isinstance(raw_args, dict) else _json_arguments(raw_args)
         metadata: dict[str, Any] = {"part_index": index}
@@ -1058,7 +1084,7 @@ def _gemini_provider_metadata(
             metadata[_camel_to_snake(key)] = copy.deepcopy(value)
     content = _candidate_content(candidate)
     if isinstance(content, dict):
-        metadata["content"] = copy.deepcopy(content)
+        metadata["content"] = _candidate_content_with_normalized_function_call_ids(content)
     metadata.update(_grounding_metadata_payload(candidate))
     usage = data.get("usageMetadata")
     if isinstance(usage, dict):
@@ -2573,15 +2599,24 @@ def _is_gemini_3_model(model: str | None) -> bool:
     return "gemini-3" in str(model or "").strip().lower()
 
 
-def _thinking_level_from_reasoning_effort(reasoning_effort: str) -> str:
+def _thinking_level_from_reasoning_effort(
+    *,
+    model: str,
+    reasoning_effort: str,
+) -> str | None:
     effort = str(reasoning_effort or "").strip().lower()
+    contract = reasoning_contract_for("gemini", model)
+    if contract.wire != WIRE_THINKING_LEVEL:
+        return None
+    if contract.allows_value(effort):
+        return effort
     if effort in {"none", "minimal"}:
-        return "minimal"
-    if effort == "low":
-        return "low"
-    if effort in {"medium", "high", "xhigh"}:
-        return "high"
-    raise LLMError(f"Gemini GenerateContent reasoning_effort is not supported: {effort}")
+        return contract.default or None
+    allowed = ", ".join(contract.values)
+    raise LLMError(
+        "Gemini GenerateContent reasoning_effort is not supported: "
+        f"{effort}; expected one of: {allowed}"
+    )
 
 
 def _gemini_thinking_config(
@@ -2594,23 +2629,27 @@ def _gemini_thinking_config(
 ) -> dict[str, Any]:
     if thinking_level is not None and thinking_budget is not None:
         raise LLMError("Gemini GenerateContent cannot set both thinking_level and thinking_budget")
-    if thinking_level is not None and not _is_gemini_3_model(model):
+    contract = reasoning_contract_for("gemini", model)
+    if thinking_level is not None and contract.wire != WIRE_THINKING_LEVEL:
         raise LLMError("Gemini GenerateContent thinking_level requires a Gemini 3 model")
     if thinking_level is not None:
         normalized_level = str(thinking_level or "").strip().lower()
-        if normalized_level not in _GEMINI_THINKING_LEVELS:
-            raise LLMError(
-                "Gemini GenerateContent thinking_level must be one of: high, low, minimal"
-            )
+        if not contract.allows_value(normalized_level):
+            allowed = ", ".join(contract.values)
+            raise LLMError(f"Gemini GenerateContent thinking_level must be one of: {allowed}")
         return {"thinkingLevel": normalized_level}
     if thinking_budget is not None:
         return {"thinkingBudget": int(thinking_budget)}
     if reasoning_effort:
         if _is_gemini_3_model(model):
-            return {"thinkingLevel": _thinking_level_from_reasoning_effort(reasoning_effort)}
+            level = _thinking_level_from_reasoning_effort(
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+            return {"thinkingLevel": level} if level else {}
         return {"thinkingBudget": _thinking_budget(reasoning_effort)}
     if enable_thinking is False:
         if _is_gemini_3_model(model):
-            return {"thinkingLevel": "minimal"}
+            return {"thinkingLevel": contract.default} if contract.default else {}
         return {"thinkingBudget": 0}
     return {}

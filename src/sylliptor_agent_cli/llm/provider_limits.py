@@ -13,6 +13,7 @@ from typing import TypeVar
 from urllib.parse import urlsplit
 
 from ..failure_category import is_provider_throttling_error, provider_unavailable_retry_reason
+from ..provider_url import known_provider_key_from_base_url
 
 T = TypeVar("T")
 
@@ -56,7 +57,18 @@ _GENERIC_HOST_PARTS = frozenset(
     }
 )
 _KNOWN_TRANSPORT_PROVIDER_KEYS = frozenset(
-    {"qwen", "openrouter", "openai", "azure", "deepseek", "gemini", "mistral", "xai"}
+    {
+        "qwen",
+        "openrouter",
+        "openai",
+        "azure",
+        "deepseek",
+        "gemini",
+        "mistral",
+        "nvidia",
+        "zai_coding_plan",
+        "xai",
+    }
 )
 _SEMAPHORE_LOCK = threading.Lock()
 _SEMAPHORES: dict[tuple[str, int], threading.Semaphore] = {}
@@ -348,6 +360,24 @@ def _is_provider_call_non_retryable(exc: BaseException) -> bool:
     return bool(getattr(exc, PROVIDER_NON_RETRYABLE_ATTR, False))
 
 
+def single_retry_is_worthwhile(exc: BaseException) -> bool:
+    """Whether one more attempt at the same call could plausibly succeed.
+
+    Only transport-class failures qualify: timeouts, resets, refused
+    connections, and transient SSL/OS errors. A rejection — bad credentials,
+    exhausted quota, a malformed request — fails identically on the second
+    attempt and only spends another round trip. Failures the provider layer has
+    already given up on are never retried again on top of that.
+
+    Exposed for callers outside this module that run their own bounded retry,
+    so the transient classification stays defined in exactly one place.
+    """
+
+    if _is_provider_call_non_retryable(exc):
+        return False
+    return _transient_transport_retry_reason(exc) is not None
+
+
 def reset_provider_limit_state_for_tests() -> None:
     with _SEMAPHORE_LOCK:
         _SEMAPHORES.clear()
@@ -435,38 +465,13 @@ def _provider_key_from_base_url(base_url: str | None) -> str | None:
     try:
         parts = urlsplit(raw)
         hostname = (parts.hostname or "").rstrip(".").casefold()
-        path = (parts.path or "").casefold()
     except ValueError:
         return None
     if not hostname:
         return None
-    # Hosted Sylliptor MiMo trial proxy (Supabase Edge Function forwarding to
-    # OpenRouter/Xiaomi). Match the proxy path so other *.supabase.co apps are
-    # not captured. Mirrors openai_compat._is_sylliptor_trial_proxy.
-    if "/functions/v1/llm" in path and (
-        hostname == "supabase.co" or hostname.endswith(".supabase.co")
-    ):
-        return "openrouter"
-    if "dashscope" in hostname:
-        return _QWEN_CANONICAL_KEY
-    if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):
-        return "openrouter"
-    if hostname == "api.openai.com":
-        return "openai"
-    if (
-        hostname.endswith(".openai.azure.com")
-        or hostname.endswith(".cognitiveservices.azure.com")
-        or hostname.endswith(".services.ai.azure.com")
-    ):
-        return "azure"
-    if hostname == "api.deepseek.com" or hostname.endswith(".deepseek.com"):
-        return "deepseek"
-    if hostname == "generativelanguage.googleapis.com":
-        return "gemini"
-    if hostname == "api.mistral.ai" or hostname.endswith(".mistral.ai"):
-        return "mistral"
-    if hostname == "api.x.ai" or hostname == "x.ai" or hostname.endswith(".x.ai"):
-        return "xai"
+    known_provider = known_provider_key_from_base_url(raw)
+    if known_provider:
+        return known_provider
     canonical = canonical_provider_key(hostname)
     if canonical is not None and canonical != hostname:
         return canonical

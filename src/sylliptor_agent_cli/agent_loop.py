@@ -24,41 +24,26 @@ from .agent.errors import (  # noqa: F401
 
 # prompt_context re-exports
 from .agent.prompt_context import (  # noqa: F401
-    _ACTIVE_WORKSPACE_CONTINUITY_FOLLOW_UP_PATTERNS,
-    _FIRST_TURN_REPO_GROUNDING_NUDGE,
     _IMAGE_ATTACHMENT_TURN_SYSTEM_HINT,
     _INLINE_CODE_SPAN_RE,
     _MAX_ROUTE_CONTEXT_ANCHORS,
     _MAX_ROUTE_CONTEXT_HINTS,
-    _MAX_ROUTE_CONTEXT_TOOL_CATALOG_ITEMS,
-    _MAX_ROUTE_CONTEXT_TOOL_DESCRIPTION_CHARS,
     _MAX_ROUTE_CONTEXT_VERIFY_COMMANDS,
     _MODE_FULLACCESS,
     _NON_REPO_MAX_RECENT_VISIBLE_HISTORY_CHARS,
     _NON_REPO_MAX_RECENT_VISIBLE_HISTORY_MESSAGES,
     _NON_REPO_MAX_RECENT_VISIBLE_HISTORY_TOTAL_CHARS,
-    _NON_REPO_MCP_RESOURCE_TOOL_NAMES,
-    _NON_REPO_WEB_TOOL_NAMES,
-    _PLAIN_DIR_ACTIVE_TASK_REFINEMENT_PATTERNS,
-    _PLAIN_DIR_CONTINUITY_FOLLOW_UP_PATTERNS,
-    _PLAIN_DIR_LOCAL_ACTION_PATTERNS,
-    _PLAIN_DIR_LOCAL_ARTIFACT_HINT_PATTERNS,
-    _PLAIN_DIR_LOCAL_WORKSPACE_HINT_PATTERNS,
     _REPO_REL_PATH_TOKEN_RE,
     _SYSTEM_PROMPT_ONE_SHOT_SECTION,
     _SYSTEM_PROMPT_SKILL_DISCOVERY_SECTION,
     _SYSTEM_PROMPT_SKILL_LIFECYCLE_SECTION,
     _SYSTEM_PROMPT_SUBAGENT_SECTION,
     _SYSTEM_PROMPT_WRITE_SECTION,
-    _TASK_BRIEF_ACK_ONLY_TEXT,
-    _TASK_BRIEF_ANCHOR_PATTERNS,
     _TASK_BRIEF_EMPTY_STATUS,
     _TASK_BRIEF_MARKER,
     _TASK_BRIEF_MAX_CURRENT_LINES,
     _TASK_BRIEF_MAX_LINE_CHARS,
     _TASK_BRIEF_MAX_PRIOR_LINES,
-    _TASK_BRIEF_MAX_RECENT_TURNS,
-    _WORKSPACE_RELATION_FILE_TOKEN_RE,
     ALWAYS_PROTECTED_WRITE_PREFIXES,
     CONVENTIONS_FILENAME,
     MAX_CONVENTIONS_CHARS,
@@ -73,7 +58,6 @@ from .agent.prompt_context import (  # noqa: F401
     _build_user_message,
     _build_workspace_grounding_descriptor,
     _clean_workspace_hint,
-    _compact_tool_description,
     _component_plugin_allowed,
     _compose_session_system_prompt,
     _empty_task_brief_message,
@@ -81,19 +65,10 @@ from .agent.prompt_context import (  # noqa: F401
     _extract_repo_relative_paths_from_text,
     _extract_workspace_relation_paths_from_text,
     _filter_discovered_skills_for_plugins,
-    _first_turn_repo_grounding_nudge_message,
-    _first_turn_repo_grounding_targets,
-    _follow_up_relates_to_active_workspace,
     _image_attachment_instruction_text,
     _is_host_managed_user_context_message,
-    _is_non_repo_mcp_tool_name,
-    _is_task_brief_candidate_text,
-    _looks_like_active_workspace_continuity_follow_up,
-    _looks_like_explicit_local_workspace_action_request,
-    _looks_like_plain_dir_continuity_follow_up,
     _merge_dropped_counts,
     _message_text_content,
-    _non_repo_tool_family_for_name,
     _normalize_rel_match_path,
     _normalize_repo_relative_hint_path,
     _normalize_scope_list,
@@ -103,25 +78,20 @@ from .agent.prompt_context import (  # noqa: F401
     _normalized_authoritative_verify_commands,
     _normalized_verify_commands,
     _paths_require_verification,
-    _plain_dir_workspace_route_override_reason,
     _PluginActivationIndex,
     _read_workspace_hint_text,
     _recent_visible_non_repo_history,
     _render_task_brief_message,
     _repo_conventions_context,
     _repo_summary_data,
-    _repo_workspace_route_override_reason,
     _RepoSummaryData,
     _resolve_effective_verification_selection,
     _resolve_one_shot_repo_bootstrap_context,
     _resolve_requested_workdir_within_workspace,
     _resolve_session_pinned_prefix_len,
-    _route_context_custom_tool_catalog,
-    _route_context_non_repo_tool_catalog,
     _session_focus_dir_path,
     _session_focus_relpath,
     _session_has_active_workspace_task,
-    _session_has_stable_workspace_grounding,
     _session_repo_scan,
     _session_task_brief_content,
     _session_verify_command_selection,
@@ -131,15 +101,9 @@ from .agent.prompt_context import (  # noqa: F401
     _should_prepare_repo_scan,
     _skill_plugin_id,
     _subagent_context_message,
-    _task_brief_candidate_from_text,
     _task_brief_content_is_placeholder,
-    _task_brief_focus_preferred_from_signals,
-    _task_brief_has_anchor,
     _task_brief_lines_from_text,
-    _TaskBriefCandidate,
     _truncate_non_repo_history_content,
-    _turn_route_context,
-    _TurnRouteContext,
     _untrusted_prompt_prelude_message,
     _workspace_binding_context_message,
     _workspace_hint_from_manifest_path,
@@ -161,29 +125,18 @@ from .agent.prompt_context import (  # noqa: F401
     set_session_active_workdir,
 )
 
-# routing re-exports
-from .agent.routing import (  # noqa: F401
-    _FALLBACK_LOCALIZED_REPLY_SYSTEM_PROMPT,
-    _FENCED_CODE_BLOCK_RE,
-    _FINAL_SUMMARY_REWRITE_SYSTEM_PROMPT,
-    _MAX_ROUTER_TOOL_CANDIDATES,
-    _NON_REPO_RECENT_HISTORY_SYSTEM_PROMPT,
-    _NON_REPO_RESPONSE_SYSTEM_PROMPT,
-    _NON_REPO_TURN_SYSTEM_HINT,
-    _REPO_CONTEXT_PATTERNS,
-    _REWRITE_PROTECTED_TOKEN_RE,
-    _ROUTE_CONTEXT_MARKER,
+# turn_path re-exports
+from .agent.turn_path import (  # noqa: F401
     _ROUTER_EXECUTION_POSTURES,
-    _ROUTER_ROUTES,
-    _ROUTER_SYSTEM_PROMPT,
-    _ROUTER_TOOL_FAMILIES,
-    _ROUTING_MODE_AUTO,
-    _ROUTING_MODES,
-    _TURN_LANGUAGE_DETECT_SYSTEM_PROMPT,
-    _arbitrate_route_capability,
-    _build_non_repo_tool_assisted_system_prompt,
     _build_turn_language_system_message,
-    _detect_turn_language_and_script,
+    _normalize_turn_language_name,
+    _normalize_turn_script_name,
+    _OneShotRepoTurnIntent,
+    _resolve_repo_turn_execution_intent,
+)
+
+# turn event helper re-exports
+from .agent.turn.events import (  # noqa: F401
     _emit_assistant_message_events,
     _emit_message_delta_event,
     _emit_message_end_event,
@@ -191,51 +144,27 @@ from .agent.routing import (  # noqa: F401
     _emit_tool_call_progress_event,
     _emit_tool_call_started_event,
     _event_preview,
-    _extract_json_object,
+)
+
+# provider-call helper re-exports
+from .agent.llm_calls import (  # noqa: F401
+    _FENCED_CODE_BLOCK_RE,
+    _FINAL_SUMMARY_REWRITE_SYSTEM_PROMPT,
+    _REWRITE_PROTECTED_TOKEN_RE,
     _extract_rewrite_protected_fragments,
-    _fallback_context_prefers_repo_route,
-    _fallback_general_reply,
-    _fallback_route_decision,
     _is_fatal_non_repo_llm_error,
-    _is_repository_or_workspace_request,
     _is_stream_unsupported_error,
     _llm_error_status_code,
-    _safe_forced_tool_choice_for_recovery,
     _main_agent_chat,
-    _managed_execution_route_override_reason,
     _non_repo_chat,
-    _non_repo_tool_assisted_tools,
-    _normalize_router_tool_candidates,
-    _normalize_router_tool_family,
-    _normalize_routing_mode,
-    _normalize_turn_language_name,
-    _normalize_turn_script_name,
-    _OneShotRepoTurnIntent,
-    _parse_route_decision,
-    _parse_route_decision_with_posture_fallback,
-    _parse_turn_language_decision,
     _registered_tool_schema_list,
     _request_messages_with_ephemeral_system_prompt_suffixes,
     _request_messages_with_ephemeral_system_prompts,
     _request_messages_with_ephemeral_user_messages,
-    _resolve_degraded_route_execution_posture,
-    _resolve_repo_turn_execution_intent,
-    _resolve_routing_mode,
-    _respond_non_repo_turn,
     _rewrite_final_summary_for_language,
     _rewritten_text_preserves_technical_tokens,
-    _route_arbitration_enabled,
-    _route_context_system_message,
-    _route_reply_for_non_repo_turn,
-    _route_reply_matches_turn_language_policy,
-    _route_turn,
-    _RouteArbitrationVerdict,
-    _router_chat,
-    _router_intent_execution_disagreement,
-    _should_add_non_repo_turn_hint,
+    _safe_forced_tool_choice_for_recovery,
     _tool_schema_function_name,
-    _TurnLanguageDecision,
-    _TurnRouteDecision,
 )
 
 # session re-exports
@@ -307,6 +236,7 @@ from .agent.mutation_classification import (  # noqa: F401
 # execution deadline re-exports
 from .execution_deadline import (  # noqa: F401
     DEFAULT_DEADLINE_CLEANUP_RESERVE_SECONDS,
+    DEFAULT_RUN_DEADLINE_SECONDS,
     MINIMUM_FORCED_SUMMARY_SECONDS,
     MINIMUM_LLM_START_SECONDS,
     MINIMUM_OPERATION_TIMEOUT_SECONDS,
@@ -314,6 +244,7 @@ from .execution_deadline import (  # noqa: F401
     MINIMUM_TOOL_START_SECONDS,
     DeadlineExhausted,
     deadline_timeout_or_raise,
+    resolve_deadline_degradation_policy,
     temporarily_clamp_client_timeout,
     validate_deadline_seconds,
 )
@@ -343,14 +274,9 @@ from .agent.turn import (  # noqa: F401
     _FINAL_TOOL_ENABLED_STEP_SYSTEM_PROMPT,
     _FORCED_FINAL_SUMMARY_SYSTEM_PROMPT_TEMPLATE,
     _LOW_STEP_BUDGET_SYSTEM_PROMPT_TEMPLATE,
-    _ONE_SHOT_BLOCKER_MARKERS,
-    _ONE_SHOT_COMPLETION_MARKERS,
-    _ONE_SHOT_NON_FINAL_PROGRESS_MARKERS,
     _PHASE_BUDGET_EXPLORATION_SYSTEM_PROMPT_TEMPLATE,
     _PHASE_BUDGET_VERIFICATION_SYSTEM_PROMPT_TEMPLATE,
     _SUBAGENT_EXPLORATION_NUDGE_TEMPLATE,
-    _SUBAGENT_REQUEST_OPT_OUT_PATTERNS,
-    _SUBAGENT_REQUEST_PATTERNS,
     _SUBAGENT_REQUIRED_NUDGE_TEMPLATE,
     _SAME_BATCH_FS_READ_DEFAULT_MAX_BYTES,
     _SAME_BATCH_FS_READ_LINES_DEFAULT_MAX_LINES,
@@ -369,15 +295,9 @@ from .agent.turn import (  # noqa: F401
     MAX_SUBAGENT_EXPLORATION_NUDGES_PER_TURN,
     MAX_SUBAGENT_REQUIRED_NUDGES_PER_TURN,
     _append_recent_exploration_path,
-    _assistant_text_contains_progress_intent,
-    _assistant_text_has_blocker_marker,
-    _assistant_text_has_completion_marker,
-    _assistant_text_has_structured_blocker_marker,
-    _assistant_text_has_well_formed_blocker,
     _build_fs_read_lines_result_from_cached_range,
     _build_fs_read_lines_result_from_full_fs_read,
     _build_post_explore_bootstrap_nudge,
-    _classify_one_shot_repo_turn_intent,
     _coerce_fs_read_lines_request,
     _coerce_fs_read_request,
     _edit_similarity_key,
@@ -392,7 +312,6 @@ from .agent.turn import (  # noqa: F401
     _is_successful_subagent_run,
     _looks_like_unexecuted_tool_call_markup,
     _maybe_reuse_same_batch_read_result,
-    _normalize_marker_text,
     _one_shot_progress_fingerprint,
     _remember_same_batch_read_result,
     _same_batch_read_cache_should_invalidate,
@@ -405,8 +324,6 @@ from .agent.turn import (  # noqa: F401
     _split_text_preserving_lines,
     _tool_call_retry_key,
     _tool_categories,
-    _instruction_explicitly_opts_out_subagent,
-    _instruction_explicitly_requests_subagent,
     _resolve_subagent_turn_policy,
     _subagent_exploration_nudge_message,
     _subagent_names_preview,
@@ -516,10 +433,6 @@ from .tools.symbols import symbol_search  # noqa: F401
 # tools.web re-exports
 from .tools.web import web_fetch  # noqa: F401
 
-# turn_intent re-exports
-from .turn_intent import (  # noqa: F401
-    looks_like_implicit_repo_bugfix_request as _looks_like_implicit_repo_bugfix_request,
-)
 # isort: on
 
 
@@ -566,8 +479,11 @@ def run_agent(
     console: Any | None = None,
     deny_write_prefixes: list[str] | None = None,
     allow_write_globs: list[str] | None = None,
+    persona_allow_write_globs: list[str] | None = None,
     non_interactive: bool = False,
     one_shot_execution: bool = False,
+    ephemeral_system_messages: list[str] | tuple[str, ...] | None = None,
+    ephemeral_user_messages: list[str] | tuple[str, ...] | None = None,
     enable_chat_turn_step_budget: bool = False,
     chat_turn_fixed_override: int | None = None,
     session_log_dir_override: Path | None = None,
@@ -591,9 +507,14 @@ def run_agent(
     mcp_manager: McpManager | ForgeTaskScopedMcpManager | None = None,
     execution_deadline: ExecutionDeadline | None = None,
     run_deadline_seconds: float | None = None,
+    no_run_deadline: bool = False,
     require_run_deadline: bool = False,
     crash_diagnostic_log_path: str | Path | None = None,
     crash_diagnostic_logger: CrashDiagnosticLogger | None = None,
+    cancellation_token: Any | None = None,
+    session_source: str = "startup",
+    session_source_metadata: dict[str, Any] | None = None,
+    tool_dispatch_guard: Any | None = None,
 ) -> int:
     runtime_kind_text = str(getattr(runtime_kind, "value", runtime_kind) or "").strip()
     if execution_deadline is not None and run_deadline_seconds is not None:
@@ -604,9 +525,29 @@ def run_agent(
             one_shot_execution
             or runtime_kind_text in {"one_shot", "forge_exec", "swarm_worker"}
             or run_deadline_seconds is not None
+            or no_run_deadline
         )
         if deadline_has_one_shot_semantics or require_run_deadline:
-            resolved_deadline = resolve_run_deadline(cfg, cli_deadline_seconds=run_deadline_seconds)
+            # A non-interactive run gets a generous default budget so it cannot
+            # grind for hours unattended. Two exclusions: a managed host that
+            # asked to fail closed (silently defaulting would defeat the check
+            # it opted into), and an explicit --no-deadline. Interactive chat
+            # never reaches here.
+            default_run_deadline_seconds = (
+                DEFAULT_RUN_DEADLINE_SECONDS
+                if (
+                    deadline_has_one_shot_semantics
+                    and not require_run_deadline
+                    and not no_run_deadline
+                )
+                else None
+            )
+            resolved_deadline = resolve_run_deadline(
+                cfg,
+                cli_deadline_seconds=run_deadline_seconds,
+                cli_no_deadline=no_run_deadline,
+                default_seconds=default_run_deadline_seconds,
+            )
             if resolved_deadline.seconds is None:
                 if require_run_deadline:
                     _emit_required_run_deadline_missing(
@@ -624,6 +565,7 @@ def run_agent(
                 execution_deadline = ExecutionDeadline.from_duration(
                     resolved_deadline.seconds,
                     source=resolved_deadline.source,
+                    degradation_policy=resolve_deadline_degradation_policy(cfg),
                 )
     elif require_run_deadline and not execution_deadline.enabled:
         _emit_required_run_deadline_missing(
@@ -650,6 +592,7 @@ def run_agent(
         console=console,
         deny_write_prefixes=deny_write_prefixes,
         allow_write_globs=allow_write_globs,
+        persona_allow_write_globs=persona_allow_write_globs,
         non_interactive=non_interactive,
         one_shot_execution=one_shot_execution,
         enable_chat_turn_step_budget=enable_chat_turn_step_budget,
@@ -675,8 +618,19 @@ def run_agent(
         execution_deadline=execution_deadline,
         crash_diagnostic_log_path=crash_diagnostic_log_path,
         crash_diagnostic_logger=crash_diagnostic_logger,
+        session_source=session_source,
+        session_source_metadata=session_source_metadata,
+        tool_dispatch_guard=tool_dispatch_guard,
     )
     try:
-        return session.run_turn(instruction, image_paths=image_paths)
+        turn_kwargs: dict[str, Any] = {
+            "image_paths": image_paths,
+            "cancellation_token": cancellation_token,
+        }
+        if ephemeral_system_messages:
+            turn_kwargs["ephemeral_system_messages"] = list(ephemeral_system_messages)
+        if ephemeral_user_messages:
+            turn_kwargs["ephemeral_user_messages"] = list(ephemeral_user_messages)
+        return session.run_turn(instruction, **turn_kwargs)
     finally:
         session.close()

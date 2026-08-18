@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -20,6 +21,7 @@ from .config import (
     is_generic_configured_verify_preset,
     is_generic_verify_command_fallback,
     normalize_verify_command_list,
+    normalize_verify_module_invocation,
     split_verify_command_parts,
     strip_verify_runner_prefix,
 )
@@ -30,8 +32,12 @@ from .failure_category import (
 )
 from .file_classification import SOURCE_EXTENSIONS_BY_LANGUAGE
 from .process_reaping import ProcessGroupRegistry
-from .repo_scan import RepoScanResult, scan_workspace
-from .sandbox_runner import HostShellRunner, build_shell_runner_from_settings
+from .repo_scan import RepoScanResult, detect_fallback_test_commands, scan_workspace
+from .sandbox_runner import (
+    HostShellRunner,
+    build_shell_runner_from_settings,
+    with_closed_stdin,
+)
 from .sandbox_settings import resolve_shell_sandbox_settings
 from .verification_command_analysis import (
     VerificationCommandEvidentiaryCapability,
@@ -47,6 +53,7 @@ from .verification_contract import (
     VerificationCommandValidationStatus,
     build_verification_command_specs,
     command_specs_payload,
+    rejection_reason_is_unclassifiable,
 )
 from .verification_failure_summary import summarize_verification_failure
 from .workspace_context import WorkspaceContext, WorkspaceContextError, resolve_workspace_context
@@ -259,6 +266,18 @@ AUTHORITATIVE_VERIFY_CONTRACT_TYPES = {
     "explicit_override",
     "repo_native",
 }
+VERIFICATION_FALLBACK_DETECTED_SOURCE = "verification_fallback.detected_runner"
+VERIFICATION_FALLBACK_BEST_EFFORT_SOURCE = "verification_fallback.best_effort"
+# Sources whose commands a human or the managed host stated outright. Sylliptor
+# may refuse to run them, but must never silently substitute its own guess for
+# what somebody explicitly asked to be run.
+EXPLICIT_VERIFY_COMMAND_SOURCES = {
+    "environment.authoritative_verification_commands",
+    "cli.verify_cmd",
+    "config.verify_commands",
+}
+_DOCTEST_MODULE_NAMES = {"doctest"}
+_PYTEST_DOCTEST_GLOB_PREFIX = "--doctest-glob"
 _NODE_REPO_CLASSIFICATION_ALLOWED_MANIFEST_KINDS = {"build", "docker", "node", "typescript"}
 _NODE_REPO_CLASSIFICATION_ALLOWED_LANGUAGE_HINTS = {"docker", "javascript", "typescript"}
 _NODE_REPO_CLASSIFICATION_ALLOWED_PACKAGE_HINTS = _NODE_PACKAGE_HINTS | {"docker", "just", "make"}
@@ -406,6 +425,9 @@ class ResolvedVerifyCommands:
         default_factory=tuple,
         compare=False,
     )
+    # True once selection has degraded: the session still runs, but no command
+    # was found that Sylliptor can hold the result of a change against.
+    best_effort: bool = field(default=False, compare=False)
 
 
 def _default_verify_contract_type(source: str, *, commands: tuple[str, ...]) -> str:
@@ -464,6 +486,14 @@ def _default_verify_selection_reason(source: str) -> str:
         "task_refinement.no_authoritative_commands": (
             "task-aware refinement suppressed the generic fallback because no confident verification command exists"
         ),
+        VERIFICATION_FALLBACK_DETECTED_SOURCE: (
+            "the originally selected verification command was unusable, so detection fell "
+            "through to the runner this workspace exposes"
+        ),
+        VERIFICATION_FALLBACK_BEST_EFFORT_SOURCE: (
+            "no usable verification command was found, so verification is best-effort for "
+            "this session"
+        ),
     }.get(source, "")
 
 
@@ -473,6 +503,7 @@ def _resolved_verify_commands(
     source: str,
     reason: str | None = None,
     contract_type: str | None = None,
+    best_effort: bool = False,
 ) -> ResolvedVerifyCommands:
     normalized_commands = tuple(str(item).strip() for item in commands if str(item).strip())
     resolved_reason = (
@@ -495,6 +526,7 @@ def _resolved_verify_commands(
             source=source,
             contract_type=resolved_contract_type,
         ),
+        best_effort=best_effort,
     )
 
 
@@ -539,6 +571,52 @@ def validation_errors_for_selection(selection: ResolvedVerifyCommands | None) ->
     return errors
 
 
+def command_is_docs_doctest(command: str) -> bool:
+    """True when a command only runs doctest over documentation files.
+
+    Running the ``>>>`` examples in a README or a docs page proves the prose is
+    still accurate; it proves nothing about the change that was just made to the
+    code, so such a command is never an authoritative verification surface. Both
+    shapes are covered: ``python -m doctest <docs>`` and pytest driven at doc
+    files through ``--doctest-glob``.
+    """
+    parts = split_verify_command_parts(str(command or ""))
+    if not parts:
+        return False
+    while parts and _is_env_assignment_token(parts[0]):
+        parts = parts[1:]
+    if parts and parts[0] == "env":
+        parts = parts[1:]
+        while parts and _is_env_assignment_token(parts[0]):
+            parts = parts[1:]
+    parts = strip_verify_runner_prefix(parts) or []
+    if not parts:
+        return False
+    module_args: list[str]
+    if _verify_command_basename(parts[0]) in _DOCTEST_MODULE_NAMES:
+        module_args = list(parts[1:])
+    elif len(parts) >= 3 and parts[1] == "-m" and parts[2].casefold() in _DOCTEST_MODULE_NAMES:
+        module_args = list(parts[3:])
+    else:
+        normalized = normalize_verify_module_invocation(parts)
+        if _verify_command_basename(normalized[0]) not in {"pytest", "py.test"}:
+            return False
+        module_args = list(normalized[1:])
+        if not any(
+            str(arg).casefold().startswith(_PYTEST_DOCTEST_GLOB_PREFIX) for arg in module_args
+        ):
+            return False
+    targets = [arg for arg in module_args if not str(arg).startswith("-") and str(arg) != "--"]
+    if not targets:
+        return False
+    return all(_looks_like_docs_only_target(str(target)) for target in targets)
+
+
+def _verify_command_basename(token: str) -> str:
+    name = PurePosixPath(str(token).replace("\\", "/")).name.casefold()
+    return name[:-4] if name.endswith(".exe") else name
+
+
 def verification_selection_payload(
     selection: ResolvedVerifyCommands,
     *,
@@ -549,6 +627,7 @@ def verification_selection_payload(
         "verification_selection_reason": selection.reason,
         "verification_contract_type": selection.contract_type,
         "verification_authoritative": authoritative,
+        "verification_best_effort": selection.best_effort,
     }
 
 
@@ -2419,6 +2498,167 @@ def resolve_verify_commands(
     )
 
 
+@dataclass(frozen=True)
+class VerificationSelectionRepair:
+    selection: ResolvedVerifyCommands
+    dropped_commands: tuple[str, ...] = tuple()
+    warning: str = ""
+
+
+def repair_invalid_verify_command_selection(
+    selection: ResolvedVerifyCommands,
+    *,
+    root: Path | None = None,
+    repo_scan: RepoScanResult | None = None,
+) -> VerificationSelectionRepair:
+    """Make an unusable verification selection survivable instead of fatal.
+
+    Selecting a verification command is an optimization over the work the agent
+    is about to do, not a precondition for it: a session that cannot name an
+    authoritative command must still run the task and report honestly on what it
+    could verify. That applies to a command Sylliptor could not *classify*. A
+    command Sylliptor recognized and *refused* -- a vacuous verifier, a masked
+    failure, an unsafe pipeline -- is a different thing entirely: running it
+    would manufacture passing evidence, so it still fails fast rather than
+    quietly becoming the session's contract.
+
+    Among survivable commands, explicitly stated ones (managed host,
+    ``--verify-cmd``, configured ``verify_commands``) are kept as-is with a
+    warning -- Sylliptor does not substitute its own guess for what somebody
+    asked for. Commands Sylliptor inferred itself are dropped, detection falls
+    through to whatever runner the workspace exposes, and an empty result
+    degrades to a best-effort contract rather than an error.
+    """
+    errors = validation_errors_for_selection(selection)
+    if not errors:
+        return VerificationSelectionRepair(selection=selection)
+
+    specs = verification_command_specs_for_selection(selection)
+    # Scoped to authoritative selections exactly as the original guard was: this
+    # change narrows what is fatal (by reason), it must never widen it.
+    if is_authoritative_verify_command_selection(selection):
+        refused = [
+            f"{spec.original_text}: {spec.rejection_reason or 'invalid_command'}"
+            for spec in specs
+            if spec.validation_status == VerificationCommandValidationStatus.INVALID
+            and not rejection_reason_is_unclassifiable(spec.rejection_reason)
+        ]
+        if refused:
+            raise VerifyError(
+                "authoritative verification command is invalid: " + "; ".join(refused[:3])
+            )
+
+    invalid = tuple(
+        spec.original_text
+        for spec in specs
+        if spec.validation_status == VerificationCommandValidationStatus.INVALID
+    )
+    detail = "; ".join(errors[:3])
+
+    if selection.source in EXPLICIT_VERIFY_COMMAND_SOURCES:
+        return VerificationSelectionRepair(
+            selection=selection,
+            warning=(
+                "verification command was explicitly requested but cannot be treated as "
+                f"authoritative evidence ({detail}); keeping it and continuing"
+            ),
+        )
+
+    remaining = tuple(command for command in selection.commands if command not in invalid)
+    if remaining:
+        return VerificationSelectionRepair(
+            selection=_resolved_verify_commands(
+                commands=remaining,
+                source=selection.source,
+                reason=_appended_reason(selection.reason, f"dropped unusable command(s): {detail}"),
+                contract_type=selection.contract_type,
+            ),
+            dropped_commands=invalid,
+            warning=f"ignoring unusable verification command(s): {detail}",
+        )
+
+    detected = _detect_fallback_verify_commands(root=root, repo_scan=repo_scan)
+    if detected:
+        return VerificationSelectionRepair(
+            selection=_resolved_verify_commands(
+                commands=detected,
+                source=VERIFICATION_FALLBACK_DETECTED_SOURCE,
+                contract_type="repo_native",
+            ),
+            dropped_commands=invalid,
+            warning=(
+                f"ignoring unusable verification command(s): {detail}; "
+                f"using detected command(s) instead: {', '.join(detected)}"
+            ),
+        )
+
+    return VerificationSelectionRepair(
+        selection=_resolved_verify_commands(
+            commands=(),
+            source=VERIFICATION_FALLBACK_BEST_EFFORT_SOURCE,
+            contract_type="unavailable",
+            best_effort=True,
+        ),
+        dropped_commands=invalid,
+        warning=(
+            f"ignoring unusable verification command(s): {detail}; no verification command was "
+            "detected, continuing with best-effort verification"
+        ),
+    )
+
+
+def _detect_fallback_verify_commands(
+    *,
+    root: Path | None,
+    repo_scan: RepoScanResult | None,
+) -> tuple[str, ...]:
+    """Detection chain consulted after a selected command turns out unusable.
+
+    Declared pytest config and ``unittest`` discovery come first: they answer
+    "what does this workspace say it runs" for exactly the old-style layouts the
+    primary inference stays silent about. Anything else Sylliptor already knows
+    how to recognize (make, just, npm, maven, go, cargo, a pytest test layout)
+    comes from the repo scan behind them.
+    """
+    layers: tuple[Callable[[], tuple[str, ...] | list[str]], ...] = (
+        (lambda: detect_fallback_test_commands(root=root)) if root is not None else (lambda: []),
+        lambda: _resolve_repo_inferred_verify_commands(root=root, repo_scan=repo_scan),
+    )
+    # Evaluated lazily: the repo-scan layer can trigger a full rescan of the
+    # workspace, which must not happen once an earlier layer has already answered.
+    for layer in layers:
+        detected = _valid_verify_commands(
+            layer(),
+            source=VERIFICATION_FALLBACK_DETECTED_SOURCE,
+            contract_type="repo_native",
+        )
+        if detected:
+            return detected
+    return ()
+
+
+def _appended_reason(reason: str, note: str) -> str:
+    base = str(reason or "").strip()
+    return f"{base}; {note}" if base else note
+
+
+def _valid_verify_commands(
+    commands: tuple[str, ...] | list[str],
+    *,
+    source: str,
+    contract_type: str,
+) -> tuple[str, ...]:
+    return tuple(
+        spec.original_text
+        for spec in build_verification_command_specs(
+            commands,
+            source=source,
+            contract_type=contract_type,
+        )
+        if spec.validation_status == VerificationCommandValidationStatus.VALID
+    )
+
+
 def _repo_scan_describes_root(scan: RepoScanResult, root: Path) -> bool:
     raw_scan_root = str(getattr(scan, "workspace_root", "") or "").strip()
     if not raw_scan_root:
@@ -2449,7 +2689,13 @@ def _resolve_repo_inferred_verify_commands(
             scan = repo_scan
     if scan is None:
         return ()
-    likely_commands = normalize_verify_command_list(scan.likely_test_commands)
+    # A scan may predate this filter (persisted scans are replayed verbatim), so
+    # docs-doctest commands are rejected here as well as at inference time.
+    likely_commands = tuple(
+        command
+        for command in normalize_verify_command_list(scan.likely_test_commands)
+        if not command_is_docs_doctest(command)
+    )
     if likely_commands:
         return likely_commands
     return ()
@@ -2737,8 +2983,14 @@ def run_task_verification(
     verify_sandbox_mode = resolve_verify_sandbox_mode(effective_cfg)
     # The verifier's own commands are tracked too: a verify_run that hits its
     # timeout orphans workers exactly the way an agent-started test run does.
+    # Verification is automated: its commands run with stdin closed so an
+    # interactive prompt fails immediately and is reported, instead of waiting
+    # on a terminal no one is reading until the per-command timeout expires.
     runner = (
-        HostShellRunner(process_group_registry=process_group_registry)
+        HostShellRunner(
+            process_group_registry=process_group_registry,
+            close_stdin=True,
+        )
         if verify_sandbox_mode == "off"
         else None
     )
@@ -2751,11 +3003,13 @@ def run_task_verification(
             try:
                 base_settings = resolve_shell_sandbox_settings(effective_cfg)
                 verify_settings = replace(base_settings, mode=verify_sandbox_mode)
-                runner = build_shell_runner_from_settings(
-                    verify_settings,
-                    root,
-                    warning_callback=None,
-                    process_group_registry=process_group_registry,
+                runner = with_closed_stdin(
+                    build_shell_runner_from_settings(
+                        verify_settings,
+                        root,
+                        warning_callback=None,
+                        process_group_registry=process_group_registry,
+                    )
                 )
             except (ConfigError, VerifyError) as e:
                 runner_build_error = str(e)

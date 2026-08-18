@@ -87,7 +87,6 @@ _NESTED_ALLOWED_FIELDS = {
     "phase",
     "provider_retry_sleep",
     "remaining_seconds",
-    "routing_llm",
     "shell_background",
     "shell_tool",
     "source",

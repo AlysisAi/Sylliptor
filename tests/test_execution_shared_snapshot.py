@@ -50,6 +50,49 @@ def test_snapshot_large_file_fingerprint_changes_when_file_changes(tmp_path: Pat
     assert first[rel] != second[rel]
 
 
+def test_snapshot_twelve_megabyte_binary_uses_bounded_metadata_fingerprint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    big = root / ".sylliptor" / "twelve-megabyte.bin"
+    big.parent.mkdir(parents=True, exist_ok=True)
+    big.write_bytes(b"\x00\xff" * (6 * 1024 * 1024))
+    target = big.resolve()
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(self: Path) -> bytes:
+        if self.resolve() == target:
+            raise AssertionError(
+                "12 MiB binary must not be loaded into memory for snapshot hashing"
+            )
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+
+    snapshot = snapshot_runtime_tree(root)
+    rel = os.fspath(target.relative_to(root.resolve()))
+    assert big.stat().st_size == 12 * 1024 * 1024
+    assert snapshot[rel].startswith("meta:")
+
+
+def test_snapshot_preserves_unicode_emoji_and_rtl_filenames(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    runtime = root / ".sylliptor" / "unicode"
+    runtime.mkdir(parents=True)
+    names = ["café-🚀.txt", "مرحبا-שלום.txt", "資料-δοκιμή.txt"]
+    for index, name in enumerate(names):
+        (runtime / name).write_text(f"payload-{index}\n", encoding="utf-8")
+
+    snapshot = snapshot_runtime_tree(root)
+
+    for name in names:
+        rel = os.fspath((runtime / name).resolve().relative_to(root.resolve()))
+        assert rel in snapshot
+        assert snapshot[rel].startswith("sha256:")
+
+
 def test_snapshot_plan_assets_use_metadata_even_when_small(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "repo"
     root.mkdir()

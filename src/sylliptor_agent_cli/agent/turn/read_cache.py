@@ -11,6 +11,9 @@ from ..tools_assembly import ToolDef
 
 _SAME_BATCH_FS_READ_DEFAULT_MAX_BYTES = 20_000
 _SAME_BATCH_FS_READ_LINES_DEFAULT_MAX_LINES = 200
+# Mirrors tools.fs._DEFAULT_READ_LINES_MAX_BYTES: an absent max_bytes argument
+# keys and caps identically to the tool's own default ceiling.
+_SAME_BATCH_FS_READ_LINES_DEFAULT_MAX_BYTES = 48_000
 _SAME_BATCH_READ_CACHE_SAFE_TOOL_NAMES = {
     "fs_read",
     "fs_read_lines",
@@ -50,8 +53,8 @@ class _SameBatchFsReadLinesRecord:
 
 @dataclass
 class _SameBatchReadReuseCache:
-    exact_fs_reads: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
-    exact_fs_read_lines: dict[tuple[str, int, int | None, int, bool], dict[str, Any]] = field(
+    exact_fs_reads: dict[tuple[str, int, bool], dict[str, Any]] = field(default_factory=dict)
+    exact_fs_read_lines: dict[tuple[str, int, int | None, int, bool, int], dict[str, Any]] = field(
         default_factory=dict
     )
     full_fs_reads: dict[str, _SameBatchFsReadRecord] = field(default_factory=dict)
@@ -93,15 +96,20 @@ def _coerce_fs_read_request(
     *,
     root: Path,
     arguments: dict[str, Any],
-) -> tuple[str, str, int] | None:
+) -> tuple[str, str, int, bool] | None:
     raw_path = str(arguments.get("path") or "")
     path_key = _same_batch_read_path_key(root=root, raw_path=raw_path)
     if not path_key:
         return None
+    raw_max_bytes = arguments.get("max_bytes")
+    max_bytes = (
+        _SAME_BATCH_FS_READ_DEFAULT_MAX_BYTES if raw_max_bytes is None else int(raw_max_bytes)
+    )
     return (
         path_key,
         raw_path,
-        int(arguments.get("max_bytes") or _SAME_BATCH_FS_READ_DEFAULT_MAX_BYTES),
+        max_bytes,
+        bool(arguments.get("allow_derived", False)),
     )
 
 
@@ -109,7 +117,7 @@ def _coerce_fs_read_lines_request(
     *,
     root: Path,
     arguments: dict[str, Any],
-) -> tuple[str, str, int, int | None, int, bool] | None:
+) -> tuple[str, str, int, int | None, int, bool, int] | None:
     raw_path = str(arguments.get("path") or "")
     path_key = _same_batch_read_path_key(root=root, raw_path=raw_path)
     if not path_key:
@@ -124,16 +132,33 @@ def _coerce_fs_read_lines_request(
         else _SAME_BATCH_FS_READ_LINES_DEFAULT_MAX_LINES
     )
     include_line_numbers = bool(arguments.get("include_line_numbers", True))
-    return path_key, raw_path, start_line, requested_end_line, max_lines, include_line_numbers
+    raw_max_bytes = arguments.get("max_bytes")
+    if raw_max_bytes is None:
+        max_bytes = _SAME_BATCH_FS_READ_LINES_DEFAULT_MAX_BYTES
+    else:
+        max_bytes = int(raw_max_bytes)
+        if max_bytes < 1:
+            # Invalid ceiling: never serve it from cache - the real tool owns
+            # the FsError for out-of-range values.
+            return None
+    return (
+        path_key,
+        raw_path,
+        start_line,
+        requested_end_line,
+        max_lines,
+        include_line_numbers,
+        max_bytes,
+    )
 
 
 def _build_fs_read_lines_result_from_full_fs_read(
     *,
     raw_path: str,
-    request: tuple[str, str, int, int | None, int, bool],
+    request: tuple[str, str, int, int | None, int, bool, int],
     record: _SameBatchFsReadRecord,
 ) -> dict[str, Any] | None:
-    _, _, start_line, requested_end_line, max_lines, include_line_numbers = request
+    _, _, start_line, requested_end_line, max_lines, include_line_numbers, max_bytes = request
     total_lines = len(record.raw_lines)
     if start_line < 1 or start_line > total_lines:
         return None
@@ -156,6 +181,11 @@ def _build_fs_read_lines_result_from_full_fs_read(
     else:
         content = "".join(selected_lines)
 
+    if len(content.encode("utf-8")) > max_bytes:
+        # The rebuilt window would exceed the request's byte ceiling; let the
+        # real tool run and apply its own clipping rather than replicate it.
+        return None
+
     return {
         "path": raw_path,
         "start_line": start_line,
@@ -169,10 +199,10 @@ def _build_fs_read_lines_result_from_full_fs_read(
 def _build_fs_read_lines_result_from_cached_range(
     *,
     raw_path: str,
-    request: tuple[str, str, int, int | None, int, bool],
+    request: tuple[str, str, int, int | None, int, bool, int],
     record: _SameBatchFsReadLinesRecord,
 ) -> dict[str, Any] | None:
-    _, _, start_line, requested_end_line, max_lines, include_line_numbers = request
+    _, _, start_line, requested_end_line, max_lines, include_line_numbers, max_bytes = request
     if start_line < record.start_line:
         return None
     if include_line_numbers != record.include_line_numbers:
@@ -230,6 +260,12 @@ def _build_fs_read_lines_result_from_cached_range(
         else:
             truncated = record.truncated
 
+    content = "".join(selected_lines)
+    if len(content.encode("utf-8")) > max_bytes:
+        # The rebuilt window would exceed the request's byte ceiling; let the
+        # real tool run and apply its own clipping rather than replicate it.
+        return None
+
     return {
         "path": raw_path,
         "start_line": start_line,
@@ -239,7 +275,7 @@ def _build_fs_read_lines_result_from_cached_range(
             if record.total_lines is not None and actual_end_line == record.total_lines
             else None
         ),
-        "content": "".join(selected_lines),
+        "content": content,
         "truncated": truncated,
     }
 
@@ -255,8 +291,8 @@ def _maybe_reuse_same_batch_read_result(
         request = _coerce_fs_read_request(root=root, arguments=arguments)
         if request is None:
             return None
-        path_key, raw_path, max_bytes = request
-        cached = cache.exact_fs_reads.get((path_key, max_bytes))
+        path_key, raw_path, max_bytes, allow_derived = request
+        cached = cache.exact_fs_reads.get((path_key, max_bytes, allow_derived))
         if cached is None:
             return None
         reused = copy.deepcopy(cached)
@@ -269,9 +305,17 @@ def _maybe_reuse_same_batch_read_result(
     request = _coerce_fs_read_lines_request(root=root, arguments=arguments)
     if request is None:
         return None
-    path_key, raw_path, start_line, requested_end_line, max_lines, include_line_numbers = request
+    (
+        path_key,
+        raw_path,
+        start_line,
+        requested_end_line,
+        max_lines,
+        include_line_numbers,
+        max_bytes,
+    ) = request
     cached_exact = cache.exact_fs_read_lines.get(
-        (path_key, start_line, requested_end_line, max_lines, include_line_numbers)
+        (path_key, start_line, requested_end_line, max_lines, include_line_numbers, max_bytes)
     )
     if cached_exact is not None:
         reused = copy.deepcopy(cached_exact)
@@ -311,9 +355,9 @@ def _remember_same_batch_read_result(
         request = _coerce_fs_read_request(root=root, arguments=arguments)
         if request is None:
             return
-        path_key, _, max_bytes = request
+        path_key, _, max_bytes, allow_derived = request
         stored = copy.deepcopy(result)
-        cache.exact_fs_reads[(path_key, max_bytes)] = stored
+        cache.exact_fs_reads[(path_key, max_bytes, allow_derived)] = stored
         if bool(result.get("truncated")):
             return
         content = result.get("content")
@@ -330,14 +374,26 @@ def _remember_same_batch_read_result(
     request = _coerce_fs_read_lines_request(root=root, arguments=arguments)
     if request is None:
         return
-    path_key, _, start_line, requested_end_line, max_lines, include_line_numbers = request
+    (
+        path_key,
+        _,
+        start_line,
+        requested_end_line,
+        max_lines,
+        include_line_numbers,
+        max_bytes,
+    ) = request
     end_line = result.get("end_line")
     content = result.get("content")
     if not isinstance(end_line, int) or not isinstance(content, str):
         return
+    if bool(result.get("byte_truncated")) or bool(result.get("line_clipped")):
+        # A byte-capped window may end mid-line; reusing it to answer other
+        # range requests would silently serve incomplete lines.
+        return
     stored = copy.deepcopy(result)
     cache.exact_fs_read_lines[
-        (path_key, start_line, requested_end_line, max_lines, include_line_numbers)
+        (path_key, start_line, requested_end_line, max_lines, include_line_numbers, max_bytes)
     ] = stored
     cache.fs_read_lines_by_path.setdefault(path_key, []).append(
         _SameBatchFsReadLinesRecord(

@@ -585,6 +585,64 @@ def _chat_mode_rows() -> list[tuple[str, str, str]]:
     ]
 
 
+def _chat_persona_rows(custom: Any = None) -> list[tuple[str, str, str]]:
+    rows = [
+        ("code", "1) code", "Implementation work; keeps your execution mode."),
+        ("architect", "2) architect", "Plans and designs; writes markdown documents only."),
+        ("ask", "3) ask", "Read-only questions with inspection tools."),
+        ("debug", "4) debug", "Reproduce-before-fix; keeps your execution mode."),
+    ]
+    if custom:
+        index = len(rows)
+        for name in sorted(custom):
+            definition = custom[name]
+            index += 1
+            rows.append(
+                (
+                    str(name),
+                    f"{index}) {name} (custom)",
+                    str(getattr(definition, "description", "") or "Custom persona."),
+                )
+            )
+    return rows
+
+
+def _chat_persona_panel(
+    *,
+    current_persona: str,
+    selected_persona: str | None = None,
+    interactive: bool = False,
+    custom: Any = None,
+) -> Panel:
+    current = current_persona.strip().lower() or "code"
+    return _selectable_options_panel(
+        title=f"Persona Options (current: {current})",
+        rows=_chat_persona_rows(custom=custom),
+        selected_value=selected_persona,
+        interactive=interactive,
+    )
+
+
+def _select_chat_persona_interactive(
+    *,
+    current_persona: str,
+    console: Console,
+    custom: Any = None,
+) -> tuple[str | None, bool]:
+    normalized_current = current_persona.strip().lower() or "code"
+    return _patchable("_run_inline_option_selector", _run_inline_option_selector)(
+        console=console,
+        rows=_chat_persona_rows(custom=custom),
+        current_value=normalized_current,
+        panel_builder=lambda selected, interactive: _chat_persona_panel(
+            current_persona=current_persona,
+            selected_persona=selected,
+            interactive=interactive,
+        ),
+        unavailable_label="Persona picker",
+    )
+
+
 def _select_chat_mode_interactive(
     *,
     current_mode: str,

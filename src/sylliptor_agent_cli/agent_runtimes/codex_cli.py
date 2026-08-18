@@ -245,6 +245,7 @@ class CodexCliRuntimeAdapter:
         if not settings.provider_managed_auth:
             raise ValueError("The Codex account runtime requires provider-managed authentication.")
         sandbox = _codex_sandbox(request.mode)
+        session_id = _validated_session_id(request.session_id)
         cwd = Path(request.cwd).expanduser().resolve()
         if not cwd.is_dir():
             return RuntimeTurnResult(
@@ -253,9 +254,6 @@ class CodexCliRuntimeAdapter:
                 exit_code=_INVALID_REQUEST_EXIT_CODE,
                 error=f"Delegated runtime cwd is not a directory: {cwd}",
             )
-        # Reject unsafe resume identifiers before probing the executable. This
-        # keeps request validation consistent even when Codex is not installed.
-        _validated_session_id(request.session_id)
         executable = _resolve_executable(settings.executable)
         if executable is None:
             return RuntimeTurnResult(
@@ -271,6 +269,7 @@ class CodexCliRuntimeAdapter:
                 executable=executable,
                 settings=settings,
                 request=request,
+                session_id=session_id,
                 cwd=cwd,
                 sandbox=sandbox,
                 final_message_path=final_message_path,
@@ -335,11 +334,11 @@ def _build_turn_command(
     executable: str,
     settings: AgentRuntimeSettings,
     request: RuntimeTurnRequest,
+    session_id: str,
     cwd: Path,
     sandbox: str,
     final_message_path: Path,
 ) -> list[str]:
-    session_id = _validated_session_id(request.session_id)
     if session_id:
         command = [
             executable,

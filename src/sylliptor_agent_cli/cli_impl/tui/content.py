@@ -12,7 +12,7 @@ from prompt_toolkit.formatted_text import FormattedText
 
 HEADING_TEXT = "Sylliptor"  # plain wordmark fallback (narrow terminals)
 CREDIT_TEXT = "crafted by AlysisAI"
-HINT_TEXT = "/forge for an autonomous run  ·  / for commands  ·  /help for everything"
+HINT_TEXT = "/forge for an autonomous run  ·  tab to switch persona  ·  /help for everything"
 # Welcome screen: full greeting. Once the conversation is underway the input
 # switches to the shorter follow-up placeholder below.
 INPUT_PLACEHOLDER = "I'm Sylliptor, your coding buddy — how can I help you?"

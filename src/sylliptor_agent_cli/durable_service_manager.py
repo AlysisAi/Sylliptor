@@ -619,8 +619,9 @@ class DurableServiceManager:
                 reason="durable service stop",
                 quiet=True,
             )
-        if popen is not None and popen.poll() is None:
-            _terminate_popen_tree(popen, timeout_s=_STOP_TIMEOUT_S)
+        if popen is not None:
+            if popen.poll() is None:
+                _terminate_popen_tree(popen, timeout_s=_STOP_TIMEOUT_S)
         else:
             pid = int(metadata.get("pid") or 0)
             pgid = metadata.get("pgid")
@@ -981,6 +982,37 @@ def _sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 def _pid_exists(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":  # pragma: no cover - exercised on Windows
+        # ``os.kill(pid, 0)`` is not a non-mutating existence probe on Windows:
+        # CPython implements unsupported signals through TerminateProcess, so it
+        # can kill the service while it is still starting. Query its exit status
+        # through a read-only process handle instead.
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        get_exit_code_process = kernel32.GetExitCodeProcess
+        get_exit_code_process.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        get_exit_code_process.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not get_exit_code_process(handle, ctypes.byref(exit_code)):
+                return False
+            return int(exit_code.value) == still_active
+        finally:
+            close_handle(handle)
     try:
         os.kill(pid, 0)
     except OSError as exc:
@@ -1015,7 +1047,7 @@ def _terminate_popen_tree(popen: subprocess.Popen[bytes], *, timeout_s: float) -
     if popen.poll() is not None:
         return
     if os.name == "nt":  # pragma: no cover - exercised on Windows
-        popen.terminate()
+        _terminate_windows_process_tree(pid=popen.pid, timeout_s=timeout_s)
     else:
         pgid = _process_group_id(popen.pid)
         if pgid is not None:
@@ -1030,7 +1062,7 @@ def _terminate_popen_tree(popen: subprocess.Popen[bytes], *, timeout_s: float) -
     except subprocess.TimeoutExpired:
         pass
     if os.name == "nt":  # pragma: no cover - exercised on Windows
-        popen.kill()
+        _terminate_windows_process_tree(pid=popen.pid, timeout_s=_KILL_TIMEOUT_S)
     else:
         pgid = _process_group_id(popen.pid)
         if pgid is not None:
@@ -1046,6 +1078,9 @@ def _terminate_popen_tree(popen: subprocess.Popen[bytes], *, timeout_s: float) -
 def _terminate_pid_or_group(*, pid: int, pgid: Any, timeout_s: float) -> None:
     if pid <= 0:
         return
+    if os.name == "nt":  # pragma: no cover - exercised on Windows
+        _terminate_windows_process_tree(pid=pid, timeout_s=timeout_s)
+        return
     _signal_pid_or_group(pid=pid, pgid=pgid, sig=signal.SIGTERM)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -1056,6 +1091,84 @@ def _terminate_pid_or_group(*, pid: int, pgid: Any, timeout_s: float) -> None:
             return
         time.sleep(0.05)
     _signal_pid_or_group(pid=pid, pgid=pgid, sig=signal.SIGKILL)
+
+
+def _terminate_windows_process_tree(*, pid: int, timeout_s: float) -> None:
+    if pid <= 0:
+        return
+    _ = timeout_s
+    import ctypes
+    from ctypes import wintypes
+
+    th32cs_snapprocess = 0x00000002
+    process_terminate = 0x0001
+    invalid_handle_value = ctypes.c_void_p(-1).value
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_snapshot = kernel32.CreateToolhelp32Snapshot
+    create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    create_snapshot.restype = wintypes.HANDLE
+    process_first = kernel32.Process32FirstW
+    process_first.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    process_first.restype = wintypes.BOOL
+    process_next = kernel32.Process32NextW
+    process_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    process_next.restype = wintypes.BOOL
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    terminate_process = kernel32.TerminateProcess
+    terminate_process.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    terminate_process.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    children_by_parent: dict[int, list[int]] = {}
+    snapshot = create_snapshot(th32cs_snapprocess, 0)
+    if snapshot and snapshot != invalid_handle_value:
+        try:
+            entry = ProcessEntry32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            if process_first(snapshot, ctypes.byref(entry)):
+                while True:
+                    child_pid = int(entry.th32ProcessID)
+                    parent_pid = int(entry.th32ParentProcessID)
+                    children_by_parent.setdefault(parent_pid, []).append(child_pid)
+                    if not process_next(snapshot, ctypes.byref(entry)):
+                        break
+        finally:
+            close_handle(snapshot)
+
+    ordered: list[int] = []
+    pending = [pid]
+    while pending:
+        current = pending.pop()
+        ordered.append(current)
+        pending.extend(children_by_parent.get(current, ()))
+
+    for target_pid in reversed(ordered):
+        handle = open_process(process_terminate, False, target_pid)
+        if not handle:
+            continue
+        try:
+            terminate_process(handle, 1)
+        finally:
+            close_handle(handle)
 
 
 def _signal_pid_or_group(*, pid: int, pgid: Any, sig: int) -> None:

@@ -30,6 +30,7 @@ from ...surface.types import (
     ToolOutputEvent,
     ToolStartEvent,
 )
+from .forge_status import FORGE_RUNNING_STATES, forge_status_counts
 from .subagent_identity import subagent_tagline
 from .transcript import TuiTranscript
 
@@ -104,24 +105,6 @@ def _truncate(text: str, *, limit: int = 160) -> str:
     return clean[: limit - 1] + "…"
 
 
-# Task-status buckets for the end-of-run summary — kept in sync with
-# cli_common._forge_task_status_counts (the authority).
-_FORGE_FAIL_SET = {
-    "failed",
-    "verify_failed",
-    "candidate_rejected",
-    "changes_requested",
-    "merge_conflict",
-    "blocked_integration",
-    "blocked",
-    "interrupted",
-    "cancelled",
-}
-_FORGE_DONE_SET = {"done", "already_satisfied"}
-_FORGE_OBSOLETE_SET = {"superseded", "invalidated"}
-_FORGE_RUNNING_SET = {"in_progress", "running", "executing", "active"}
-
-
 def _condense_subagent_desc(description: str, *, limit: int = 72) -> str:
     """One brief clause of what the subagent is for, from its (often huge)
     definition description. Reuses the spawn picker's condenser so the entry
@@ -175,9 +158,15 @@ class TuiSurface:
         self._forge_last_refresh: float = 0.0
         self._forge_token: object | None = None
         self._forge_run_id: str = ""
-        # Live subagent identity. Pair each name with the worker thread that
-        # started it so a late event from an abandoned turn cannot pop a
-        # same-named agent that a newer turn owns.
+        # Live subagent identity. The stack tracks concurrent subagent runs
+        # (start pushes, end pops); the callback tells the app which name to pin
+        # in the footer badge — None clears it. Entries are keyed by the pushing
+        # THREAD as well as the name: a run's start and end always fire on the
+        # same thread (the tool's run() is synchronous), while a stale end from
+        # an abandoned turn arrives on a thread that no longer owns an entry —
+        # so it can never pop a same-named agent the next turn just started.
+        # Cleared at every turn boundary and on soft-interrupt so an interrupted
+        # run can never leave a stale badge.
         self._on_subagent_activity = on_subagent_activity
         self._subagent_stack: list[tuple[int, str]] = []
         self._subagent_status_word: dict[str, str] = {}
@@ -258,6 +247,11 @@ class TuiSurface:
             return
         self._t.end_reasoning(block_id)
 
+    def reset_streamed_assistant(self) -> None:
+        # Transport retry restreams the reply; wipe the live block so the
+        # abandoned generation never shows doubled (see core._on_stream_restart).
+        self._t.restart_assistant()
+
     def on_assistant_message_done(self, text: str) -> None:
         if _worker_cancelled():
             return
@@ -326,22 +320,20 @@ class TuiSurface:
         self._t.forge_set_active(task_id, phase=phase, message=message)
         self._maybe_refresh_forge_statuses()
 
-    def end_forge(self, summary: str = "") -> None:
+    def end_forge(self, summary: str = "", *, paths: object | None = None) -> None:
         """Apply the final task statuses from disk (adding any tasks enrichment added
-        mid-run) and freeze the view as done, with a concise outcome summary."""
+        mid-run) and freeze the view as done, with a concise outcome summary.
+
+        ``paths`` re-arms the run paths for a late finalize: a soft-interrupt
+        clears ``self._forge_paths`` (via :meth:`interrupt_forge`) even though
+        the swarm cannot actually be stopped — when it then runs to its natural
+        end, the worker passes the run's paths back so the frozen table shows
+        the statuses the finished swarm really wrote instead of an empty view."""
+        if paths is not None:
+            self._forge_paths = paths
         tasks = self._read_plan_tasks()
         self._t.forge_sync_tasks(tasks)
-        done = failed = remaining = 0
-        for _tid, _title, status in tasks:
-            sl = status.strip().lower()
-            if sl in _FORGE_DONE_SET:
-                done += 1
-            elif sl in _FORGE_FAIL_SET:
-                failed += 1
-            elif sl in _FORGE_OBSOLETE_SET:
-                continue
-            else:
-                remaining += 1
+        done, failed, remaining = forge_status_counts(status for _tid, _title, status in tasks)
         ok = failed == 0 and remaining == 0
         if not summary:
             if not tasks:
@@ -374,7 +366,7 @@ class TuiSurface:
                         continue
                     status = str(task.get("status") or "").strip().lower()
                     task_id = str(task.get("id") or "").strip()
-                    if not task_id or status not in _FORGE_RUNNING_SET:
+                    if not task_id or status not in FORGE_RUNNING_STATES:
                         continue
                     task["status"] = "interrupted"
                     task["last_error"] = "Interrupted by user."
@@ -481,9 +473,9 @@ class TuiSurface:
             self._t.set_status("Working…")
             return
         if arg_detail and event.tool_call_id:
-            # Keep argument context for nested failures too; their successful
-            # calls stay quiet, but a failure must identify which invocation
-            # failed when the agent retries a tool with different inputs.
+            # Stale-entry backstop: evict oldest first, never in-flight wholesale.
+            # Stored for nested calls too, so a nested FAILURE's ✗ line can say
+            # which invocation failed (its success line is suppressed anyway).
             while len(self._tool_details) > 256:
                 self._tool_details.pop(next(iter(self._tool_details)))
             self._tool_details[event.tool_call_id] = arg_detail
@@ -532,6 +524,9 @@ class TuiSurface:
                     "error", f"✗ {event.subagent_name} ▸ {label} {verdict}{suffix}{detail}"
                 )
             if self._trace_level == "off":
+                # Off is quiet everywhere else — no named identity in the status
+                # (mirrors on_subagent_start's off branch and the pre-feature
+                # None-after-every-tool-end behavior).
                 self._t.set_status(None)
             else:
                 word = self._subagent_status_word.get(str(event.subagent_name), "working")
@@ -584,7 +579,12 @@ class TuiSurface:
             pass
 
     def clear_subagent_activity(self) -> None:
-        """Forget live subagents and make abandoned late events harmless."""
+        """Forget every live subagent and clear the footer badge.
+
+        Called at turn boundaries and on soft-interrupt. After this, the
+        abandoned runs' late end events find no matching stack entry and are
+        dropped whole — they cannot pop, restyle, or re-pin anything the next
+        turn owns."""
         if self._subagent_stack:
             self._subagent_stack.clear()
             self._sync_subagent_badge()
@@ -597,6 +597,9 @@ class TuiSurface:
         name = str(event.name)
         self._subagent_stack.append((threading.get_ident(), name))
         self._sync_subagent_badge()
+        # Resolve the activity tagline once per run (a custom definition
+        # shadowing a built-in name keeps its own story, hence the description
+        # check) and remember it for the between-step status rollbacks.
         tagline = subagent_tagline(name, event.description)
         self._subagent_status_word[name] = tagline or "working"
         if self._trace_level == "off":
@@ -614,8 +617,11 @@ class TuiSurface:
         self._t.set_status(f"↪ {name} · {tagline or 'working'}…")
 
     def on_subagent_end(self, event: SubagentEndEvent) -> None:
-        # Only the thread that recorded a start may unwind that run. A missing
-        # match is a stale event and must not alter the current badge or status.
+        # A run's start and end fire on the same thread, so the end may only
+        # unwind an entry this thread pushed. An end with no matching entry is
+        # stale — an abandoned turn's agent finishing late, or a start this
+        # surface never recorded — and must not touch the live turn's badge,
+        # status, or transcript at all.
         entry = (threading.get_ident(), str(event.name))
         matched = False
         for index in range(len(self._subagent_stack) - 1, -1, -1):
@@ -628,14 +634,22 @@ class TuiSurface:
         name = entry[1]
         if all(stacked_name != name for _tid, stacked_name in self._subagent_stack):
             self._subagent_status_word.pop(name, None)
+        # Unwind the badge even for a cancelled worker — the matched pop only
+        # ever removes this thread's own entry, so re-syncing here can never
+        # resurrect a name the interrupt already dropped (clear_subagent_activity
+        # emptied the stack, making this pop unreachable for abandoned runs).
         self._sync_subagent_badge()
         if not self._subagent_stack:
+            # The last live agent is gone — clear the activity line at every
+            # trace level so an "↪ name · …" status can never outlive its run.
             self._t.set_status(None)
         if _worker_cancelled() or self._trace_level == "off":
             return
         status = "finished" if event.status == "success" else event.status
         self._t.append("trace", f"↩ {event.name} · {status} · {event.steps_completed} steps")
         if self._subagent_stack:
+            # Roll the activity line to a survivor so the status is never
+            # attributed to an agent whose ↩ line just printed.
             top = self._subagent_stack[-1][1]
             word = self._subagent_status_word.get(top, "working")
             self._t.set_status(f"↪ {top} · {word}…")

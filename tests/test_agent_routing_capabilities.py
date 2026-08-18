@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sylliptor_agent_cli.agent.routing import (
+from sylliptor_agent_cli.agent.llm_calls import (
     _main_agent_chat,
     _safe_forced_tool_choice_for_recovery,
 )

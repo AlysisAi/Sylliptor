@@ -15,6 +15,7 @@ ToolAliasTransform = Callable[[dict[str, Any]], dict[str, Any]]
 _PATH_BASE_ENUM = ["active_workdir", "workspace_root"]
 _UNKNOWN_TOOL_SUGGESTION_THRESHOLD = 0.72
 _UNKNOWN_TOOL_MAX_SUGGESTIONS = 3
+REPORT_BLOCKER_MAX_MESSAGE_CHARS = 16_384
 
 
 def _path_base_property(*, description: str | None = None) -> dict[str, Any]:
@@ -247,6 +248,10 @@ def _summary_fs_read(parsed: dict[str, Any]) -> str:
     path = str(parsed.get("path") or "?")
     content = str(parsed.get("content") or "")
     truncated = bool(parsed.get("truncated"))
+    if parsed.get("derived_artifact"):
+        size_bytes = parsed.get("size_bytes")
+        size_note = f"; {size_bytes} bytes on disk" if isinstance(size_bytes, int) else ""
+        return f'Sampled derived artifact "{path}" (head only{size_note}; content withheld).'
     trunc_note = ", truncated" if truncated else ""
     return f'Loaded "{path}" ({len(content)} chars{trunc_note}).'
 
@@ -708,8 +713,81 @@ class BuiltinToolMetadata:
 
 _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
     BuiltinToolMetadata(
+        name="report_blocker",
+        description=(
+            "Report a concrete obstacle that prevents this top-level execute turn from "
+            "completing safely. Supply the user-facing explanation in message and use this "
+            "as the final tool call when no available tool can resolve the obstacle. The host "
+            "uses the successful tool result as a structured blocker signal; words in message "
+            "never control routing or completion."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": (
+                        "User-facing explanation of what prevents completion. Any language, "
+                        "script, or punctuation is allowed; maxLength is transport protection "
+                        "only."
+                    ),
+                    "maxLength": REPORT_BLOCKER_MAX_MESSAGE_CHARS,
+                },
+            },
+            "required": ["message"],
+        },
+        categories=("session",),
+        rich=RichToolMetadata(
+            display_name="Report Blocker",
+            reasoning_hint="A concrete obstacle prevents safe completion of this turn.",
+            action_hint="Report the obstacle as the final structured turn action.",
+            fallback_hint="Continue with available tools when the obstacle can still be resolved.",
+        ),
+        built_in_subagent_exposure="hidden",
+        optional=True,
+        optional_unavailable_reason="completion gating is not active for this runtime",
+    ),
+    BuiltinToolMetadata(
+        name="switch_mode",
+        description=(
+            "Propose switching this chat session to another persona mode: code, "
+            "architect, ask, or debug. The user must approve; an approved switch "
+            "applies when the current turn ends. Use only when the conversation "
+            "clearly calls for a different posture (e.g. pure explanation -> ask, "
+            "implementation after planning -> code). Never required for normal work."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "persona": {
+                    "type": "string",
+                    "enum": ["code", "architect", "ask", "debug"],
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One short sentence shown to the user in the approval prompt.",
+                },
+            },
+            "required": ["persona", "reason"],
+        },
+        categories=("session",),
+        rich=RichToolMetadata(
+            display_name="Switch Persona",
+            reasoning_hint="The requested work fits a different persona posture.",
+            action_hint="Ask the user to approve a persona switch.",
+            fallback_hint="If declined, continue in the current persona without asking again.",
+        ),
+        built_in_subagent_exposure="readonly",
+        optional=True,
+        optional_unavailable_reason="persona modes disabled or non-interactive runtime",
+    ),
+    BuiltinToolMetadata(
         name="fs_read",
-        description="Read a UTF-8 text file under the working root. Prefer after symbol_search or search_rg for exact file contents.",
+        description=(
+            "Read a UTF-8 text file under the working root. Prefer after symbol_search or "
+            "search_rg for exact file contents. Derived artifacts (lockfiles, minified or "
+            "generated output) return size + head sample unless allow_derived=true."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -721,6 +799,14 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
                     )
                 ),
                 "max_bytes": {"type": "integer", "default": 12000},
+                "allow_derived": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Full content for derived artifacts; set only when the artifact "
+                        "itself is the subject of the task."
+                    ),
+                },
             },
             "required": ["path"],
         },
@@ -747,6 +833,11 @@ _BUILTIN_TOOL_METADATA: tuple[BuiltinToolMetadata, ...] = (
                 "end_line": {"type": "integer"},
                 "max_lines": {"type": "integer", "default": 200},
                 "include_line_numbers": {"type": "boolean", "default": True},
+                "max_bytes": {
+                    "type": "integer",
+                    "default": 48000,
+                    "description": "Byte ceiling for the returned range.",
+                },
             },
             "required": ["path", "start_line"],
         },

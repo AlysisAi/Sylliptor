@@ -30,6 +30,13 @@ from sylliptor_agent_cli.provider_auth import (
 
 
 class _CatalogAdapter:
+    provider_id = "openai-codex"
+    protocol = "openai_responses"
+    base_url = "https://chatgpt.com/backend-api/codex"
+
+    def route_credential_scope(self) -> str:
+        return "test-subscription-account"
+
     def account_status(self) -> ProviderAccountStatus:
         return ProviderAccountStatus(connected=True)
 
@@ -103,6 +110,41 @@ def test_config_uses_subscription_catalog_for_models_and_effort(monkeypatch) -> 
     )
 
 
+@pytest.mark.parametrize(
+    ("base_url", "model", "expected"),
+    [
+        (
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            "qwen3.8-max",
+            ("off", "low", "medium", "xhigh", "auto"),
+        ),
+        (
+            "https://api.deepseek.com",
+            "deepseek-v4-pro",
+            ("off", "high", "max", "auto"),
+        ),
+        (
+            "https://integrate.api.nvidia.com/v1",
+            "nvidia/nemotron-3-super-120b-a12b",
+            ("off", "low", "high", "auto"),
+        ),
+        (
+            "https://integrate.api.nvidia.com/v1",
+            "deepseek-ai/deepseek-v4-pro",
+            ("off", "high", "max", "auto"),
+        ),
+    ],
+)
+def test_api_profile_reasoning_picker_uses_documented_model_contract(
+    base_url: str,
+    model: str,
+    expected: tuple[str, ...],
+) -> None:
+    state = ConfigMenuState.from_cfg(AppConfig(base_url=base_url, model=model))
+
+    assert config_menu_mod._thinking_labels_for_state(state) == expected
+
+
 def test_tui_config_persists_subscription_model_and_supported_effort(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     adapter = _CatalogAdapter()
     monkeypatch.setattr(
@@ -137,9 +179,16 @@ def test_native_session_accepts_subscription_profile_without_api_key(
     monkeypatch,
     tmp_path,
 ) -> None:  # type: ignore[no-untyped-def]
+    def adapter_factory(_provider_id, **_kwargs):  # type: ignore[no-untyped-def]
+        return _CatalogAdapter()
+
     monkeypatch.setattr(
         "sylliptor_agent_cli.provider_auth.create_provider_auth",
-        lambda _provider_id: _CatalogAdapter(),
+        adapter_factory,
+    )
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.llm.factory.create_provider_auth",
+        adapter_factory,
     )
     cfg = _subscription_cfg()
     update_profile(

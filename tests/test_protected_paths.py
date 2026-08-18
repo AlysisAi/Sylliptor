@@ -143,16 +143,18 @@ def test_git_apply_patch_blocks_git_dir_case_insensitive(tmp_path: Path) -> None
         tools["git_apply_patch"].run({"patch": patch})
 
 
-def test_fs_write_allows_protected_prefix_in_fullaccess_mode(tmp_path: Path) -> None:
+def test_fs_write_fullaccess_still_requires_explicit_sensitive_path_approval(
+    tmp_path: Path,
+) -> None:
     tools = _tools(tmp_path, mode="fullaccess")
-    out = tools["fs_write"].run(
-        {
-            "path": ".git/hooks/pre-commit",
-            "content": "#!/bin/sh\necho allowed\n",
-        }
-    )
-    assert out["bytes"] > 0
-    assert (tmp_path / ".git" / "hooks" / "pre-commit").exists()
+    with pytest.raises(AgentRuntimeError, match="Explicit one-time user approval"):
+        tools["fs_write"].run(
+            {
+                "path": ".git/hooks/pre-commit",
+                "content": "#!/bin/sh\necho requires-approval\n",
+            }
+        )
+    assert not (tmp_path / ".git" / "hooks" / "pre-commit").exists()
 
 
 def test_fs_write_allows_gitignore(tmp_path: Path) -> None:

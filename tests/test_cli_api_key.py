@@ -19,6 +19,12 @@ from typer.testing import CliRunner
 
 from sylliptor_agent_cli import agent_loop as agent_loop_mod
 from sylliptor_agent_cli import cli as cli_mod
+from sylliptor_agent_cli.agent.turn_contract import (
+    TurnEffect,
+    TurnOutcome,
+    TurnRelation,
+    TurnSemantics,
+)
 from sylliptor_agent_cli.agent_loop import SYSTEM_PROMPT, create_session
 from sylliptor_agent_cli.cli import app as sylliptor_app
 from sylliptor_agent_cli.config import AppConfig, ConfigError
@@ -60,6 +66,21 @@ def _init_git_repo_with_commit(repo: Path) -> None:
     _git(repo, "commit", "-m", "init")
 
 
+def _workspace_turn_semantics(
+    *,
+    outcome: TurnOutcome = TurnOutcome.CHANGE,
+    relation: TurnRelation = TurnRelation.NEW,
+) -> TurnSemantics:
+    effects = (
+        (TurnEffect.READ_WORKSPACE, TurnEffect.WRITE_WORKSPACE)
+        if outcome is TurnOutcome.CHANGE
+        else (TurnEffect.READ_WORKSPACE,)
+        if outcome in {TurnOutcome.INSPECT, TurnOutcome.REVIEW, TurnOutcome.PLAN}
+        else ()
+    )
+    return TurnSemantics(outcome=outcome, relation=relation, requested_effects=effects)
+
+
 def test_create_session_uses_api_key_override(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("SYLLIPTOR_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -81,8 +102,12 @@ def test_create_session_uses_api_key_override(tmp_path: Path, monkeypatch) -> No
 
 
 def test_system_prompt_reinforces_narrow_repo_execution_changes() -> None:
+    # The old wording ("unmatched or unknown cases") was orphaned jargon: the sibling
+    # bullets that glossed it were dropped in a compression pass, leaving the term
+    # undefined in the shipped prompt. It now says what it means in place.
     assert (
-        "Preserve existing output/API/file shape and unmatched or unknown cases unless a broader change is clearly required."
+        "Preserve existing output/API/file shape, and leave input cases the request did not "
+        "name behaving exactly as they do today, unless a broader change is clearly required."
         in SYSTEM_PROMPT
     )
     assert "Keep diffs minimal and reviewable." in SYSTEM_PROMPT
@@ -221,10 +246,11 @@ def test_create_session_skips_repo_scan_when_normal_chat_does_not_need_it(
         session.close()
 
 
-def test_create_session_uses_resolved_llm_timeout_for_main_router_and_compactor(
+def test_create_session_uses_resolved_llm_timeout_for_main_and_compactor(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    # Router-free path: only the main and compactor clients are provisioned.
     captured: list[dict[str, Any]] = []
     monkeypatch.setenv("SYLLIPTOR_LLM_TIMEOUT_S", "44.0")
 
@@ -253,7 +279,7 @@ def test_create_session_uses_resolved_llm_timeout_for_main_router_and_compactor(
         session_log_dir_override=tmp_path / "sessions",
     )
     try:
-        assert len(captured) == 3
+        assert len(captured) == 2
         assert {item["timeout_s"] for item in captured} == {44.0}
     finally:
         session.close()
@@ -374,6 +400,8 @@ def test_create_session_records_model_metadata_diagnostics_and_dedupes_same_mode
     surface = _Surface()
     session_id = "metadata-warn"
     sessions_dir = tmp_path / "sessions"
+    # Router-free path: the compactor (sharing the main model) is the second
+    # role that exercises the same-model warning dedupe.
     session = create_session(
         cfg=AppConfig(model="unknown-model-xyz"),
         root=tmp_path,
@@ -383,7 +411,7 @@ def test_create_session_records_model_metadata_diagnostics_and_dedupes_same_mode
         no_log=False,
         api_key_override="override-key",
         surface=surface,
-        enable_conversation_summarization=False,
+        enable_conversation_summarization=True,
         session_log_dir_override=sessions_dir,
         session_id_override=session_id,
     )
@@ -397,7 +425,7 @@ def test_create_session_records_model_metadata_diagnostics_and_dedupes_same_mode
     payload = dict(session_start.get("payload") or {})
     diagnostics = list(payload.get("model_metadata_diagnostics") or [])
     assert payload["model_metadata_policy"] == "warn"
-    assert {item["role"] for item in diagnostics} == {"coding", "router"}
+    assert {item["role"] for item in diagnostics} == {"coding", "compactor"}
     assert all(item["fallback_capacity_active"] is True for item in diagnostics)
     assert all("context_window_tokens" in item["fallback_capacity_fields"] for item in diagnostics)
     assert all("max_output_tokens" in item["fallback_capacity_fields"] for item in diagnostics)
@@ -809,6 +837,7 @@ def test_refresh_session_task_brief_adds_pinned_repo_context(tmp_path: Path, mon
             pending_instruction=(
                 "Fix src/parser.py without changing the CSV shape and keep the public API stable."
             ),
+            turn_semantics=_workspace_turn_semantics(),
         )
         task_brief = next(
             (
@@ -864,6 +893,7 @@ def test_refresh_session_task_brief_refreshes_in_place_with_new_constraints(
         agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Fix src/parser.py without changing the CSV shape.",
+            turn_semantics=_workspace_turn_semantics(),
         )
         session.messages.append(
             {
@@ -875,6 +905,7 @@ def test_refresh_session_task_brief_refreshes_in_place_with_new_constraints(
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Also preserve unknown values like pending and add a regression test in tests/test_parser.py.",
+            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.REFINE),
         )
         task_brief_messages = [
             str(message.get("content") or "")
@@ -936,6 +967,7 @@ def test_refresh_session_task_brief_keeps_existing_content_for_generic_follow_up
         agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Only touch src/parser.py and keep the public API unchanged.",
+            turn_semantics=_workspace_turn_semantics(),
         )
         original_task_brief = next(
             str(message.get("content") or "")
@@ -946,6 +978,10 @@ def test_refresh_session_task_brief_keeps_existing_content_for_generic_follow_up
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction=follow_up,
+            turn_semantics=_workspace_turn_semantics(
+                outcome=TurnOutcome.INSPECT,
+                relation=TurnRelation.EXPLAIN_PRIOR,
+            ),
         )
         task_brief_messages = [
             str(message.get("content") or "")
@@ -1000,6 +1036,11 @@ def test_refresh_session_task_brief_keeps_placeholder_for_generic_follow_up_with
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction=follow_up,
+            turn_semantics=_workspace_turn_semantics(
+                outcome=TurnOutcome.ANSWER,
+                relation=TurnRelation.ACKNOWLEDGE,
+            ),
+            route="general",
         )
         task_brief_messages = [
             str(message.get("content") or "")
@@ -1039,6 +1080,7 @@ def test_refresh_session_task_brief_keeps_anchored_focus_over_unanchored_constra
         agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Fix src/parser.py without changing the CSV shape.",
+            turn_semantics=_workspace_turn_semantics(),
         )
         session.messages.append(
             {
@@ -1050,6 +1092,7 @@ def test_refresh_session_task_brief_keeps_anchored_focus_over_unanchored_constra
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Also preserve unknown values like pending.",
+            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.REFINE),
         )
         task_brief_messages = [
             str(message.get("content") or "")
@@ -1092,6 +1135,7 @@ def test_refresh_session_task_brief_keeps_short_meaningful_constraint(
         agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Fix src/parser.py without changing the CSV shape.",
+            turn_semantics=_workspace_turn_semantics(),
         )
         session.messages.append(
             {
@@ -1103,6 +1147,7 @@ def test_refresh_session_task_brief_keeps_short_meaningful_constraint(
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Keep API stable.",
+            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.REFINE),
         )
         task_brief = next(
             str(message.get("content") or "")
@@ -1142,6 +1187,7 @@ def test_refresh_session_task_brief_keeps_concise_real_constraint(
         agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Fix src/parser.py without changing the CSV shape.",
+            turn_semantics=_workspace_turn_semantics(),
         )
         session.messages.append(
             {
@@ -1153,6 +1199,7 @@ def test_refresh_session_task_brief_keeps_concise_real_constraint(
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Handle empty lines too.",
+            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.REFINE),
         )
         task_brief = next(
             str(message.get("content") or "")
@@ -1192,6 +1239,7 @@ def test_refresh_session_task_brief_promotes_strong_unanchored_task_shift(
         agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Fix src/parser.py without changing the CSV shape.",
+            turn_semantics=_workspace_turn_semantics(),
         )
         session.messages.append(
             {
@@ -1203,6 +1251,7 @@ def test_refresh_session_task_brief_promotes_strong_unanchored_task_shift(
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Actually add a regression test and keep API stable.",
+            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.NEW),
         )
         task_brief_lines = next(
             str(message.get("content") or "").splitlines()
@@ -1213,7 +1262,7 @@ def test_refresh_session_task_brief_promotes_strong_unanchored_task_shift(
         assert refreshed is True
         assert task_brief_lines[2] == "current_focus:"
         assert task_brief_lines[3] == "- Actually add a regression test and keep API stable."
-        assert "- Fix src/parser.py without changing the CSV shape." in task_brief_lines
+        assert "- Fix src/parser.py without changing the CSV shape." not in task_brief_lines
     finally:
         session.close()
 
@@ -1253,6 +1302,7 @@ def test_refresh_session_task_brief_keeps_existing_focus_for_anchored_explanator
             pending_instruction=(
                 "Fix src/parser.py without changing the CSV shape. Keep the public API stable."
             ),
+            turn_semantics=_workspace_turn_semantics(),
         )
         original_task_brief = next(
             str(message.get("content") or "")
@@ -1271,6 +1321,10 @@ def test_refresh_session_task_brief_keeps_existing_focus_for_anchored_explanator
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction=follow_up,
+            turn_semantics=_workspace_turn_semantics(
+                outcome=TurnOutcome.INSPECT,
+                relation=TurnRelation.EXPLAIN_PRIOR,
+            ),
         )
         task_brief = next(
             str(message.get("content") or "")
@@ -1278,14 +1332,14 @@ def test_refresh_session_task_brief_keeps_existing_focus_for_anchored_explanator
             if str(message.get("content") or "").startswith("<task_brief>")
         )
 
-        assert refreshed is True
+        assert refreshed is False
         assert "current_focus:" in task_brief
         assert (
             "- Fix src/parser.py without changing the CSV shape. Keep the public API stable."
             in task_brief
         )
-        assert follow_up in task_brief
-        assert task_brief != original_task_brief
+        assert follow_up not in task_brief
+        assert task_brief == original_task_brief
     finally:
         session.close()
 
@@ -1314,6 +1368,10 @@ def test_refresh_session_task_brief_initializes_from_first_explanatory_repo_requ
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="How does src/parser.py work?",
+            turn_semantics=_workspace_turn_semantics(
+                outcome=TurnOutcome.INSPECT,
+                relation=TurnRelation.NEW,
+            ),
         )
         task_brief = next(
             str(message.get("content") or "")
@@ -1352,6 +1410,7 @@ def test_refresh_session_task_brief_promotes_real_anchored_execution_follow_up(
         agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Fix src/parser.py without changing the CSV shape.",
+            turn_semantics=_workspace_turn_semantics(),
         )
         session.messages.append(
             {
@@ -1363,6 +1422,7 @@ def test_refresh_session_task_brief_promotes_real_anchored_execution_follow_up(
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Only touch src/parser.py and tests/test_parser.py.",
+            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.REFINE),
         )
         task_brief = next(
             str(message.get("content") or "")
@@ -1372,9 +1432,9 @@ def test_refresh_session_task_brief_promotes_real_anchored_execution_follow_up(
 
         assert refreshed is True
         assert "current_focus:" in task_brief
-        assert "- Only touch src/parser.py and tests/test_parser.py." in task_brief
-        assert "recent_user_constraints:" in task_brief
         assert "- Fix src/parser.py without changing the CSV shape." in task_brief
+        assert "recent_user_constraints:" in task_brief
+        assert "- Only touch src/parser.py and tests/test_parser.py." in task_brief
     finally:
         session.close()
 
@@ -1409,6 +1469,7 @@ def test_refresh_session_task_brief_adds_pinned_plain_dir_context(
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Create timer.py here and keep the output simple.",
+            turn_semantics=_workspace_turn_semantics(),
         )
         task_brief = next(
             (
@@ -1466,6 +1527,11 @@ def test_refresh_session_task_brief_keeps_placeholder_for_plain_dir_anchored_adv
         refreshed = agent_loop_mod.refresh_session_task_brief_message(
             session,
             pending_instruction="Can you explain `asyncio.gather` more?",
+            turn_semantics=_workspace_turn_semantics(
+                outcome=TurnOutcome.ANSWER,
+                relation=TurnRelation.NEW,
+            ),
+            route="general",
         )
         task_brief = next(
             str(message.get("content") or "")
@@ -2045,6 +2111,206 @@ def test_run_passes_simple_agent_turn_budget_flags_to_run_agent(
     assert result.exit_code == 0
     assert captured["enable_chat_turn_step_budget"] is True
     assert captured["chat_turn_fixed_override"] == 7
+
+
+def test_run_benchmark_profile_applies_raw_agent_defaults(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    captured: dict[str, Any] = {}
+
+    def fake_run_agent(**kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli_mod, "run_agent", fake_run_agent)
+    env = {
+        "SYLLIPTOR_CONFIG_DIR": os.fspath(tmp_path / "cfg"),
+        "SYLLIPTOR_DATA_DIR": os.fspath(tmp_path / "data"),
+    }
+
+    result = runner.invoke(
+        sylliptor_app,
+        [
+            "run",
+            "--path",
+            os.fspath(tmp_path),
+            "--model",
+            "test-model",
+            "--api-key",
+            "k",
+            "--benchmark",
+            "hi",
+        ],
+        env=env,
+    )
+
+    assert result.exit_code == 0
+    cfg = captured["cfg"]
+    assert isinstance(cfg, AppConfig)
+    assert captured["mode"] == "auto"
+    assert captured["yes"] is True
+    assert captured["max_steps"] >= 80
+    assert captured["chat_turn_fixed_override"] == captured["max_steps"]
+    assert captured["enable_tool_output_offload"] is True
+    assert captured["compaction_profile"] == "execution"
+    assert captured["subagents_enabled"] is False
+    assert cfg.routing_mode == "code_only"
+    assert cfg.subagents_enabled is False
+    assert cfg.skills_enabled is False
+    assert cfg.skills_auto_invoke is False
+    assert cfg.custom_tools_enabled is False
+    assert cfg.web_search_mode == "off"
+
+
+def test_benchmark_flag_keeps_one_shot_system_prompt_identical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_cfg = AppConfig(
+        model="test-model",
+        routing_mode="code_only",
+        subagents_enabled=False,
+        skills_enabled=False,
+        skills_auto_invoke=False,
+        custom_tools_enabled=False,
+        web_search_mode="off",
+        max_steps=80,
+    )
+    prompts: list[bytes] = []
+
+    def fake_load_config() -> AppConfig:
+        return profile_cfg.model_copy(deep=True)
+
+    def fake_run_agent(**kwargs: Any) -> int:
+        prompt_context = agent_loop_mod.prepare_session_prompt_context(
+            cfg=kwargs["cfg"],
+            root=kwargs["root"],
+            mode=kwargs["mode"],
+            yes=kwargs["yes"],
+            non_interactive=kwargs["non_interactive"],
+            one_shot_execution=kwargs["one_shot_execution"],
+            verification_enabled=False,
+            subagents_enabled=kwargs["subagents_enabled"],
+            workspace_binding=kwargs["workspace_binding"],
+        )
+        prompts.append(prompt_context.system_prompt.encode("utf-8"))
+        return 0
+
+    monkeypatch.setattr(cli_mod, "load_config", fake_load_config)
+    monkeypatch.setattr(cli_mod, "run_agent", fake_run_agent)
+    env = {
+        "SYLLIPTOR_CONFIG_DIR": os.fspath(tmp_path / "cfg"),
+        "SYLLIPTOR_DATA_DIR": os.fspath(tmp_path / "data"),
+    }
+    common_args = [
+        "run",
+        "--path",
+        os.fspath(tmp_path),
+        "--allow-broad-workspace",
+        "--yes",
+        "--mode",
+        "auto",
+        "--max-steps",
+        "80",
+        "--no-subagents",
+        "--model",
+        "test-model",
+        "--api-key",
+        "k",
+    ]
+
+    normal = CliRunner().invoke(sylliptor_app, [*common_args, "hi"], env=env)
+    profiled = CliRunner().invoke(
+        sylliptor_app,
+        [*common_args, "--benchmark", "hi"],
+        env=env,
+    )
+
+    assert normal.exit_code == 0
+    assert profiled.exit_code == 0
+    assert len(prompts) == 2
+    assert prompts[0] == prompts[1]
+
+
+def test_run_benchmark_profile_respects_explicit_overrides(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    captured: dict[str, Any] = {}
+
+    def fake_run_agent(**kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli_mod, "run_agent", fake_run_agent)
+    env = {
+        "SYLLIPTOR_CONFIG_DIR": os.fspath(tmp_path / "cfg"),
+        "SYLLIPTOR_DATA_DIR": os.fspath(tmp_path / "data"),
+    }
+
+    result = runner.invoke(
+        sylliptor_app,
+        [
+            "run",
+            "--path",
+            os.fspath(tmp_path),
+            "--model",
+            "test-model",
+            "--api-key",
+            "k",
+            "--benchmark",
+            "--mode",
+            "review",
+            "--max-steps",
+            "12",
+            "--subagents",
+            "hi",
+        ],
+        env=env,
+    )
+
+    assert result.exit_code == 0
+    cfg = captured["cfg"]
+    assert isinstance(cfg, AppConfig)
+    assert captured["mode"] == "review"
+    assert captured["max_steps"] == 12
+    assert captured["chat_turn_fixed_override"] == 12
+    assert captured["subagents_enabled"] is True
+    assert cfg.subagents_enabled is True
+
+
+def test_run_profile_env_enables_raw_benchmark_profile(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    captured: dict[str, Any] = {}
+
+    def fake_run_agent(**kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(cli_mod, "run_agent", fake_run_agent)
+    env = {
+        "SYLLIPTOR_CONFIG_DIR": os.fspath(tmp_path / "cfg"),
+        "SYLLIPTOR_DATA_DIR": os.fspath(tmp_path / "data"),
+        "SYLLIPTOR_RUN_PROFILE": "raw-benchmark",
+    }
+
+    result = runner.invoke(
+        sylliptor_app,
+        [
+            "run",
+            "--path",
+            os.fspath(tmp_path),
+            "--model",
+            "test-model",
+            "--api-key",
+            "k",
+            "hi",
+        ],
+        env=env,
+    )
+
+    assert result.exit_code == 0
+    assert captured["mode"] == "auto"
+    assert captured["yes"] is True
+    assert captured["max_steps"] >= 80
+    assert captured["compaction_profile"] == "execution"
 
 
 def test_run_passes_api_key_env_to_run_agent(tmp_path: Path, monkeypatch) -> None:
@@ -2756,6 +3022,8 @@ def test_chat_trace_command_without_arg_uses_picker_selection(tmp_path: Path, mo
 
 
 def test_chat_model_command_updates_model_for_following_turn(tmp_path: Path, monkeypatch) -> None:
+    from sylliptor_agent_cli.cli_impl.chat import loop as chat_loop_mod
+
     runner = CliRunner()
     captured: dict[str, str] = {}
 
@@ -2769,6 +3037,7 @@ def test_chat_model_command_updates_model_for_following_turn(tmp_path: Path, mon
     class _DummySession:
         store = _DummyStore()
         client = _DummyClient()
+        cfg = AppConfig(model="test-model")
         stream = False
         mode = "review"
 
@@ -2782,7 +3051,12 @@ def test_chat_model_command_updates_model_for_following_turn(tmp_path: Path, mon
     def fake_create_session(**_kwargs) -> _DummySession:
         return _DummySession()
 
+    def fake_apply_config(*, session: _DummySession, cfg: AppConfig) -> None:
+        session.cfg = cfg
+        session.client.model = cfg.model
+
     monkeypatch.setattr(cli_mod, "create_session", fake_create_session)
+    monkeypatch.setattr(chat_loop_mod, "_apply_config_menu_changes_to_session", fake_apply_config)
     env = {
         "SYLLIPTOR_CONFIG_DIR": os.fspath(tmp_path),
         "SYLLIPTOR_DATA_DIR": os.fspath(tmp_path),
@@ -3335,12 +3609,12 @@ def test_chat_usage_and_context_commands_are_handled(tmp_path: Path, monkeypatch
     result = runner.invoke(
         sylliptor_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/usage\n/context\nhello\nexit\n",
+        input="/usage\n/context\n/ctx\nhello\nexit\n",
         env=env,
     )
     assert result.exit_code == 0
     assert "Usage" in result.output
-    assert "Context Window Left" in result.output
+    assert result.output.count("Context Window Left") == 2
     assert "context_window_left_percent" in result.output
     assert "Effective Input Budget" in result.output
     assert "Conversation Context Left" in result.output

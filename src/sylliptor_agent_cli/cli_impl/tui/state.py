@@ -27,8 +27,15 @@ class TuiState:
     # "$0.0000". A literal 0.0 means nothing has been spent yet.
     cost_usd: float | None = 0.0
     cost_unknown_calls: int = 0  # calls whose cost couldn't be metered (footer "+N")
+    # Preformatted billing status (for example ``subscription`` or ``~$0.0123``).
+    # Empty retains the legacy numeric fallback for callers that do not have a
+    # UsageSummary available yet.
+    cost_display: str = ""
     mode: str = ACT_MODE  # "plan" | "act"
     exec_mode: str = ""  # execution mode: review | auto | readonly | fullaccess
+    # Active persona (code|architect|ask|debug); "" or "code" renders no
+    # persona badge — the execution-mode badge alone stays authoritative.
+    persona: str = ""
     # Forge: True while the user is inside a Forge planning session (ui_mode ==
     # "forge"); drives the footer FORGE badge + the forge-specific placeholder.
     forge_mode: bool = False
@@ -42,7 +49,10 @@ class TuiState:
     workspace: str = ""  # short display form, e.g. "~/coder-plugin-install"
     branch: str = ""  # git branch name, e.g. "feat/tui-rebuild"
     usage_hud_enabled: bool = True
-    context_pct: float = 100.0  # % of context window remaining
+    # Conversation headroom %, seeded from the session before first paint.
+    # ``None`` means "not measured yet" so a failed compute reads n/a in the
+    # footer instead of a fabricated 100%.
+    context_pct: float | None = None
 
     @property
     def plan_mode(self) -> bool:

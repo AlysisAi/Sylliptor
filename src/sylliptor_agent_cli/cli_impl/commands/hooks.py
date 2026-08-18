@@ -294,10 +294,10 @@ def hooks_trace(
         infos = filter_sessions_to_local_owner(all_infos)
         if not infos:
             if all_infos:
-                console.print(f"No sessions owned by this account in {sessions_dir}")
                 console.print(
-                    f"{len(all_infos)} session(s) recorded by a different account; "
-                    "pass an explicit session id."
+                    f"No sessions owned by this account in {sessions_dir} "
+                    f"({len(all_infos)} recorded by a different account; "
+                    "pass an explicit session id)."
                 )
             else:
                 console.print(f"No retained sessions found in {sessions_dir}")
@@ -703,10 +703,10 @@ def hooks_watch(
         infos = filter_sessions_to_local_owner(all_infos)
         if not infos:
             if all_infos:
-                console.print(f"No sessions owned by this account in {sessions_dir}")
                 console.print(
-                    f"{len(all_infos)} session(s) recorded by a different account; "
-                    "pass an explicit session id."
+                    f"No sessions owned by this account in {sessions_dir} "
+                    f"({len(all_infos)} recorded by a different account; "
+                    "pass an explicit session id)."
                 )
             else:
                 console.print(f"No retained sessions found in {sessions_dir}")

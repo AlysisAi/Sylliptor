@@ -32,6 +32,8 @@ class BackgroundProcessSpawn:
     cleanup: Callable[[], None]
     started_argv: tuple[str, ...]
     termination_mode: BackgroundTerminationMode = "process_group"
+    orphan_cleanup_kind: str | None = None
+    orphan_cleanup_id: str | None = None
 
 
 class BackgroundShellRunner(Protocol):
@@ -262,6 +264,8 @@ class DockerBackgroundRunner:
             cleanup=cleanup,
             started_argv=tuple(argv),
             termination_mode="direct",
+            orphan_cleanup_kind="docker-container",
+            orphan_cleanup_id=container_name,
         )
 
 

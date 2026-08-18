@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 import typer
 
 from ... import __version__
+from ...auth_diagnostics import auth_doctor_payload
 from ...config import (
     AppConfig,
     ConfigError,
@@ -19,7 +20,12 @@ from ...config import (
     resolve_model_access_api_key,
     resolve_web_search_policy,
 )
-from ...provider_diagnostics import build_provider_diagnostics, validate_active_provider_live
+from ...provider_diagnostics import (
+    build_provider_diagnostics,
+    probe_reasoning_suppression_live,
+    validate_active_provider_live,
+    validate_web_search_live,
+)
 from ...provider_telemetry import (
     diagnostic_bundle_payload,
     last_provider_call_summary,
@@ -33,7 +39,13 @@ from ...tools.registry import iter_builtin_tool_metadata
 from ...tools.web_search import resolve_web_search_runtime_status
 from ..assets_cli import assets_app as forge_assets_app
 from . import _patchable
-from ._shared import Mode, _console, _Table
+from ._shared import (
+    Mode,
+    _console,
+    _Table,
+)
+from .auth import JSON_OPTION_HELP as _JSON_OPTION_HELP
+from .auth import _status_payload as _auth_status_payload
 from .auth import auth_app
 from .config import config_app
 from .conventions import conventions_app
@@ -198,6 +210,13 @@ def run(
         help="Attach image path(s). Repeat --image for multiple files.",
     ),
     mode: Mode | None = typer.Option(None, "--mode", help="Mode override."),
+    persona: str | None = typer.Option(
+        None,
+        "--persona",
+        help=(
+            "Persona: code, architect, ask, debug, or a custom persona from .sylliptor_personas."
+        ),
+    ),
     model: str | None = typer.Option(None, "--model", help="Model override."),
     base_url: str | None = typer.Option(None, "--base-url", help="Base URL override."),
     temperature: float | None = typer.Option(None, "--temperature", help="Sampling temperature."),
@@ -258,7 +277,15 @@ def run(
     deadline_seconds: float | None = typer.Option(
         None,
         "--deadline-seconds",
-        help="Stop this one-shot run after the given invocation-wide wall-clock seconds.",
+        help=(
+            "Stop this one-shot run after the given invocation-wide wall-clock seconds. "
+            "Defaults to 3600 (60 min); use --no-deadline to run unbounded."
+        ),
+    ),
+    no_deadline: bool = typer.Option(
+        False,
+        "--no-deadline",
+        help="Run without any wall-clock budget, overriding the default one-shot deadline.",
     ),
     require_deadline: bool = typer.Option(
         False,
@@ -289,6 +316,7 @@ def run(
         allow_broad_workspace,
         image,
         mode,
+        persona,
         model,
         base_url,
         temperature,
@@ -303,6 +331,7 @@ def run(
         yes,
         benchmark,
         deadline_seconds,
+        no_deadline,
         require_deadline,
         diagnostic_log,
         cli_ctx=ctx,
@@ -329,6 +358,13 @@ def chat(
         help="Queue image path(s) for the next message. Repeat --image for multiple files.",
     ),
     mode: Mode | None = typer.Option(None, "--mode", help="Mode override."),
+    persona: str | None = typer.Option(
+        None,
+        "--persona",
+        help=(
+            "Persona: code, architect, ask, debug, or a custom persona from .sylliptor_personas."
+        ),
+    ),
     model: str | None = typer.Option(None, "--model", help="Model override."),
     base_url: str | None = typer.Option(None, "--base-url", help="Base URL override."),
     temperature: float | None = typer.Option(None, "--temperature", help="Sampling temperature."),
@@ -399,6 +435,7 @@ def chat(
         allow_broad_workspace,
         image,
         mode,
+        persona,
         model,
         base_url,
         temperature,
@@ -517,6 +554,57 @@ def _provider_doctor_table(cfg: AppConfig) -> Table:
     return table
 
 
+def _auth_doctor_table() -> Table:
+    payload = auth_doctor_payload()
+    context = payload["context"]
+    environment = payload["environment"]
+    path = environment["path"]
+    keyring = payload["keyring"]
+    table = _Table(title="sylliptor doctor auth")
+    table.add_column("check")
+    table.add_column("result")
+    table.add_row("context", str(context["kind"]))
+    table.add_row(
+        "tty",
+        f"stdin={_yes_no(context['stdin_tty'])} stdout={_yes_no(context['stdout_tty'])} "
+        f"stderr={_yes_no(context['stderr_tty'])}",
+    )
+    table.add_row("term", str(context["term"] or "(unset)"))
+    table.add_row("ci_env", ", ".join(context["ci_env"]) or "(none)")
+    table.add_row("home", str(environment["home"]))
+    table.add_row("home_env", str(environment["home_env"] or "(unset)"))
+    table.add_row("config_dir", str(environment["config_dir"]))
+    table.add_row("config_dir_override", str(environment["config_dir_override"] or "(unset)"))
+    table.add_row("config_exists", _yes_no(environment["config_exists"]))
+    table.add_row(
+        "path",
+        f"{path['entry_count']} entries"
+        + (" (looks minimal)" if path["looks_minimal"] else "")
+        + f" · cli={path['resolved_cli'] or '(not on PATH)'}",
+    )
+    table.add_row("keyring_backend", str(keyring["backend"] or "(unresolved)"))
+    table.add_row("keyring_available", _yes_no(keyring["available"]))
+    table.add_row("keyring_env_override", str(keyring["env_override"] or "(unset)"))
+    if not keyring["available"]:
+        table.add_row("keyring_reason", str(keyring["reason"] or "(unknown)"))
+    for store in payload["credential_stores"]:
+        summary = "missing (no credentials stored yet)" if not store["exists"] else "readable"
+        if store["exists"] and not store["readable"]:
+            summary = f"UNREADABLE — {store['error']}"
+        elif store["exists"]:
+            summary = (
+                f"readable · {store['entry_count']} entries · "
+                f"key_source={store['key_source'] or '(unknown)'}"
+            )
+        table.add_row(f"store:{store['name']}", summary)
+        table.add_row(f"store:{store['name']}:next_write", str(store["planned_key_source"]))
+    return table
+
+
+def _yes_no(value: object) -> str:
+    return "yes" if value else "no"
+
+
 def _doctor_bundle_payload(cfg: AppConfig) -> dict[str, Any]:
     diagnostics = build_provider_diagnostics(cfg)
     return diagnostic_bundle_payload(
@@ -533,6 +621,32 @@ def _provider_live_validation_table(cfg: AppConfig, *, timeout_s: float = 15.0) 
     table.add_column("field")
     table.add_column("value")
     for key, value in validation.rows():
+        table.add_row(key, value)
+    return table
+
+
+def _web_search_live_validation_table(cfg: AppConfig, *, timeout_s: float = 15.0) -> Table:
+    validation = _patchable("validate_web_search_live", validate_web_search_live)(
+        cfg,
+        timeout_s=timeout_s,
+    )
+    table = _Table(title="web_search live check")
+    table.add_column("field")
+    table.add_column("value")
+    for key, value in validation.rows():
+        table.add_row(key, value)
+    return table
+
+
+def _reasoning_suppression_table(cfg: AppConfig, *, timeout_s: float = 15.0) -> Table:
+    report = _patchable("probe_reasoning_suppression_live", probe_reasoning_suppression_live)(
+        cfg,
+        timeout_s=timeout_s,
+    )
+    table = _Table(title="reasoning-off live check")
+    table.add_column("field")
+    table.add_column("value")
+    for key, value in report.rows():
         table.add_row(key, value)
     return table
 
@@ -721,7 +835,7 @@ def setup(
 def doctor(
     section: str | None = typer.Argument(
         None,
-        help="Optional check group. Use `sandbox`, `providers`, or `bundle`.",
+        help="Optional check group. Use `sandbox`, `providers`, `auth`, or `bundle`.",
     ),
     smoke: bool = typer.Option(
         True,
@@ -754,9 +868,30 @@ def doctor(
         "--redacted/--no-redacted",
         help="Emit only redacted diagnostic data for `doctor bundle`.",
     ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help=(
+            "Emit `doctor auth` as one machine-readable JSON object on stdout. "
+            "Rejected for the check groups that have no JSON form."
+        ),
+    ),
 ) -> None:
     if section is not None:
         target = section.strip().lower()
+        if target == "auth":
+            if json_output is True:
+                typer.echo(json.dumps(auth_doctor_payload(), sort_keys=True))
+                return
+            _console().print(_auth_doctor_table())
+            return
+        if json_output is True and target != "bundle":
+            # Silently printing a table to a caller that asked for JSON would hand
+            # it unparseable output. `bundle` is already JSON-only.
+            _console().print(
+                "[red]--json is only supported for `doctor auth` and `doctor bundle`.[/red]"
+            )
+            raise typer.Exit(code=2)
         if target == "sandbox":
             _cli_module()._run_sandbox_doctor_command(include_smoke=smoke, include_env=env)
             return
@@ -767,8 +902,9 @@ def doctor(
             if live:
                 _require_active_subscription_ready(model=None, base_url=None)
                 console.print(
-                    "[yellow]Live provider validation sends one minimal text request and may "
-                    "incur provider cost or rate-limit usage.[/yellow]"
+                    "[yellow]Live provider validation sends a few minimal requests (one text "
+                    "request, one reasoning-off request, and one web search when enabled) and "
+                    "may incur provider cost or rate-limit usage.[/yellow]"
                 )
                 if not yes and not typer.confirm(
                     "Run live provider validation for the active profile?", default=False
@@ -776,6 +912,8 @@ def doctor(
                     console.print("Live provider validation cancelled.")
                     return
                 console.print(_provider_live_validation_table(cfg, timeout_s=live_timeout))
+                console.print(_reasoning_suppression_table(cfg, timeout_s=live_timeout))
+                console.print(_web_search_live_validation_table(cfg, timeout_s=live_timeout))
             return
         if target == "bundle":
             if not redacted:
@@ -786,9 +924,15 @@ def doctor(
             return
         if target != "sandbox":
             _console().print(
-                "[red]Unknown doctor target.[/red] Use: sylliptor doctor sandbox|providers|bundle"
+                "[red]Unknown doctor target.[/red] "
+                "Use: sylliptor doctor sandbox|providers|auth|bundle"
             )
             raise typer.Exit(code=2)
+    if json_output is True:
+        _console().print(
+            "[red]--json is only supported for `doctor auth` and `doctor bundle`.[/red]"
+        )
+        raise typer.Exit(code=2)
     console = _console()
     cfg = _patchable("load_config", load_config)()
     console.print(_doctor_table(cfg))
@@ -861,30 +1005,61 @@ def login() -> None:
 
 @app.command()
 def logout() -> None:
-    """Disconnect your Sylliptor account (forgets the stored access key)."""
+    """Disconnect your Sylliptor account and remove its stored access key."""
     from ... import account_login
 
     console = _console()
     cfg = _patchable("load_config", load_config)()
     if account_login.logout(cfg):
-        console.print("[green]Logged out.[/green] Your stored MiMo access key was removed.")
+        console.print("[green]Logged out.[/green] Your stored Sylliptor key was removed.")
     else:
         console.print("You're not logged in to a Sylliptor account.")
 
 
+def _whoami_payload(cfg: AppConfig) -> dict[str, Any]:
+    """Build the Sylliptor account status contract for a supervising app."""
+    from ... import account_login
+
+    status = account_login.login_status(cfg)
+    trial = account_login.fetch_trial_status(cfg) if status.logged_in else None
+    detail: str | None = None
+    if not status.logged_in:
+        detail = "No Sylliptor account is connected."
+    elif trial is None:
+        detail = "Connected. Manage your plan and credits at sylliptor.alysisai.com/account."
+    else:
+        detail = account_login.format_trial_status_line(trial) or None
+    return _auth_status_payload(
+        connection="sylliptor",
+        authenticated=status.logged_in,
+        account_label=(trial.email if trial is not None else None),
+        method=("access-key" if status.logged_in else None),
+        detail=detail,
+        transport=status.base_url,
+        profile_name=status.profile_name,
+        profile_active=bool(status.active),
+        plan=(trial.plan if trial is not None else None),
+    )
+
+
 @app.command()
-def whoami() -> None:
+def whoami(
+    json_output: bool = typer.Option(False, "--json", help=_JSON_OPTION_HELP),
+) -> None:
     """Show your Sylliptor login status."""
     from ... import account_login
 
     console = _console()
     cfg = _patchable("load_config", load_config)()
+    if json_output is True:
+        typer.echo(json.dumps(_whoami_payload(cfg), sort_keys=True))
+        return
     status = account_login.login_status(cfg)
     if not status.logged_in:
         console.print("Not logged in. Run `sylliptor login` to connect your Sylliptor account.")
         return
     active = "active" if status.active else "not active"
-    console.print("[green]Logged in[/green] to the Sylliptor MiMo trial.")
+    console.print("[green]Logged in[/green] to your Sylliptor account.")
     console.print(
         f"Profile: [bold]{status.profile_name}[/bold] ({active}) · key {status.key_preview}"
     )
@@ -895,4 +1070,4 @@ def whoami() -> None:
         if line:
             console.print(line)
     else:
-        console.print("[dim](Could not reach the trial service for live status.)[/dim]")
+        console.print("[dim](Live account status is unavailable.)[/dim]")

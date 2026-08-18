@@ -35,6 +35,9 @@ WIRE_THINKING_ADAPTIVE = "thinking_adaptive"  # thinking:{"type":"adaptive"} + o
 WIRE_BUDGET_TOKENS = "budget_tokens"  # thinking:{"type":"enabled","budget_tokens":N}
 WIRE_THINKING_LEVEL = "thinking_level"  # generationConfig.thinkingConfig.thinkingLevel
 WIRE_ENABLE_THINKING = "enable_thinking"  # boolean (+ optional thinking_budget)
+WIRE_CHAT_TEMPLATE_ENABLE_THINKING = (
+    "chat_template_enable_thinking"  # chat_template_kwargs: {enable_thinking: bool}
+)
 WIRE_REASONING_OBJECT = "reasoning_object"  # reasoning: {effort|max_tokens|enabled|exclude}
 WIRE_REASONING_ENABLED = "reasoning_enabled"  # reasoning: {"enabled": bool}
 WIRE_NONE = "none"  # no reasoning knob exists on this surface
@@ -56,6 +59,8 @@ class ReasoningContract:
     values: tuple[str, ...] = ()  # exact allowed effort/level strings ("" knob → empty)
     default: str = ""  # server default value; "" when unknown / not applicable
     off: str = OFF_UNKNOWN
+    replay_reasoning_content: bool = False
+    emits_flat_reasoning_effort: bool = False  # verified on Chat Completions
     notes: str = ""
 
     def allows_value(self, value: str | None) -> bool:
@@ -70,6 +75,46 @@ class ReasoningContract:
 
 
 UNKNOWN_CONTRACT = ReasoningContract()
+
+
+def reasoning_labels_allowed_by_contract(
+    contract: ReasoningContract,
+    labels: list[str] | tuple[str, ...],
+    *,
+    current: str,
+) -> list[str]:
+    """Filter a reasoning picker to the active model's documented contract."""
+
+    if contract is UNKNOWN_CONTRACT:
+        return list(labels)
+    effort_wires = {
+        WIRE_REASONING_EFFORT,
+        WIRE_THINKING_LEVEL,
+        WIRE_THINKING_ADAPTIVE,
+    }
+    filter_by_values = bool(contract.values) and contract.wire in effort_wires
+    toggle_only = contract.wire == WIRE_CHAT_TEMPLATE_ENABLE_THINKING
+    allowed: list[str] = []
+    for label in labels:
+        normalized = label.casefold()
+        if label == current:
+            allowed.append(label)
+            continue
+        if normalized == "off":
+            if contract.mode == ALWAYS_ON and contract.off != OFF_SWAPS_MODEL:
+                continue
+            allowed.append(label)
+            continue
+        if normalized == "auto":
+            allowed.append(label)
+            continue
+        if toggle_only:
+            continue
+        if filter_by_values and normalized not in contract.values:
+            continue
+        allowed.append(label)
+    return allowed
+
 
 # Per provider_key: ordered (prefix, contract) rules; first match wins. Exact
 # ids sort naturally before shorter prefixes where it matters.
@@ -142,6 +187,20 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
             ),
         ),
         (
+            "claude-opus-5",
+            _C(
+                mode=OPTIONAL,
+                wire=WIRE_THINKING_ADAPTIVE,
+                values=("low", "medium", "high", "xhigh", "max"),
+                default="high",
+                off=OFF_EXPLICIT,
+                notes="thinks by DEFAULT — omitting the param is adaptive, not off "
+                "(unlike 4.8/4.7); disable is accepted only at effort <= high, so "
+                "'disabled' + xhigh/max = 400; extended shape and non-default "
+                "sampling params = 400",
+            ),
+        ),
+        (
             "claude-opus-4-8",
             _C(
                 mode=OPTIONAL,
@@ -163,6 +222,17 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
         ),
     ),
     "gemini": (
+        (
+            "gemini-3.7-flash",
+            _C(
+                mode=ALWAYS_ON,
+                wire=WIRE_THINKING_LEVEL,
+                values=("low", "medium", "high"),
+                default="medium",
+                off=OFF_IMPOSSIBLE,
+                notes="'minimal' is explicitly unsupported on Gemini 3.7 Flash",
+            ),
+        ),
         (
             "gemini-3.1-pro",
             _C(
@@ -189,14 +259,101 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
             "deepseek-",
             _C(
                 mode=OPTIONAL,
-                wire=WIRE_THINKING_TYPE,
+                wire=WIRE_REASONING_EFFORT,
                 values=("high", "max"),
+                default="high",
                 off=OFF_EXPLICIT,
-                notes="low/medium silently coerce to high, xhigh to max; sampling params ignored",
+                notes="effort is a flat field; thinking:{type} is the separate on/off toggle; "
+                "compatibility aliases low/medium to high and xhigh to max, so expose only "
+                "the two distinct documented levels",
+            ),
+        ),
+    ),
+    "sylliptor": (
+        (
+            "deepseek-",
+            _C(
+                mode=OPTIONAL,
+                wire=WIRE_REASONING_EFFORT,
+                values=("high", "max"),
+                default="high",
+                off=OFF_EXPLICIT,
+                notes="hosted models accept the high/max reasoning-effort contract",
+            ),
+        ),
+    ),
+    "nvidia": (
+        (
+            "deepseek-ai/deepseek-v4-pro",
+            _C(
+                mode=OPTIONAL,
+                wire=WIRE_REASONING_EFFORT,
+                values=("high", "max"),
+                default="high",
+                off=OFF_EXPLICIT,
+                notes="NVIDIA-hosted DeepSeek V4 Pro accepts none|high|max on the flat "
+                "reasoning_effort field",
+            ),
+        ),
+        (
+            "deepseek-ai/deepseek-v4-flash",
+            _C(
+                mode=OPTIONAL,
+                wire=WIRE_REASONING_EFFORT,
+                values=("high", "max"),
+                default="high",
+                off=OFF_EXPLICIT,
+                notes="NVIDIA-hosted DeepSeek V4 Flash accepts none|high|max on the flat "
+                "reasoning_effort field",
+            ),
+        ),
+        (
+            "nvidia/nemotron-3-super-120b-a12b",
+            _C(
+                mode=OPTIONAL,
+                wire=WIRE_REASONING_EFFORT,
+                values=("low", "high"),
+                default="high",
+                off=OFF_EXPLICIT,
+                notes="NVIDIA's hosted endpoint accepts none|low|high and returns private "
+                "reasoning on the structured reasoning_content channel",
+            ),
+        ),
+        (
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            _C(
+                mode=OPTIONAL,
+                wire=WIRE_REASONING_EFFORT,
+                values=("medium", "high"),
+                default="high",
+                off=OFF_EXPLICIT,
+                notes="NVIDIA's hosted endpoint accepts none|medium|high",
+            ),
+        ),
+        (
+            "nvidia/nemotron-3-nano-30b-a3b",
+            _C(
+                mode=OPTIONAL,
+                wire=WIRE_CHAT_TEMPLATE_ENABLE_THINKING,
+                off=OFF_EXPLICIT,
+                notes="the hosted endpoint documents the chat-template toggle, not a flat "
+                "reasoning_effort enum",
             ),
         ),
     ),
     "qwen": (
+        (
+            "qwen3.8-max",
+            _C(
+                mode=OPTIONAL,
+                wire=WIRE_REASONING_EFFORT,
+                values=("low", "medium", "xhigh"),
+                default="xhigh",
+                off=OFF_EXPLICIT,
+                replay_reasoning_content=True,
+                notes="effort is flat; enable_thinking is the separate on/off toggle",
+            ),
+        ),
         (
             "qwen3-coder",
             _C(mode=NONE, wire=WIRE_NONE, off=OFF_OMIT, notes="coder line has no thinking"),
@@ -241,9 +398,54 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
             _C(mode=OPTIONAL, wire=WIRE_THINKING_TYPE, off=OFF_EXPLICIT),
         ),
     ),
+    "zai_coding_plan": (
+        # Sources: https://docs.z.ai/guides/llm/glm-5.3
+        # https://docs.z.ai/guides/llm/glm-5-turbo
+        # https://docs.z.ai/guides/llm/glm-4.7
+        (
+            "glm-5.3",
+            _C(
+                mode=ALWAYS_ON,
+                wire=WIRE_REASONING_EFFORT,
+                values=("low", "high", "max"),
+                default="max",
+                off=OFF_IMPOSSIBLE,
+                emits_flat_reasoning_effort=True,
+                notes=(
+                    "Coding Plan surface: disabling thinking is coerced to low rather than "
+                    "turning reasoning off; aliases are normalized server-side"
+                ),
+            ),
+        ),
+        (
+            "glm-5-turbo",
+            _C(
+                mode=ALWAYS_ON,
+                wire=WIRE_REASONING_EFFORT,
+                values=("low", "high", "max"),
+                default="max",
+                off=OFF_IMPOSSIBLE,
+                emits_flat_reasoning_effort=True,
+                notes="Coding Plan reasoning floor follows the shared effort normalizer",
+            ),
+        ),
+        (
+            "glm-4.7",
+            _C(
+                mode=ALWAYS_ON,
+                wire=WIRE_REASONING_EFFORT,
+                values=("low", "high", "max"),
+                default="max",
+                off=OFF_IMPOSSIBLE,
+                emits_flat_reasoning_effort=True,
+                notes="Coding Plan reasoning floor follows the shared effort normalizer",
+            ),
+        ),
+    ),
     "moonshot": (
         # Platform surface (api.moonshot.ai / .cn). The kimi-code membership
         # surface has different contracts — provider_key "kimi-code" below.
+        # Source: https://www.kimi.com/help/kimi-api/api-model-selection
         (
             "kimi-k2.7-code",
             _C(
@@ -263,6 +465,7 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
                 values=("low", "high", "max"),
                 default="max",
                 off=OFF_IMPOSSIBLE,
+                emits_flat_reasoning_effort=True,
                 notes="uses reasoning_effort, not thinking; do not send the K2.x param",
             ),
         ),
@@ -278,6 +481,7 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
         ),
     ),
     "kimi-code": (
+        # Source: https://www.kimi.com/code/docs/en/kimi-code/models.html
         (
             "k3",
             _C(
@@ -286,6 +490,7 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
                 values=("low", "high", "max"),
                 default="high",
                 off=OFF_SWAPS_MODEL,
+                emits_flat_reasoning_effort=True,
                 notes="disabling thinking silently routes the request to K2.6 — surface "
                 "the substitution, never treat it as a speed knob",
             ),
@@ -336,6 +541,7 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
         ),
     ),
     "groq": (
+        # Source: https://console.groq.com/docs/reasoning
         (
             "groq/compound",
             _C(
@@ -352,6 +558,7 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
                 wire=WIRE_REASONING_EFFORT,
                 values=("none", "default"),
                 off=OFF_EXPLICIT,
+                emits_flat_reasoning_effort=True,
             ),
         ),
         (
@@ -362,12 +569,14 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
                 values=("low", "medium", "high"),
                 default="medium",
                 off=OFF_IMPOSSIBLE,
+                emits_flat_reasoning_effort=True,
                 notes="reasoning_format 'raw' + tools/JSON = 400; "
                 "include_reasoning + reasoning_format together = 400",
             ),
         ),
     ),
     "cerebras": (
+        # Source: https://inference-docs.cerebras.ai/api-reference/chat-completions
         (
             "gpt-oss-120b",
             _C(
@@ -376,6 +585,7 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
                 values=("low", "medium", "high"),
                 default="medium",
                 off=OFF_IMPOSSIBLE,
+                emits_flat_reasoning_effort=True,
                 notes="no 'none'; disable_reasoning dead since 2026-07-21; "
                 "tools + response_format together = rejected",
             ),
@@ -385,9 +595,11 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
             _C(
                 mode=OPTIONAL,
                 wire=WIRE_REASONING_EFFORT,
-                values=("none", "low", "medium", "high"),
+                values=("none",),
                 off=OFF_EXPLICIT,
-                notes="also accepts clear_thinking",
+                emits_flat_reasoning_effort=True,
+                notes="only 'none' is documented as a control value; low/medium/high are not "
+                "documented on this Cerebras model",
             ),
         ),
         (
@@ -427,6 +639,22 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
         ("ministral-", _C(mode=NONE, wire=WIRE_NONE, off=OFF_OMIT)),
     ),
     "xai": (
+        # The current xAI reasoning guide documents the flat field for its SDK,
+        # while the legacy Chat Completions reference does not. Keep emission
+        # off until that transport surface is explicitly documented.
+        # Sources: https://docs.x.ai/developers/model-capabilities/text/reasoning
+        # https://docs.x.ai/developers/model-capabilities/legacy/chat-completions
+        (
+            "grok-4.6",
+            _C(
+                mode=ALWAYS_ON,
+                wire=WIRE_REASONING_EFFORT,
+                values=("low", "medium", "high", "xhigh"),
+                default="high",
+                off=OFF_IMPOSSIBLE,
+                notes="effort + stop/presence_penalty/frequency_penalty = documented error",
+            ),
+        ),
         (
             "grok-4.5",
             _C(
@@ -463,6 +691,7 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
         ),
     ),
     "cohere": (
+        # Source: https://docs.cohere.com/v2/docs/compatibility-api
         (
             "command-a-reasoning-",
             _C(
@@ -470,6 +699,7 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
                 wire=WIRE_REASONING_EFFORT,
                 values=("none", "high"),
                 off=OFF_EXPLICIT,
+                emits_flat_reasoning_effort=True,
                 notes="medium/low documented not supported on the compat surface; native "
                 "thinking param likely does not pass through /compatibility/v1",
             ),
@@ -538,6 +768,9 @@ _CONTRACTS: dict[str, tuple[tuple[str, ReasoningContract], ...]] = {
         ),
     ),
     "fireworks": (
+        # The endpoint accepts reasoning_effort, but the current reference does
+        # not define values for MiniMax M3. Leave this model probe-gated.
+        # Source: https://docs.fireworks.ai/api-reference/post-chatcompletions
         (
             "accounts/fireworks/models/minimax-m3",
             _C(
@@ -624,6 +857,7 @@ __all__ = [
     "ReasoningContract",
     "WIRE_BUDGET_TOKENS",
     "WIRE_ENABLE_THINKING",
+    "WIRE_CHAT_TEMPLATE_ENABLE_THINKING",
     "WIRE_NONE",
     "WIRE_REASONING_EFFORT",
     "WIRE_REASONING_ENABLED",
@@ -632,6 +866,7 @@ __all__ = [
     "WIRE_THINKING_LEVEL",
     "WIRE_THINKING_TYPE",
     "reasoning_contract_for",
+    "reasoning_labels_allowed_by_contract",
     "reasoning_off_hazard",
     "reasoning_off_is_safe",
 ]

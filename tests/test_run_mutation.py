@@ -394,7 +394,9 @@ def test_workspace_lock_identity_normalizes_cross_platform_path_forms(tmp_path: 
     )
     resolved_tmp_path = os.fspath(tmp_path.resolve()).replace("\\", "/")
     expected_tmp_identity = resolved_tmp_path
-    if resolved_tmp_path.startswith("/mnt/") and len(resolved_tmp_path) > 6:
+    if len(resolved_tmp_path) >= 3 and resolved_tmp_path[1:3] == ":/":
+        expected_tmp_identity = resolved_tmp_path.casefold()
+    elif resolved_tmp_path.startswith("/mnt/") and len(resolved_tmp_path) > 6:
         expected_tmp_identity = f"{resolved_tmp_path[5]}:{resolved_tmp_path[6:]}".lower()
     assert normalize_workspace_identity_path(tmp_path) == expected_tmp_identity
 

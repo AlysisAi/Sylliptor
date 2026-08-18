@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import warnings
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -19,6 +21,15 @@ from .repo_scan import (
     render_repo_scan_markdown,
     render_repo_scan_summary_lines,
     scan_workspace,
+)
+from .run_state import (
+    RUN_STATUS_APPROVED,
+    RUN_STATUS_DRAFT,
+    RUN_STATUS_RUNNING,
+    apply_run_status,
+    plan_fingerprint,
+    pointer_status,
+    reconcile_status_after_crash,
 )
 from .runtime_artifacts import is_runtime_artifact_path
 from .serialized_paths import safe_serialized_path
@@ -48,7 +59,10 @@ if TYPE_CHECKING:
     from .execution_shared import ExecutionLogArtifactsResult
 
 MAX_TEXT_ASSET_BYTES = 200 * 1024
-CURRENT_RUN_POINTER_SCHEMA_VERSION = 4
+# 5 added the run lifecycle block: ``status`` (see :mod:`sylliptor_agent_cli.run_state`),
+# ``status_updated_at``, ``status_history``, ``run_owner``, and ``plan_fingerprint``.
+# Readers must keep accepting older pointers; they simply read as ``draft``.
+CURRENT_RUN_POINTER_SCHEMA_VERSION = 5
 PLAN_SCHEMA_VERSION = 2
 LOGGER = logging.getLogger(__name__)
 
@@ -125,11 +139,164 @@ def now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
-def make_run_id() -> str:
+# Words for counter-based run ids: legendary smiths, bright stars, and smithing
+# terms. Order is load-bearing — the word is a pure function of the counter, so
+# reordering or removing entries renames future runs at existing counters.
+RUN_NAME_WORDS: tuple[str, ...] = (
+    "vulcan",
+    "vega",
+    "wayland",
+    "sirius",
+    "brigid",
+    "altair",
+    "sindri",
+    "rigel",
+    "brokkr",
+    "deneb",
+    "ilmarinen",
+    "atlas",
+    "svarog",
+    "mira",
+    "goibniu",
+    "lyra",
+    "kalvis",
+    "orion",
+    "seppo",
+    "castor",
+    "anvil",
+    "pollux",
+    "ember",
+    "capella",
+    "ingot",
+    "antares",
+    "crucible",
+    "spica",
+    "hearth",
+    "mizar",
+    "kiln",
+    "alcor",
+    "rivet",
+    "procyon",
+    "alloy",
+    "canopus",
+    "temper",
+    "arcturus",
+    "bellows",
+    "regulus",
+    "tongs",
+    "thuban",
+    "flux",
+    "kochab",
+    "forgefire",
+    "alkaid",
+    "quench",
+    "hamal",
+    "smelt",
+    "ankaa",
+    "brazier",
+    "acrux",
+    "mantle",
+    "alphard",
+    "gilder",
+    "sabik",
+    "solder",
+    "shaula",
+    "chisel",
+    "nunki",
+    "sledge",
+    "markab",
+    "patina",
+    "polaris",
+)
+
+_RUN_ID_COUNTER_RE = re.compile(r"^(\d{3,6})-[a-z]+$")
+
+
+def format_run_id(counter: int) -> str:
+    word = RUN_NAME_WORDS[(counter - 1) % len(RUN_NAME_WORDS)]
+    return f"{counter:03d}-{word}"
+
+
+def _next_run_counter(runs_dir: Path) -> int:
+    highest = 0
+    try:
+        entries = list(runs_dir.iterdir())
+    except OSError:
+        return 1
+    for entry in entries:
+        match = _RUN_ID_COUNTER_RE.match(entry.name)
+        if match is not None:
+            highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
+_RUN_COUNTER_MARK_NAME = ".run_counter"
+
+
+def _legacy_run_id() -> str:
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     import uuid
 
     return f"{ts}_{uuid.uuid4().hex[:8]}"
+
+
+def _stored_run_counter(runs_dir: Path) -> int:
+    try:
+        raw = (runs_dir / _RUN_COUNTER_MARK_NAME).read_text(encoding="utf-8")
+        return max(0, int(raw.strip()))
+    except (OSError, ValueError):
+        return 0
+
+
+def _store_run_counter(runs_dir: Path, counter: int) -> None:
+    value = max(counter, _stored_run_counter(runs_dir))
+    try:
+        atomic_write_text(runs_dir / _RUN_COUNTER_MARK_NAME, f"{value}\n")
+    except OSError:
+        # The mark only guards against re-minting ids of deleted runs; the
+        # mkdir claim stays the uniqueness authority when it cannot be written.
+        pass
+
+
+def make_run_id(
+    root: Path | None = None,
+    *,
+    runtime_dir_name: str = ".sylliptor",
+) -> str:
+    if root is None:
+        # Without a workspace there is no run counter to scan; fall back to the
+        # legacy globally-unique id so uniqueness never depends on shared state.
+        return _legacy_run_id()
+    resolved = root.expanduser().resolve()
+    runs_dir = _runs_dir(resolved, runtime_dir_name=runtime_dir_name)
+    counter = max(_next_run_counter(runs_dir), _stored_run_counter(runs_dir) + 1)
+    if not resolved.is_dir():
+        # Workspace existence is validated later by make_run_paths; never create
+        # directories under a root that does not exist yet.
+        return format_run_id(counter)
+    try:
+        runs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # The runs dir cannot be materialized (e.g. a stray file occupies the
+        # path). Hand out a legacy globally-unique id instead of an unclaimed
+        # counter so uniqueness never degrades; downstream directory creation
+        # surfaces the underlying error.
+        return _legacy_run_id()
+    while True:
+        candidate = format_run_id(counter)
+        try:
+            # mkdir is the atomic claim: concurrent creators that computed the
+            # same counter collide here and retry with the next one. The parent
+            # was materialized above, so FileExistsError can only mean the
+            # candidate itself is taken.
+            (runs_dir / candidate).mkdir(exist_ok=False)
+        except FileExistsError:
+            counter += 1
+            continue
+        except OSError:
+            return _legacy_run_id()
+        _store_run_counter(runs_dir, counter)
+        return candidate
 
 
 def ensure_repo_root(root: Path) -> Path:
@@ -1074,6 +1241,12 @@ def save_plan(paths: RunPaths, plan: dict[str, Any]) -> None:
     if write_plan_md:
         atomic_write_text(paths.plan_md_path, rendered_plan_md)
 
+    if semantic_changed:
+        # Best-effort: the plan is already on disk, and a pointer that cannot be
+        # updated is a stale status line, not a lost plan.
+        with suppress(Exception):
+            sync_current_run_plan_status(paths, plan)
+
 
 def load_workspace_context_artifact(paths: RunPaths) -> RepoScanResult | None:
     artifact_path = paths.workspace_context_json_path
@@ -1203,31 +1376,6 @@ def append_planner_summary(paths: RunPaths, summary_line: str) -> None:
         fh.write(f"- [{ts}] {safe_summary}\n")
 
 
-def append_planner_router_event(paths: RunPaths, payload: dict[str, Any]) -> None:
-    paths.notes_dir.mkdir(parents=True, exist_ok=True)
-    event_type = (
-        "planner_router_failure"
-        if str(payload.get("fallback_reason") or "").strip()
-        else "planner_router_decision"
-    )
-    event = {
-        "type": event_type,
-        "ts": now_iso(),
-        "payload": payload,
-    }
-    event_path = paths.notes_dir / "planner_router_events.jsonl"
-    with event_path.open("a", encoding="utf-8") as fh:
-        fh.write(
-            json.dumps(
-                event,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n"
-        )
-
-
 def finalize_plan(plan: dict[str, Any]) -> dict[str, Any]:
     raw_requirements = plan.get("requirements") or []
     requirements = [requirement_text(x) for x in raw_requirements if requirement_text(x)]
@@ -1263,6 +1411,24 @@ def finalize_plan(plan: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
+_LIFECYCLE_POINTER_KEYS: tuple[str, ...] = (
+    "status",
+    "status_updated_at",
+    "status_reason",
+    "status_history",
+    "run_owner",
+    "plan_fingerprint",
+)
+
+
+def read_current_run_pointer(root: Path) -> dict[str, Any] | None:
+    """The raw pointer payload for ``root``, or ``None`` when there is none."""
+    try:
+        return _read_json(current_run_pointer_path(root))
+    except ForgeError:
+        return None
+
+
 def write_current_run_pointer(paths: RunPaths) -> None:
     pointer = {
         "schema_version": CURRENT_RUN_POINTER_SCHEMA_VERSION,
@@ -1288,7 +1454,139 @@ def write_current_run_pointer(paths: RunPaths) -> None:
         pointer["git_root"] = os.fspath(paths.git_root)
     if paths.current_branch:
         pointer["current_branch"] = paths.current_branch
+
+    # Rebinding a workspace must not silently reset the run's lifecycle. The binding
+    # fields above are recomputed every time; the lifecycle block belongs to the run
+    # and only ``set_current_run_status`` may move it.
+    existing = read_current_run_pointer(paths.root)
+    if existing is not None and str(existing.get("run_id") or "").strip() == paths.run_id:
+        for key in _LIFECYCLE_POINTER_KEYS:
+            if key in existing:
+                pointer[key] = existing[key]
+    else:
+        pointer["status"] = RUN_STATUS_DRAFT
+        pointer["status_updated_at"] = now_iso()
+        pointer["status_history"] = [
+            {"status": RUN_STATUS_DRAFT, "at": pointer["status_updated_at"]}
+        ]
     _write_json(current_run_pointer_path(paths.root), pointer)
+
+
+def set_current_run_status(
+    paths: RunPaths,
+    status: str,
+    *,
+    reason: str = "",
+    owner: dict[str, Any] | None = None,
+    plan: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Move the current-run pointer to ``status``, if it still tracks this run.
+
+    Returns the written payload, or ``None`` when the pointer is missing or has
+    moved on to a different run -- a finishing run must never stamp its outcome
+    onto whatever run became current in the meantime.
+    """
+    pointer = read_current_run_pointer(paths.root)
+    if pointer is None or str(pointer.get("run_id") or "").strip() != paths.run_id:
+        return None
+    updated = apply_run_status(
+        pointer,
+        status,
+        reason=reason,
+        owner=owner,
+        plan_fingerprint=plan_fingerprint(plan) if plan is not None else None,
+    )
+    _write_json(current_run_pointer_path(paths.root), updated)
+    return updated
+
+
+def current_run_status(root: Path) -> str:
+    """The recorded lifecycle status for the workspace's current run."""
+    return pointer_status(read_current_run_pointer(root))
+
+
+def sync_current_run_plan_status(paths: RunPaths, plan: dict[str, Any]) -> None:
+    """Keep the pointer's draft/approved status and fingerprint in step with the plan.
+
+    Called from :func:`save_plan`, which is the one choke point every plan edit goes
+    through. Two things happen here:
+
+    * A plan crossing the execution-readiness gate flips ``draft`` <-> ``approved``,
+      so a UI can show "ready to run" without re-deriving the gate itself.
+    * While a run is ``running``, its own saves refresh the recorded fingerprint.
+      That is what makes drift detection mean "changed while nobody was running it":
+      in-run edits (scope amendments, replanning) are the run observing its own
+      plan, whereas an edit made after the run died is exactly what `forge resume`
+      must stop and surface.
+    """
+    from .plan_repair import PLAN_STATUS_EXECUTION_READY, plan_status
+
+    pointer = read_current_run_pointer(paths.root)
+    if pointer is None or str(pointer.get("run_id") or "").strip() != paths.run_id:
+        return
+    status = pointer_status(pointer)
+    if status == RUN_STATUS_RUNNING:
+        fingerprint = plan_fingerprint(plan)
+        # Most in-run saves only move task status/attempts, which the fingerprint
+        # deliberately ignores. Rewriting an identical pointer on every one of them
+        # would be pure churn.
+        if pointer.get("plan_fingerprint") != fingerprint:
+            _write_json(
+                current_run_pointer_path(paths.root),
+                {**pointer, "plan_fingerprint": fingerprint},
+            )
+        return
+    if status not in {RUN_STATUS_DRAFT, RUN_STATUS_APPROVED}:
+        return
+    try:
+        ready = plan_status(plan) == PLAN_STATUS_EXECUTION_READY
+    except Exception:  # noqa: BLE001 - a plan we cannot grade is not a status change
+        return
+    desired = RUN_STATUS_APPROVED if ready else RUN_STATUS_DRAFT
+    if desired == status:
+        return
+    _write_json(
+        current_run_pointer_path(paths.root),
+        apply_run_status(
+            pointer,
+            desired,
+            reason=(
+                "plan passes the execution-readiness gate"
+                if ready
+                else "plan no longer passes the execution-readiness gate"
+            ),
+            plan_fingerprint=plan_fingerprint(plan) if ready else None,
+        ),
+    )
+
+
+def reconcile_current_run_status(root: Path) -> str | None:
+    """Demote a crashed ``running`` pointer to ``interrupted``. Returns the new status.
+
+    A run marked ``running`` holds the workspace mutation lock for its whole life,
+    so ``running`` with no live lock means the owning process died without ever
+    reaching a terminal state. Rewriting it here is what removes the need for
+    outside tools to patch ``current_run.json`` themselves to un-stick a workspace.
+    """
+    # Imported lazily: run_lock imports this module, so a top-level import would
+    # close the cycle.
+    from .run_lock import lock_is_live
+
+    pointer = read_current_run_pointer(root)
+    if pointer is None or pointer_status(pointer) != RUN_STATUS_RUNNING:
+        return None
+    workspace_lock_dir = _runtime_dir(root) / "workspace_execution"
+    run_path_raw = str(pointer.get("run_path") or "").strip()
+    run_lock_dirs = [workspace_lock_dir]
+    if run_path_raw and not Path(run_path_raw).is_absolute():
+        run_lock_dirs.append(root / run_path_raw)
+    if any(lock_is_live(candidate) for candidate in run_lock_dirs):
+        return None
+    updated = reconcile_status_after_crash(pointer, lock_is_live=False)
+    if updated is None:
+        return None
+    _write_json(current_run_pointer_path(root), updated)
+    return pointer_status(updated)
 
 
 def refresh_current_run_pointer_if_tracking_same_run(paths: RunPaths) -> bool:
@@ -1314,6 +1612,11 @@ def load_current_run_paths(root: Path) -> RunPaths:
         pointer_path = current_run_pointer_path(pointer_root)
         if not pointer_path.exists():
             continue
+        # Every surface that shows a run reaches it through here, so this is where a
+        # crash leftover stops being shown as active. Best-effort on purpose: an
+        # unwritable pointer must not make reading the run fail.
+        with suppress(Exception):
+            reconcile_current_run_status(pointer_root)
         return _run_paths_from_pointer(
             pointer_root=pointer_root,
             pointer_path=pointer_path,
@@ -1351,7 +1654,7 @@ def create_plan_run(
         raise _workspace_binding_error(binding) from None
     paths = _run_paths_from_workspace_context(
         context=binding.workspace_context,
-        run_id=make_run_id(),
+        run_id=make_run_id(binding.workspace_context.workspace_root),
         binding_requested_path=binding.requested_path,
         binding_source=binding.binding_source,
         workspace_created_at_startup=binding.created_path,
@@ -1612,6 +1915,8 @@ def write_task_report(
     task_kind: str | None = None,
     task_lifecycle_reason: str | None = None,
     remote_lines: list[str] | None = None,
+    scope_amendments: list[dict[str, Any]] | None = None,
+    scope_amended_patterns: list[str] | None = None,
 ) -> Path:
     ensure_execution_dirs(paths)
     task_id = str(task.get("id") or "")
@@ -1713,6 +2018,21 @@ def write_task_report(
             lines.append(f"- `{item}`")
     else:
         lines.append("- (none detected)")
+
+    lines.extend(["", "## Scope Amendments", ""])
+    if scope_amendments:
+        for item in scope_amendments:
+            path = str(item.get("path") or "")
+            reason_code = str(item.get("reason_code") or "unknown")
+            evidence = str(item.get("evidence") or "")
+            lines.append(f"- `{path}` ({reason_code}): {evidence}")
+        added = [str(pattern) for pattern in (scope_amended_patterns or []) if str(pattern).strip()]
+        lines.append(
+            "- write_scope additions: "
+            + (", ".join(f"`{pattern}`" for pattern in added) if added else "(already covered)")
+        )
+    else:
+        lines.append("- (none)")
 
     lines.extend(["", "## Verification Results", ""])
     lines.extend(_verification_results_lines(verify_payload))

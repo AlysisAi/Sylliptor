@@ -3,12 +3,38 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
 from sylliptor_agent_cli import cli as cli_mod
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.skills import discover_skills
+from sylliptor_agent_cli.workspace_context import WorkspaceContext
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cli_workspace_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep CLI fixtures scoped even when pytest's base temp lives in this Git repo."""
+
+    def resolve(path: Path) -> WorkspaceContext:
+        root = Path(path).expanduser().resolve()
+        return WorkspaceContext(
+            input_path=root,
+            focus_path=root,
+            workspace_root=root,
+            git_root=None,
+            focus_relpath=".",
+            workspace_kind="plain_dir",
+            has_head_commit=False,
+            current_branch=None,
+        )
+
+    monkeypatch.setattr(
+        cli_mod,
+        "resolve_workspace_context",
+        resolve,
+    )
 
 
 def _write_skill(

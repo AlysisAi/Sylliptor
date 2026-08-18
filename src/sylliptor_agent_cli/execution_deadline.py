@@ -9,6 +9,15 @@ from enum import StrEnum
 from typing import Any
 
 DEFAULT_DEADLINE_CLEANUP_RESERVE_SECONDS = 1.0
+
+# Ceiling for a single LLM attempt when a run deadline is active. One hung read
+# must not consume the whole remaining budget: bounding the attempt turns a
+# stuck provider into an ordinary retryable timeout while the deadline still
+# owns the overall budget. Generous on purpose - legitimate long generations
+# (reasoning models) routinely run several minutes.
+DEFAULT_LLM_ATTEMPT_TIMEOUT_CEILING_SECONDS = 900.0
+_LLM_ATTEMPT_TIMEOUT_ENV = "SYLLIPTOR_LLM_ATTEMPT_TIMEOUT_S"
+_ATTEMPT_CEILING_OFF_WORDS = frozenset({"off", "unlimited", "none", "never", "0", "disabled"})
 MINIMUM_OPERATION_TIMEOUT_SECONDS = 0.05
 MINIMUM_LLM_START_SECONDS = 0.25
 MINIMUM_TOOL_START_SECONDS = 0.05
@@ -17,11 +26,25 @@ MINIMUM_SUBAGENT_START_SECONDS = 2.0
 DEFAULT_FINALIZATION_MINIMUM_SECONDS = 1.0
 DEFAULT_FINALIZATION_MAX_SECONDS = 120.0
 DEFAULT_FINALIZATION_MAX_FRACTION = 0.25
+
+# Wall-clock budget applied to non-interactive runs that did not configure one.
+# Generous on purpose: it exists to bound a run that has stopped converging, not
+# to cut short a long job a user deliberately started.
+DEFAULT_RUN_DEADLINE_SECONDS = 3600.0
+
+# Fractions of the configured budget at which the run degrades. Both are
+# elapsed-time fractions, so they are monotonic: once a stage is reached the run
+# never returns to a less degraded one.
+DEFAULT_CONVERGENCE_ELAPSED_FRACTION = 0.75
+DEFAULT_WRAP_UP_ELAPSED_FRACTION = 0.90
+
 _MISSING = object()
 
 
 class DeadlinePhase(StrEnum):
     NORMAL = "normal"
+    CONVERGENCE = "convergence"
+    WRAP_UP = "wrap_up"
     FINALIZATION_WINDOW = "finalization_window"
     EXHAUSTED = "exhausted"
 
@@ -30,6 +53,7 @@ class DeadlineSource(StrEnum):
     EXPLICIT_CLI = "explicit_cli"
     ENVIRONMENT = "environment"
     CONFIG = "config"
+    RUNTIME_DEFAULT = "runtime_default"
     INHERITED_PARENT = "inherited_parent"
     SUBAGENT_FALLBACK = "subagent_fallback"
     ABSENT = "absent"
@@ -37,7 +61,6 @@ class DeadlineSource(StrEnum):
 
 
 class DeadlineOperation(StrEnum):
-    ROUTING_LLM = "routing_llm"
     MAIN_LLM = "main_llm"
     MAIN_LLM_RETRY = "main_llm_retry"
     COMPACTION_LLM = "compaction_llm"
@@ -55,7 +78,6 @@ class DeadlineOperation(StrEnum):
 
 _FINALIZATION_BLOCKED_OPERATIONS = frozenset(
     {
-        DeadlineOperation.ROUTING_LLM.value,
         DeadlineOperation.MAIN_LLM_RETRY.value,
         DeadlineOperation.COMPACTION_LLM.value,
         DeadlineOperation.ADAPTIVE_RETRY_LLM.value,
@@ -65,6 +87,32 @@ _FINALIZATION_BLOCKED_OPERATIONS = frozenset(
         DeadlineOperation.PROVIDER_RETRY_SLEEP.value,
     }
 )
+
+# Convergence closes the operations that open a *new* line of work. Reads and
+# edits stay available: the run still has to drive what it already started to a
+# verifiable state, and it cannot do that with its hands tied.
+_CONVERGENCE_BLOCKED_OPERATIONS = frozenset(
+    {
+        DeadlineOperation.SUBAGENT.value,
+        DeadlineOperation.SHELL_BACKGROUND.value,
+    }
+)
+
+# Wrap-up closes editing and exploration. Verification, foreground shell
+# commands, and the main model call stay open, because they are exactly what
+# "run final verification and write the summary" needs.
+_WRAP_UP_BLOCKED_OPERATIONS = frozenset(
+    {
+        *_CONVERGENCE_BLOCKED_OPERATIONS,
+        DeadlineOperation.EXPLORATION_TOOL.value,
+        DeadlineOperation.MUTATION_TOOL.value,
+    }
+)
+
+_DEGRADATION_BLOCKED_OPERATIONS: dict[str, frozenset[str]] = {
+    DeadlinePhase.CONVERGENCE.value: _CONVERGENCE_BLOCKED_OPERATIONS,
+    DeadlinePhase.WRAP_UP.value: _WRAP_UP_BLOCKED_OPERATIONS,
+}
 
 
 class DeadlineExhausted(RuntimeError):
@@ -79,6 +127,87 @@ def validate_deadline_seconds(value: Any, *, key: str = "run_deadline_seconds") 
     if parsed <= 0 or not math.isfinite(parsed):
         raise ValueError(f"{key} must be a finite number > 0")
     return parsed
+
+
+def _clamp_fraction(value: Any, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(parsed) or parsed <= 0.0 or parsed > 1.0:
+        return fallback
+    return parsed
+
+
+@dataclass(frozen=True)
+class DeadlineDegradationPolicy:
+    """When a run stops opening new work, and when it stops editing.
+
+    Both thresholds are fractions of the configured budget. ``enabled`` is the
+    kill-switch: with it off the deadline behaves exactly as it did before
+    phased degradation existed.
+    """
+
+    enabled: bool = True
+    convergence_fraction: float = DEFAULT_CONVERGENCE_ELAPSED_FRACTION
+    wrap_up_fraction: float = DEFAULT_WRAP_UP_ELAPSED_FRACTION
+
+    def normalized(self) -> DeadlineDegradationPolicy:
+        wrap_up = _clamp_fraction(self.wrap_up_fraction, DEFAULT_WRAP_UP_ELAPSED_FRACTION)
+        convergence = _clamp_fraction(
+            self.convergence_fraction,
+            DEFAULT_CONVERGENCE_ELAPSED_FRACTION,
+        )
+        # Convergence can never come after wrap-up: a misconfigured pair
+        # collapses to a single threshold rather than inverting the ladder.
+        convergence = min(convergence, wrap_up)
+        return DeadlineDegradationPolicy(
+            enabled=bool(self.enabled),
+            convergence_fraction=convergence,
+            wrap_up_fraction=wrap_up,
+        )
+
+    def as_payload(self) -> dict[str, Any]:
+        normalized = self.normalized()
+        return {
+            "enabled": normalized.enabled,
+            "convergence_fraction": normalized.convergence_fraction,
+            "wrap_up_fraction": normalized.wrap_up_fraction,
+        }
+
+
+def run_deadline_degradation_enabled(cfg: Any | None) -> bool:
+    """Kill-switch for phased budget degradation.
+
+    ``SYLLIPTOR_RUN_BUDGET_DEGRADATION`` (off/0/false/no/disabled) wins over the
+    config value; default is on. When off, the wall-clock budget still applies
+    but the run runs flat out until the existing finalization window.
+    """
+    from .branding import env_get
+
+    env_value = env_get("SYLLIPTOR_RUN_BUDGET_DEGRADATION")
+    if env_value is not None:
+        normalized = str(env_value).strip().lower()
+        if normalized in {"off", "0", "false", "no", "disabled"}:
+            return False
+        if normalized in {"on", "1", "true", "yes", "enabled"}:
+            return True
+    return bool(getattr(cfg, "run_deadline_degradation_enabled", True))
+
+
+def resolve_deadline_degradation_policy(cfg: Any | None) -> DeadlineDegradationPolicy:
+    """Build the degradation policy from config, falling back on bad values."""
+    return DeadlineDegradationPolicy(
+        enabled=run_deadline_degradation_enabled(cfg),
+        convergence_fraction=_clamp_fraction(
+            getattr(cfg, "run_deadline_convergence_fraction", None),
+            DEFAULT_CONVERGENCE_ELAPSED_FRACTION,
+        ),
+        wrap_up_fraction=_clamp_fraction(
+            getattr(cfg, "run_deadline_wrap_up_fraction", None),
+            DEFAULT_WRAP_UP_ELAPSED_FRACTION,
+        ),
+    ).normalized()
 
 
 @dataclass(frozen=True)
@@ -183,6 +312,11 @@ class ExecutionDeadline:
         repr=False,
         compare=False,
     )
+    degradation_policy: DeadlineDegradationPolicy = field(
+        default_factory=DeadlineDegradationPolicy,
+        repr=False,
+        compare=False,
+    )
     _clock: Callable[[], float] = field(default=time.monotonic, repr=False, compare=False)
     _duration_observations: dict[str, DeadlineDurationObservation] = field(
         default_factory=dict,
@@ -197,6 +331,11 @@ class ExecutionDeadline:
     )
     _finalization_directive_sent: bool = field(default=False, repr=False, compare=False)
     _finalization_llm_started: bool = field(default=False, repr=False, compare=False)
+    _degradation_stages_entered: dict[str, float] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
 
     @classmethod
     def from_duration(
@@ -206,6 +345,7 @@ class ExecutionDeadline:
         clock: Callable[[], float] = time.monotonic,
         source: DeadlineSource | str = DeadlineSource.UNKNOWN,
         finalization_policy: DeadlineFinalizationPolicy | None = None,
+        degradation_policy: DeadlineDegradationPolicy | None = None,
     ) -> ExecutionDeadline:
         started = float(clock())
         if duration_seconds is None:
@@ -215,6 +355,7 @@ class ExecutionDeadline:
                 configured_duration_seconds=None,
                 source=source,
                 finalization_policy=finalization_policy or DeadlineFinalizationPolicy(),
+                degradation_policy=degradation_policy or DeadlineDegradationPolicy(),
                 _clock=clock,
             )
         duration = validate_deadline_seconds(duration_seconds)
@@ -224,6 +365,7 @@ class ExecutionDeadline:
             configured_duration_seconds=duration,
             source=source,
             finalization_policy=finalization_policy or DeadlineFinalizationPolicy(),
+            degradation_policy=degradation_policy or DeadlineDegradationPolicy(),
             _clock=clock,
         )
 
@@ -237,6 +379,7 @@ class ExecutionDeadline:
         clock: Callable[[], float] = time.monotonic,
         source: DeadlineSource | str = DeadlineSource.INHERITED_PARENT,
         finalization_policy: DeadlineFinalizationPolicy | None = None,
+        degradation_policy: DeadlineDegradationPolicy | None = None,
     ) -> ExecutionDeadline:
         if deadline_monotonic is not None and not math.isfinite(float(deadline_monotonic)):
             raise ValueError("deadline_monotonic must be finite when provided")
@@ -250,6 +393,7 @@ class ExecutionDeadline:
             configured_duration_seconds=configured_duration_seconds,
             source=source,
             finalization_policy=finalization_policy or DeadlineFinalizationPolicy(),
+            degradation_policy=degradation_policy or DeadlineDegradationPolicy(),
             _clock=clock,
         )
 
@@ -390,6 +534,80 @@ class ExecutionDeadline:
             return None
         return max(0.0, remaining - self.finalization_reserve_seconds())
 
+    def budget_span_seconds(self) -> float | None:
+        """The budget the degradation fractions are measured against.
+
+        A deadline built from absolute bounds may carry no configured duration
+        (an inherited parent ceiling), so its own span is the fallback.
+        """
+        if self.deadline_monotonic is None:
+            return None
+        configured = self.configured_duration_seconds
+        if configured is not None and configured > 0:
+            return float(configured)
+        span = self.deadline_monotonic - self.started_at_monotonic
+        return span if span > 0 else None
+
+    def elapsed_fraction(self) -> float | None:
+        span = self.budget_span_seconds()
+        if span is None:
+            return None
+        return max(0.0, self.elapsed_seconds() / span)
+
+    def degradation_stage(self) -> DeadlinePhase:
+        """How far the run has degraded, from elapsed budget alone.
+
+        This is deliberately independent of the finalization reserve: the
+        reserve tracks observed latency and can open at any point past 75%,
+        while these stages are fixed fractions of the budget. Keeping them
+        separate is what makes the ladder monotonic.
+        """
+        policy = self.degradation_policy.normalized()
+        if not policy.enabled:
+            return DeadlinePhase.NORMAL
+        fraction = self.elapsed_fraction()
+        if fraction is None:
+            return DeadlinePhase.NORMAL
+        if fraction >= policy.wrap_up_fraction:
+            return DeadlinePhase.WRAP_UP
+        if fraction >= policy.convergence_fraction:
+            return DeadlinePhase.CONVERGENCE
+        return DeadlinePhase.NORMAL
+
+    def degradation_blocked_operations(self) -> frozenset[str]:
+        """Operations closed by the current degradation stage, cumulatively."""
+        return _DEGRADATION_BLOCKED_OPERATIONS.get(
+            self.degradation_stage().value,
+            frozenset(),
+        )
+
+    def maybe_enter_degradation_stage(self) -> DeadlinePhase | None:
+        """Report a degradation stage the first time it is reached.
+
+        Returns ``None`` on every later call for the same stage, so a caller can
+        log one transition per stage without tracking that itself. A run that
+        jumps a stage (one long tool call spanning both thresholds) reports only
+        the stage it actually landed in; the restrictions are cumulative either
+        way.
+        """
+        stage = self.degradation_stage()
+        if stage is DeadlinePhase.NORMAL:
+            return None
+        if stage.value in self._degradation_stages_entered:
+            return None
+        self._degradation_stages_entered[stage.value] = float(self._clock())
+        return stage
+
+    @property
+    def degradation_stages_entered(self) -> tuple[str, ...]:
+        return tuple(
+            stage
+            for stage, _entered_at in sorted(
+                self._degradation_stages_entered.items(),
+                key=lambda item: item[1],
+            )
+        )
+
     def phase(self) -> DeadlinePhase:
         if self.is_exhausted():
             return DeadlinePhase.EXHAUSTED
@@ -398,7 +616,7 @@ class ExecutionDeadline:
             return DeadlinePhase.NORMAL
         if remaining <= self.finalization_reserve_seconds():
             return DeadlinePhase.FINALIZATION_WINDOW
-        return DeadlinePhase.NORMAL
+        return self.degradation_stage()
 
     def maybe_enter_finalization(self, reason: str = "reserve_reached") -> bool:
         phase = self.phase()
@@ -488,6 +706,7 @@ class ExecutionDeadline:
                 minimum_required_seconds=minimum,
                 estimated_duration_seconds=estimate,
             )
+        degradation_blocked = self.degradation_blocked_operations()
         if phase == DeadlinePhase.FINALIZATION_WINDOW:
             blocked = operation_name in _FINALIZATION_BLOCKED_OPERATIONS
             if blocked and not allow_during_finalization:
@@ -502,11 +721,40 @@ class ExecutionDeadline:
                     minimum_required_seconds=minimum,
                     estimated_duration_seconds=estimate,
                 )
+            if operation_name in degradation_blocked:
+                # The finalization carve-out lets an operation finish the run,
+                # but it cannot reopen something an earlier stage already
+                # closed: the reserve window can begin before wrap-up, so
+                # without this an edit blocked at 90% would be legal again at
+                # 98%.
+                return DeadlineStartDecision(
+                    operation=operation_name,
+                    allowed=False,
+                    phase=phase,
+                    reason="budget_degradation_disallows_operation",
+                    remaining_seconds=remaining,
+                    normal_work_remaining_seconds=normal_remaining,
+                    finalization_reserve_seconds=reserve,
+                    minimum_required_seconds=minimum,
+                    estimated_duration_seconds=estimate,
+                )
             return DeadlineStartDecision(
                 operation=operation_name,
                 allowed=True,
                 phase=phase,
                 reason="finalization_allowed",
+                remaining_seconds=remaining,
+                normal_work_remaining_seconds=normal_remaining,
+                finalization_reserve_seconds=reserve,
+                minimum_required_seconds=minimum,
+                estimated_duration_seconds=estimate,
+            )
+        if operation_name in degradation_blocked:
+            return DeadlineStartDecision(
+                operation=operation_name,
+                allowed=False,
+                phase=phase,
+                reason="budget_degradation_disallows_operation",
                 remaining_seconds=remaining,
                 normal_work_remaining_seconds=normal_remaining,
                 finalization_reserve_seconds=reserve,
@@ -541,12 +789,18 @@ class ExecutionDeadline:
         remaining = self.remaining_seconds()
         phase = self.phase()
         normal_work_remaining = self.normal_work_remaining_seconds()
+        elapsed_fraction = self.elapsed_fraction()
         return {
             "enabled": self.enabled,
             "configured_seconds": self.configured_duration_seconds,
             "source": _normalize_source(self.source),
             "deadline_monotonic": self.deadline_monotonic,
             "elapsed_seconds": round(self.elapsed_seconds(), 6),
+            "elapsed_fraction": (None if elapsed_fraction is None else round(elapsed_fraction, 6)),
+            "degradation_stage": self.degradation_stage().value,
+            "degradation_stages_entered": list(self.degradation_stages_entered),
+            "degradation_policy": self.degradation_policy.as_payload(),
+            "degradation_blocked_operations": sorted(self.degradation_blocked_operations()),
             "remaining_seconds": None if remaining is None else round(remaining, 6),
             "normal_work_remaining_seconds": (
                 None if normal_work_remaining is None else round(normal_work_remaining, 6)
@@ -598,6 +852,7 @@ def derive_subagent_deadline(
         clock=clock,
         source=DeadlineSource.SUBAGENT_FALLBACK,
         finalization_policy=parent_deadline.finalization_policy,
+        degradation_policy=parent_deadline.degradation_policy,
     )
 
 
@@ -610,6 +865,33 @@ def _normalize_source(source: DeadlineSource | str) -> str:
     raw = getattr(source, "value", source)
     cleaned = str(raw or "").strip().lower()
     return cleaned or DeadlineSource.UNKNOWN.value
+
+
+def resolve_llm_attempt_timeout_ceiling_seconds() -> float | None:
+    """Per-attempt LLM timeout ceiling; ``None`` disables the ceiling.
+
+    ``SYLLIPTOR_LLM_ATTEMPT_TIMEOUT_S`` overrides the default. Off-words
+    (off/unlimited/none/never/0/disabled) disable the ceiling entirely,
+    restoring the pre-ceiling behavior where only the run deadline bounds an
+    attempt.
+    """
+    from .branding import env_get
+
+    raw = env_get(_LLM_ATTEMPT_TIMEOUT_ENV)
+    if raw is None:
+        return DEFAULT_LLM_ATTEMPT_TIMEOUT_CEILING_SECONDS
+    cleaned = str(raw).strip().lower()
+    if not cleaned:
+        return DEFAULT_LLM_ATTEMPT_TIMEOUT_CEILING_SECONDS
+    if cleaned in _ATTEMPT_CEILING_OFF_WORDS:
+        return None
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return DEFAULT_LLM_ATTEMPT_TIMEOUT_CEILING_SECONDS
+    if value <= 0 or not math.isfinite(value):
+        return None
+    return value
 
 
 def deadline_timeout_or_raise(
@@ -646,13 +928,32 @@ def temporarily_clamp_client_timeout(
         return
     original = client.timeout_s
     original_retry_deadline = getattr(client, "_provider_retry_deadline_allows", _MISSING)
-    timeout = deadline_timeout_or_raise(
-        deadline,
-        float(original) if original is not None else None,
-        reserve_seconds=reserve_seconds,
-        minimum_timeout_seconds=minimum_timeout_seconds,
-        operation=operation,
-    )
+    attempt_ceiling = resolve_llm_attempt_timeout_ceiling_seconds()
+    configured = float(original) if original is not None else None
+    if attempt_ceiling is not None:
+        configured = attempt_ceiling if configured is None else min(configured, attempt_ceiling)
+    # Outside the finalization window, a single attempt must also leave the
+    # finalization reserve untouched, so a slow provider times out with enough
+    # budget left for the wrap-up call. Inside the window (or when the
+    # reserve-aware bound would be unusably small) fall back to the plain
+    # cleanup-reserve clamp, which is the pre-existing behavior.
+    timeout: float | None = None
+    if deadline.phase() not in (DeadlinePhase.FINALIZATION_WINDOW, DeadlinePhase.EXHAUSTED):
+        timeout = deadline.clamp_timeout(
+            configured,
+            reserve_seconds=(
+                max(0.0, float(reserve_seconds)) + deadline.finalization_reserve_seconds()
+            ),
+            minimum_timeout_seconds=minimum_timeout_seconds,
+        )
+    if timeout is None:
+        timeout = deadline_timeout_or_raise(
+            deadline,
+            configured,
+            reserve_seconds=reserve_seconds,
+            minimum_timeout_seconds=minimum_timeout_seconds,
+            operation=operation,
+        )
 
     def _provider_retry_deadline_allows(wait_seconds: float) -> bool:
         retry_window_seconds = max(0.0, float(wait_seconds)) + max(
@@ -666,7 +967,29 @@ def temporarily_clamp_client_timeout(
             estimated_duration_seconds=retry_window_seconds,
             allow_during_finalization=in_finalization,
         )
-        return decision.allowed
+        if not decision.allowed:
+            return False
+        # The client timeout was computed when the call started; by retry time
+        # far less budget may remain. A retry is only allowed when the sleep
+        # plus a minimally useful attempt still fits, and the next attempt is
+        # shrunk to the remaining budget so it cannot outlive the deadline
+        # (each provider attempt re-reads client.timeout_s). Outside the
+        # finalization window the budget also excludes the finalization
+        # reserve, mirroring the entry-time clamp: the reserve belongs to the
+        # wrap-up call, not to provider retries.
+        remaining = deadline.remaining_seconds()
+        if remaining is not None:
+            reserve_guard = max(0.0, float(reserve_seconds))
+            if not in_finalization:
+                reserve_guard += deadline.finalization_reserve_seconds()
+            budget_after_sleep = remaining - max(0.0, float(wait_seconds)) - reserve_guard
+            floor = max(float(minimum_timeout_seconds), MINIMUM_OPERATION_TIMEOUT_SECONDS)
+            if budget_after_sleep < floor:
+                return False
+            current_timeout = getattr(client, "timeout_s", None)
+            if current_timeout is None or float(current_timeout) > budget_after_sleep:
+                client.timeout_s = budget_after_sleep
+        return True
 
     client.timeout_s = timeout
     client._provider_retry_deadline_allows = _provider_retry_deadline_allows

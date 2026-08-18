@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import os
-import shlex
 import subprocess
-import sys
 from pathlib import Path
 
 import sylliptor_agent_cli.repo_scan as repo_scan_mod
@@ -94,7 +92,7 @@ def test_repo_scan_plain_repo_with_non_python_tests_stays_conservative(tmp_path:
     assert scan.likely_test_commands == []
 
 
-def test_repo_scan_readme_pycon_examples_add_doctest_commands(tmp_path: Path) -> None:
+def test_repo_scan_readme_pycon_examples_never_infer_doctest_commands(tmp_path: Path) -> None:
     (tmp_path / "README.md").write_text(
         "# Mathlet\n\n```pycon\n>>> from mathlet import double\n>>> double(3)\n6\n```\n",
         encoding="utf-8",
@@ -106,19 +104,19 @@ def test_repo_scan_readme_pycon_examples_add_doctest_commands(tmp_path: Path) ->
 
     scan = scan_workspace(context=resolve_workspace_context(tmp_path))
 
-    assert scan.likely_test_commands == [
-        shlex.join([sys.executable, "-m", "doctest", "README.md"]),
-        shlex.join(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "--doctest-glob=README.md",
-                "-q",
-                "README.md",
-            ]
-        ),
-    ]
+    assert scan.likely_test_commands == []
+
+
+def test_repo_scan_readme_doctest_never_shadows_a_real_test_surface(tmp_path: Path) -> None:
+    (tmp_path / "README.rst").write_text(
+        "Mathlet\n=======\n\n>>> from mathlet import double\n>>> double(3)\n6\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "test_mathlet.py").write_text("def test_double() -> None:\n    pass\n", "utf-8")
+
+    scan = scan_workspace(context=resolve_workspace_context(tmp_path))
+
+    assert scan.likely_test_commands == ["pytest -q"]
 
 
 def test_repo_scan_tests_helper_py_without_python_test_signals_stays_conservative(

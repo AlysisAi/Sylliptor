@@ -69,7 +69,7 @@ BENCHMARK_CASES = (
         ),
         node_ids=(
             "tests/test_agent_loop_one_shot_follow_through.py::"
-            "test_one_shot_readonly_explorer_subagent_synthesis_skips_mutating_completion_guards",
+            "test_one_shot_readonly_explorer_subagent_synthesis_completes_via_advisory_completion",
         ),
         provider_request_count="2 scripted parent requests",
         child_roles=("explorer",),
@@ -105,7 +105,7 @@ BENCHMARK_CASES = (
             "tests/test_agent_loop_event_emission.py::"
             "test_run_turn_dispatches_same_batch_subagent_runs_in_parallel",
         ),
-        provider_request_count="7 parent/child requests",
+        provider_request_count="6 parent/child requests",
         child_roles=("explorer", "code-reviewer"),
         tool_names=("subagent_run", "fs_read"),
         terminal_status="success,success",
@@ -435,6 +435,8 @@ def test_subagent_benchmark_m03_multi_file_implementation(tmp_path: Path) -> Non
         requests = list(server.requests)
 
     _assert_clean_cli_result(result)
+    # The router-free explicit child makes one request for both writes, one for
+    # verification, and one final report request.
     assert len(requests) == 3
     assert _called_tool_names(requests) == {"fs_write", "verify_run"}
     assert _changed_paths(repo) == ("src/a.py", "tests/test_a.py")
@@ -471,7 +473,11 @@ def test_subagent_benchmark_m04_parallel_readonly_decomposition(tmp_path: Path) 
         rendezvous = server.benchmark_parallel_rendezvous
 
     _assert_clean_cli_result(result)
-    assert len(requests) == 7, json.dumps(_request_summary(requests), indent=2)
+    # One parent planning request launches both children. Each child then makes
+    # one planning request and one fs_read request, followed by one parent
+    # synthesis request. Keep this phase count aligned with the router-free
+    # runtime; a read-only delegation adds no mutation-gate retry.
+    assert len(requests) == 6, json.dumps(_request_summary(requests), indent=2)
     assert rendezvous == {"alpha": True, "beta": True}
     assert _called_tool_names(requests) == {"subagent_run", "fs_read"}
     assert _changed_paths(repo) == ()

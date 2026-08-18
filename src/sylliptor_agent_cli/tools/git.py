@@ -3,14 +3,30 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
 from ..diff_paths import iter_patch_paths
+from .fs import (
+    FilePrecondition,
+    FsError,
+    StaleFileError,
+    assert_file_precondition,
+    capture_file_precondition,
+)
 
 
 class GitError(RuntimeError):
     pass
+
+
+class GitStaleFileError(GitError, StaleFileError):
+    """A patch precondition conflict recognizable by both tool error contracts."""
+
+    def __init__(self, path: str) -> None:
+        StaleFileError.__init__(self, path)
 
 
 _GIT_HISTORY_DEFAULT_LOG_LIMIT = 10
@@ -21,10 +37,16 @@ _GIT_HISTORY_SHOW_PATCH_MAX_CHARS = 6000
 _GIT_HISTORY_BLAME_MAX_LINES = 200
 _GIT_HISTORY_BLAME_LINE_MAX_CHARS = 240
 _VALID_UNIFIED_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(?: .*)?$")
+_PATCH_LOCKS_GUARD = threading.Lock()
+_PATCH_LOCKS: dict[str, threading.RLock] = {}
 
 
 def _run_git(
-    root: Path, args: list[str], *, input_s: str | None = None
+    root: Path,
+    args: list[str],
+    *,
+    input_s: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -33,6 +55,7 @@ def _run_git(
             check=False,
             capture_output=True,
             text=True,
+            env=env,
         )
     except OSError as e:
         raise GitError("git not available") from e
@@ -57,9 +80,10 @@ def _run_git_checked(
     root: Path,
     args: list[str],
     input_s: str | None = None,
+    env: dict[str, str] | None = None,
     fallback: str,
 ) -> subprocess.CompletedProcess[str]:
-    cp = _run_git(root, args, input_s=input_s)
+    cp = _run_git(root, args, input_s=input_s, env=env)
     if cp.returncode != 0:
         raise GitError(_normalize_git_error(cp.stderr, fallback=fallback))
     return cp
@@ -99,6 +123,40 @@ def _validate_patch_shape(patch_text: str) -> None:
     if invalid_hunk_header.startswith("@@ ..."):
         raise GitError("malformed patch: placeholder hunk header '@@ ...' is not allowed")
     raise GitError(f"malformed patch: invalid hunk header: {invalid_hunk_header}")
+
+
+def _patch_lock(root: Path) -> threading.RLock:
+    key = os.path.normcase(os.fspath(root.resolve()))
+    with _PATCH_LOCKS_GUARD:
+        lock = _PATCH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATCH_LOCKS[key] = lock
+        return lock
+
+
+def _capture_patch_preconditions(root: Path, patch_text: str) -> tuple[FilePrecondition, ...]:
+    preconditions: list[FilePrecondition] = []
+    for raw_path in iter_patch_paths(patch_text):
+        normalized_path = _resolve_git_path(root, raw_path)
+        try:
+            preconditions.append(capture_file_precondition(root=root, path=normalized_path))
+        except StaleFileError as exc:
+            raise GitStaleFileError(exc.path) from exc
+        except FsError as exc:
+            raise GitError(f"Cannot safely prepare patch path {normalized_path}: {exc}") from exc
+    return tuple(preconditions)
+
+
+def _assert_patch_preconditions(
+    root: Path,
+    preconditions: tuple[FilePrecondition, ...],
+) -> None:
+    for precondition in preconditions:
+        try:
+            assert_file_precondition(root=root, precondition=precondition)
+        except StaleFileError as exc:
+            raise GitStaleFileError(exc.path) from exc
 
 
 def _resolve_git_path(root: Path, user_path: str) -> str:
@@ -341,19 +399,59 @@ def git_history(
 def git_apply_patch(*, root: Path, patch: str) -> dict[str, Any]:
     normalized_patch = _normalize_patch_text(patch)
     _validate_patch_shape(normalized_patch)
-    try:
-        _run_git_checked(
-            root=root,
-            args=["apply", "--check", "--whitespace=nowarn"],
-            input_s=normalized_patch,
-            fallback="git apply preflight failed",
-        )
-    except GitError as e:
-        raise GitError(f"git apply preflight failed: {e}") from e
-    _run_git_checked(
-        root=root,
-        args=["apply", "--whitespace=nowarn"],
-        input_s=normalized_patch,
-        fallback="git apply failed",
-    )
+    with _patch_lock(root):
+        preconditions = _capture_patch_preconditions(root, normalized_patch)
+        with tempfile.TemporaryDirectory(prefix="sylliptor-patch-index-") as temporary:
+            patch_env = dict(os.environ)
+            patch_env["GIT_INDEX_FILE"] = os.fspath(Path(temporary) / "index")
+            no_filters = ["-c", "core.autocrlf=false"]
+            _run_git_checked(
+                root=root,
+                args=[*no_filters, "read-tree", "--empty"],
+                env=patch_env,
+                fallback="git apply preflight failed",
+            )
+            existing_paths = [item.path for item in preconditions if item.exists]
+            if existing_paths:
+                _run_git_checked(
+                    root=root,
+                    args=[*no_filters, "add", "-f", "--", *existing_paths],
+                    env=patch_env,
+                    fallback="git apply preflight failed",
+                )
+            _assert_patch_preconditions(root, preconditions)
+            try:
+                _run_git_checked(
+                    root=root,
+                    args=[
+                        *no_filters,
+                        "apply",
+                        "--check",
+                        "--index",
+                        "--whitespace=nowarn",
+                    ],
+                    input_s=normalized_patch,
+                    env=patch_env,
+                    fallback="git apply preflight failed",
+                )
+            except GitError as e:
+                raise GitError(f"git apply preflight failed: {e}") from e
+            _assert_patch_preconditions(root, preconditions)
+            try:
+                # The private index records the exact whole-file preconditions.
+                # ``--index`` rechecks those blobs inside the mutating Git process,
+                # without reading or changing the developer's real index.
+                _run_git_checked(
+                    root=root,
+                    args=[*no_filters, "apply", "--index", "--whitespace=nowarn"],
+                    input_s=normalized_patch,
+                    env=patch_env,
+                    fallback="git apply failed",
+                )
+            except GitError as exc:
+                # If another writer won after our final user-space check, surface
+                # the deterministic stale-file contract rather than a generic
+                # index mismatch.
+                _assert_patch_preconditions(root, preconditions)
+                raise exc
     return {"applied": True}

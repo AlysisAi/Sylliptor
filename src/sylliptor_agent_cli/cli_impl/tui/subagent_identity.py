@@ -8,7 +8,7 @@ a subagent wears no per-agent symbol, so they have nothing to keep in sync.
 
 The name is the identity: the shared ``↪``/``↩`` marks say only that a nested
 run started or ended, never which agent it was. Colours are distinct from the
-fixed mode accents (green chat, violet forge, and cyan brand) so a
+fixed mode accents (green chat, violet forge, reserved gold, cyan brand) so a
 subagent badge never impersonates a mode. Custom subagents get a colour picked
 deterministically from the name — the same agent looks the same every run — and
 an empty tagline (callers fall back to the description).
@@ -28,6 +28,7 @@ class SubagentIdentity:
 
 _BUILTIN_IDENTITIES: dict[str, SubagentIdentity] = {
     "frontend-engineer": SubagentIdentity("#a371f7", "crafting the interface"),
+    # Silver, not gold — gold is reserved for a mode badge.
     "visual-designer": SubagentIdentity("#c9d1d9", "composing the asset"),
     "explorer": SubagentIdentity("#58a6ff", "charting the codebase"),
     "implementer": SubagentIdentity("#f0883e", "shaping the change"),

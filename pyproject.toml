@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.24.2"]
+requires = ["editables==0.5", "hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "sylliptor-agent-cli"
-version = "0.11.2"
+version = "0.12.0"
 description = "Local CLI coding agent powered by any API."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -39,7 +39,7 @@ dependencies = [
   "httpx>=0.27.0",
   "keyring>=25.0.0",
   "packaging>=23.0",
-  "pillow>=10.0.0",
+  "pillow>=12.3.0",
   "platformdirs>=4.2.0",
   "pydantic>=2.6.0",
   "prompt-toolkit>=3.0.43",
@@ -58,6 +58,9 @@ Source = "https://github.com/AlysisAi/Sylliptor"
 
 [project.optional-dependencies]
 dev = [
+  "editables==0.5",
+  "hatchling==1.31.0",
+  "pyyaml>=6.0.0",
   "pytest>=8.0.0",
   "ruff>=0.6.0",
 ]
@@ -78,6 +81,15 @@ exclude = [
 ]
 
 [tool.hatch.build.targets.sdist]
+include = [
+  "/.gitignore",
+  "/CHANGELOG.md",
+  "/LICENSE",
+  "/NOTICE",
+  "/README.md",
+  "/pyproject.toml",
+  "/src/sylliptor_agent_cli",
+]
 exclude = [
   "**/__pycache__/**",
   "**/*.py[cod]",
@@ -87,6 +99,9 @@ exclude = [
 testpaths = ["tests"]
 addopts = "--capture=sys"
 pythonpath = ["src", "."]
+markers = [
+  "smoke: portable mock-provider end-to-end build smoke across execution modes (pytest -m smoke)",
+]
 
 [tool.ruff]
 line-length = 100

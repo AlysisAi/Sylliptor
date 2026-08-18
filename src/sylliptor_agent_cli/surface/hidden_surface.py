@@ -104,6 +104,9 @@ class HiddenApprovalSurface(NoopSurface):
     def emit_mode_changed(self, mode: str) -> None:
         _ = mode
 
+    def emit_persona_changed(self, persona: str, effective_mode: str, source: str = "user") -> None:
+        _ = (persona, effective_mode, source)
+
     def emit_plan_node_updated(
         self,
         node_id: str,
@@ -191,14 +194,21 @@ class NestedSubagentSurface(HiddenApprovalSurface):
         *,
         subagent_name: str,
         subagent_mode: str,
+        subagent_run_id: str | None = None,
     ) -> None:
         super().__init__(parent_surface)
         self._subagent_name = subagent_name
         self._subagent_mode = subagent_mode
+        self._subagent_run_id = subagent_run_id
         self._tool_call_prefix = f"subagent:{subagent_name}:"
         self._steps_completed = 0
         self._assistant_messages_done: list[str] = []
         self._assistant_message_chunks: dict[tuple[str | None, str | None], list[str]] = {}
+
+    @property
+    def canonical_message_tool_events(self) -> bool:
+        """Preserve the parent's single-delivery protocol contract through this wrapper."""
+        return bool(getattr(self._parent_surface, "canonical_message_tool_events", False))
 
     @property
     def steps_completed(self) -> int:
@@ -232,13 +242,17 @@ class NestedSubagentSurface(HiddenApprovalSurface):
         handler = getattr(self._parent_surface, "on_subagent_start", None)
         if callable(handler):
             with _PARENT_SURFACE_FORWARD_LOCK:
-                handler(event)
+                handler(
+                    replace(event, subagent_run_id=event.subagent_run_id or self._subagent_run_id)
+                )
 
     def on_subagent_end(self, event: SubagentEndEvent) -> None:
         handler = getattr(self._parent_surface, "on_subagent_end", None)
         if callable(handler):
             with _PARENT_SURFACE_FORWARD_LOCK:
-                handler(event)
+                handler(
+                    replace(event, subagent_run_id=event.subagent_run_id or self._subagent_run_id)
+                )
 
     def emit_message_delta(
         self,

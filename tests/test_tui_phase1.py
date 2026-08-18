@@ -89,14 +89,14 @@ def test_pretty_model_label(model, expected):
 
 
 def test_footer_auto_on():
-    state = TuiState(model_name="deepseek-chat", username="perdikis")
+    state = TuiState(model_name="deepseek-chat", username="developer", context_pct=100.0)
     text = _plain(footer_fragments(state, width=90))
     assert "sylliptor" in text
     assert "DeepSeek Chat" in text
-    assert "ctx 100% left" in text
-    assert "session 0 tok" in text and "$0.0000" in text
-    assert "perdikis" in text
-    assert "sensitive: auto" in text and "shift+tab" in text
+    assert "context: 100% left" in text
+    assert "0 processed" in text and "$0.0000" in text
+    assert "developer" in text
+    assert "sensitive: auto" in text and "shift+tab" not in text
     # Distinct from Cline: no "(0)", no "▶▶", no Plan/Act toggle.
     assert "(0)" not in text
     assert "▶▶" not in text
@@ -104,7 +104,7 @@ def test_footer_auto_on():
 
 
 def test_footer_auto_off():
-    state = TuiState(model_name="deepseek-chat", username="perdikis", auto_approve=False)
+    state = TuiState(model_name="deepseek-chat", username="developer", auto_approve=False)
     text = _plain(footer_fragments(state, width=90))
     assert "sensitive: ask" in text
     assert "auto-approve off" not in text
@@ -114,7 +114,7 @@ def test_footer_fast_mode_with_manual_sensitive_approvals_is_not_contradictory()
     state = TuiState(
         model_name="deepseek-chat",
         exec_mode="auto",
-        username="perdikis",
+        username="developer",
         auto_approve=False,
     )
     text = _plain(footer_fragments(state, width=100))
@@ -127,12 +127,12 @@ def test_footer_fast_mode_with_manual_sensitive_approvals_is_not_contradictory()
 def test_footer_shows_workspace_and_branch():
     state = TuiState(
         model_name="m",
-        username="perdikis",
+        username="developer",
         workspace="~/coder-plugin-install",
         branch="feat/tui-rebuild",
     )
     text = _plain(footer_fragments(state, width=120))
-    assert "perdikis" in text
+    assert "developer" in text
     assert "~/coder-plugin-install" in text
     assert "feat/tui-rebuild" in text
 
@@ -141,7 +141,42 @@ def test_footer_context_indicator_value():
     text = _plain(
         footer_fragments(TuiState(model_name="m", username="u", context_pct=42.0), width=90)
     )
-    assert "ctx 42% left" in text
+    assert "context: 42% left" in text
+
+
+def test_footer_context_unmeasured_reads_na_not_fabricated_100():
+    text = _plain(footer_fragments(TuiState(model_name="m", username="u"), width=90))
+    assert "context: n/a" in text
+    assert "% left" not in text.split("\n")[0]
+
+
+def test_footer_context_never_rounds_up_to_full_or_down_to_empty():
+    near_full = _plain(footer_fragments(TuiState(model_name="m", context_pct=99.6), width=90))
+    assert "context: 99% left" in near_full
+    near_empty = _plain(footer_fragments(TuiState(model_name="m", context_pct=0.4), width=90))
+    assert "context: 1% left" in near_empty
+
+
+def test_footer_context_metric_uses_effective_provider_capacity():
+    from sylliptor_agent_cli.cli_impl.commands.startup import _chat_context_percent_value
+
+    measured = SimpleNamespace(
+        _hud_context_cache=SimpleNamespace(
+            dynamic_context_budget_tokens=120_000,
+            dynamic_context_percent_left=100.0,
+            effective_percent_left=99.2,
+        )
+    )
+    assert _chat_context_percent_value(measured) == 99.2
+
+    window_fallback = SimpleNamespace(
+        _hud_context_cache=SimpleNamespace(
+            effective_percent_left=None,
+            context_window_percent_left=95.7,
+        )
+    )
+    assert _chat_context_percent_value(window_fallback) == 95.7
+    assert _chat_context_percent_value(SimpleNamespace(_hud_context_cache=None)) is None
 
 
 def test_footer_usage_hud_off_hides_usage_metrics():
@@ -149,7 +184,7 @@ def test_footer_usage_hud_off_hides_usage_metrics():
         footer_fragments(
             TuiState(
                 model_name="deepseek-chat",
-                username="perdikis",
+                username="developer",
                 usage_hud_enabled=False,
                 context_pct=42.0,
                 tokens=1234,
@@ -160,8 +195,8 @@ def test_footer_usage_hud_off_hides_usage_metrics():
     )
     line1 = text.split("\n")[0]
     assert "DeepSeek Chat" in line1
-    assert "ctx " not in line1
-    assert "session " not in line1
+    assert "context" not in line1
+    assert "tokens" not in line1
     assert "$" not in line1
 
 
@@ -193,7 +228,7 @@ def test_footer_forge_badge_hidden_by_default():
 def test_footer_forge_badge_shown_when_active():
     state = TuiState(
         model_name="m",
-        username="perdikis",
+        username="developer",
         exec_mode="review",
         forge_mode=True,
         forge_run_id="run-1a2b",
@@ -222,9 +257,9 @@ def test_footer_is_two_lines_and_right_aligned():
     assert len(lines) == 2
     assert lines[0].rstrip().endswith("$0.0000")  # cost right-aligned, line 1
     assert lines[0].startswith("◇ sylliptor")  # brand mark + wordmark, line 1 left
-    assert "session 1,234 tok" in lines[0]  # labeled + comma-grouped
+    assert "1,234 processed" in lines[0]  # comma-grouped cumulative usage
     assert "u" in lines[1]  # username still present on line 2
-    assert lines[1].rstrip().endswith("shift+tab")  # hint right-aligned, line 2
+    assert lines[1].rstrip().endswith("sensitive: auto")  # approval policy right-aligned
 
 
 def test_footer_never_overflows_width():
@@ -253,6 +288,19 @@ def test_owl_frames_load():
     owl.advance()
     assert owl.current_ansi() is not None
     assert first is not None and first.value  # non-empty ASCII art
+
+
+def test_neutral_owl_uses_the_terminal_foreground(monkeypatch) -> None:
+    from sylliptor_agent_cli.cli_impl.commands import welcome as welcome_mod
+    from sylliptor_agent_cli.cli_impl.tui import owl as owl_mod
+
+    monkeypatch.setattr(welcome_mod, "_detect_owl_theme", lambda _stream: "neutral")
+
+    frames = owl_mod._load_frames(color_enabled=True, stream=None)
+    output = "\n".join(line for frame in frames for line in frame)
+
+    assert "\x1b[" not in output
+    assert "█" in output
 
 
 # --------------------------- headless app ---------------------------
@@ -373,7 +421,7 @@ def test_tui_state_has_no_mouse_mode_toggle():
 def test_footer_omits_mouse_mode_chip():
     default = _plain(footer_fragments(TuiState(model_name="m", username="u"), width=120))
     line2 = default.split("\n")[1]
-    assert line2.rstrip().endswith("shift+tab")
+    assert line2.rstrip().endswith("sensitive: auto")
     assert "F2" not in line2
 
 
@@ -411,7 +459,7 @@ def test_footer_cost_unknown_shows_na():
 
 
 def test_footer_cost_known_shows_dollars():
-    state = TuiState(model_name="m", username="u", tokens=5000, cost_usd=0.1234)
+    state = TuiState(model_name="m", username="u", tokens=5000, cost_usd=0.1234, context_pct=100.0)
     line1 = _plain(footer_fragments(state, width=120)).split("\n")[0]
     assert "$0.1234" in line1
     assert "n/a" not in line1

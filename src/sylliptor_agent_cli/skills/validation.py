@@ -45,6 +45,36 @@ class SkillValidationResult:
 
 
 def validate_skill_bundle(bundle_path: Path) -> SkillValidationResult:
+    """Validate a skill bundle without allowing filesystem faults to escape.
+
+    Skill directories are untrusted workspace input.  On Windows in particular,
+    even metadata probes such as ``is_symlink()`` can raise ``PermissionError``
+    for a deny-ACL directory.  Discovery must fail that one bundle closed instead
+    of making session creation fail.
+    """
+
+    try:
+        return _validate_skill_bundle(bundle_path)
+    except OSError as exc:
+        try:
+            reported_bundle = bundle_path.expanduser().absolute()
+        except OSError:
+            reported_bundle = bundle_path
+        entry_path = reported_bundle / "SKILL.md"
+        issue = SkillValidationIssue(
+            severity="error",
+            message=f"Failed to inspect skill bundle: {exc}",
+            path=reported_bundle,
+        )
+        return SkillValidationResult(
+            bundle_path=reported_bundle,
+            entry_path=entry_path,
+            valid=False,
+            issues=(issue,),
+        )
+
+
+def _validate_skill_bundle(bundle_path: Path) -> SkillValidationResult:
     resolved_bundle = bundle_path.expanduser().resolve()
     entry_path = resolved_bundle / "SKILL.md"
     issues: list[SkillValidationIssue] = []

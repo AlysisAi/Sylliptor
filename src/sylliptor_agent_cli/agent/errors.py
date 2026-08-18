@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+from typing import Any
+
 
 class AgentRuntimeError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        *args: object,
+        result_payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.result_payload = result_payload
+        super().__init__(*args)
 
 
 class ApprovalDeclinedError(AgentRuntimeError):

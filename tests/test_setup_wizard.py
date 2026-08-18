@@ -113,9 +113,8 @@ class PromptScript:
 
 
 class PickerScript:
-    def __init__(self, answers: list[str | None], *, auto_router_inherit: bool = True) -> None:
+    def __init__(self, answers: list[str | None]) -> None:
         self.answers = list(answers)
-        self.auto_router_inherit = auto_router_inherit
         self.calls: list[dict[str, Any]] = []
         self.connection_calls: list[dict[str, Any]] = []
 
@@ -133,16 +132,6 @@ class PickerScript:
                 raise AssertionError(f"Unexpected picker: {kwargs}")
             return self.answers.pop(0)
         self.calls.append(kwargs)
-        if kwargs.get("title") == "Router Model" and self.auto_router_inherit:
-            if not self.answers:
-                return setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE
-            next_answer = self.answers[0]
-            if next_answer not in {
-                None,
-                setup_wizard_mod._CUSTOM_MODEL_VALUE,
-                setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
-            }:
-                return setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE
         if not self.answers:
             raise AssertionError(f"Unexpected picker: {kwargs}")
         return self.answers.pop(0)
@@ -161,6 +150,7 @@ def _config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SYLLIPTOR_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ZAI_API_KEY", raising=False)
 
 
 def _sandbox_diagnostic(
@@ -527,10 +517,15 @@ def test_subscription_login_interrupt_reports_that_settings_are_already_saved(
     assert load_config().execution.runtime is None
 
 
-def test_setup_wizard_router_model_inherits_and_clears_existing_override(
+def test_setup_wizard_has_no_router_step_and_profile_switch_drops_legacy_key(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    # The router-model step is gone: setup never prompts for or writes a
+    # router model. The legacy role_models.router key is still removed, but by
+    # the profile-switch hygiene in profiles.set_active_profile (the migrated
+    # "default" profile is swapped for the chosen provider during commit),
+    # while other unexposed role keys survive.
     _config_env(tmp_path, monkeypatch)
     cfg = AppConfig()
     cfg.extra_fields = {"role_models": {"coding": "coding-model", "router": "old-router-model"}}
@@ -541,40 +536,8 @@ def test_setup_wizard_router_model_inherits_and_clears_existing_override(
     assert result is True
     saved_cfg = load_config()
     assert saved_cfg.extra_fields["role_models"] == {"coding": "coding-model"}
-    assert "Router model:" in output
-    assert "inherits default" in output
-    router_rows = picker.calls[2]["rows"]
-    assert router_rows[0][0] == setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE
-
-
-def test_setup_wizard_persists_explicit_router_model_and_validates_it(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    _config_env(tmp_path, monkeypatch)
-    _patch_console(monkeypatch)
-    picker = PickerScript(
-        ["openai", "gpt-5", "gpt-5.4-mini"],
-        auto_router_inherit=False,
-    )
-    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
-    monkeypatch.setattr(
-        setup_wizard_mod.typer,
-        "prompt",
-        PromptScript(["", "sk-test-1234", os.fspath(tmp_path)]),
-    )
-    validated_models: list[str | None] = []
-
-    def validate(*, profile, api_key, model=None, **_kwargs):
-        del profile, api_key
-        validated_models.append(model)
-        return setup_wizard_mod._ApiKeyValidationResult(status="validated")
-
-    monkeypatch.setattr(setup_wizard_mod, "_validate_api_key", validate)
-
-    assert setup_wizard_mod.run_setup_wizard() is True
-    assert load_config().extra_fields["role_models"]["router"] == "gpt-5.4-mini"
-    assert validated_models == [None, "gpt-5", "gpt-5.4-mini"]
+    assert "Router model:" not in output
+    assert all(call.get("title") != "Router Model" for call in picker.calls)
 
 
 def test_setup_wizard_no_backend_disable_writes_off_to_both_gates(
@@ -733,7 +696,7 @@ def test_setup_wizard_creates_anthropic_profile_with_chosen_model(
         monkeypatch,
         tmp_path,
         provider="anthropic",
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         api_key="sk-ant-test",
     )
 
@@ -788,16 +751,19 @@ def test_setup_profile_picker_separates_compatibility_and_native_presets() -> No
     advanced_keys = [preset.key for preset in advanced]
 
     # Native first-party providers lead the primary picker; every other hosted
-    # provider follows so users are not limited to
-    # the big-three brands.
-    assert keys[:4] == ["openai-responses", "anthropic", "gemini", "deepseek"]
+    # provider follows in registration order. The account-gated Sylliptor
+    # preset stays behind the advanced picker.
+    assert keys[:3] == ["openai-responses", "anthropic", "gemini"]
+    assert "sylliptor" not in keys
+    assert "xiaomi-mimo" not in keys
     assert "deepseek" in keys
     assert "openrouter" in keys
     assert all(preset.protocol != "gemini_interactions" for preset in presets)
     assert all(preset.protocol != "gemini_interactions" for preset in advanced)
-    # Only compatibility duplicates, local endpoints, custom URLs, and legacy
-    # aliases are held back for the advanced picker.
-    assert "sylliptor" not in advanced_keys
+    # Only compatibility duplicates, local endpoints, custom URLs, legacy
+    # aliases, and the account-gated hosted preset are held back for the
+    # advanced picker.
+    assert "sylliptor" in advanced_keys
     assert "deepseek" not in advanced_keys
     assert "anthropic-compat" not in keys
     assert "gemini-compat" not in keys
@@ -901,10 +867,110 @@ def test_deepseek_model_picker_uses_v4_models(monkeypatch, tmp_path: Path) -> No
     assert "deepseek-coder" not in model_values
 
 
+def test_nvidia_setup_merges_live_third_party_models_and_persists_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    picker = PickerScript(["nvidia", "deepseek-ai/deepseek-v4-pro", "max"])
+    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
+    monkeypatch.setattr(
+        setup_wizard_mod.typer,
+        "prompt",
+        PromptScript(["", "nvapi-test", os.fspath(tmp_path)]),
+    )
+    monkeypatch.setattr(
+        setup_wizard_mod,
+        "_discover_setup_provider_models",
+        lambda *_args, **_kwargs: (
+            (
+                setup_wizard_mod.ProviderModelOption(
+                    id="deepseek-ai/deepseek-v4-pro",
+                    label="deepseek-ai/deepseek-v4-pro",
+                ),
+                setup_wizard_mod.ProviderModelOption(
+                    id="meta/llama-3.3-70b-instruct",
+                    label="meta/llama-3.3-70b-instruct",
+                ),
+            ),
+            "",
+        ),
+    )
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+
+    model_values = [value for value, _label, _description in picker.calls[1]["rows"]]
+    assert "deepseek-ai/deepseek-v4-pro" in model_values
+    assert "meta/llama-3.3-70b-instruct" in model_values
+    live_meta_row = next(
+        row for row in picker.calls[1]["rows"] if row[0] == "meta/llama-3.3-70b-instruct"
+    )
+    assert live_meta_row[1].endswith("(chat compatibility unverified)")
+    assert "validated before setup completes" in live_meta_row[2]
+    assert picker.calls[2]["title"] == "Reasoning Effort"
+    assert [value for value, _label, _description in picker.calls[2]["rows"]] == [
+        "off",
+        "high",
+        "max",
+        "auto",
+    ]
+    cfg = load_config()
+    assert cfg.model == "deepseek-ai/deepseek-v4-pro"
+    assert cfg.llm_reasoning_effort == "max"
+    assert cfg.llm_enable_thinking is True
+    assert cfg.extra_fields["llm_thinking_label"] == "max"
+
+
+def test_unknown_nvidia_model_uses_auto_without_exposing_guessed_efforts() -> None:
+    preset = setup_wizard_mod._preset_by_key("nvidia")
+    assert preset is not None
+    profile_result = setup_wizard_mod._ProfileStepResult(
+        profile=make_profile_from_preset(preset),
+        label=preset.label,
+        preset=preset,
+    )
+
+    assert setup_wizard_mod._setup_reasoning_labels(
+        profile_result,
+        model="new-vendor/model-released-today",
+    ) == ("auto",)
+
+
+def test_zai_coding_plan_setup_persists_only_documented_reasoning_levels(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _config_env(tmp_path, monkeypatch)
+    _patch_console(monkeypatch)
+    picker = PickerScript(["zai-coding-plan", "glm-5.3", "high"])
+    monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
+    monkeypatch.setattr(
+        setup_wizard_mod.typer,
+        "prompt",
+        PromptScript(["", "zai-test", os.fspath(tmp_path)]),
+    )
+
+    assert setup_wizard_mod.run_setup_wizard() is True
+
+    assert picker.calls[2]["title"] == "Reasoning Effort"
+    assert [value for value, _label, _description in picker.calls[2]["rows"]] == [
+        "low",
+        "high",
+        "max",
+        "auto",
+    ]
+    cfg = load_config()
+    assert cfg.model == "glm-5.3"
+    assert cfg.llm_reasoning_effort == "high"
+    assert cfg.llm_enable_thinking is True
+    assert cfg.extra_fields["llm_thinking_label"] == "high"
+
+
 def test_gemini_model_picker_uses_stable_models(monkeypatch, tmp_path: Path) -> None:
     _config_env(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
-    picker = PickerScript(["gemini", "gemini-3.5-flash"])
+    picker = PickerScript(["gemini", "gemini-3.7-flash"])
     monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
     monkeypatch.setattr(
         setup_wizard_mod.typer, "prompt", PromptScript(["", "sk-test-1234", os.fspath(tmp_path)])
@@ -912,8 +978,9 @@ def test_gemini_model_picker_uses_stable_models(monkeypatch, tmp_path: Path) -> 
 
     assert setup_wizard_mod.run_setup_wizard() is True
     model_values = [value for value, _label, _description in picker.calls[1]["rows"]]
-    assert model_values[0] == "gemini-3.5-flash"
-    assert "gemini-3.1-flash-lite" in model_values
+    assert model_values[0] == "gemini-3.7-flash"
+    assert "gemini-3.6-flash" in model_values
+    assert "gemini-3.5-flash-lite" in model_values
     assert "gemini-3.1-pro-preview" in model_values
     assert "gemini-2.5-pro" not in model_values
     assert "gemini-2.5-flash" not in model_values
@@ -1120,8 +1187,8 @@ def test_gemini_api_key_validation_uses_fast_validation_model_before_model_choic
         ),
         api_key="sk-test",
         suggested_models=(
-            "gemini-3.5-flash",
-            "gemini-3.1-flash-lite",
+            "gemini-3.7-flash",
+            "gemini-3.5-flash-lite",
             "gemini-2.5-flash",
             "gemini-2.5-pro",
         ),
@@ -1160,6 +1227,29 @@ def test_gemini_selected_model_validation_uses_low_reasoning_effort() -> None:
     assert result.status == "validated"
     assert result.message == ""
     assert captured["body"]["model"] == "gemini-2.5-flash"
+    assert captured["body"]["reasoning_effort"] == "low"
+
+
+def test_zai_coding_plan_validation_uses_low_reasoning_effort() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "p"}}]})
+
+    result = _ORIGINAL_VALIDATE_API_KEY(
+        profile=ProfileSpec(
+            name="zai-coding-plan",
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            default_model="glm-5.3",
+        ),
+        api_key="zai-test",
+        model="glm-5.3",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.status == "validated"
+    assert captured["body"]["model"] == "glm-5.3"
     assert captured["body"]["reasoning_effort"] == "low"
 
 
@@ -1248,7 +1338,6 @@ def test_setup_summary_renders_api_key_validation_status(
             validation_message=validation_message,
         ),
         model_result=setup_wizard_mod._ModelStepResult(model="example-model"),
-        router_model_result=setup_wizard_mod._RouterModelStepResult(),
         workspace_result=setup_wizard_mod._WorkspaceStepResult(workspace="C:\\repo"),
         sandbox_result=setup_wizard_mod._SandboxStepResult(ready=True, status="docker"),
     )
@@ -1579,7 +1668,6 @@ def test_setup_wizard_escape_at_profile_returns_to_execution(monkeypatch, tmp_pa
         "Provider Profile",
         "Provider Profile",
         "Default Model",
-        "Router Model",
     ]
 
 
@@ -1633,22 +1721,16 @@ def test_setup_wizard_escape_at_workspace_returns_to_model_with_preselection(
         [
             "openai",
             "gpt-5.6-terra",
-            setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
-            None,
             "gpt-5.6-terra",
-            setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
-        ],
-        auto_router_inherit=False,
+        ]
     )
     text_input = PromptScript(["", "sk-test-1234", setup_wizard_mod._GoBack(), os.fspath(tmp_path)])
     monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
     monkeypatch.setattr(setup_wizard_mod, "_esc_aware_text_input", text_input)
 
     assert setup_wizard_mod.run_setup_wizard() is True
-    assert picker.calls[3]["title"] == "Router Model"
-    assert picker.calls[3]["current_value"] == setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE
-    assert picker.calls[4]["title"] == "Default Model"
-    assert picker.calls[4]["current_value"] == "gpt-5.6-terra"
+    assert picker.calls[2]["title"] == "Default Model"
+    assert picker.calls[2]["current_value"] == "gpt-5.6-terra"
 
 
 def test_setup_wizard_profile_change_invalidates_api_key_and_model_results(
@@ -1660,15 +1742,11 @@ def test_setup_wizard_profile_change_invalidates_api_key_and_model_results(
     picker = PickerScript(
         [
             "openai",
-            "gpt-5",
-            setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
-            None,
+            "gpt-5.6-terra",
             None,
             "anthropic",
             "claude-sonnet-5",
-            setup_wizard_mod._INHERIT_DEFAULT_MODEL_VALUE,
-        ],
-        auto_router_inherit=False,
+        ]
     )
     text_input = PromptScript(
         [
@@ -1689,8 +1767,8 @@ def test_setup_wizard_profile_change_invalidates_api_key_and_model_results(
     assert load_persisted_profile_keys()["anthropic"] == "sk-ant"
     api_prompts = [call[0] for call in text_input.calls if call[0].startswith("Paste your API key")]
     assert api_prompts[-1] == "Paste your API key"
-    assert picker.calls[-2]["title"] == "Default Model"
-    assert any(row[0] == "claude-sonnet-5" for row in picker.calls[-2]["rows"])
+    assert picker.calls[-1]["title"] == "Default Model"
+    assert any(row[0] == "claude-sonnet-5" for row in picker.calls[-1]["rows"])
 
 
 def test_setup_wizard_ctrl_c_confirmation_decline_stays_on_same_step(
@@ -1962,14 +2040,23 @@ def test_setup_typer_command_runs_wizard(monkeypatch) -> None:
 
     def fake_wizard() -> bool:
         called.append(True)
-        return False
+        return True
 
-    monkeypatch.setattr(cli_mod, "_try_setup_tui", lambda **_k: None)
     monkeypatch.setattr(setup_wizard_mod, "run_setup_wizard", fake_wizard)
+    monkeypatch.setattr(
+        cli_mod,
+        "load_config",
+        lambda: AppConfig(
+            execution={"backend": "delegated", "runtime": "openai-codex"},
+            agent_runtimes={
+                "openai-codex": {"adapter": "codex-cli", "executable": "codex"},
+            },
+        ),
+    )
 
     result = CliRunner().invoke(sylliptor_app, ["setup"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, (result.output, result.exception)
     assert called == [True]
 
 
@@ -1977,12 +2064,13 @@ def test_setup_command_launches_chat_after_interactive_tui(monkeypatch) -> None:
     chat_calls: list[bool] = []
     monkeypatch.setattr(cli_mod, "_try_setup_tui", lambda **_k: True)  # TUI saved
     monkeypatch.setattr(cli_mod, "load_config", lambda: AppConfig())
+    monkeypatch.setattr(cli_mod, "_provider_auth_ready_for_chat", lambda: True)
     monkeypatch.setattr(cli_mod, "_maybe_run_startup_config_menu", lambda: None)
     monkeypatch.setattr(cli_mod, "_run_chat_after_setup", lambda: chat_calls.append(True))
 
     result = CliRunner().invoke(sylliptor_app, ["setup"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, (result.output, result.exception)
     assert chat_calls == [True]  # flows straight into chat
 
 
@@ -2094,6 +2182,7 @@ def test_run_default_run_action_passes_concrete_typer_defaults(monkeypatch) -> N
     assert captured["instruction"] == "inspect"
     assert captured["benchmark"] is False
     assert captured["deadline_seconds"] is None
+    assert captured["no_deadline"] is False
     assert captured["require_deadline"] is False
     assert captured["diagnostic_log"] is None
 
@@ -2101,9 +2190,12 @@ def test_run_default_run_action_passes_concrete_typer_defaults(monkeypatch) -> N
 def _mimo_login_preset() -> ProfilePreset:
     from sylliptor_agent_cli.sylliptor_cloud import PROFILE_KEY
 
-    # The hosted MiMo trial is now a first-class setup option, not buried in the
-    # advanced/gateway picker.
-    return next(p for p in setup_wizard_mod.provider_selection_presets() if p.key == PROFILE_KEY)
+    # While no hosted campaign is running the MiMo login preset stays behind
+    # the advanced picker — never on the primary provider picker.
+    assert all(p.key != PROFILE_KEY for p in setup_wizard_mod.provider_selection_presets())
+    return next(
+        p for p in setup_wizard_mod.advanced_provider_selection_presets() if p.key == PROFILE_KEY
+    )
 
 
 def _profile_step_for(preset: ProfilePreset) -> Any:

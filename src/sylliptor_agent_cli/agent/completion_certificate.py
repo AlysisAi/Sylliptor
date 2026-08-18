@@ -48,6 +48,14 @@ class CompletionCertificate:
     agent_authored_failures: tuple[str, ...] = tuple()
     # Turn-contract v2 (step 4): expectation ids left unaddressed at the gate.
     expectations_unaddressed: tuple[str, ...] = tuple()
+    # Reproduction-first (step 5): the protocol status for a bug-fix-shaped turn,
+    # plus any repro scaffolding still present in the working tree.
+    repro_status: str = ""
+    repro_artifacts_present: tuple[str, ...] = tuple()
+    # Blast radius (step 6): tests that passed in the clean-tree baseline of the
+    # selected scope and fail after the change, plus the protocol status.
+    blast_radius_status: str = ""
+    blast_radius_new_failures: tuple[str, ...] = tuple()
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -63,6 +71,10 @@ class CompletionCertificate:
             "pre_existing_failures": list(self.pre_existing_failures),
             "agent_authored_failures": list(self.agent_authored_failures),
             "expectations_unaddressed": list(self.expectations_unaddressed),
+            "repro_status": self.repro_status,
+            "repro_artifacts_present": list(self.repro_artifacts_present),
+            "blast_radius_status": self.blast_radius_status,
+            "blast_radius_new_failures": list(self.blast_radius_new_failures),
         }
 
 
@@ -108,6 +120,27 @@ class CompletionCertificateInput:
     # never CONTRADICTED, since a missing disposition is not a proven failure.
     turn_contract_v2_enabled: bool = False
     expectations_unaddressed: tuple[str, ...] = tuple()
+    # Reproduction-first (step 5). ``repro_unconfirmed`` is True when the turn is
+    # bug-fix-shaped, changed product code, and no reproduction of the *reported*
+    # symptom was observed failing before the fix and passing after it. It blocks
+    # as a repairable INSUFFICIENT problem — except when the reproduction actively
+    # still fails (``repro_failing_after_fix``), which is a proven CONTRADICTED
+    # result, the same rank as a detected regression. ``repro_artifacts_present``
+    # are recorded scaffolding paths still in the tree at finalization.
+    reproduction_first_enabled: bool = False
+    repro_unconfirmed: bool = False
+    repro_failing_after_fix: bool = False
+    repro_status: str = ""
+    repro_artifacts_present: tuple[str, ...] = tuple()
+    # Blast radius (step 6). ``blast_radius_new_failures`` are tests that passed in
+    # the clean-tree baseline of the selected scope and fail after the change: proven
+    # collateral damage, so they rank CONTRADICTED alongside a step-3 regression.
+    # ``blast_radius_unverified`` is the weaker deficit — the scope around the change
+    # was never run after it — and blocks as a repairable INSUFFICIENT problem.
+    blast_radius_enabled: bool = False
+    blast_radius_new_failures: tuple[str, ...] = tuple()
+    blast_radius_unverified: bool = False
+    blast_radius_status: str = ""
 
 
 def evaluate_completion_certificate(
@@ -172,6 +205,35 @@ def evaluate_completion_certificate(
     ):
         problems.append("expectations_unaddressed")
 
+    # Reproduction-first: a bug-fix-shaped turn that changed product code without a
+    # reproduction that failed before the fix and passes after it has not validated
+    # the *reported* symptom, only its own reading of it. Blocked finalizations are
+    # exempt (consistent with steps 2-4).
+    repro_enabled = certificate_input.reproduction_first_enabled
+    repro_unconfirmed = repro_enabled and certificate_input.repro_unconfirmed
+    if repro_unconfirmed and not certificate_input.blocked:
+        problems.append("repro_unconfirmed")
+    if (
+        repro_enabled
+        and not certificate_input.blocked
+        and certificate_input.repro_artifacts_present
+    ):
+        problems.append("repro_artifacts_present")
+
+    # Blast radius: a change that broke tests it was not aiming at has failed the
+    # task even when its own verification passes. New failures are proven collateral
+    # damage; a scope that was never re-run is an unmeasured blast radius. Blocked
+    # finalizations are exempt (consistent with steps 2-5).
+    blast_radius_enabled = certificate_input.blast_radius_enabled
+    has_blast_radius_regressions = blast_radius_enabled and bool(
+        certificate_input.blast_radius_new_failures
+    )
+    if not certificate_input.blocked and blast_radius_enabled:
+        if has_blast_radius_regressions:
+            problems.append("blast_radius_regressions")
+        elif certificate_input.blast_radius_unverified:
+            problems.append("blast_radius_unverified")
+
     # Ordering rule: post-edit execution evidence. Applies even when no named
     # verification contract exists, catching "edited source, then only ran a
     # syntax check, then finalized". Deduped against the block above.
@@ -209,10 +271,17 @@ def evaluate_completion_certificate(
     status = CompletionCertificateStatus.SUFFICIENT
     reason = "requirements_satisfied"
     deduped_problems = tuple(dict.fromkeys(problems))
+    repro_contradicted = bool(
+        repro_enabled
+        and certificate_input.repro_failing_after_fix
+        and "repro_unconfirmed" in deduped_problems
+    )
     if (
         failed_hard
         or "verification_failed" in deduped_problems
         or "regressions_detected" in deduped_problems
+        or "blast_radius_regressions" in deduped_problems
+        or repro_contradicted
     ):
         status = CompletionCertificateStatus.CONTRADICTED
         reason = "hard_requirement_failed"
@@ -242,6 +311,16 @@ def evaluate_completion_certificate(
             tuple(certificate_input.expectations_unaddressed)
             if certificate_input.turn_contract_v2_enabled
             else tuple()
+        ),
+        repro_status=str(certificate_input.repro_status or "") if repro_enabled else "",
+        repro_artifacts_present=(
+            tuple(certificate_input.repro_artifacts_present) if repro_enabled else tuple()
+        ),
+        blast_radius_status=(
+            str(certificate_input.blast_radius_status or "") if blast_radius_enabled else ""
+        ),
+        blast_radius_new_failures=(
+            tuple(certificate_input.blast_radius_new_failures) if blast_radius_enabled else tuple()
         ),
     )
 

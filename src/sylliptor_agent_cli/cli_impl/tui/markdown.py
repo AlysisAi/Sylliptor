@@ -16,6 +16,12 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 from io import StringIO
+from typing import Any
+
+from pygments.style import Style as PygmentsStyle
+from pygments.token import Comment, Keyword, Name, Number, Operator, String
+
+from ...surface.styles import TerminalTheme
 
 # One visual line: a list of ``(style, text)`` fragments.
 Row = list[tuple[str, str]]
@@ -24,8 +30,42 @@ Row = list[tuple[str, str]]
 # TUI and the plain console agree on what counts as markdown worth rendering.
 _NUMBERED = re.compile(r"\d+\.\s")
 _FENCED_CODE_RE = re.compile(r"```[^\n]*\n(.*?)(?:\n```|$)", re.S)
-_CODE_THEME = "monokai"
 _CODE_FALLBACK_STYLE = "class:markdown.code"
+
+
+class _NeutralCodeStyle(PygmentsStyle):
+    """Syntax colours that preserve the terminal's own background."""
+
+    background_color = None
+    highlight_color = None
+    styles = {
+        Comment: "italic ansibrightblack",
+        Keyword: "bold ansimagenta",
+        Name.Builtin: "ansicyan",
+        Number: "ansicyan",
+        Operator: "bold",
+        String: "ansigreen",
+    }
+
+
+def _code_theme(theme: TerminalTheme) -> Any:
+    if theme == "dark":
+        return "monokai"
+    if theme == "light":
+        return "friendly"
+    return _NeutralCodeStyle
+
+
+# Rich wraps markdown links (e.g. "[apnews.com](https://…)") in an OSC 8 terminal
+# hyperlink — ``ESC]8;id=<n>;<url>ESC\ <anchor> ESC]8;;ESC\`` — whenever
+# legacy_windows is off, which _render_ansi deliberately sets so Rich emits ANSI
+# rather than Win32 console calls. prompt_toolkit's ANSI parser does not
+# understand OSC: it drops the ESC/ST control bytes but leaks the payload
+# ("8;id=1234;https://…" and "8;;") as visible text in the transcript (the stray
+# line users see after a web-search answer). OSC hyperlinks are not clickable
+# inside the alt-screen TUI anyway, so strip every OSC sequence; the anchor text
+# lives *between* the open and close markers and is left intact.
+_OSC_SEQUENCE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 
 def looks_like_markdown(text: str) -> bool:
@@ -54,11 +94,11 @@ def looks_like_markdown(text: str) -> bool:
 
 
 @lru_cache(maxsize=256)
-def _render_ansi(text: str, width: int) -> str:
-    """Render markdown to an ANSI string at a fixed width (cached per text+width).
+def _render_ansi(text: str, width: int, theme: TerminalTheme) -> str:
+    """Render markdown to ANSI at a fixed width and terminal theme.
 
     Completed replies never change, so a redraw reuses the cached ANSI; only a
-    terminal resize (new width) forces a re-render.
+    terminal resize or theme change forces a re-render.
     """
     from rich.markdown import Markdown
 
@@ -74,8 +114,18 @@ def _render_ansi(text: str, width: int) -> str:
         emoji=False,  # ":)" etc. stay literal
         legacy_windows=False,  # emit ANSI escapes, not Win32 console calls
     )
-    console.print(Markdown(text, code_theme=_CODE_THEME))
-    return buf.getvalue()
+    console.print(Markdown(text, code_theme=_code_theme(theme)))  # type: ignore[arg-type]
+    return _strip_osc_sequences(buf.getvalue())
+
+
+def _strip_osc_sequences(ansi: str) -> str:
+    """Drop OSC sequences (notably Rich's OSC 8 hyperlinks) prompt_toolkit leaks.
+
+    Only the escape wrappers are removed; a hyperlink's anchor text sits between
+    its open and close markers and survives, and CSI/SGR color sequences are left
+    untouched. See ``_OSC_SEQUENCE_RE`` for why this is needed.
+    """
+    return _OSC_SEQUENCE_RE.sub("", ansi)
 
 
 def _is_blank(row: Row) -> bool:
@@ -146,12 +196,25 @@ def _apply_code_fallback_styles(rows: list[Row], text: str) -> list[Row]:
     return styled_rows
 
 
-def render_markdown_rows(text: str, width: int) -> list[Row] | None:
+@lru_cache(maxsize=256)
+def render_markdown_rows(
+    text: str,
+    width: int,
+    theme: TerminalTheme = "neutral",
+) -> list[Row] | None:
     """Markdown-render ``text`` into rows of fragments, or ``None`` to render plain.
 
     Returns ``None`` when the text is not markdown (so the caller keeps its plain
     layout) or when rendering fails for any reason. Never raises. ``width`` is the
     target content width in columns.
+
+    Memoized per ``(text, width, theme)`` — the transcript re-renders EVERY completed
+    reply on every redraw, and a streaming turn redraws many times a second, so
+    without this the full ANSI→fragments→wrap post-processing re-ran each frame
+    for each finished reply (cost grows with conversation length → visible lag).
+    Caching the ``_render_ansi`` string alone was not enough. The returned rows
+    are shared across frames, so callers MUST treat them as read-only (both
+    current callers build fresh lists rather than mutating in place).
     """
     if not looks_like_markdown(text):
         return None
@@ -159,7 +222,7 @@ def render_markdown_rows(text: str, width: int) -> list[Row] | None:
         from prompt_toolkit.formatted_text import ANSI, to_formatted_text
         from prompt_toolkit.formatted_text.utils import split_lines
 
-        ansi = _render_ansi(text, int(width))
+        ansi = _render_ansi(text, int(width), theme)
         fragments = to_formatted_text(ANSI(ansi.rstrip("\n")))
         rows = []
         for line in split_lines(fragments):

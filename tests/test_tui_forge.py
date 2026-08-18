@@ -966,3 +966,252 @@ def test_editor_invalid_save_keeps_open():
     )
     assert calls and "X" in calls[0]  # save attempted
     assert all(role != "system" or "Invalid" not in text for role, text in transcript)
+
+
+# ------------------------------------ honest live swarm view (Change 1)
+
+
+def test_transcript_active_map_tracks_and_prunes_workers():
+    # active_map tracks EVERY currently-running worker (so all spin + get a timer),
+    # while ``active`` stays the single most-recent task for the phase line.
+    t = TuiTranscript()
+    t.forge_begin(
+        "r",
+        [("T01", "a", "planned"), ("T02", "b", "planned"), ("T03", "c", "planned")],
+    )
+    t.forge_set_active("T01", phase="worker.lifecycle", message="run")
+    t.forge_set_active("T02", phase="worker.lifecycle", message="run")
+    snap = t.forge_snapshot()
+    assert set(snap["active_map"]) == {"T01", "T02"}  # both live workers tracked
+    assert snap["active"] == "T02"  # last one drives the bottom phase line
+    assert all("started" in info for info in snap["active_map"].values())
+    # A terminal status prunes the finished worker from the live set.
+    t.forge_update_statuses({"T01": "done"})
+    assert set(t.forge_snapshot()["active_map"]) == {"T02"}
+    # A status-driven running task joins the set (gets a timer) without an event.
+    t.forge_sync_tasks([("T03", "c", "in_progress")])
+    assert "T03" in t.forge_snapshot()["active_map"]
+    # Finishing the run clears the whole live set.
+    t.forge_finish({"T01": "done", "T02": "done", "T03": "done"}, summary="ok")
+    assert t.forge_snapshot()["active_map"] == {}
+
+
+def test_transcript_active_map_never_resurrects_terminal_task():
+    # A late event for an already-finished task must not add it back as "running".
+    t = TuiTranscript()
+    t.forge_begin("r", [("T01", "a", "done")])
+    t.forge_set_active("T01", phase="p", message="late")
+    assert t.forge_snapshot()["active_map"] == {}
+
+
+def test_forge_view_rows_header_gauge_and_per_task_timer():
+    view = {
+        "run_id": "run-1",
+        "tasks": [
+            {"id": "T01", "title": "alpha", "status": "done"},
+            {"id": "T02", "title": "beta", "status": "in_progress"},
+        ],
+        "active": "T02",
+        "active_map": {"T02": {"started": 0.0}},
+        "phase": "worker.lifecycle",
+        "message": "",
+        "started": 0.0,
+        "done": False,
+        "ok": True,
+    }
+    rows = _forge_view_rows(view, 72, "⠹", 30, {"T02": 75})
+    text = "\n".join("".join(t for _s, t in row) for row in rows)
+    assert "1/2" in text  # header progress count
+    assert "1m15s" in text  # per-task elapsed timer for the running task
+    assert all(sum(len(t) for _s, t in row) <= 72 for row in rows)
+
+
+def test_forge_view_rows_no_timers_without_active_map():
+    # The historical 4-arg call (no task_elapsed) draws no per-row timers and never
+    # overflows — the width invariant the cursor-pin scroll math relies on.
+    view = {
+        "run_id": "r",
+        "tasks": [{"id": "T01", "title": "x " * 30, "status": "in_progress"}],
+        "active": "T01",
+        "phase": "execute",
+        "message": "m",
+        "started": 0.0,
+        "done": False,
+    }
+    for w in (20, 30, 60, 100):
+        rows = _forge_view_rows(view, w, "⠹", 9)
+        assert all(sum(len(t) for _s, t in row) <= w for row in rows)
+
+
+def test_forge_status_glyph_matches_task_visual():
+    # The shared glyph helper must reproduce _forge_task_visual's glyph exactly, so
+    # the /show panel and the live table can never disagree.
+    from sylliptor_agent_cli.cli_impl.tui.forge_status import forge_status_glyph
+
+    for status in (
+        "done",
+        "already_satisfied",
+        "failed",
+        "verify_failed",
+        "interrupted",
+        "superseded",
+        "invalidated",
+        "in_progress",
+        "running",
+        "planned",
+        "todo",
+        "",
+    ):
+        for active in (False, True):
+            assert (
+                forge_status_glyph(status, active=active, spinner="S")
+                == _forge_task_visual(status, active, "S")[0]
+            ), (status, active)
+
+
+# ------------------------------------ violet identity + glyph unify (Change 3)
+
+
+def test_forge_plan_panel_prefixes_status_glyph_and_carries_accent():
+    paths = SimpleNamespace(run_id="run-1a2b")
+    spec = panels._chat_forge_plan_panel_spec(paths=paths, plan=_plan())
+    assert spec.get("accent") == "forge"  # violet frame border
+    values = {k: v for _n, rows in spec["sections"] for (k, v, _t) in rows}
+    assert values["T01"].startswith("✓")  # done glyph, matching the live table
+    assert values["T02"].startswith("✗")  # failed glyph
+    assert values["T03"].startswith("○")  # planned glyph
+
+
+def test_forge_specs_carry_forge_accent():
+    assert panels._chat_forge_intro_panel_spec().get("accent") == "forge"
+
+
+# ---------------------------------------- launch gate + knob picker (Change 2)
+
+
+def test_execute_gate_picker_launch_defers_clean_command():
+    # A panel spec carrying {"picker": ...} opens the picker directly. Selecting the
+    # Launch row flags a one-shot bypass and re-submits a CLEAN "/execute plan" (no
+    # internal sentinel); the gate consumes the flag so that re-submission falls
+    # through to the runner exactly once instead of re-opening the gate.
+    state = TuiState(model_name="m", username="t")
+    calls: list = []
+    gate_flag = {"confirmed": False}
+
+    def execute_gate(arg=""):
+        if arg.strip().lower() != "plan":
+            return None
+        if gate_flag["confirmed"]:
+            gate_flag["confirmed"] = False
+            return None  # the Launch re-submit falls through to the runner
+
+        def _on_launch(_value):
+            gate_flag["confirmed"] = True
+            return {"submit": "/execute plan"}
+
+        return {
+            "picker": {
+                "title": "Launch Forge",
+                "rows": [{"value": "__launch__", "label": "Launch now", "current": True}],
+                "on_select": _on_launch,
+            }
+        }
+
+    _run_headless(
+        state,
+        "/execute plan\r\r/exit\r",  # open gate, Enter picks Launch, exit
+        session_builder=_FakeSession,
+        command_runner=_runner(calls),
+        panel_providers={"/execute": execute_gate},
+        background_turns=False,
+    )
+    # The first "/execute plan" opened the gate (not routed); the Launch re-submit
+    # reached the runner once, as a clean "/execute plan" — no "--go" sentinel.
+    assert calls.count("/execute plan") == 1
+    assert all("--go" not in c for c in calls)
+
+
+def test_picker_on_select_can_reopen_picker():
+    # on_select returning {"picker": ...} re-opens a (rebuilt) picker — the knob
+    # cycling the launch gate relies on. Cycle once, then Launch.
+    state = TuiState(model_name="m", username="t")
+    calls: list = []
+
+    def gate():
+        return {
+            "title": "Gate",
+            "rows": [
+                {"value": "cycle", "label": "cycle", "current": True},
+                {"value": "launch", "label": "launch"},
+            ],
+            "on_select": (
+                lambda v: {"picker": gate()} if str(v) == "cycle" else {"submit": "/launched"}
+            ),
+        }
+
+    _run_headless(
+        state,
+        "/gate\r12/exit\r",  # open picker; "1" cycles (re-opens); "2" launches
+        session_builder=_FakeSession,
+        command_runner=_runner(calls),
+        picker_providers={"/gate": gate},
+        background_turns=False,
+    )
+    assert "/launched" in calls  # only reachable if the cycle re-opened the picker
+
+
+def test_forge_chat_state_swarm_knobs_default_empty():
+    from sylliptor_agent_cli.cli_impl.chat.state import _ForgeChatState
+
+    assert _ForgeChatState().swarm_knobs == {}
+
+
+# ---------------------------------- planner reply → assistant block (TUI polish)
+
+
+def test_planner_reply_sink_param_threaded_to_forge_handler():
+    # Regression: the TUI hands _handle_chat_command a forge_planner_reply_sink, and
+    # it MUST forward it to _handle_forge_chat_command (where the planner branch that
+    # uses it actually lives). If the inner function lacks the parameter the name is
+    # undefined there and the planner turn crashes at runtime — so assert BOTH
+    # functions accept it. (commands.py resolves its helpers via runtime injection,
+    # so a signature check is the isolation-safe way to pin this contract.)
+    import inspect
+
+    from sylliptor_agent_cli.cli_impl.chat import commands as cmd
+
+    for fn in (cmd._handle_chat_command, cmd._handle_forge_chat_command):
+        params = inspect.signature(fn).parameters
+        assert "forge_planner_reply_sink" in params, fn.__name__
+
+
+def test_plan_meta_rows_collapse_and_expand():
+    from sylliptor_agent_cli.cli_impl.tui.app import _plan_meta_rows
+
+    notes = "\n".join(
+        [
+            "Applied planner update to plan.",
+            "Planner: New task 'SEO metadata': inferred estimated_files: README",
+            "Plan reconciliation: Task T02: added explicit task path hints: README",
+        ]
+    )
+    # Collapsed: exactly one summary line — an honest headline + counts (the
+    # status note is folded into the headline, not repeated), never overflows.
+    collapsed = _plan_meta_rows(notes, 70, expanded=False)
+    assert len(collapsed) == 1
+    text = "".join(t for _s, t in collapsed[0])
+    assert text.startswith("▸")
+    assert "plan updated" in text
+    assert "2 notes" in text
+    assert all(sum(len(t) for _s, t in row) <= 70 for row in collapsed)
+    # Expanded: a header + the notes grouped per touched task (titles once,
+    # not repeated per note), wrapped within width.
+    expanded = _plan_meta_rows(notes, 70, expanded=True)
+    body = "\n".join("".join(t for _s, t in row) for row in expanded)
+    assert body.startswith("▾")
+    assert "2 notes" in body
+    assert body.count("SEO metadata") == 1 and "T02" in body
+    assert "new task" in body and "inferred estimated_files: README" in body
+    assert all(sum(len(t) for _s, t in row) <= 70 for row in expanded)
+    # Empty input renders nothing.
+    assert _plan_meta_rows("\n  \n", 70, expanded=False) == []

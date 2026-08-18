@@ -228,7 +228,13 @@ _RUNTIME_SECRET_FIELD_SEGMENTS = frozenset(
         "token",
     }
 )
-_RUNTIME_NON_SECRET_FIELD_ALLOWLIST = frozenset({"credential_store_backend"})
+_RUNTIME_NON_SECRET_FIELD_ALLOWLIST = frozenset(
+    {
+        # Describes which provider-owned store is used; it is not a credential,
+        # credential path, or credential value.
+        "credential_store_backend",
+    }
+)
 
 
 def _runtime_secret_field(value: object) -> bool:
@@ -321,6 +327,10 @@ class AppConfig(BaseModel):
     model: str = ""
     llm_timeout_s: float = 60.0
     run_deadline_seconds: float | None = None
+    run_deadline_unlimited: bool = False
+    run_deadline_degradation_enabled: bool = True
+    run_deadline_convergence_fraction: float = 0.75
+    run_deadline_wrap_up_fraction: float = 0.90
     llm_enable_thinking: bool | None = None
     llm_reasoning_effort: str | None = None
     provider_concurrency_caps: dict[str, int] = Field(
@@ -331,6 +341,15 @@ class AppConfig(BaseModel):
     provider_retry_max_delay_seconds: float = DEFAULT_PROVIDER_RETRY_MAX_DELAY_SECONDS
     model_metadata_policy: str = "warn"
     default_mode: str = "review"  # review|auto|readonly|fullaccess
+    # Default persona for interactive chat: code|architect|ask|debug. Personas
+    # are conventions (prompt overlay, model role, default execution mode)
+    # layered on the execution-mode gate; "code" is the no-op persona and
+    # preserves pre-persona behavior exactly. See docs/persona_modes_design.md.
+    default_persona: str = "code"
+    # Kill-switch for persona modes; env override SYLLIPTOR_PERSONA_MODES=off
+    # wins over the config value. Off: /mode accepts only execution modes,
+    # the switch_mode tool is not registered, and personas stay at Code.
+    persona_modes_enabled: bool = True
     max_steps: int = DEFAULT_CHAT_MAX_STEPS
     temperature: float = 0.2  # legacy global override
     coding_temperature: float = 0.2
@@ -344,6 +363,22 @@ class AppConfig(BaseModel):
     # Kill-switch for capability arbitration over router verdicts; env override
     # SYLLIPTOR_ROUTE_ARBITRATION=off wins over the config value.
     route_arbitration_enabled: bool = True
+    # Kill-switch for the router's semantic turn contract; env override
+    # SYLLIPTOR_SEMANTIC_TURN_CONTRACT=off keeps the router's legacy posture-only
+    # path without restoring language-specific controller classification.
+    semantic_turn_contract_enabled: bool = True
+    # The router-free unified turn path: no router client is provisioned,
+    # every text turn goes straight to the main model with the full per-mode
+    # agent surface, and execution posture derives from the execution mode.
+    # The legacy pre-turn semantic-router path has been removed; this key
+    # (and SYLLIPTOR_UNIFIED_TURN_PATH) stays accepted for one release but is
+    # ignored — every turn takes the unified path.
+    unified_turn_path_enabled: bool = True
+    # Optional fixed reply language (e.g. "Greek") for turns that run without
+    # the router. Empty means the model answers in the user's language
+    # naturally. When set, the host injects a reply-language directive and
+    # keys the final-summary language rewrite to it.
+    reply_language: str = ""
     # Kill-switch for the fact-based completion-evidence classifier (evidence v2);
     # env override SYLLIPTOR_EVIDENCE_V2=off reverts to legacy string-shape evidence.
     evidence_v2_enabled: bool = True
@@ -356,6 +391,25 @@ class AppConfig(BaseModel):
     # but reverts the completion-gate policy (no expectations_unaddressed / advisory
     # completion enforcement). Prompt additions are unconditional either way.
     turn_contract_v2_enabled: bool = True
+    # Kill-switch for the reproduction-first protocol on bug-fix-shaped tasks
+    # (step 7); env override SYLLIPTOR_REPRODUCTION_FIRST=off keeps repro-run
+    # capture/telemetry but reverts the turn directives and the completion-gate
+    # policy (no repro_unconfirmed / repro_artifacts_present enforcement).
+    reproduction_first_enabled: bool = True
+    # Kill-switch for the blast-radius regression gate (a correct fix that breaks
+    # neighbouring tests is a failed task); env override SYLLIPTOR_BLAST_RADIUS=off
+    # keeps scope-run capture/telemetry but reverts the turn directives and the
+    # completion-gate policy (no blast_radius_regressions / blast_radius_unverified).
+    blast_radius_gate_enabled: bool = True
+    # Ceiling on how many test files one blast-radius scope may name. The scope is a
+    # safety net around the change, not a suite run.
+    blast_radius_max_scope_files: int = Field(default=40, gt=0)
+    # Wall-clock ceiling for one scope run. A run that exceeds it shrinks the scope
+    # (nearest tests kept) for the next run; it never disables the gate.
+    blast_radius_scope_seconds_cap: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    # Newly-broken test count past which the change is treated as over-broad and the
+    # repair directive switches from "fix each failure" to "rewrite the patch narrowly".
+    blast_radius_over_broad_threshold: int = Field(default=20, gt=0)
     # Kill-switch for reaping agent-started process groups (step 5); env override
     # SYLLIPTOR_PROCESS_REAPING=off keeps commands in their own process group but
     # never signals one, restoring the legacy leave-it-running behaviour.
@@ -364,6 +418,20 @@ class AppConfig(BaseModel):
     # SYLLIPTOR_WORKSPACE_PROVISIONING=off suppresses both the one-shot install in
     # autonomous runs and the env_gap_detected telemetry.
     workspace_provisioning_enabled: bool = True
+    # Kill-switch for bounded empty-response handling; env override
+    # SYLLIPTOR_EMPTY_RESPONSE_STALL=off restores the legacy behaviour of retrying
+    # an endpoint that returns contentless responses until the attempt cap, then
+    # terminating non-zero regardless of what the working tree already holds.
+    empty_response_stall_guard_enabled: bool = True
+    # A stall is declared after this many consecutive responses with no text and
+    # no tool calls, or after this many seconds of an unbroken contentless streak,
+    # whichever comes first.
+    empty_response_stall_threshold: int = Field(default=3, gt=0)
+    empty_response_stall_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    # Ceilings on stall handling: recovery cycles per session, and total wall-clock
+    # seconds the session may spend on empty-response handling before salvaging.
+    empty_response_max_recovery_cycles: int = Field(default=2, gt=0)
+    empty_response_handling_budget_seconds: float = Field(default=600.0, gt=0, allow_inf_nan=False)
     step_budget_policy: str = AUTONOMOUS_STEP_BUDGET_POLICY
     task_max_steps: int = DEFAULT_TASK_MAX_STEPS
     subagent_max_steps: int = DEFAULT_SUBAGENT_MAX_STEPS
@@ -879,12 +947,18 @@ def _canonicalize_model_for_config(
         return raw
 
     active_profile = str((cfg.extra_fields or {}).get("active_profile") or "").strip()
-    if active_preset is None and active_profile:
-        from .profile_presets import find_preset_for_profile, get_preset
+    active_profile_obj = None
+    if active_profile:
         from .profiles import get_profile
 
-        profile = get_profile(cfg, active_profile)
-        active_preset = find_preset_for_profile(profile) if profile is not None else None
+        active_profile_obj = get_profile(cfg, active_profile)
+
+    if active_preset is None and active_profile:
+        from .profile_presets import find_preset_for_profile, get_preset
+
+        active_preset = (
+            find_preset_for_profile(active_profile_obj) if active_profile_obj is not None else None
+        )
         active_preset = active_preset or get_preset(active_profile)
 
     if active_preset is not None:
@@ -892,6 +966,13 @@ def _canonicalize_model_for_config(
         if active_model is not None:
             return active_model
         if _provider_switch_is_unsafe(active_preset):
+            return raw
+    elif active_profile_obj is not None:
+        from .profiles import DEFAULT_OPENAI_BASE_URL
+
+        base_url = str(getattr(active_profile_obj, "base_url", "") or "").strip().rstrip("/")
+        default_base_url = DEFAULT_OPENAI_BASE_URL.strip().rstrip("/")
+        if base_url and base_url != default_base_url:
             return raw
 
     matches = _matching_model_presets(raw)
@@ -1384,6 +1465,8 @@ _SETTABLE_KEYS: set[str] = {
     "provider_retry_max_delay_seconds",
     "model_metadata_policy",
     "default_mode",
+    "default_persona",
+    "persona_modes_enabled",
     "max_steps",
     "temperature",
     "coding_temperature",
@@ -1395,9 +1478,17 @@ _SETTABLE_KEYS: set[str] = {
     "stream",
     "routing_mode",
     "route_arbitration_enabled",
+    "semantic_turn_contract_enabled",
+    "unified_turn_path_enabled",
+    "reply_language",
     "evidence_v2_enabled",
     "regression_baseline_enabled",
     "turn_contract_v2_enabled",
+    "reproduction_first_enabled",
+    "blast_radius_gate_enabled",
+    "blast_radius_max_scope_files",
+    "blast_radius_scope_seconds_cap",
+    "blast_radius_over_broad_threshold",
     "process_reaping_enabled",
     "workspace_provisioning_enabled",
     "step_budget_policy",
@@ -1480,8 +1571,15 @@ _ROLE_MODEL_NAMES: set[str] = {
     "conflict_resolve",
     "comprehension",
     "router",
+    "power_blind_judge",
+    "power_debater",
+    "power_adjudicator",
 }
 _ROLE_MODEL_CONFIG_PREFIXES: set[str] = {"role_models", "forge_role_models"}
+# Persona vocabulary for persona_models.<persona> keys and default_persona
+# validation. Kept as a local literal set like _ROLE_MODEL_NAMES (the runtime
+# registry lives in personas.BUILTIN_PERSONAS).
+_PERSONA_NAMES: set[str] = {"code", "architect", "ask", "debug"}
 _AGENT_RUNTIME_CONFIG_FIELDS: set[str] = {
     "adapter",
     "executable",
@@ -1559,7 +1657,7 @@ def _coerce_optional_positive_float(value: Any, *, key: str) -> float | None:
     if value is None:
         return None
     normalized = str(value).strip()
-    if normalized.lower() in {"", "none", "null", "default", "off"}:
+    if normalized.lower() in {"", "none", "null", "default", "off", "unlimited", "never"}:
         return None
     try:
         parsed = float(normalized)
@@ -1639,6 +1737,16 @@ def _coerce_non_negative_int(value: str, *, key: str) -> int:
         raise ConfigError(f"{key} must be an integer") from e
     if parsed < 0:
         raise ConfigError(f"{key} must be >= 0")
+    return parsed
+
+
+def _coerce_min_int(value: str, *, key: str, minimum: int) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise ConfigError(f"{key} must be an integer") from e
+    if parsed < minimum:
+        raise ConfigError(f"{key} must be >= {minimum}")
     return parsed
 
 
@@ -1741,12 +1849,31 @@ class ResolvedRunDeadline:
     seconds: float | None
     source: str
 
+    @property
+    def unlimited(self) -> bool:
+        """True when no finite budget applies, however that was decided."""
+        return self.seconds is None
+
 
 def resolve_run_deadline(
     cfg: AppConfig | None,
     *,
     cli_deadline_seconds: float | None = None,
+    cli_no_deadline: bool = False,
+    default_seconds: float | None = None,
 ) -> ResolvedRunDeadline:
+    """Resolve the wall-clock budget for one run.
+
+    Precedence is CLI, environment, config, then ``default_seconds``. Each of
+    the first three can select unlimited explicitly, and doing so stops the
+    search rather than falling through to the default -- otherwise there would
+    be no way to turn the default off. Unlimited is spelled with a word
+    (``unlimited``, ``never``, ``off``, ``none``); ``0`` remains invalid, since
+    a zero-second budget is exhausted before it starts.
+    """
+    if cli_no_deadline:
+        return ResolvedRunDeadline(seconds=None, source="explicit_cli")
+
     if cli_deadline_seconds is not None:
         return ResolvedRunDeadline(
             seconds=_coerce_optional_positive_float(
@@ -1757,7 +1884,9 @@ def resolve_run_deadline(
         )
 
     env_value = env_get("SYLLIPTOR_RUN_DEADLINE_SECONDS")
-    if env_value is not None:
+    if env_value is not None and str(env_value).strip() != "":
+        # Presence of the variable is itself the explicit choice, so a word form
+        # here means unlimited rather than "unset".
         return ResolvedRunDeadline(
             seconds=_coerce_optional_positive_float(
                 env_value,
@@ -1772,6 +1901,17 @@ def resolve_run_deadline(
     )
     if cfg_value is not None:
         return ResolvedRunDeadline(seconds=cfg_value, source="config")
+    if bool(getattr(cfg, "run_deadline_unlimited", False)):
+        return ResolvedRunDeadline(seconds=None, source="config")
+
+    if default_seconds is not None:
+        return ResolvedRunDeadline(
+            seconds=_coerce_optional_positive_float(
+                default_seconds,
+                key="run_deadline_seconds default",
+            ),
+            source="runtime_default",
+        )
     return ResolvedRunDeadline(seconds=None, source="absent")
 
 
@@ -1779,10 +1919,14 @@ def resolve_run_deadline_seconds(
     cfg: AppConfig | None,
     *,
     cli_deadline_seconds: float | None = None,
+    cli_no_deadline: bool = False,
+    default_seconds: float | None = None,
 ) -> float | None:
     return resolve_run_deadline(
         cfg,
         cli_deadline_seconds=cli_deadline_seconds,
+        cli_no_deadline=cli_no_deadline,
+        default_seconds=default_seconds,
     ).seconds
 
 
@@ -2211,6 +2355,48 @@ def _set_role_model_config_value(
     return cfg
 
 
+def _persona_model_key_parts(key: str) -> str | None:
+    namespace, separator, persona = str(key or "").partition(".")
+    if not separator or namespace != "persona_models":
+        return None
+    persona_key = persona.strip().lower()
+    if not persona_key:
+        raise ConfigError("persona_models config key must include a persona name")
+    if persona_key not in _PERSONA_NAMES:
+        raise ConfigError(
+            f"persona_models.{persona_key} is not supported. "
+            f"Supported personas: {', '.join(sorted(_PERSONA_NAMES))}"
+        )
+    return persona_key
+
+
+def _set_persona_model_config_value(
+    cfg: AppConfig,
+    *,
+    persona: str,
+    value: str,
+) -> AppConfig:
+    normalized = str(value or "").strip().lower()
+    if normalized and normalized not in _ROLE_MODEL_NAMES:
+        raise ConfigError(
+            f"persona_models.{persona} must name a model role. "
+            f"Supported roles: {', '.join(sorted(_ROLE_MODEL_NAMES))}"
+        )
+    extra_fields = dict(cfg.extra_fields or {})
+    raw_map = extra_fields.get("persona_models")
+    personas = dict(raw_map) if isinstance(raw_map, dict) else {}
+    if normalized:
+        personas[persona] = normalized
+    else:
+        personas.pop(persona, None)
+    if personas:
+        extra_fields["persona_models"] = dict(sorted(personas.items()))
+    else:
+        extra_fields.pop("persona_models", None)
+    cfg.extra_fields = extra_fields
+    return cfg
+
+
 def _agent_runtime_key_parts(key: str) -> tuple[str, str] | None:
     parts = str(key or "").split(".")
     if not parts or parts[0] != "agent_runtimes":
@@ -2293,6 +2479,14 @@ def set_config_value(
             value=value,
         )
 
+    persona_model_persona = _persona_model_key_parts(key)
+    if persona_model_persona is not None:
+        return _set_persona_model_config_value(
+            cfg,
+            persona=persona_model_persona,
+            value=value,
+        )
+
     agent_runtime_parts = _agent_runtime_key_parts(key)
     if agent_runtime_parts is not None:
         runtime_id, field = agent_runtime_parts
@@ -2307,7 +2501,8 @@ def set_config_value(
         raise ConfigError(
             f"Unknown/unsupported key: {key}. Supported keys: "
             f"{', '.join(sorted(_SETTABLE_KEYS))}, role_models.<role>, "
-            "forge_role_models.<role>, agent_runtimes.<runtime-id>.<field>"
+            "forge_role_models.<role>, persona_models.<persona>, "
+            "agent_runtimes.<runtime-id>.<field>"
         )
 
     if key == "execution.backend":
@@ -2395,6 +2590,9 @@ def set_config_value(
 
     if key == "run_deadline_seconds":
         cfg.run_deadline_seconds = _coerce_optional_positive_float(value, key=key)
+        # A word form here is a deliberate "no budget", which has to be
+        # distinguishable from an unset value now that unset means "default".
+        cfg.run_deadline_unlimited = cfg.run_deadline_seconds is None
         return cfg
 
     if key == "llm_enable_thinking":
@@ -2442,6 +2640,23 @@ def set_config_value(
         cfg.default_mode = value
         return cfg
 
+    if key == "default_persona":
+        v = value.strip().lower()
+        if v not in _PERSONA_NAMES:
+            raise ConfigError("default_persona must be one of: code, architect, ask, debug")
+        cfg.default_persona = v
+        return cfg
+
+    if key == "persona_modes_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.persona_modes_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.persona_modes_enabled = False
+            return cfg
+        raise ConfigError("persona_modes_enabled must be true/false")
+
     if key in {"max_steps", "task_max_steps", "subagent_max_steps"}:
         setattr(cfg, key, _coerce_positive_int(value, key=key))
         return cfg
@@ -2485,6 +2700,30 @@ def set_config_value(
             return cfg
         raise ConfigError("route_arbitration_enabled must be true/false")
 
+    if key == "semantic_turn_contract_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.semantic_turn_contract_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.semantic_turn_contract_enabled = False
+            return cfg
+        raise ConfigError("semantic_turn_contract_enabled must be true/false")
+
+    if key == "unified_turn_path_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.unified_turn_path_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.unified_turn_path_enabled = False
+            return cfg
+        raise ConfigError("unified_turn_path_enabled must be true/false")
+
+    if key == "reply_language":
+        cfg.reply_language = value.strip()
+        return cfg
+
     if key == "evidence_v2_enabled":
         v = value.strip().lower()
         if v in {"1", "true", "yes", "on"}:
@@ -2514,6 +2753,48 @@ def set_config_value(
             cfg.turn_contract_v2_enabled = False
             return cfg
         raise ConfigError("turn_contract_v2_enabled must be true/false")
+
+    if key == "reproduction_first_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.reproduction_first_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.reproduction_first_enabled = False
+            return cfg
+        raise ConfigError("reproduction_first_enabled must be true/false")
+
+    if key == "blast_radius_gate_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.blast_radius_gate_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.blast_radius_gate_enabled = False
+            return cfg
+        raise ConfigError("blast_radius_gate_enabled must be true/false")
+
+    if key in {"blast_radius_max_scope_files", "blast_radius_over_broad_threshold"}:
+        try:
+            parsed_count = int(value.strip())
+        except ValueError:
+            raise ConfigError(f"{key} must be a positive integer") from None
+        if parsed_count <= 0:
+            raise ConfigError(f"{key} must be a positive integer")
+        setattr(cfg, key, parsed_count)
+        return cfg
+
+    if key == "blast_radius_scope_seconds_cap":
+        try:
+            parsed_seconds = float(value.strip())
+        except ValueError:
+            raise ConfigError("blast_radius_scope_seconds_cap must be a positive number") from None
+        # ``inf``/``nan`` parse fine but would disable the cap silently; the field
+        # declares allow_inf_nan=False and direct assignment does not re-validate.
+        if not math.isfinite(parsed_seconds) or parsed_seconds <= 0:
+            raise ConfigError("blast_radius_scope_seconds_cap must be a positive number")
+        cfg.blast_radius_scope_seconds_cap = parsed_seconds
+        return cfg
 
     if key == "process_reaping_enabled":
         v = value.strip().lower()

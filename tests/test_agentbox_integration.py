@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import os
-import sys
 import time
-import types
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+import sylliptor_agent_cli.agentbox_integration as agentbox_integration
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.agentbox_integration import (
     AgentBoxTelemetry,
@@ -102,9 +100,7 @@ class _FakeTurnContext:
 
 def _install_fake_agentbox(monkeypatch: pytest.MonkeyPatch) -> type[_FakeAgentBox]:
     _FakeAgentBox.instances.clear()
-    module = types.ModuleType("agentbox_sdk")
-    module.AgentBox = _FakeAgentBox  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "agentbox_sdk", module)
+    monkeypatch.setattr(agentbox_integration, "AgentBoxClient", _FakeAgentBox)
     return _FakeAgentBox
 
 
@@ -113,6 +109,22 @@ def _enable_agentbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("AGENTBOX_PLANE_URL", "http://agentbox.local")
     monkeypatch.setenv("AGENTBOX_TOKEN", "test-token")
     monkeypatch.setenv("AGENTBOX_QUEUE_DIR", str(tmp_path / "queue"))
+
+
+def _clear_agentbox_connection_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        "AGENTBOX_PLANE_URL",
+        "AGENTBOX_TOKEN",
+        "AGENTBOX_ORG_ID",
+        "AGENTBOX_PERSON_ID",
+        "AGENTBOX_MACHINE_ID",
+        "AGENTBOX_AGENT_ID",
+        "AGENTBOX_QUEUE_DIR",
+        "AGENTBOX_TASK_DETAIL",
+        "AGENTBOX_CONFIG",
+        "AGENTBOX_HOME",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _session_for(
@@ -132,17 +144,17 @@ def _session_for(
     )
 
 
-def test_agentbox_disabled_mode_does_not_import_or_emit(
+def test_agentbox_disabled_mode_does_not_create_or_emit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    fake_agentbox = _install_fake_agentbox(monkeypatch)
     monkeypatch.setenv("AGENTBOX_ENABLED", "0")
     monkeypatch.setenv("AGENTBOX_PLANE_URL", "http://agentbox.local")
     monkeypatch.setenv("AGENTBOX_TOKEN", "test-token")
-    monkeypatch.delitem(sys.modules, "agentbox_sdk", raising=False)
 
     assert AgentBoxTelemetry.from_env(root=tmp_path, runtime_version="test") is None
-    assert "agentbox_sdk" not in sys.modules
+    assert fake_agentbox.instances == []
 
     session = _session_for(tmp_path, max_steps=2)
     session.client = _ScriptedClient([LLMResponse(content="done", tool_calls=[], raw={})])
@@ -153,7 +165,7 @@ def test_agentbox_disabled_mode_does_not_import_or_emit(
         session.close()
 
     assert session.agentbox_telemetry is None
-    assert "agentbox_sdk" not in sys.modules
+    assert fake_agentbox.instances == []
 
 
 def test_agentbox_run_turn_emits_metadata_only_events(
@@ -192,7 +204,7 @@ def test_agentbox_run_turn_emits_metadata_only_events(
 
     try:
         assert (
-            session.run_turn("Inspect /workspace/sylliptor/src/auth.py and summarize `def x()`.")
+            session.run_turn("Inspect /workspace/private-repo/src/auth.py and summarize `def x()`.")
             == 0
         )
         assert session.run_turn("Run the verification step.") == 0
@@ -214,7 +226,104 @@ def test_agentbox_run_turn_emits_metadata_only_events(
         "Inspect file and summarize.",
         "Run the verification step.",
     ]
-    assert not any("/Users" in event or "def x" in event for event in task_events)
+    assert not any("/workspace" in event or "def x" in event for event in task_events)
+
+
+def test_agentbox_uses_enrolled_machine_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_agentbox = _install_fake_agentbox(monkeypatch)
+    _clear_agentbox_connection_env(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                'plane_url = "https://agentbox.example.test"',
+                'machine_token = "machine-token"',
+                'org_id = "org_a"',
+                'person_id = "person_a"',
+                'machine_id = "machine_b"',
+                'task_detail = "category"',
+                # TOML basic strings treat backslashes as escapes. Use a
+                # portable path spelling so the enrolled-config fixture stays
+                # valid on Windows as well as POSIX hosts.
+                f'queue_dir = "{(tmp_path / "queue").as_posix()}"',
+                "",
+                "[runtime.sylliptor]",
+                'agent_id = "machine_b_sylliptor_custom"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTBOX_ENABLED", "1")
+    monkeypatch.setenv("AGENTBOX_CONFIG", str(config_path))
+
+    telemetry = AgentBoxTelemetry.from_env(root=tmp_path, runtime_version="test")
+
+    assert telemetry is not None
+    agentbox = fake_agentbox.instances[0]
+    assert agentbox.kwargs == {
+        "token": "machine-token",
+        "plane_url": "https://agentbox.example.test",
+        "org_id": "org_a",
+        "person_id": "person_a",
+        "machine_id": "machine_b",
+        "agent_id": "machine_b_sylliptor_custom",
+        "runtime_version": "test",
+        "queue_dir": str(tmp_path / "sdk-queue"),
+        "task_detail": "category",
+    }
+    telemetry.close()
+
+
+def test_agentbox_environment_overrides_enrolled_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_agentbox = _install_fake_agentbox(monkeypatch)
+    _clear_agentbox_connection_env(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "\n".join(
+            [
+                'plane_url = "https://config.example.test"',
+                'machine_token = "config-token"',
+                'machine_id = "config-machine"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENTBOX_ENABLED", "1")
+    monkeypatch.setenv("AGENTBOX_CONFIG", str(config_path))
+    monkeypatch.setenv("AGENTBOX_PLANE_URL", "https://env.example.test")
+    monkeypatch.setenv("AGENTBOX_TOKEN", "env-token")
+    monkeypatch.setenv("AGENTBOX_MACHINE_ID", "env-machine")
+    monkeypatch.setenv("AGENTBOX_AGENT_ID", "env-agent")
+
+    telemetry = AgentBoxTelemetry.from_env(root=tmp_path, runtime_version="test")
+
+    assert telemetry is not None
+    assert fake_agentbox.instances[0].kwargs["plane_url"] == "https://env.example.test"
+    assert fake_agentbox.instances[0].kwargs["token"] == "env-token"
+    assert fake_agentbox.instances[0].kwargs["machine_id"] == "env-machine"
+    assert fake_agentbox.instances[0].kwargs["agent_id"] == "env-agent"
+    telemetry.close()
+
+
+def test_agentbox_ignores_invalid_or_incomplete_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_agentbox = _install_fake_agentbox(monkeypatch)
+    _clear_agentbox_connection_env(monkeypatch)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('machine_token = "unterminated', encoding="utf-8")
+    monkeypatch.setenv("AGENTBOX_ENABLED", "1")
+    monkeypatch.setenv("AGENTBOX_CONFIG", str(config_path))
+
+    assert AgentBoxTelemetry.from_env(root=tmp_path, runtime_version="test") is None
+    assert fake_agentbox.instances == []
 
 
 def test_agentbox_task_sanitizer_removes_content_and_paths() -> None:
@@ -224,7 +333,7 @@ def test_agentbox_task_sanitizer_removes_content_and_paths() -> None:
     )
 
     assert 0 < len(hint) <= 140
-    assert "/Users" not in hint
+    assert "/workspace" not in hint
     assert "secret diff" not in hint
     assert "def login" not in hint
 
@@ -241,17 +350,11 @@ def test_unreachable_agentbox_plane_does_not_fail_sylliptor_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    configured_sdk_path = os.environ.get("AGENTBOX_SDK_PATH")
-    if not configured_sdk_path:
-        pytest.skip("AGENTBOX_SDK_PATH is not configured")
-    sdk_path = Path(configured_sdk_path).expanduser()
-    if not sdk_path.exists():
-        pytest.skip("Configured AgentBox SDK checkout is not available")
-    monkeypatch.syspath_prepend(str(sdk_path))
-    monkeypatch.delitem(sys.modules, "agentbox_sdk", raising=False)
     monkeypatch.setenv("AGENTBOX_ENABLED", "1")
     monkeypatch.setenv("AGENTBOX_PLANE_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("AGENTBOX_TOKEN", "test-token")
+    monkeypatch.setenv("AGENTBOX_MACHINE_ID", "test-machine")
+    monkeypatch.delenv("AGENTBOX_CONFIG", raising=False)
     monkeypatch.setenv("AGENTBOX_HOME", str(tmp_path / "agentbox-home"))
     monkeypatch.setenv("AGENTBOX_QUEUE_DIR", str(tmp_path / "agentbox-queue"))
 

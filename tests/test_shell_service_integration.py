@@ -181,7 +181,7 @@ def test_workspace_preview_tool_works_with_strict_unavailable_docker_image(
     root = tmp_path / "workspace"
     sessions_dir = tmp_path / "sessions"
     root.mkdir()
-    (root / "index.html").write_text("preview-tool-ok\n", encoding="utf-8")
+    (root / "index.html").write_bytes(b"preview-tool-ok\n")
     cfg = AppConfig(model="test-model")
     cfg.extra_fields = {
         "shell_sandbox": {

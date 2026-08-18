@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,6 +30,8 @@ __all__ = [
     "mcp_oauth_token_store_path",
     "save_oauth_token_record",
 ]
+
+_OAUTH_BINDING_ID_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 
 
 def _store_path() -> Path:
@@ -65,6 +68,17 @@ def _optional_string(value: object, *, field_name: str, server_id: str) -> str |
     if value is None:
         return None
     return _require_string(value, field_name=field_name, server_id=server_id)
+
+
+def _optional_binding_id(value: object, *, server_id: str) -> str | None:
+    if value is None:
+        return None
+    binding_id = _require_string(value, field_name="binding_id", server_id=server_id)
+    if not _OAUTH_BINDING_ID_RE.fullmatch(binding_id):
+        raise McpOAuthTokenStoreError(
+            f"OAuth token store entry for server '{server_id}' field 'binding_id' is invalid."
+        )
+    return binding_id
 
 
 def _normalize_datetime(value: datetime, *, field_name: str) -> datetime:
@@ -105,6 +119,7 @@ class McpOAuthTokenRecord:
     refresh_token: str | None = field(default=None, repr=False)
     granted_scopes: tuple[str, ...] = field(default_factory=tuple)
     obtained_at: datetime = field(default_factory=lambda: datetime.now(UTC).replace(microsecond=0))
+    binding_id: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         access_token = _require_string(
@@ -124,15 +139,17 @@ class McpOAuthTokenRecord:
         )
         expires_at = _normalize_datetime(self.expires_at, field_name="expires_at")
         obtained_at = _normalize_datetime(self.obtained_at, field_name="obtained_at")
+        binding_id = _optional_binding_id(self.binding_id, server_id="<record>")
         object.__setattr__(self, "access_token", access_token)
         object.__setattr__(self, "token_type", token_type)
         object.__setattr__(self, "refresh_token", refresh_token)
         object.__setattr__(self, "granted_scopes", scopes)
         object.__setattr__(self, "expires_at", expires_at)
         object.__setattr__(self, "obtained_at", obtained_at)
+        object.__setattr__(self, "binding_id", binding_id)
 
     def as_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "access_token": self.access_token,
             "token_type": self.token_type,
             "expires_at": _format_datetime(self.expires_at),
@@ -140,6 +157,9 @@ class McpOAuthTokenRecord:
             "granted_scopes": list(self.granted_scopes),
             "obtained_at": _format_datetime(self.obtained_at),
         }
+        if self.binding_id is not None:
+            payload["binding_id"] = self.binding_id
+        return payload
 
     @classmethod
     def from_payload(cls, payload: object, *, server_id: str) -> McpOAuthTokenRecord:
@@ -183,6 +203,7 @@ class McpOAuthTokenRecord:
                 field_name="obtained_at",
                 server_id=server_id,
             ),
+            binding_id=_optional_binding_id(payload.get("binding_id"), server_id=server_id),
         )
 
 

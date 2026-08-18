@@ -485,7 +485,11 @@ def _resume_chat_session(
     if current_session_id == requested_id:
         return True, f"Session already active: {requested_id}", []
 
-    history_messages = _load_chat_resume_messages(target_path)
+    synthesized_tool_results: list[str] = []
+    history_messages = _load_chat_resume_messages(
+        target_path,
+        synthesized_tool_results=synthesized_tool_results,
+    )
     resume_context_message = _build_chat_resume_context_message(target_path)
     start_payload = _load_chat_resume_session_start(target_path)
     runtime_settings = _load_chat_resume_runtime_settings(target_path)
@@ -743,11 +747,24 @@ def _resume_chat_session(
 
     resume_context_loaded = _insert_chat_resume_context_message(
         new_session,
-        resume_context_message or "",
+        resume_context_message,
     )
 
     if history_messages:
         new_session.messages.extend(history_messages)
+
+    # Restored compaction state (summary/pins) only becomes model-visible via
+    # _upsert_context_messages, which otherwise runs on the next compaction.
+    # Re-inject here, after the pinned resume context bumped pinned_prefix_len,
+    # so the memory message lands after the pinned prefix.
+    compaction_memory_reinjected = False
+    resume_compactor = getattr(new_session, "conversation_compactor", None)
+    if resume_compactor is not None:
+        new_session.messages[:] = resume_compactor.reinject_context_messages(new_session.messages)
+        compaction_memory_reinjected = (
+            getattr(getattr(resume_compactor, "state", None), "memory_message_index", None)
+            is not None
+        )
 
     new_session.store.append(
         "system_note",
@@ -756,8 +773,11 @@ def _resume_chat_session(
             "from_session_id": current_session_id,
             "resumed_session_id": requested_id,
             "loaded_messages": len(history_messages),
+            "synthesized_tool_results": len(synthesized_tool_results),
+            "synthesized_tool_result_ids": list(synthesized_tool_results),
             "resume_context_loaded": resume_context_loaded,
-            "resume_context_chars": len(resume_context_message or ""),
+            "resume_context_chars": len(resume_context_message),
+            "compaction_memory_reinjected": compaction_memory_reinjected,
             "historical_model_restored": historical_model_restored,
             "model_restore_reason": model_restore_reason,
         },

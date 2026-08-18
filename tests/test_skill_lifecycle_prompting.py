@@ -3,13 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from sylliptor_agent_cli.agent.turn_contract import (
+    TurnEffect,
+    TurnOutcome,
+    TurnSemantics,
+    TurnTarget,
+    TurnTargetKind,
+)
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse
-from sylliptor_agent_cli.turn_intent import (
-    detect_skill_lifecycle_intent,
-    is_skill_lifecycle_request,
-)
 
 
 class _CaptureClient:
@@ -33,29 +36,21 @@ class _CaptureClient:
         return LLMResponse(content="Done.", tool_calls=[], raw={})
 
 
-def test_detect_skill_lifecycle_intent_supports_english_and_greek() -> None:
-    assert (
-        detect_skill_lifecycle_intent(
-            "Create the first reusable skill for pytest debugging in this workspace."
-        )
-        == "create"
+def test_skill_lifecycle_uses_provider_neutral_capability_semantics() -> None:
+    semantics = TurnSemantics(
+        outcome=TurnOutcome.MANAGE_CAPABILITY,
+        requested_effects=(TurnEffect.WRITE_WORKSPACE,),
+        targets=(
+            TurnTarget(
+                kind=TurnTargetKind.CAPABILITY,
+                value="pytest debugging skill",
+                evidence_quote="pytest debugging skill",
+            ),
+        ),
     )
-    assert (
-        detect_skill_lifecycle_intent("Install this skill from a local zip archive.") == "install"
-    )
-    assert detect_skill_lifecycle_intent("Enable this skill for the project.") == "enable"
-    assert detect_skill_lifecycle_intent("Disable this skill for now.") == "disable"
-    assert detect_skill_lifecycle_intent("Remove this skill from the workspace.") == "remove"
-    assert detect_skill_lifecycle_intent("Validate this skill after editing it.") == "validate"
-    assert (
-        detect_skill_lifecycle_intent("Δημιούργησε το πρώτο reusable skill για pytest debugging.")
-        == "create"
-    )
-    assert detect_skill_lifecycle_intent("Εγκατέστησε αυτό το skill από git.") == "install"
-    assert (
-        detect_skill_lifecycle_intent("Απενεργοποίησε αυτό το skill για το project.") == "disable"
-    )
-    assert is_skill_lifecycle_request("Implement search command and update tests.") is False
+
+    assert semantics.execution_posture == "execute"
+    assert semantics.targets[0].kind is TurnTargetKind.CAPABILITY
 
 
 def test_run_turn_uses_canonical_skill_lifecycle_guidance_for_first_skill_request_in_empty_workspace(

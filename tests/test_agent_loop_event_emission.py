@@ -6,6 +6,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+import pytest
 from rich.console import Console
 
 from sylliptor_agent_cli.agent_loop import AgentSession, ToolDef
@@ -480,7 +481,7 @@ def test_run_turn_dispatches_same_batch_subagent_runs_in_parallel(tmp_path: Path
         surface=surface,
         tool=tool,
         # Parallel prelaunch of a same-batch subagent group requires every call
-        # to resolve a readonly/review subagent. Real sessions always carry a
+        # to resolve an exactly-readonly subagent. Real sessions always carry a
         # resolved registry (built-ins at minimum), so mirror that here to make
         # "explorer" resolve to its built-in readonly definition.
         subagent_registry=built_in_subagents(),
@@ -513,6 +514,83 @@ def test_run_turn_dispatches_same_batch_subagent_runs_in_parallel(tmp_path: Path
     assert [message["tool_call_id"] for message in tool_messages] == ["call_a", "call_b"]
     assert "catalog for alpha" in tool_messages[0]["content"]
     assert "catalog for beta" in tool_messages[1]["content"]
+
+
+def test_run_turn_serializes_same_batch_review_subagents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    execution_order: list[str] = []
+
+    def _run_subagent(args: dict[str, Any]) -> dict[str, Any]:
+        task = str(args["task"])
+        execution_order.append(f"start:{task}")
+        execution_order.append(f"end:{task}")
+        return {
+            "subagent": "implementer",
+            "subagent_session_id": f"sub-{task}",
+            "result": f"result for {task}",
+        }
+
+    class _UnexpectedParallelExecutor:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            _ = args, kwargs
+            raise AssertionError("review-mode subagents must not use the parallel executor")
+
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.agent.turn.core.ThreadPoolExecutor",
+        _UnexpectedParallelExecutor,
+    )
+    tool = ToolDef(
+        name="subagent_run",
+        description="fake subagent",
+        parameters={"type": "object", "properties": {}, "required": []},
+        run=_run_subagent,
+    )
+    client = _ScriptedClient(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="call_a",
+                        name="subagent_run",
+                        arguments={
+                            "name": "implementer",
+                            "task": "alpha",
+                            "mode": "review",
+                        },
+                    ),
+                    ToolCall(
+                        id="call_b",
+                        name="subagent_run",
+                        arguments={
+                            "name": "frontend-engineer",
+                            "task": "beta",
+                            "mode": "review",
+                        },
+                    ),
+                ],
+                raw={},
+            ),
+            LLMResponse(content="done", tool_calls=[], raw={}),
+        ]
+    )
+    session = _make_session(
+        root=tmp_path,
+        client=client,
+        surface=_RecordingEventSurface(),
+        tool=tool,
+        subagent_registry=built_in_subagents(),
+    )
+
+    try:
+        exit_code = session.run_turn("review two changes")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert execution_order == ["start:alpha", "end:alpha", "start:beta", "end:beta"]
 
 
 def test_run_turn_tool_failure_emits_failed_completion_event(tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -57,6 +58,176 @@ _MAX_MCP_PROMPT_LIST_LIMIT = 50
 _ALIAS_CHARS_RE = re.compile(r"[^a-z0-9]+")
 _McpLiveClient = McpStdioClient | McpHttpClient
 _RESOURCE_TOOL_ALIASES = frozenset({"mcp_resources_list", "mcp_resource_read"})
+
+
+class _McpClientLease:
+    """Stable, session-owned indirection for one live MCP connection.
+
+    Tool definitions keep this lease for the lifetime of the agent session.  A
+    lifecycle reconnect can therefore replace the underlying transport without
+    leaving model-facing tool callables pointed at a closed client.  Disabling a
+    lease is fail-closed: every subsequent operation raises before any transport
+    call is made.
+    """
+
+    def __init__(self, *, server_id: str, client: _McpLiveClient) -> None:
+        self.server_id = server_id
+        self._client: _McpLiveClient | None = client
+        self._enabled = True
+        self._generation = 1
+        self._lock = threading.RLock()
+
+    def _require_client(self) -> _McpLiveClient:
+        if not self._enabled:
+            raise RuntimeError(f"MCP server '{self.server_id}' is disabled for this session.")
+        client = self._client
+        if client is None or client.closed:
+            raise RuntimeError(
+                f"MCP server '{self.server_id}' is disconnected for this session. "
+                "Reconnect it before retrying the operation."
+            )
+        return client
+
+    @property
+    def enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            client = self._client
+            return client is None or client.closed
+
+    @property
+    def connected(self) -> bool:
+        with self._lock:
+            if not self._enabled:
+                return False
+            client = self._client
+            if client is None or client.closed:
+                return False
+            transport = client.transport
+            process = getattr(transport, "process", None)
+            if process is not None and process.poll() is not None:
+                return False
+            return True
+
+    @property
+    def transport(self) -> Any:
+        """Compatibility-only access used by low-level transport diagnostics/tests."""
+        with self._lock:
+            return self._require_client().transport
+
+    @property
+    def tools_list_changed(self) -> bool:
+        with self._lock:
+            return self._require_client().tools_list_changed
+
+    @property
+    def resources_list_changed(self) -> bool:
+        with self._lock:
+            return self._require_client().resources_list_changed
+
+    @property
+    def prompts_list_changed(self) -> bool:
+        with self._lock:
+            return self._require_client().prompts_list_changed
+
+    @property
+    def session_negotiated(self) -> bool:
+        with self._lock:
+            return self._require_client().session_negotiated
+
+    @property
+    def roots_capability_enabled(self) -> bool:
+        with self._lock:
+            return self._require_client().roots_capability_enabled
+
+    @property
+    def supports_tools(self) -> bool:
+        with self._lock:
+            return self._require_client().supports_tools
+
+    @property
+    def supports_resources(self) -> bool:
+        with self._lock:
+            return self._require_client().supports_resources
+
+    @property
+    def supports_prompts(self) -> bool:
+        with self._lock:
+            return self._require_client().supports_prompts
+
+    def ensure_initialized(self) -> None:
+        with self._lock:
+            self._require_client().ensure_initialized()
+
+    def observe_notifications(self) -> None:
+        with self._lock:
+            self._require_client().observe_notifications()
+
+    def list_tools(self) -> tuple[McpListedTool, ...]:
+        with self._lock:
+            return self._require_client().list_tools()
+
+    def list_resources(self) -> tuple[McpListedResource, ...]:
+        with self._lock:
+            return self._require_client().list_resources()
+
+    def list_prompts(self) -> tuple[McpListedPrompt, ...]:
+        with self._lock:
+            return self._require_client().list_prompts()
+
+    def read_resource(
+        self,
+        *,
+        resource_uri: str,
+        allowed_uris: Any = None,
+    ) -> Any:
+        with self._lock:
+            return self._require_client().read_resource(
+                resource_uri=resource_uri,
+                allowed_uris=allowed_uris,
+            )
+
+    def get_prompt(self, *, name: str, arguments: dict[str, str] | None = None) -> Any:
+        with self._lock:
+            return self._require_client().get_prompt(name=name, arguments=arguments)
+
+    def call_tool(self, *, tool_name: str, arguments: dict[str, Any]) -> Any:
+        with self._lock:
+            return self._require_client().call_tool(tool_name=tool_name, arguments=arguments)
+
+    def disable(self) -> bool:
+        with self._lock:
+            changed = self._enabled or self._client is not None
+            self._enabled = False
+            client = self._client
+            self._client = None
+            if client is not None:
+                client.close()
+            return changed
+
+    def replace_client(self, client: _McpLiveClient) -> None:
+        with self._lock:
+            old_client = self._client
+            self._client = client
+            self._enabled = True
+            self._generation += 1
+            if old_client is not None and old_client is not client:
+                old_client.close()
+
+    def close(self) -> None:
+        self.disable()
+
+
+_McpSessionClient = _McpLiveClient | _McpClientLease
 
 
 def _sanitize_alias_part(value: str, *, fallback: str) -> str:
@@ -234,7 +405,7 @@ class McpToolBinding:
     tool_alias: str
     description: str
     parameters: dict[str, Any]
-    client: _McpLiveClient = field(repr=False)
+    client: _McpSessionClient = field(repr=False)
     session_mode: str | None = None
 
     def bind_session_mode(self, session_mode: str | None) -> McpToolBinding:
@@ -308,7 +479,7 @@ class McpHostToolBinding:
 @dataclass(frozen=True)
 class _CollectedServerCatalog:
     server: ResolvedMcpServer
-    client: _McpLiveClient
+    client: _McpSessionClient
     raw_tools: tuple[McpListedTool, ...]
     filtered_tools: tuple[McpListedTool, ...]
     raw_tool_names: tuple[str, ...]
@@ -316,12 +487,15 @@ class _CollectedServerCatalog:
     resources_snapshot_loaded: bool
     tools_list_changed: bool
     resources_list_changed: bool
+    roots_capability_enabled: bool
+    resources_capability_advertised: bool
+    session_negotiated: bool
 
 
 @dataclass(frozen=True)
 class _FlatToolRecord:
     server: ResolvedMcpServer
-    client: _McpLiveClient
+    client: _McpSessionClient
     tool: McpListedTool
     parameters: dict[str, Any]
 
@@ -337,7 +511,7 @@ class _FlatToolRecord:
 @dataclass(frozen=True)
 class _SnapshottedResourceRecord:
     server: ResolvedMcpServer
-    client: _McpLiveClient
+    client: _McpSessionClient
     resource: McpListedResource
 
     @property
@@ -348,7 +522,7 @@ class _SnapshottedResourceRecord:
 @dataclass(frozen=True)
 class _SnapshottedPromptRecord:
     server: ResolvedMcpServer
-    client: _McpLiveClient
+    client: _McpSessionClient
     prompt: McpListedPrompt
 
     @property
@@ -378,6 +552,9 @@ class McpManager:
         self._active_servers_by_id = {server.id: server for server in self._active_servers}
         self._live_runtime_enabled = _mcp_runtime_enabled(self.runtime_kind)
         self._closed = False
+        self._lifecycle_lock = threading.RLock()
+        self._disabled_server_ids: set[str] = set()
+        self._client_leases_by_server_id: dict[str, list[_McpClientLease]] = {}
         self._snapshot_loaded = False
         self._snapshot_error: BaseException | None = None
         self._tool_bindings: tuple[_McpManagerToolBinding, ...] = ()
@@ -404,8 +581,8 @@ class McpManager:
         self._tool_stale_server_ids: set[str] = set()
         self._resource_stale_server_ids: set[str] = set()
         self._prompt_stale_server_ids: set[str] = set()
-        self._clients_by_server_id: dict[str, _McpLiveClient] = {}
-        self._prompt_clients_by_server_id: dict[str, _McpLiveClient] = {}
+        self._clients_by_server_id: dict[str, _McpSessionClient] = {}
+        self._prompt_clients_by_server_id: dict[str, _McpSessionClient] = {}
         self._prompt_server_catalogs_by_id = {
             server.id: self._initial_prompt_server_catalog(server)
             for server in self._prompt_enabled_servers
@@ -463,14 +640,260 @@ class McpManager:
             "live_tool_runtime_enabled": self._live_runtime_enabled,
         }
 
+    def _register_client_lease(
+        self,
+        *,
+        server_id: str,
+        client: _McpLiveClient,
+    ) -> _McpClientLease:
+        if self._client_leases_by_server_id.get(server_id):
+            raise RuntimeError(
+                f"MCP server '{server_id}' already has a session-owned client lease."
+            )
+        lease = _McpClientLease(server_id=server_id, client=client)
+        self._client_leases_by_server_id[server_id] = [lease]
+        return lease
+
+    def _server_lifecycle_target(self, server_id: str) -> ResolvedMcpServer:
+        normalized_server_id = str(server_id or "").strip()
+        if not normalized_server_id:
+            raise RuntimeError("server_id must be a non-empty string.")
+        if self._closed:
+            raise RuntimeError("MCP manager is closed.")
+        server = self._active_servers_by_id.get(normalized_server_id)
+        if server is not None:
+            if server.trust != "explicit":
+                raise RuntimeError(
+                    f"MCP server '{normalized_server_id}' is not explicitly trusted."
+                )
+            if not self._live_runtime_enabled:
+                raise RuntimeError(
+                    f"MCP server lifecycle is unavailable for runtime '{self.runtime_kind.value}'."
+                )
+            return server
+        if normalized_server_id in self._resolved_servers_by_id:
+            raise RuntimeError(
+                f"MCP server '{normalized_server_id}' is not active for runtime "
+                f"'{self.runtime_kind.value}'."
+            )
+        raise RuntimeError(f"Unknown MCP server '{normalized_server_id}'.")
+
+    def server_lifecycle_status(self, *, server_id: str) -> dict[str, Any]:
+        with self._lifecycle_lock:
+            server = self._server_lifecycle_target(server_id)
+            leases = tuple(self._client_leases_by_server_id.get(server.id, ()))
+            enabled = server.id not in self._disabled_server_ids
+            connected = bool(enabled and any(lease.connected for lease in leases))
+            if not enabled:
+                connection_state = "disabled"
+            elif connected:
+                connection_state = "connected"
+            elif leases:
+                connection_state = "disconnected"
+            else:
+                connection_state = "not_materialized"
+            server_bindings = [
+                binding
+                for binding in self._tool_bindings
+                if isinstance(binding, McpToolBinding) and binding.server_id == server.id
+            ]
+            resource_count = sum(
+                1 for record in self._resource_records if record.server.id == server.id
+            )
+            prompt_count = len(self._prompt_records_by_server_id.get(server.id, ()))
+            return {
+                "session_id": self.session_id,
+                "server_id": server.id,
+                "transport": server.transport,
+                "enabled": enabled,
+                "connection_state": connection_state,
+                "connected": connected,
+                "generation": max((lease.generation for lease in leases), default=0),
+                "catalog_initialized": self._snapshot_loaded,
+                "exposed_tool_count": len(server_bindings),
+                "snapshotted_resource_count": resource_count,
+                "prompt_snapshot_loaded": server.id in self._prompt_loaded_server_ids,
+                "snapshotted_prompt_count": prompt_count,
+                "secret_values_included": False,
+            }
+
+    def disable_server(self, *, server_id: str) -> dict[str, Any]:
+        with self._lifecycle_lock:
+            server = self._server_lifecycle_target(server_id)
+            already_disabled = server.id in self._disabled_server_ids
+            self._disabled_server_ids.add(server.id)
+            changed = not already_disabled
+            for lease in self._client_leases_by_server_id.get(server.id, ()):
+                changed = lease.disable() or changed
+            return {
+                **self.server_lifecycle_status(server_id=server.id),
+                "changed": changed,
+                "action": "disable",
+            }
+
+    def _replacement_tool_signature(
+        self,
+        *,
+        server: ResolvedMcpServer,
+        client: _McpLiveClient,
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        if not client.supports_tools:
+            if server.allowed_tools or server.denied_tools:
+                raise RuntimeError(
+                    f"MCP server '{server.id}' no longer advertises its configured tools."
+                )
+            return []
+        raw_tools = client.list_tools()
+        filtered_tools, _raw_names = self._filter_server_tools(
+            server=server,
+            raw_tools=raw_tools,
+        )
+        return [
+            (
+                tool.name,
+                build_host_owned_mcp_tool_description(
+                    server_id=server.id,
+                    tool_name=tool.name,
+                    server_description=tool.description,
+                ),
+                _validate_function_tool_schema(server=server, tool=tool),
+            )
+            for tool in filtered_tools
+        ]
+
+    def _validate_replacement_client(
+        self,
+        *,
+        server: ResolvedMcpServer,
+        client: _McpLiveClient,
+        validate_prompts: bool = True,
+    ) -> None:
+        client.ensure_initialized()
+        if self._snapshot_loaded:
+            expected_tools = [
+                (binding.tool_name, binding.description, binding.parameters)
+                for binding in self._tool_bindings
+                if isinstance(binding, McpToolBinding) and binding.server_id == server.id
+            ]
+            replacement_tools = self._replacement_tool_signature(server=server, client=client)
+            if replacement_tools != expected_tools:
+                raise RuntimeError(
+                    f"MCP server '{server.id}' tool catalog changed. Recreate the runtime session "
+                    "before using the new catalog."
+                )
+        if server.id in self._resource_snapshotted_server_ids:
+            replacement_resources = (
+                list(client.list_resources()) if client.supports_resources else []
+            )
+            expected_resources = [
+                record.resource
+                for record in self._resource_records
+                if record.server.id == server.id
+            ]
+            if replacement_resources != expected_resources:
+                raise RuntimeError(
+                    f"MCP server '{server.id}' resource catalog changed. Recreate the runtime "
+                    "session before using the new catalog."
+                )
+        if validate_prompts and server.id in self._prompt_loaded_server_ids:
+            replacement_prompts = list(client.list_prompts()) if client.supports_prompts else []
+            expected_prompts = [
+                record.prompt for record in self._prompt_records_by_server_id.get(server.id, ())
+            ]
+            if replacement_prompts != expected_prompts:
+                raise RuntimeError(
+                    f"MCP server '{server.id}' prompt catalog changed. Recreate the runtime session "
+                    "before using the new catalog."
+                )
+        # A list_changed notification that races any comparison means the
+        # replacement was already stale before it could become session-owned.
+        # Never swap such a connection under frozen model-facing bindings.
+        client.observe_notifications()
+        changed_surfaces: list[str] = []
+        if self._snapshot_loaded and client.tools_list_changed:
+            changed_surfaces.append("tool")
+        if server.id in self._resource_snapshotted_server_ids and client.resources_list_changed:
+            changed_surfaces.append("resource")
+        if (
+            validate_prompts
+            and server.id in self._prompt_loaded_server_ids
+            and client.prompts_list_changed
+        ):
+            changed_surfaces.append("prompt")
+        if changed_surfaces:
+            surfaces = ", ".join(changed_surfaces)
+            raise RuntimeError(
+                f"MCP server '{server.id}' reported a {surfaces} catalog change while "
+                "reconnecting. Recreate the runtime session before using the new catalog."
+            )
+
+    def _connect_server(self, *, server_id: str, action: str) -> dict[str, Any]:
+        with self._lifecycle_lock:
+            server = self._server_lifecycle_target(server_id)
+            if action == "enable" and server.id not in self._disabled_server_ids:
+                status = self.server_lifecycle_status(server_id=server.id)
+                if status["connected"]:
+                    return {**status, "changed": False, "action": action}
+            client = self._build_live_client(server)
+            try:
+                self._validate_replacement_client(server=server, client=client)
+                leases = self._client_leases_by_server_id.get(server.id, [])
+                if leases:
+                    leases[0].replace_client(client)
+                    for redundant_lease in leases[1:]:
+                        redundant_lease.disable()
+                    self._client_leases_by_server_id[server.id] = [leases[0]]
+                    live_client: _McpSessionClient = leases[0]
+                else:
+                    live_client = self._register_client_lease(
+                        server_id=server.id,
+                        client=client,
+                    )
+                if server.id in self._clients_by_server_id:
+                    self._clients_by_server_id[server.id] = live_client
+                elif server.id in self._prompt_clients_by_server_id:
+                    self._prompt_clients_by_server_id[server.id] = live_client
+                else:
+                    # Keep a configured-but-empty server connected to this live manager so
+                    # status and later prompt materialization operate on the owned connection.
+                    self._clients_by_server_id[server.id] = live_client
+                if server.id in self._prompt_clients_by_server_id:
+                    self._prompt_clients_by_server_id[server.id] = live_client
+                self._disabled_server_ids.discard(server.id)
+                # The replacement has just been compared with every frozen
+                # surface above. Clear stale state inherited from the closed
+                # transport so status reflects the validated connection.
+                self._tool_stale_server_ids.discard(server.id)
+                self._resource_stale_server_ids.discard(server.id)
+                self._prompt_stale_server_ids.discard(server.id)
+                self._sync_stale_catalog_snapshot_metadata()
+            except Exception:
+                client.close()
+                raise
+            return {
+                **self.server_lifecycle_status(server_id=server.id),
+                "changed": True,
+                "action": action,
+            }
+
+    def enable_server(self, *, server_id: str) -> dict[str, Any]:
+        return self._connect_server(server_id=server_id, action="enable")
+
+    def restart_server(self, *, server_id: str) -> dict[str, Any]:
+        return self._connect_server(server_id=server_id, action="restart")
+
     def _refresh_stale_state_from_clients(self) -> None:
         for server_id, client in self._clients_by_server_id.items():
+            if isinstance(client, _McpClientLease) and not client.enabled:
+                continue
             client.observe_notifications()
             if client.tools_list_changed:
                 self._tool_stale_server_ids.add(server_id)
             if client.resources_list_changed and server_id in self._resource_snapshotted_server_ids:
                 self._resource_stale_server_ids.add(server_id)
         for server_id, client in self._prompt_clients_by_server_id.items():
+            if isinstance(client, _McpClientLease) and not client.enabled:
+                continue
             client.observe_notifications()
             if client.prompts_list_changed and server_id in self._prompt_loaded_server_ids:
                 self._prompt_stale_server_ids.add(server_id)
@@ -493,7 +916,9 @@ class McpManager:
                     continue
                 server_id = str(entry.get("server_id") or "").strip()
                 client = self._clients_by_server_id.get(server_id)
-                if client is not None:
+                if client is not None and not (
+                    isinstance(client, _McpClientLease) and not client.enabled
+                ):
                     entry["tools_list_changed"] = client.tools_list_changed
                     entry["resources_list_changed"] = client.resources_list_changed
                     entry["tools_snapshot_stale"] = server_id in self._tool_stale_server_ids
@@ -511,7 +936,9 @@ class McpManager:
                     entry["prompt_snapshot_stale"] = True
                 else:
                     entry.pop("prompt_snapshot_stale", None)
-                if client is not None:
+                if client is not None and not (
+                    isinstance(client, _McpClientLease) and not client.enabled
+                ):
                     if client.prompts_list_changed:
                         entry["prompts_list_changed"] = True
                     else:
@@ -848,6 +1275,8 @@ class McpManager:
     ) -> None:
         if self._closed:
             raise RuntimeError("MCP manager is closed.")
+        if server.id in self._disabled_server_ids:
+            raise RuntimeError(f"MCP server '{server.id}' is disabled for this session.")
         if refresh:
             self._prompt_server_errors.pop(server.id, None)
         if server.id in self._prompt_loaded_server_ids and not refresh:
@@ -869,7 +1298,14 @@ class McpManager:
             self._prompt_server_catalogs_by_id[server.id]["prompt_snapshot_failed"] = True
             self._sync_prompt_catalog_snapshot_metadata()
             raise error
-        client = self._build_live_client(server)
+        existing_client = self._clients_by_server_id.get(server.id)
+        raw_client: _McpLiveClient | None = None
+        client: _McpSessionClient
+        if existing_client is not None and not refresh:
+            client = existing_client
+        else:
+            raw_client = self._build_live_client(server)
+            client = raw_client
         try:
             client.ensure_initialized()
             listed_prompts: tuple[McpListedPrompt, ...] = ()
@@ -889,6 +1325,19 @@ class McpManager:
                     f"({total_prompts} prompts). Narrow server-side prompt exposure or "
                     "disable prompts_mode."
                 )
+            if raw_client is not None and isinstance(existing_client, _McpClientLease):
+                self._validate_replacement_client(
+                    server=server,
+                    client=raw_client,
+                    validate_prompts=False,
+                )
+                existing_client.replace_client(raw_client)
+                client = existing_client
+                raw_client = None
+            elif raw_client is not None:
+                client = self._register_client_lease(server_id=server.id, client=raw_client)
+                raw_client = None
+            self._clients_by_server_id[server.id] = client
             new_records = tuple(
                 _SnapshottedPromptRecord(
                     server=server,
@@ -905,8 +1354,6 @@ class McpManager:
                 for record in new_records:
                     self._prompt_lookup[record.lookup_key] = record
                 self._prompt_clients_by_server_id[server.id] = client
-            else:
-                client.close()
             self._prompt_loaded_server_ids.add(server.id)
             self._prompt_snapshot_loaded = len(self._prompt_loaded_server_ids) == len(
                 self._prompt_enabled_servers
@@ -928,7 +1375,8 @@ class McpManager:
             catalog_entry["snapshotted_prompt_count"] = prompt_count
             self._sync_prompt_catalog_snapshot_metadata()
         except Exception as exc:
-            client.close()
+            if raw_client is not None:
+                raw_client.close()
             self._prompt_server_errors[server.id] = exc
             catalog_entry = self._prompt_server_catalogs_by_id[server.id]
             if not replacing_loaded_snapshot:
@@ -1093,6 +1541,21 @@ class McpManager:
         collected_catalogs: tuple[_CollectedServerCatalog, ...] = ()
         try:
             collected_catalogs = self._collect_server_catalogs()
+            leased_catalogs: list[_CollectedServerCatalog] = []
+            for catalog in collected_catalogs:
+                if isinstance(catalog.client, _McpClientLease):
+                    leased_catalogs.append(catalog)
+                    continue
+                lease = self._register_client_lease(
+                    server_id=catalog.server.id,
+                    client=catalog.client,
+                )
+                if catalog.server.id in self._disabled_server_ids:
+                    # A disable issued before first tool materialization must
+                    # remain fail-closed after the frozen catalog is built.
+                    lease.disable()
+                leased_catalogs.append(replace(catalog, client=lease))
+            collected_catalogs = tuple(leased_catalogs)
             flat_records: list[_FlatToolRecord] = []
             resource_records: list[_SnapshottedResourceRecord] = []
             total_schema_bytes = 0
@@ -1144,7 +1607,7 @@ class McpManager:
             alias_map = self._assign_aliases(flat_records)
             bindings: list[_McpManagerToolBinding] = []
             server_catalogs: list[dict[str, Any]] = []
-            clients_with_bindings: dict[str, _McpLiveClient] = {}
+            clients_with_bindings: dict[str, _McpSessionClient] = {}
             for catalog in collected_catalogs:
                 exposed_aliases: list[str] = []
                 exposed_tool_names: list[str] = []
@@ -1174,9 +1637,11 @@ class McpManager:
                         "server_id": catalog.server.id,
                         "transport": catalog.server.transport,
                         "roots_mode": catalog.server.roots_mode,
-                        "roots_capability_enabled": catalog.client.roots_capability_enabled,
+                        "roots_capability_enabled": catalog.roots_capability_enabled,
                         "resources_mode": catalog.server.resources_mode,
-                        "resources_capability_advertised": catalog.client.supports_resources,
+                        "resources_capability_advertised": (
+                            catalog.resources_capability_advertised
+                        ),
                         "resources_snapshot_loaded": catalog.resources_snapshot_loaded,
                         "snapshotted_resource_count": len(catalog.listed_resources),
                         "resources_list_changed": catalog.resources_list_changed,
@@ -1191,16 +1656,16 @@ class McpManager:
                         "tools_list_changed": catalog.tools_list_changed,
                         "tools_snapshot_stale": catalog.tools_list_changed,
                         **(
-                            {"session_negotiated": catalog.client.session_negotiated}
+                            {"session_negotiated": catalog.session_negotiated}
                             if catalog.server.transport == "http"
                             else {}
                         ),
                     }
                 )
-                if exposed_tool_names or catalog.listed_resources:
-                    clients_with_bindings[catalog.server.id] = catalog.client
-                else:
-                    catalog.client.close()
+                # Keep one initialized, manager-owned connection for every active server.
+                # This makes lifecycle status honest even when a server currently exposes
+                # no tools/resources, and lets later prompt access share the same owner.
+                clients_with_bindings[catalog.server.id] = catalog.client
             self._resource_records = tuple(resource_records)
             self._resource_lookup = {record.lookup_key: record for record in self._resource_records}
             self._resource_snapshotted_server_ids = {
@@ -1274,7 +1739,18 @@ class McpManager:
                         f"MCP server '{server.id}' uses unsupported trust mode '{server.trust}'. "
                         "Live MCP tool exposure currently requires trust='explicit'."
                     )
-                client = self._build_live_client(server)
+                leases = self._client_leases_by_server_id.get(server.id, [])
+                existing_lease = leases[0] if leases else None
+                raw_client: _McpLiveClient | None = None
+                if (
+                    existing_lease is not None
+                    and existing_lease.enabled
+                    and not existing_lease.closed
+                ):
+                    client: _McpSessionClient = existing_lease
+                else:
+                    raw_client = self._build_live_client(server)
+                    client = raw_client
                 try:
                     client.ensure_initialized()
                     raw_tools: tuple[McpListedTool, ...] = ()
@@ -1298,10 +1774,23 @@ class McpManager:
                     )
                     if resources_snapshot_loaded:
                         listed_resources = client.list_resources()
+                    catalog_client = client
+                    if raw_client is not None and existing_lease is not None:
+                        if existing_lease.enabled:
+                            # Recover an enabled-but-disconnected lease without
+                            # invalidating objects that already reference it.
+                            existing_lease.replace_client(raw_client)
+                        else:
+                            # A pre-snapshot disable remains disabled. The
+                            # temporary connection existed only to freeze the
+                            # catalog and must not become reachable afterward.
+                            raw_client.close()
+                        raw_client = None
+                        catalog_client = existing_lease
                     catalogs.append(
                         _CollectedServerCatalog(
                             server=server,
-                            client=client,
+                            client=catalog_client,
                             raw_tools=raw_tools,
                             filtered_tools=filtered_tools,
                             raw_tool_names=raw_tool_names,
@@ -1309,10 +1798,16 @@ class McpManager:
                             resources_snapshot_loaded=resources_snapshot_loaded,
                             tools_list_changed=client.tools_list_changed,
                             resources_list_changed=client.resources_list_changed,
+                            roots_capability_enabled=client.roots_capability_enabled,
+                            resources_capability_advertised=client.supports_resources,
+                            session_negotiated=client.session_negotiated,
                         )
                     )
                 except Exception:
-                    client.close()
+                    if raw_client is not None:
+                        raw_client.close()
+                    elif existing_lease is None:
+                        client.close()
                     raise
         except Exception:
             for catalog in catalogs:
@@ -1424,17 +1919,27 @@ class McpManager:
         return assigned
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        clients = list(self._clients_by_server_id.values())
-        clients.extend(
-            client for client in self._prompt_clients_by_server_id.values() if client not in clients
-        )
-        self._clients_by_server_id = {}
-        self._prompt_clients_by_server_id = {}
-        for client in clients:
-            client.close()
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            clients = list(self._clients_by_server_id.values())
+            clients.extend(
+                client
+                for client in self._prompt_clients_by_server_id.values()
+                if client not in clients
+            )
+            # Defensive cleanup: leases are the authoritative owners. Include
+            # every lease even if a partially failed catalog build never placed
+            # it in either lookup map.
+            for leases in self._client_leases_by_server_id.values():
+                clients.extend(client for client in leases if client not in clients)
+            self._clients_by_server_id = {}
+            self._prompt_clients_by_server_id = {}
+            self._client_leases_by_server_id = {}
+            self._disabled_server_ids = set(self._active_servers_by_id)
+            for client in clients:
+                client.close()
 
 
 class ForgeTaskScopedMcpManager:

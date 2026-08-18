@@ -331,6 +331,11 @@ class RecordingSurface:
         self._delegate = delegate
         self.final_assistant_message = ""
 
+    @property
+    def canonical_message_tool_events(self) -> bool:
+        """Preserve the delegate's single-delivery event contract."""
+        return bool(getattr(self._delegate, "canonical_message_tool_events", False))
+
     def on_status_update(self, status) -> None:  # type: ignore[no-untyped-def]
         self._delegate.on_status_update(status)
 
@@ -526,6 +531,11 @@ class RecordingSurface:
         handler = getattr(self._delegate, "emit_mode_changed", None)
         if callable(handler):
             handler(mode)
+
+    def emit_persona_changed(self, persona: str, effective_mode: str, source: str = "user") -> None:
+        handler = getattr(self._delegate, "emit_persona_changed", None)
+        if callable(handler):
+            handler(persona, effective_mode, source)
 
     def request_approval(self, request):  # type: ignore[no-untyped-def]
         return self._delegate.request_approval(request)

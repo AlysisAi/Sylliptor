@@ -139,6 +139,28 @@ def test_rebuild_session_tools_preserves_mcp_bindings_in_write_capable_modes(
         session.store.close()
 
 
+def test_rebuild_with_persona_scope_blocks_unbounded_execution_tools(
+    tmp_path: Path,
+) -> None:
+    from sylliptor_agent_cli.agent.errors import AgentRuntimeError
+
+    session = _make_session(
+        tmp_path,
+        mcp_manager=_DummyMcpManager(_FakeMcpBinding()),
+        persona_allow_write_globs=["**/*.md"],
+    )
+    try:
+        cli_mod._rebuild_session_tools_for_mode(session=session, mode="review")
+
+        assert "mcp__alpha__echo" not in session.tools
+        with pytest.raises(AgentRuntimeError, match="persona write scope"):
+            session.tools["shell_run"].run({"cmd": "touch source.py"})
+        with pytest.raises(AgentRuntimeError, match="persona write scope"):
+            session.tools["verify_run"].run({"commands": ["pytest -q"]})
+    finally:
+        session.store.close()
+
+
 def test_rebuild_session_tools_preserves_verification_disabled_flag(tmp_path: Path) -> None:
     session = _make_session(tmp_path, verification_enabled=False)
     try:

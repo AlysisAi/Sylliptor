@@ -5,6 +5,7 @@ from typing import Any
 
 from ...config import AppConfig
 from ...forge import RunPaths
+from ...plan_repair import ClarificationLoopTracker
 
 
 @dataclass
@@ -14,6 +15,9 @@ class _ForgePlannerSessionState:
     workspace_context: dict[str, Any] | None = None
     awaiting_clarification: bool = False
     pending_questions: list[str] = field(default_factory=list)
+    # Consecutive clarification-only planner turns for the current goal. Past the
+    # policy cap the planner is made to draft a plan instead of asking again.
+    clarification_loop: ClarificationLoopTracker = field(default_factory=ClarificationLoopTracker)
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,17 @@ class _ForgeChatState:
     entry_request_mode: str = "plain"
     entry_goal: str = ""
     planner_session: _ForgePlannerSessionState = field(default_factory=_ForgePlannerSessionState)
+    # Swarm knobs chosen in the TUI launch gate (``/execute plan``), read by the
+    # ``/execute`` command handler when present. Empty dict → the handler's own
+    # defaults apply (so the classic, non-TUI path is unchanged). Recognised keys:
+    # ``parallel`` (int), ``scope_mode`` ("strict"|"warn"), ``verify_mode``
+    # ("warn"|"strict"|"off"), ``review`` (bool).
+    swarm_knobs: dict[str, Any] = field(default_factory=dict)
+    # True once the current ``/execute plan`` invocation actually reached
+    # ``run_swarm`` (reset at the top of each invocation). Lets the TUI worker
+    # distinguish "the handler rejected the execute before anything ran" from
+    # "a swarm ran" when finalizing the live forge view.
+    swarm_run_attempted: bool = False
 
     @property
     def planner_transcript(self) -> list[dict[str, str]]:
@@ -103,6 +118,7 @@ class _ChatExecutionRequest:
     mode_override: str | None = None
     restore_mode_after: str | None = None
     plan_mode_capture_task: str | None = None
+    chat_only: bool = False
 
 
 __all__ = [name for name in globals() if not name.startswith("__") or name == "__version__"]

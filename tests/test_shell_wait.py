@@ -323,14 +323,6 @@ def test_shell_output_existing_callers_remain_immediate(
     )
     try:
         started = session.tools["shell_background"].run({"cmd": "fake"})
-        session.tools["shell_wait"].run(
-            {
-                "process_id": started["process_id"],
-                "since": 0,
-                "until": "output_available",
-                "wait_seconds": 1,
-            }
-        )
         result = session.tools["shell_output"].run({"process_id": started["process_id"]})
 
         assert "waited" not in result

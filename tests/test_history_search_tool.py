@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from sylliptor_agent_cli.compaction.tool_output_offload import ToolOutputOffloader
+from sylliptor_agent_cli.session_artifacts import SessionArtifactLayout
 from sylliptor_agent_cli.tools.history import HistorySearchError, history_search
 
 
@@ -80,7 +82,13 @@ def test_history_search_invalid_regex_raises(tmp_path: Path) -> None:
 
 def test_history_search_missing_session_dir_returns_empty(tmp_path: Path) -> None:
     result = history_search(root=tmp_path, session_id="missing", pattern="anything")
-    assert result == {"pattern": "anything", "matches": [], "truncated": False}
+    assert result == {
+        "pattern": "anything",
+        "matches": [],
+        "truncated": False,
+        "scanned_bytes": 0,
+        "scanned_files": 0,
+    }
 
 
 def test_history_search_uses_session_artifact_root_for_tool_outputs(tmp_path: Path) -> None:
@@ -118,3 +126,79 @@ def test_history_search_uses_session_artifact_root_for_tool_outputs(tmp_path: Pa
         str(row["path"]) for row in result["matches"] if "external" in str(row["text"])
     ]
     assert any(path.startswith("session_artifacts/") for path in external_paths)
+
+
+def test_history_search_finds_offload_after_restart_and_redacts_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_id = "restart-session"
+    secret = "history-secret-canary"
+    monkeypatch.setenv("SYLLIPTOR_API_KEY", secret)
+    offloader = ToolOutputOffloader(
+        artifact_layout=SessionArtifactLayout(filesystem_root=tmp_path / "external" / session_id),
+        workspace_root=workspace,
+        threshold_chars=20,
+        preview_chars=10,
+    )
+    result = offloader.maybe_offload(
+        tool_name="shell_run",
+        tool_call_id="restart-call",
+        step=4,
+        result={},
+        content_json='{"stdout":"durable-needle ' + secret + " " + "x" * 500 + '"}',
+    )
+    assert result.offloaded is True
+
+    # A new search object/process has no in-memory result and must use the artifact.
+    found = history_search(
+        root=workspace,
+        session_id=session_id,
+        session_artifact_root=tmp_path / "external" / session_id,
+        pattern="durable-needle",
+        include_history=False,
+        include_memory=False,
+    )
+
+    assert [row["kind"] for row in found["matches"]] == ["tool_output"]
+    serialized = str(found)
+    assert secret not in serialized
+    assert "<redacted>" in serialized
+    assert found["scanned_files"] == 1
+
+
+def test_history_search_rejects_unscoped_root_and_symlink_escape(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    foreign_root = tmp_path / "foreign-session"
+    _write(foreign_root / "tool_outputs" / "foreign.json", "foreign-needle")
+
+    unscoped = history_search(
+        root=workspace,
+        session_id="owned-session",
+        session_artifact_root=foreign_root,
+        pattern="foreign-needle",
+        include_history=False,
+        include_memory=False,
+    )
+    assert unscoped["matches"] == []
+
+    owned_root = workspace / ".sylliptor" / "sessions" / "owned-session"
+    outside = tmp_path / "outside.json"
+    outside.write_text("escaped-needle", encoding="utf-8")
+    link = owned_root / "tool_outputs" / "escape.json"
+    link.parent.mkdir(parents=True)
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("File symlinks are unavailable on this host")
+    escaped = history_search(
+        root=workspace,
+        session_id="owned-session",
+        pattern="escaped-needle",
+        include_history=False,
+        include_memory=False,
+    )
+    assert escaped["matches"] == []

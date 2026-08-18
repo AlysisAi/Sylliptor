@@ -3,8 +3,8 @@ from __future__ import annotations
 import getpass
 import json
 import os
-import platform
 import re
+import socket
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -59,7 +59,11 @@ def local_session_owner() -> str | None:
         # OSError) — this function must degrade to None, never crash startup.
         user = ""
     try:
-        host = platform.node().strip()
+        # Use the direct socket API instead of ``platform.node()``. On Windows,
+        # ``platform.node()`` can invoke ``ver`` through a shell, which makes a
+        # harmless identity lookup observable as an unrelated subprocess and
+        # lets hook subprocess instrumentation intercept it.
+        host = socket.gethostname().strip()
     except OSError:
         host = ""
     if not user and not host:
@@ -164,14 +168,20 @@ class SessionStore:
     def runtime_artifact_path(self, *parts: str) -> Path:
         return self.session_artifact_layout.artifact_fs_path(*parts)
 
-    def append(self, event_type: str, payload: dict[str, Any]) -> None:
+    def append(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        observation_payload: dict[str, Any] | None = None,
+    ) -> None:
         event = self._build_event(event_type=event_type, payload=payload)
         with self._lock:
             event["event_id"] = f"{self.session_id}:{len(self._events) + 1}"
             self._events.append(event)
             observed_web_research = self._web_research.observe_event(
                 event_type=event_type,
-                payload=payload,
+                payload=observation_payload if observation_payload is not None else payload,
                 ts=str(event.get("ts") or "").strip() or None,
                 event_id=str(event.get("event_id") or "").strip() or None,
             )

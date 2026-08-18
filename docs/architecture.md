@@ -47,24 +47,20 @@ The High-level flow is:
 
 ### CLI And Session Runtime
 
-The Typer CLI exposes `sylliptor`, `sylliptor chat`, `sylliptor run`, Forge
-commands, setup commands, and supporting inspection commands.
+The terminal app opens an interactive session and also provides supporting
+setup and automation commands.
 
 The session runtime owns:
 
 - workspace binding
 - prompt assembly
-- routing between normal chat, repository work, and tool-assisted turns
+- one shared turn path for conversation, repository work, and tool-assisted turns
 - tool assembly
 - step limits and final response handling
 - session logging and local artifacts
 
-`sylliptor chat` is interactive and supports commands such as `/status`,
-`/mode`, `/pwd`, `/plan`, `/subagent`, and `/forge`.
-
-`sylliptor run` is the one-shot entrypoint. It is best for focused tasks that
-can be completed from a single instruction. For exploratory or highly iterative
-work, interactive chat or Forge is usually a better fit.
+The interactive session supports commands such as `/status`, `/mode`,
+`/persona`, `/pwd`, `/plan`, `/subagent`, and `/forge`.
 
 ### Model Provider Layer
 
@@ -142,11 +138,11 @@ each has a clear trust model.
   entrypoint. Project tools require an explicit trust decision.
 - Hooks run deterministic command-based policy or automation around lifecycle
   events and require trust for project-local configuration.
-- Subagents are focused helper sessions used by normal chat and one-shot flows
-  for exploration, review, or testing strategy.
+- Subagents are focused helper sessions used for exploration, implementation,
+  debugging, review, or testing strategy.
 - Subagents use the earlier of the parent run's absolute deadline and their
-  finite configured fallback ceiling, so delegation cannot extend a one-shot
-  run beyond its original time limit and cannot run unbounded without one.
+  finite configured fallback ceiling, so delegation cannot extend the parent
+  session deadline.
 
 See [MCP](mcp.md), [Skills](skills.md), [Plugins](plugins.md),
 [Custom tools](custom_tools.md), [Lifecycle hooks](hooks.md), and

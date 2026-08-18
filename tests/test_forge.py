@@ -1025,23 +1025,13 @@ def test_forge_plan_assistant_recovers_after_transient_request_retry(
     runner = CliRunner()
     repo = tmp_path / "repo"
     repo.mkdir()
-    calls = {"router": 0, "planner": 0}
+    calls = {"planner": 0}
 
     class FakePlannerClient:
         def __init__(self, **_kwargs) -> None:  # type: ignore[no-untyped-def]
             pass
 
         def chat(self, **kwargs):  # type: ignore[no-untyped-def]
-            messages = kwargs.get("messages") or []
-            system_prompt = str(messages[0].get("content") if messages else "")
-            if "Forge planner turn" in system_prompt:
-                calls["router"] += 1
-                payload = {
-                    "route": "planning",
-                    "confidence": 0.99,
-                    "reason": "test_planning_request",
-                }
-                return type("Resp", (), {"content": json.dumps(payload)})()
             calls["planner"] += 1
             if calls["planner"] == 1:
                 raise LLMError("LLM request failed: ReadTimeout")
@@ -1086,7 +1076,7 @@ def test_forge_plan_assistant_recovers_after_transient_request_retry(
     assert "Recovered planner response." in result.output
     assert "Applied planner update to plan." in result.output
     assert "Planner request recovered after 1 transient retry." in result.output
-    assert calls == {"router": 1, "planner": 3}
+    assert calls == {"planner": 3}
 
     pointer = _load_json(repo / ".sylliptor" / "current_run.json")
     plan_dir = repo / pointer["run_path"] / "plan"

@@ -45,6 +45,25 @@ from .task_scope import (
 _NON_EXECUTABLE_OBSOLETE_STATUSES = frozenset({"superseded", "invalidated"})
 PlanAcceptanceRuleId = Literal["R1", "R2", "R3", "R4", "R5"]
 
+# Attached to every R3/R4 scope issue. Execution triages out-of-scope changes rather than
+# rejecting them outright -- adjacent changes are amended into write_scope automatically --
+# so the planner's job is to name the directories the work lives in, not to guess the exact
+# filenames. An exact file list that misses one file costs a round trip; a directory glob
+# does not.
+SCOPE_GLOB_PREFERENCE_GUIDANCE = (
+    "Prefer directory-level globs over exact file lists in write_scope: write "
+    "`src/pkg/**` or `tests/**` rather than enumerating every file you expect to touch. "
+    "Execution auto-amends adjacent changes (a new file in a declared directory, a sibling "
+    "test file, a generated artifact of a declared file) into write_scope, but an unrelated "
+    "path still blocks the task, so declare the directories the work belongs to. Keep the "
+    "globs as narrow as the work: scope a package directory, not the repository root."
+)
+
+
+def _with_scope_guidance(detail: str) -> str:
+    text = str(detail or "").strip()
+    return f"{text} {SCOPE_GLOB_PREFERENCE_GUIDANCE}" if text else SCOPE_GLOB_PREFERENCE_GUIDANCE
+
 
 class PlannerFailedError(RuntimeError):
     failure_category = FailureCategory.PLANNER_FAILED
@@ -160,7 +179,9 @@ def _missing_field_issue(
     task_id: str,
     field_name: str,
 ) -> PlanAcceptanceIssue:
-    detail = EXECUTION_UNREADY_SCOPE_WARNING if field_name == "write_scope" else ""
+    detail = (
+        _with_scope_guidance(EXECUTION_UNREADY_SCOPE_WARNING) if field_name == "write_scope" else ""
+    )
     return PlanAcceptanceIssue(
         rule_id="R4",
         task_id=task_id,
@@ -750,7 +771,7 @@ def find_plan_acceptance_issues(
                         "scope omits explicit task path hints: "
                         + ", ".join(missing_explicit_scope[:8])
                     ),
-                    detail="write_scope=" + ", ".join(write_scope[:8]),
+                    detail=_with_scope_guidance("write_scope=" + ", ".join(write_scope[:8])),
                 )
             )
 
@@ -778,7 +799,7 @@ def find_plan_acceptance_issues(
                     rule_id="R3",
                     task_id=task_id,
                     observed=_metadata_only_observed(write_scope),
-                    detail="write_scope=" + ", ".join(write_scope[:8]),
+                    detail=_with_scope_guidance("write_scope=" + ", ".join(write_scope[:8])),
                 )
             )
 

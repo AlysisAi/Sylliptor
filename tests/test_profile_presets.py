@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import re
 
+from sylliptor_agent_cli.llm.cache_capabilities import resolve_effective_cache_capability
 from sylliptor_agent_cli.profile_presets import (
     PROFILE_PRESETS,
+    advanced_provider_selection_presets,
     canonical_model_alias_for_preset,
     convert_profile_to_preset,
     find_preset_for_base_url,
     find_preset_for_profile,
     get_preset,
     make_profile_from_preset,
+    preset_selection_label,
+    provider_selection_presets,
     target_preset_for_profile_conversion,
 )
 from sylliptor_agent_cli.profiles import ProfileSpec
@@ -81,7 +85,6 @@ def test_first_party_compatibility_presets_are_explicit_legacy_fallbacks() -> No
 
 def test_provider_presets_select_documented_hosted_search_adapters() -> None:
     expected = {
-        "sylliptor": "openrouter_web",
         "openai": "openai_responses",
         "openai-responses": "openai_responses",
         "anthropic": "anthropic_messages",
@@ -114,6 +117,7 @@ def test_provider_presets_select_documented_hosted_search_adapters() -> None:
 def test_presets_without_provider_hosted_search_remain_model_independent() -> None:
     for key in (
         "deepseek",
+        "zai-coding-plan",
         "cerebras",
         "together",
         "fireworks",
@@ -184,6 +188,7 @@ def test_moonshot_presets_alias_retired_kimi_k2_to_current_model() -> None:
 
 def test_provider_presets_use_current_openai_compatible_base_urls() -> None:
     expected_base_urls = {
+        # The Sylliptor hosted proxy (llm Edge Function, DeepSeek upstream).
         "sylliptor": "https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1",
         "openai": "https://api.openai.com/v1",
         "openai-responses": "https://api.openai.com/v1",
@@ -194,10 +199,12 @@ def test_provider_presets_use_current_openai_compatible_base_urls() -> None:
         "gemini-compat": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "gemini-native": "https://generativelanguage.googleapis.com/v1beta",
         "deepseek": "https://api.deepseek.com",
+        "nvidia": "https://integrate.api.nvidia.com/v1",
         "qwen-intl": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         "qwen-us": "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
         "qwen-cn": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "zhipu": "https://open.bigmodel.cn/api/paas/v4/",
+        "zai-coding-plan": "https://api.z.ai/api/coding/paas/v4",
         "moonshot": "https://api.moonshot.ai/v1",
         "kimi-code": "https://api.kimi.com/coding/v1",
         "moonshot-cn": "https://api.moonshot.cn/v1",
@@ -233,11 +240,46 @@ def test_anthropic_preset_uses_native_messages_endpoint_and_current_models() -> 
     assert preset.extra_headers == {}
     assert preset.suggested_models == (
         "claude-sonnet-5",
-        "claude-opus-4-8",
+        "claude-opus-5",
         "claude-fable-5",
         "claude-haiku-4-5",
+        "claude-opus-4-8",
         "claude-opus-4-7",
     )
+    assert all(model in preset.suggested_model_descriptions for model in preset.suggested_models)
+
+
+def test_anthropic_presets_all_offer_the_same_claude_roster() -> None:
+    rosters = {
+        key: get_preset(key).suggested_models  # type: ignore[union-attr]
+        for key in ("anthropic", "anthropic-compat", "anthropic-native")
+    }
+
+    assert len(set(rosters.values())) == 1, rosters
+
+
+def test_anthropic_cache_minimum_is_per_model_not_one_number() -> None:
+    preset = get_preset("anthropic")
+    assert preset is not None
+    capability = preset.cache_capability
+    assert capability is not None
+
+    def minimum(model: str) -> int | None:
+        return resolve_effective_cache_capability(
+            provider_key="anthropic",
+            protocol="anthropic_messages",
+            model=model,
+            transport_capabilities=None,
+            preset_cache_capability=capability,
+        ).min_cacheable_tokens
+
+    # Opus 5 halved the floor; the older Opus tiers never did.
+    assert minimum("claude-opus-5") == 512
+    assert minimum("claude-fable-5") == 512
+    assert minimum("claude-opus-4-8") == 1024
+    assert minimum("claude-sonnet-5") == 1024
+    assert minimum("claude-opus-4-7") == 2048
+    assert minimum("claude-haiku-4-5") == 4096
 
 
 def test_first_party_presets_do_not_default_to_preview_only_models() -> None:
@@ -261,10 +303,10 @@ def test_launch_provider_presets_use_supported_chat_models() -> None:
     expected_models = {
         "deepseek": ("deepseek-v4-pro", "deepseek-v4-flash"),
         "gemini": (
-            "gemini-3.5-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
             "gemini-3.1-pro-preview",
-            "gemini-3.1-flash-lite",
-            "gemini-3-flash-preview",
         ),
         "groq": (
             "openai/gpt-oss-120b",
@@ -273,7 +315,7 @@ def test_launch_provider_presets_use_supported_chat_models() -> None:
             "groq/compound",
         ),
         "mistral": (
-            "mistral-medium-2604",
+            "mistral-medium-3-5",
             "mistral-large-2512",
             "mistral-small-2603",
             "codestral-2508",
@@ -291,6 +333,14 @@ def test_launch_provider_presets_use_supported_chat_models() -> None:
             "kimi-k2.7-code-highspeed",
             "kimi-k2.6",
         ),
+        "nvidia": (
+            "nvidia/nemotron-3-super-120b-a12b",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-nano-30b-a3b",
+            "deepseek-ai/deepseek-v4-pro",
+            "deepseek-ai/deepseek-v4-flash",
+        ),
+        "zai-coding-plan": ("glm-5.3", "glm-5-turbo", "glm-4.7"),
         "kimi-code": ("k3", "kimi-for-coding", "kimi-for-coding-highspeed"),
         "openrouter": (
             "anthropic/claude-sonnet-5",
@@ -309,6 +359,7 @@ def test_launch_provider_presets_use_supported_chat_models() -> None:
             "openai/gpt-oss-20b",
         ),
         "xai": (
+            "grok-4.6",
             "grok-4.5",
             "grok-build-0.1",
             "grok-4.3",
@@ -342,6 +393,78 @@ def test_deepseek_preset_does_not_offer_legacy_or_retired_aliases() -> None:
     assert "deepseek-coder" not in preset.suggested_models
     assert "deepseek-chat" not in preset.suggested_models
     assert "deepseek-reasoner" not in preset.suggested_models
+
+
+def test_nvidia_preset_uses_hosted_nim_contract() -> None:
+    preset = get_preset("nvidia")
+
+    assert preset is not None
+    assert preset.provider_key == "nvidia"
+    assert preset.protocol == "openai_compat"
+    assert preset.api_key_env == "NVIDIA_API_KEY"
+    assert preset.validation_model == "nvidia/nemotron-3-nano-30b-a3b"
+    assert preset.web_search_adapter == "auto"
+    assert "rate-limited" in preset.setup_warning
+
+
+def test_zai_coding_plan_preset_is_separate_from_general_zhipu_api() -> None:
+    preset = get_preset("zai-coding-plan")
+
+    assert preset is not None
+    assert preset.provider_key == "zai_coding_plan"
+    assert preset.protocol == "openai_compat"
+    assert preset.base_url == "https://api.z.ai/api/coding/paas/v4"
+    assert preset.api_key_env == "ZAI_API_KEY"
+    assert preset.validation_model == "glm-4.7"
+    assert preset.model_aliases == {}
+    assert "glm-5.2" not in preset.suggested_models
+    assert "supported coding tools" in preset.setup_warning
+
+
+def test_qwen_intl_offers_38_max_without_changing_the_balanced_default() -> None:
+    preset = get_preset("qwen-intl")
+    us_preset = get_preset("qwen-us")
+    cn_preset = get_preset("qwen-cn")
+
+    assert preset is not None
+    assert us_preset is not None
+    assert cn_preset is not None
+    assert preset.suggested_models[:3] == (
+        "qwen3.7-plus",
+        "qwen3.8-max",
+        "qwen3.7-max",
+    )
+    assert preset.suggested_model_descriptions["qwen3.8-max"].startswith("advanced")
+    assert "qwen3.8-max" not in us_preset.suggested_models
+    assert "qwen3.8-max" not in cn_preset.suggested_models
+
+
+def test_gemini_aliases_preserve_active_and_provider_managed_model_ids() -> None:
+    preset = get_preset("gemini")
+
+    assert preset is not None
+    for model in (
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest",
+        "gemini-pro-latest",
+    ):
+        assert canonical_model_alias_for_preset(preset, model) == model
+
+    assert canonical_model_alias_for_preset(preset, "gemini-2.0-flash") == ("gemini-3.6-flash")
+
+
+def test_mistral_uses_documented_medium_id_and_preserves_legacy_default() -> None:
+    preset = get_preset("mistral")
+
+    assert preset is not None
+    assert preset.suggested_models[0] == "mistral-medium-3-5"
+    assert canonical_model_alias_for_preset(preset, "mistral-medium-2604") == ("mistral-medium-3-5")
+    assert canonical_model_alias_for_preset(preset, "mistral-medium-latest") == (
+        "mistral-medium-latest"
+    )
 
 
 def test_find_preset_for_profile_matches_base_url_without_requiring_env_var() -> None:
@@ -451,7 +574,7 @@ def test_profile_conversion_replaces_known_incompatible_model() -> None:
     converted = convert_profile_to_preset(profile, native_preset)
 
     assert converted.protocol == "gemini_generate_content"
-    assert converted.default_model == "gemini-3.5-flash"
+    assert converted.default_model == "gemini-3.7-flash"
 
 
 def test_profile_conversion_replaces_provider_qualified_model_ids() -> None:
@@ -479,9 +602,9 @@ def test_profile_conversion_replaces_known_stale_alias_for_target_preset() -> No
         protocol="openai_compat",
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         api_key_env="GEMINI_API_KEY",
-        # gemini-2.5-flash shuts down 2026-10-16 and is aliased forward;
-        # (gemini-3-flash-preview is now a real fallback row, not an alias).
-        default_model="gemini-2.5-flash",
+        # gemini-2.0-flash is shut down and aliases to Google's documented
+        # replacement; active stable and provider-managed aliases are retained.
+        default_model="gemini-2.0-flash",
         web_search_adapter="gemini_grounding",
     )
 
@@ -491,7 +614,7 @@ def test_profile_conversion_replaces_known_stale_alias_for_target_preset() -> No
     converted = convert_profile_to_preset(profile, native_preset)
 
     assert converted.protocol == "gemini_generate_content"
-    assert converted.default_model == "gemini-3.5-flash"
+    assert converted.default_model == "gemini-3.6-flash"
 
 
 def test_find_preset_for_base_url_matches_known_provider() -> None:
@@ -513,3 +636,22 @@ def test_make_profile_from_preset_uses_preset_key_as_name_default() -> None:
 
     assert preset is not None
     assert make_profile_from_preset(preset).name == "openai"
+
+
+def test_primary_picker_never_carries_the_sylliptor_brand_as_a_provider() -> None:
+    for preset in provider_selection_presets():
+        assert "sylliptor" not in preset.label.casefold(), preset.key
+        assert "sylliptor" not in preset_selection_label(preset).casefold(), preset.key
+
+
+def test_hosted_sylliptor_preset_stays_intact_behind_the_advanced_picker() -> None:
+    advanced_keys = [preset.key for preset in advanced_provider_selection_presets()]
+    assert "sylliptor" in advanced_keys
+
+    hosted = get_preset("sylliptor")
+    assert hosted is not None
+    assert preset_selection_label(hosted) == "Sylliptor Pro (hosted models) - requires login"
+    # The preset itself must keep working for `sylliptor login` / sylliptor_cloud.
+    assert hosted.api_key_env is None
+    # Retired MiMo-trial ids migrate to the Pro default.
+    assert canonical_model_alias_for_preset(hosted, "mimo") == "deepseek-v4-flash"

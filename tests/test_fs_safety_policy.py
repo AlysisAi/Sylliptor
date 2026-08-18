@@ -1,0 +1,611 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+import stat
+import subprocess
+from pathlib import Path
+
+import pytest
+from rich.console import Console
+
+import sylliptor_agent_cli.tools.fs as fs_module
+from sylliptor_agent_cli.agent.errors import AgentRuntimeError
+from sylliptor_agent_cli.agent_loop import build_tools
+from sylliptor_agent_cli.config import AppConfig
+from sylliptor_agent_cli.session_store import SessionStore
+from sylliptor_agent_cli.surface import ApprovalDecision, ApprovalRequest, NoopSurface
+from sylliptor_agent_cli.tools.fs import (
+    StaleFileError,
+    capture_file_precondition,
+    classify_sensitive_path,
+    fs_delete,
+    fs_move,
+    prepare_fs_edit,
+    prepare_fs_write,
+    write_prepared_fs_edit,
+    write_prepared_fs_write,
+)
+
+
+def _store(root: Path, *, enabled: bool = False) -> SessionStore:
+    return SessionStore(
+        enabled=enabled,
+        sessions_dir=root / "sessions",
+        session_id="fs-safety-policy-test",
+        cwd=str(root),
+        repo_root=str(root),
+    )
+
+
+class _RecordingSurface(NoopSurface):
+    host_managed_approvals = True
+
+    def __init__(
+        self,
+        *,
+        decision: ApprovalDecision = ApprovalDecision(allow=True),
+        before_decision: object | None = None,
+    ) -> None:
+        self.decision = decision
+        self.before_decision = before_decision
+        self.requests: list[ApprovalRequest] = []
+        self.patch_events: list[object] = []
+
+    def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
+        self.requests.append(request)
+        if callable(self.before_decision):
+            self.before_decision()
+        return self.decision
+
+    def on_patch_generated(self, event: object) -> None:
+        self.patch_events.append(event)
+
+
+def _tools(
+    root: Path,
+    *,
+    surface: NoopSurface,
+    mode: str = "auto",
+    yes: bool = True,
+    store: SessionStore | None = None,
+) -> dict[str, object]:
+    return build_tools(
+        root=root,
+        console=Console(file=io.StringIO(), force_terminal=False),
+        surface=surface,
+        store=store or _store(root),
+        mode=mode,
+        yes=yes,
+        cfg=AppConfig(model="test-model"),
+        non_interactive=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "sensitive", "category"),
+    [
+        (".env", True, "environment_file"),
+        ("config/.env.production", True, "environment_file"),
+        (".env.example", False, None),
+        ("config/.env.test.template", False, None),
+        ("keys/id_ed25519", True, "private_key"),
+        ("keys/id_ed25519.pub", False, None),
+        ("tls/server.pem", True, "private_key"),
+        ("keys/deploy.ppk", True, "private_key"),
+        (".aws/credentials", True, "credential_directory"),
+        (".docker/config.json", True, "credential_directory"),
+        (".ssh/config", True, "credential_directory"),
+        (".kube/config", True, "credential_directory"),
+        (".gnupg/random.txt", True, "credential_directory"),
+        ("infra/kubeconfig", True, "credential_file"),
+        ("config/service-account-prod.json", True, "credential_file"),
+        ("config/settings.json", False, None),
+    ],
+)
+def test_sensitive_path_classification(path: str, sensitive: bool, category: str | None) -> None:
+    result = classify_sensitive_path(path)
+    assert result.sensitive is sensitive
+    assert result.category == category
+
+
+def test_prepared_edit_rejects_human_change_with_stable_code(tmp_path: Path) -> None:
+    target = tmp_path / "demo.txt"
+    target.write_text("before\n", encoding="utf-8")
+    prepared = prepare_fs_edit(
+        root=tmp_path,
+        path="demo.txt",
+        edits=[{"op": "replace_exact", "target": "before", "replacement": "agent"}],
+    )
+
+    target.write_text("human\n", encoding="utf-8")
+
+    with pytest.raises(StaleFileError) as raised:
+        write_prepared_fs_edit(prepared, root=tmp_path)
+    assert raised.value.code == "stale_file"
+    assert target.read_text(encoding="utf-8") == "human\n"
+    assert not list(tmp_path.glob(".demo.txt.*.tmp"))
+
+
+def test_prepared_write_rejects_file_created_while_waiting(tmp_path: Path) -> None:
+    prepared = prepare_fs_write(root=tmp_path, path="new.txt", content="agent\n")
+    (tmp_path / "new.txt").write_text("human\n", encoding="utf-8")
+
+    with pytest.raises(StaleFileError, match="stale_file"):
+        write_prepared_fs_write(prepared, root=tmp_path)
+
+    assert (tmp_path / "new.txt").read_text(encoding="utf-8") == "human\n"
+
+
+def test_atomic_write_preserves_edit_injected_after_final_precondition_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "demo.txt"
+    target.write_text("before\n", encoding="utf-8")
+    prepared = prepare_fs_write(root=tmp_path, path="demo.txt", content="agent\n")
+    original_assert = fs_module.assert_file_precondition
+    injected = False
+
+    def assert_then_inject(*, root: Path, precondition: object) -> None:
+        nonlocal injected
+        original_assert(root=root, precondition=precondition)  # type: ignore[arg-type]
+        if not injected:
+            injected = True
+            target.write_text("human\n", encoding="utf-8")
+
+    monkeypatch.setattr(fs_module, "assert_file_precondition", assert_then_inject)
+
+    with pytest.raises(StaleFileError, match="stale_file"):
+        write_prepared_fs_write(prepared, root=tmp_path)
+
+    assert target.read_text(encoding="utf-8") == "human\n"
+    assert not list(tmp_path.glob(".demo.txt.*.tmp"))
+    assert not list(tmp_path.glob(".demo.txt.*.displaced"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not portable to Windows")
+def test_atomic_edit_preserves_existing_permissions(tmp_path: Path) -> None:
+    target = tmp_path / "script.sh"
+    target.write_text("echo before\n", encoding="utf-8")
+    target.chmod(0o751)
+    prepared = prepare_fs_edit(
+        root=tmp_path,
+        path="script.sh",
+        edits=[{"op": "replace_exact", "target": "before", "replacement": "after"}],
+    )
+
+    write_prepared_fs_edit(prepared, root=tmp_path)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o751
+
+
+def test_tool_edit_returns_stale_file_when_approval_wait_races(tmp_path: Path) -> None:
+    target = tmp_path / "demo.txt"
+    target.write_text("before\n", encoding="utf-8")
+    surface = _RecordingSurface(
+        before_decision=lambda: target.write_text("human\n", encoding="utf-8")
+    )
+    tools = _tools(tmp_path, surface=surface, mode="review", yes=False)
+
+    result = tools["fs_edit"].run(  # type: ignore[attr-defined]
+        {
+            "path": "demo.txt",
+            "edits": [{"op": "replace_exact", "target": "before", "replacement": "agent"}],
+        }
+    )
+
+    assert result["error_code"] == "stale_file"
+    assert result["recoverable"] is True
+    assert target.read_text(encoding="utf-8") == "human\n"
+
+
+def test_tool_write_returns_stale_file_when_approval_wait_races(tmp_path: Path) -> None:
+    target = tmp_path / "demo.txt"
+    target.write_text("before\n", encoding="utf-8")
+    surface = _RecordingSurface(
+        before_decision=lambda: target.write_text("human\n", encoding="utf-8")
+    )
+    tools = _tools(tmp_path, surface=surface, mode="review", yes=False)
+
+    result = tools["fs_write"].run(  # type: ignore[attr-defined]
+        {"path": "demo.txt", "content": "agent\n"}
+    )
+
+    assert result["error_code"] == "stale_file"
+    assert target.read_text(encoding="utf-8") == "human\n"
+
+
+@pytest.mark.parametrize("tool_name", ["fs_delete", "fs_move"])
+def test_destructive_tool_rejects_source_change_during_approval(
+    tmp_path: Path, tool_name: str
+) -> None:
+    target = tmp_path / "demo.txt"
+    target.write_text("before\n", encoding="utf-8")
+    surface = _RecordingSurface(
+        before_decision=lambda: target.write_text("human\n", encoding="utf-8")
+    )
+    tools = _tools(tmp_path, surface=surface, mode="review", yes=False)
+    args = (
+        {"path": "demo.txt"}
+        if tool_name == "fs_delete"
+        else {"source_path": "demo.txt", "destination_path": "moved.txt"}
+    )
+
+    result = tools[tool_name].run(args)  # type: ignore[attr-defined]
+
+    assert result["error_code"] == "stale_file"
+    assert target.read_text(encoding="utf-8") == "human\n"
+    assert not (tmp_path / "moved.txt").exists()
+
+
+def test_delete_preserves_edit_injected_after_final_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "demo.txt"
+    target.write_text("before\n", encoding="utf-8")
+    precondition = capture_file_precondition(root=tmp_path, path="demo.txt")
+    original_assert = fs_module.assert_file_precondition
+    injected = False
+
+    def assert_then_inject(*, root: Path, precondition: object) -> None:
+        nonlocal injected
+        original_assert(root=root, precondition=precondition)  # type: ignore[arg-type]
+        if not injected:
+            injected = True
+            target.write_text("human\n", encoding="utf-8")
+
+    monkeypatch.setattr(fs_module, "assert_file_precondition", assert_then_inject)
+
+    with pytest.raises(StaleFileError, match="stale_file"):
+        fs_delete(root=tmp_path, path="demo.txt", precondition=precondition)
+
+    assert target.read_text(encoding="utf-8") == "human\n"
+
+
+def test_delete_rejects_path_recreated_after_verified_displacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "demo.txt"
+    target.write_text("before\n", encoding="utf-8")
+    precondition = capture_file_precondition(root=tmp_path, path="demo.txt")
+    original_match = fs_module._displaced_file_matches
+    match_checks = 0
+
+    def match_then_recreate(path: Path, expected: object) -> bool:
+        nonlocal match_checks
+        result = original_match(path, expected)  # type: ignore[arg-type]
+        match_checks += 1
+        if match_checks == 2:
+            target.write_text("human\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(fs_module, "_displaced_file_matches", match_then_recreate)
+
+    with pytest.raises(StaleFileError, match="stale_file"):
+        fs_delete(root=tmp_path, path="demo.txt", precondition=precondition)
+
+    assert target.read_text(encoding="utf-8") == "human\n"
+
+
+@pytest.mark.parametrize("racing_endpoint", ["source", "destination"])
+def test_move_rolls_back_other_endpoint_when_commit_boundary_races(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    racing_endpoint: str,
+) -> None:
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "destination.txt"
+    source.write_text("source-before\n", encoding="utf-8")
+    destination.write_text("destination-before\n", encoding="utf-8")
+    source_precondition = capture_file_precondition(root=tmp_path, path="source.txt")
+    destination_precondition = capture_file_precondition(root=tmp_path, path="destination.txt")
+    original_displace = fs_module._displace_regular_file_if_matches
+    injected = False
+
+    def displace_after_human_edit(*, target_path: Path, precondition: object) -> Path | None:
+        nonlocal injected
+        if not injected and target_path == (source if racing_endpoint == "source" else destination):
+            injected = True
+            target_path.write_text(f"{racing_endpoint}-human\n", encoding="utf-8")
+        return original_displace(
+            target_path=target_path,
+            precondition=precondition,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(fs_module, "_displace_regular_file_if_matches", displace_after_human_edit)
+
+    with pytest.raises(StaleFileError, match="stale_file"):
+        fs_move(
+            root=tmp_path,
+            source_path="source.txt",
+            destination_path="destination.txt",
+            overwrite=True,
+            source_precondition=source_precondition,
+            destination_precondition=destination_precondition,
+        )
+
+    expected_source = "source-human\n" if racing_endpoint == "source" else "source-before\n"
+    expected_destination = (
+        "destination-human\n" if racing_endpoint == "destination" else "destination-before\n"
+    )
+    assert source.read_text(encoding="utf-8") == expected_source
+    assert destination.read_text(encoding="utf-8") == expected_destination
+
+
+@pytest.mark.parametrize("racing_endpoint", ["source", "destination"])
+def test_copy_rejects_endpoint_change_during_approval(tmp_path: Path, racing_endpoint: str) -> None:
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "destination.txt"
+    source.write_text("source-before\n", encoding="utf-8")
+    destination.write_text("destination-before\n", encoding="utf-8")
+    raced = source if racing_endpoint == "source" else destination
+    surface = _RecordingSurface(
+        before_decision=lambda: raced.write_text(f"{racing_endpoint}-human\n", encoding="utf-8")
+    )
+    tools = _tools(tmp_path, surface=surface, mode="review", yes=False)
+
+    result = tools["fs_copy"].run(  # type: ignore[attr-defined]
+        {
+            "source_path": "source.txt",
+            "destination_path": "destination.txt",
+            "overwrite": True,
+        }
+    )
+
+    assert result["error_code"] == "stale_file"
+    assert raced.read_text(encoding="utf-8") == f"{racing_endpoint}-human\n"
+
+
+def test_copy_preserves_destination_edit_injected_at_commit_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "destination.txt"
+    source.write_text("source\n", encoding="utf-8")
+    destination.write_text("destination-before\n", encoding="utf-8")
+    source_precondition = capture_file_precondition(root=tmp_path, path="source.txt")
+    destination_precondition = capture_file_precondition(root=tmp_path, path="destination.txt")
+    original_displace = fs_module._displace_regular_file_if_matches
+
+    def displace_after_human_edit(*, target_path: Path, precondition: object) -> Path | None:
+        if target_path == destination:
+            destination.write_text("destination-human\n", encoding="utf-8")
+        return original_displace(
+            target_path=target_path,
+            precondition=precondition,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(fs_module, "_displace_regular_file_if_matches", displace_after_human_edit)
+
+    with pytest.raises(StaleFileError, match="stale_file"):
+        fs_module.fs_copy(
+            root=tmp_path,
+            source_path="source.txt",
+            destination_path="destination.txt",
+            overwrite=True,
+            source_precondition=source_precondition,
+            destination_precondition=destination_precondition,
+        )
+
+    assert source.read_text(encoding="utf-8") == "source\n"
+    assert destination.read_text(encoding="utf-8") == "destination-human\n"
+
+
+def test_git_apply_rejects_change_during_approval(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    target = tmp_path / "demo.txt"
+    target.write_text("before\n", encoding="utf-8", newline="\n")
+    surface = _RecordingSurface(
+        before_decision=lambda: target.write_text("human\n", encoding="utf-8", newline="\n")
+    )
+    tools = _tools(tmp_path, surface=surface, mode="review", yes=False)
+    patch = """diff --git a/demo.txt b/demo.txt
+--- a/demo.txt
++++ b/demo.txt
+@@ -1 +1 @@
+-before
++agent
+"""
+
+    result = tools["git_apply_patch"].run({"patch": patch})  # type: ignore[attr-defined]
+
+    assert result["error_code"] == "stale_file"
+    assert target.read_text(encoding="utf-8") == "human\n"
+
+
+def test_sensitive_read_requires_one_time_approval_even_in_fullaccess(tmp_path: Path) -> None:
+    secret = "token=do-not-render"
+    (tmp_path / ".env").write_text(secret, encoding="utf-8")
+    surface = _RecordingSurface()
+    tools = _tools(tmp_path, surface=surface, mode="fullaccess", yes=True)
+
+    result = tools["fs_read"].run({"path": ".env"})  # type: ignore[attr-defined]
+
+    assert result["content"] == secret
+    assert result["_sylliptor_output_policy"]["persist"] == "redact"
+    [request] = surface.requests
+    assert request.kind == "fs_read"
+    assert request.allow_for_session_scope is None
+    assert request.metadata["mandatory_explicit_approval"] is True
+    assert secret not in request.preview
+
+
+@pytest.mark.parametrize("path", ["keys/deploy.ppk", ".kube/config", ".ssh/custom-key"])
+def test_credential_locations_require_explicit_read_approval(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    target = tmp_path / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("credential-canary", encoding="utf-8")
+    surface = _RecordingSurface(decision=ApprovalDecision(allow=False))
+    tools = _tools(tmp_path, surface=surface, mode="fullaccess", yes=True)
+
+    with pytest.raises(AgentRuntimeError):
+        tools["fs_read"].run({"path": path})  # type: ignore[attr-defined]
+
+    [request] = surface.requests
+    assert request.metadata["mandatory_explicit_approval"] is True
+    assert "credential-canary" not in request.preview
+
+
+def test_sensitive_read_rejects_auto_or_session_decision_without_reading(tmp_path: Path) -> None:
+    secret = "token=never-returned"
+    (tmp_path / ".env.local").write_text(secret, encoding="utf-8")
+    surface = _RecordingSurface(decision=ApprovalDecision(allow=True, allow_for_session=True))
+    tools = _tools(tmp_path, surface=surface, mode="fullaccess", yes=True)
+
+    with pytest.raises(AgentRuntimeError) as raised:
+        tools["fs_read"].run({"path": ".env.local"})  # type: ignore[attr-defined]
+
+    assert "Automatic or session approval cannot authorize" in str(raised.value)
+    assert secret not in str(raised.value)
+
+
+def test_sensitive_write_never_persists_or_emits_content_preview(tmp_path: Path) -> None:
+    secret = "API_TOKEN=super-secret-value"
+    surface = _RecordingSurface()
+    store = _store(tmp_path, enabled=True)
+    tools = _tools(
+        tmp_path,
+        surface=surface,
+        mode="fullaccess",
+        yes=True,
+        store=store,
+    )
+
+    result = tools["fs_write"].run(  # type: ignore[attr-defined]
+        {"path": ".env.production", "content": secret}
+    )
+
+    assert (tmp_path / ".env.production").read_text(encoding="utf-8") == secret
+    assert result["_sylliptor_output_policy"]["display"] == "redact"
+    serialized_events = json.dumps(store.events_snapshot(), ensure_ascii=True)
+    assert secret not in serialized_events
+    assert "sensitive_change_preview" in serialized_events
+    assert surface.patch_events == []
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["fs_edit", "fs_write", "fs_move", "fs_copy", "fs_delete", "git_apply_patch"],
+)
+def test_every_sensitive_mutation_rejects_human_edit_during_explicit_approval(
+    tmp_path: Path, tool_name: str
+) -> None:
+    target = tmp_path / ".env"
+    target.write_text("before\n", encoding="utf-8", newline="\n")
+    if tool_name == "git_apply_patch":
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    surface = _RecordingSurface(
+        before_decision=lambda: target.write_text("human\n", encoding="utf-8", newline="\n")
+    )
+    tools = _tools(tmp_path, surface=surface, mode="fullaccess", yes=True)
+    args_by_tool: dict[str, dict[str, object]] = {
+        "fs_edit": {
+            "path": ".env",
+            "edits": [{"op": "replace_exact", "target": "before", "replacement": "agent"}],
+        },
+        "fs_write": {"path": ".env", "content": "agent\n"},
+        "fs_move": {"source_path": ".env", "destination_path": "moved.txt"},
+        "fs_copy": {"source_path": ".env", "destination_path": "copied.txt"},
+        "fs_delete": {"path": ".env"},
+        "git_apply_patch": {
+            "patch": """diff --git a/.env b/.env
+--- a/.env
++++ b/.env
+@@ -1 +1 @@
+-before
++agent
+"""
+        },
+    }
+
+    result = tools[tool_name].run(args_by_tool[tool_name])  # type: ignore[attr-defined]
+
+    assert result["error_code"] == "stale_file"
+    assert result["recoverable"] is True
+    assert target.read_text(encoding="utf-8") == "human\n"
+    assert not (tmp_path / "moved.txt").exists()
+    assert not (tmp_path / "copied.txt").exists()
+    assert [request.kind for request in surface.requests] == [tool_name]
+
+
+def test_sensitive_create_rejects_file_created_during_explicit_approval(tmp_path: Path) -> None:
+    target = tmp_path / ".env.local"
+    surface = _RecordingSurface(
+        before_decision=lambda: target.write_text("human\n", encoding="utf-8")
+    )
+    tools = _tools(tmp_path, surface=surface, mode="fullaccess", yes=True)
+
+    result = tools["fs_write"].run(  # type: ignore[attr-defined]
+        {"path": ".env.local", "content": "agent\n"}
+    )
+
+    assert result["error_code"] == "stale_file"
+    assert target.read_text(encoding="utf-8") == "human\n"
+
+
+@pytest.mark.parametrize("tool_name", ["fs_move", "fs_copy"])
+def test_sensitive_destination_edit_during_approval_is_preserved(
+    tmp_path: Path, tool_name: str
+) -> None:
+    source = tmp_path / "source.txt"
+    destination = tmp_path / ".env.production"
+    source.write_text("source\n", encoding="utf-8")
+    destination.write_text("before\n", encoding="utf-8")
+    surface = _RecordingSurface(
+        before_decision=lambda: destination.write_text("human\n", encoding="utf-8")
+    )
+    tools = _tools(tmp_path, surface=surface, mode="fullaccess", yes=True)
+
+    result = tools[tool_name].run(  # type: ignore[attr-defined]
+        {
+            "source_path": "source.txt",
+            "destination_path": ".env.production",
+            "overwrite": True,
+        }
+    )
+
+    assert result["error_code"] == "stale_file"
+    assert source.read_text(encoding="utf-8") == "source\n"
+    assert destination.read_text(encoding="utf-8") == "human\n"
+
+
+def test_sensitive_edit_validation_error_does_not_echo_file_content(tmp_path: Path) -> None:
+    secret = "PRIVATE_VALUE_THAT_MUST_NOT_BE_IN_ERRORS"
+    (tmp_path / ".env").write_text(secret, encoding="utf-8")
+    surface = _RecordingSurface()
+    tools = _tools(tmp_path, surface=surface, mode="fullaccess", yes=True)
+
+    with pytest.raises(AgentRuntimeError) as raised:
+        tools["fs_edit"].run(  # type: ignore[attr-defined]
+            {
+                "path": ".env",
+                "edits": [
+                    {
+                        "op": "replace_lines",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "expected_old": "a different value",
+                        "replacement": "replacement",
+                    }
+                ],
+            }
+        )
+
+    assert secret not in str(raised.value)
+    assert "content details were redacted" in str(raised.value)
+
+
+def test_env_example_remains_readable_without_approval(tmp_path: Path) -> None:
+    (tmp_path / ".env.example").write_text("TOKEN=placeholder\n", encoding="utf-8")
+    surface = _RecordingSurface(decision=ApprovalDecision(allow=False))
+    tools = _tools(tmp_path, surface=surface, mode="fullaccess", yes=True)
+
+    result = tools["fs_read"].run({"path": ".env.example"})  # type: ignore[attr-defined]
+
+    assert result["content"].splitlines() == ["TOKEN=placeholder"]
+    assert "_sylliptor_output_policy" not in result
+    assert surface.requests == []

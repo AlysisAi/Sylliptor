@@ -145,7 +145,13 @@ def _supports_disabled_thinking(model: str) -> bool:
 
 
 def _thinking_enabled_by_default(model: str) -> bool:
-    """Models whose documented default already includes adaptive thinking."""
+    """Models whose documented default already includes adaptive thinking.
+
+    Opus joined the 5-generation families here: on Opus 5 an omitted ``thinking``
+    field runs adaptive, where on Opus 4.8/4.7 the same request did not think at
+    all. Reporting that honestly matters for output budgeting — ``max_tokens``
+    caps thinking and answer text together.
+    """
 
     normalized = str(model or "").strip().casefold()
     if "claude-mythos-preview" in normalized:
@@ -153,7 +159,7 @@ def _thinking_enabled_by_default(model: str) -> bool:
     version = _claude_model_version(model)
     if version is None or version.major < 5:
         return False
-    return version.family in {"fable", "mythos", "sonnet"}
+    return version.family in {"fable", "mythos", "opus", "sonnet"}
 
 
 def _supports_output_effort(model: str) -> bool:
@@ -226,6 +232,11 @@ def _anthropic_thinking_plan(
     if enable_thinking is False or effort == "none":
         if not _supports_disabled_thinking(model):
             raise LLMError(f"Anthropic model {model!r} does not support disabling thinking")
+        # output_effort stays None on purpose: Opus 5 accepts disabled thinking
+        # only at effort 'high' or below, and rejects it outright at xhigh/max.
+        # Emitting no effort leaves the server default (high), which is the
+        # documented way to keep a thinking-off route legal. Do not pass the
+        # caller's effort through here.
         return _AnthropicThinkingPlan(
             config={"type": "disabled"},
             output_effort=None,

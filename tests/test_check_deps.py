@@ -83,7 +83,7 @@ def test_find_missing_dependencies_accepts_declared_and_server_optional_deps(
 ) -> None:
     root = _write_project(
         tmp_path,
-        dependencies=["httpx>=0.27.0", "packaging>=23.0", "pillow>=10.0.0"],
+        dependencies=["httpx>=0.27.0", "packaging>=23.0", "pillow>=12.3.0"],
     )
     source = root / "src" / "sylliptor_agent_cli"
     (source / "demo.py").write_text(

@@ -903,13 +903,16 @@ def test_headless_slash_help_opens_popup_not_routed_to_runner():
 
 
 def test_help_popup_rows_render_green_commands_and_descriptions():
-    from sylliptor_agent_cli.cli_impl.tui.app import _help_inner_width, _help_rows_for_sections
+    from sylliptor_agent_cli.cli_impl.tui.app import (
+        _help_content_width_for,
+        _help_rows_for_sections,
+    )
 
     sections = [
         ("Getting Started", [("/help", "commands & config"), ("/status", "session details")]),
         ("Execution", [("/mode", "change execution mode")]),
     ]
-    width = _help_inner_width(100)
+    width = _help_content_width_for(100)
     rows = _help_rows_for_sections(sections, width)
     # Every row is padded to the panel width (solid background block).
     assert all(sum(len(t) for _s, t in row) == width for row in rows)

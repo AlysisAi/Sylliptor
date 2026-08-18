@@ -478,7 +478,7 @@ def test_extract_skills_eval_metrics_tracks_launch_runtime_events() -> None:
     assert metrics["completion_gate_incomplete_after_retries_count"] == 1
     assert metrics["forced_final_summary_count"] == 1
     assert metrics["verification_credit_miss_count"] == 2
-    assert metrics["execution_posture_fallback_count"] == 1
+    assert "execution_posture_fallback_count" not in metrics
 
 
 def test_extract_skills_eval_metrics_counts_one_shot_launch_runtime_events() -> None:
@@ -541,7 +541,6 @@ def test_aggregate_skills_eval_records_computes_mode_rates() -> None:
             completion_gate_incomplete_after_retries_count=0,
             forced_final_summary_count=0,
             verification_credit_miss_count=1,
-            execution_posture_fallback_count=1,
             session_log_path=None,
             session_artifact_root=None,
         ),
@@ -578,7 +577,6 @@ def test_aggregate_skills_eval_records_computes_mode_rates() -> None:
             completion_gate_incomplete_after_retries_count=1,
             forced_final_summary_count=1,
             verification_credit_miss_count=0,
-            execution_posture_fallback_count=0,
             session_log_path=None,
             session_artifact_root=None,
         ),
@@ -630,7 +628,6 @@ def test_aggregate_skills_eval_records_computes_mode_rates() -> None:
     assert combined_auto["completion_gate_incomplete_after_retries_rate"] == 0.5
     assert combined_auto["forced_final_summary_rate"] == 0.5
     assert combined_auto["verification_credit_miss_rate"] == 0.5
-    assert combined_auto["execution_posture_fallback_rate"] == 0.5
     assert baseline["skipped_runs"] == 1
     assert summary["relevant_skill_usage_rate"] == 1.0
     assert summary["explicit_invocation_success_rate"] is None
@@ -944,9 +941,6 @@ def test_render_skills_eval_summary_markdown_includes_launch_metrics_and_release
         "verification_credit_miss_count": 1,
         "verification_credit_miss_run_count": 1,
         "verification_credit_miss_rate": 0.5,
-        "execution_posture_fallback_count": 1,
-        "execution_posture_fallback_run_count": 1,
-        "execution_posture_fallback_rate": 0.5,
         "pass_rate": 0.5,
         "relevant_skill_usage_rate": 1.0,
         "explicit_invocation_success_rate": 1.0,

@@ -730,7 +730,11 @@ def _resolve_chat_resume_direct_session_id(*, raw_value: str, sessions_dir: Path
     return normalized_id
 
 
-def _load_chat_resume_messages(path: Path) -> list[dict[str, Any]]:
+def _load_chat_resume_messages(
+    path: Path,
+    *,
+    synthesized_tool_results: list[str] | None = None,
+) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     pending_tool_calls: list[dict[str, Any]] = []
     pending_tool_index = 0
@@ -834,9 +838,14 @@ def _load_chat_resume_messages(path: Path) -> list[dict[str, Any]]:
                     # replay accumulated so far, then continue applying newer
                     # events. Fresh session bootstrap messages are added by
                     # create_session and therefore are intentionally excluded.
+                    # The snapshot may end inside an open tool turn, so pairing
+                    # state must be rebuilt from it rather than blanked or the
+                    # turn's remaining tool_result events would be dropped.
                     out = restored
-                    pending_tool_calls = []
-                    pending_tool_index = 0
+                    (
+                        pending_tool_calls,
+                        pending_tool_index,
+                    ) = _restored_snapshot_pending_tool_state(restored)
         elif event_type == "user_message":
             _append_message("user", _user_message_display_content(payload))
         elif event_type in {"assistant_message", "final", "route_decision"}:
@@ -851,7 +860,93 @@ def _load_chat_resume_messages(path: Path) -> list[dict[str, Any]]:
             _append_message("assistant", content)
         elif event_type == "tool_result":
             _append_tool_result(payload)
+    repaired_ids = _reconcile_chat_resume_tool_results(out)
+    if repaired_ids and synthesized_tool_results is not None:
+        synthesized_tool_results.extend(repaired_ids)
     return out
+
+
+_CHAT_RESUME_SYNTHETIC_TOOL_RESULT_CONTENT = "[tool result unavailable after session resume]"
+
+
+def _restored_snapshot_pending_tool_state(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Rebuild tool pairing state from a restored compaction snapshot.
+
+    Returns the trailing assistant turn's tool_calls plus how many are already
+    answered, but only when the snapshot ends inside that open turn; any later
+    user or assistant message closes the turn, so replayed tool_result events
+    can no longer be appended legally and the state resets instead.
+    """
+    open_calls: list[dict[str, Any]] = []
+    answered = 0
+    for message in messages:
+        role = str(message.get("role") or "").strip()
+        if role == "assistant":
+            raw_calls = message.get("tool_calls")
+            open_calls = (
+                [call for call in raw_calls if isinstance(call, dict)]
+                if isinstance(raw_calls, list)
+                else []
+            )
+            answered = 0
+        elif role == "tool":
+            answered += 1
+        elif role == "user":
+            open_calls = []
+            answered = 0
+    if open_calls and answered < len(open_calls):
+        return open_calls, answered
+    return [], 0
+
+
+def _reconcile_chat_resume_tool_results(messages: list[dict[str, Any]]) -> list[str]:
+    """Answer every orphaned assistant tool_call with a synthetic tool result.
+
+    Providers reject transcripts whose tool_use blocks have no matching
+    result, and replay can drop results (empty rendered content, snapshot
+    boundaries, truncated logs). Synthetic placeholders are inserted at the
+    end of the run of tool messages directly following the owning assistant
+    turn, preserving assistant text that deletion would discard. Idempotent:
+    previously inserted placeholders count as answers on a later pass.
+    """
+    synthesized: list[str] = []
+    idx = 0
+    while idx < len(messages):
+        message = messages[idx]
+        idx += 1
+        if str(message.get("role") or "") != "assistant":
+            continue
+        raw_calls = message.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            continue
+        call_ids = [
+            str(call.get("id") or "").strip()
+            for call in raw_calls
+            if isinstance(call, dict) and str(call.get("id") or "").strip()
+        ]
+        if not call_ids:
+            continue
+        answered: set[str] = set()
+        while idx < len(messages) and str(messages[idx].get("role") or "") == "tool":
+            answered.add(str(messages[idx].get("tool_call_id") or "").strip())
+            idx += 1
+        for call_id in call_ids:
+            if call_id in answered:
+                continue
+            answered.add(call_id)
+            messages.insert(
+                idx,
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": _CHAT_RESUME_SYNTHETIC_TOOL_RESULT_CONTENT,
+                },
+            )
+            idx += 1
+            synthesized.append(call_id)
+    return synthesized
 
 
 def _redact_chat_resume_context_text(text: Any) -> str:

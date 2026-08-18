@@ -163,8 +163,47 @@ def test_usage_panel_unknown_cost_not_green():
             }
 
     spec = panels._chat_usage_panel_spec(session=SimpleNamespace(usage_summary=_Sum()))
-    cost = [(v, tone) for _name, rows in spec["sections"] for (k, v, tone) in rows if k == "cost"]
+    cost = [
+        (v, tone) for _name, rows in spec["sections"] for (k, v, tone) in rows if k == "billing"
+    ]
     assert cost and cost[0][1] != "accent"  # not painted healthy-green
+
+
+def test_usage_panel_labels_subscription_and_unreported_cache_fields() -> None:
+    class _Sum:
+        def by_model_rows(self):
+            return [
+                {
+                    "model": "gpt-subscription",
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "total_tokens": 110,
+                    "known_cost_calls": 0,
+                    "unknown_cost_count": 0,
+                    "subscription_calls": 2,
+                    "api_usage_calls": 1,
+                    "estimate_usage_calls": 1,
+                    "cache_read_input_tokens": 0,
+                    "cache_read_reported_calls": 1,
+                    "cache_creation_input_tokens": 0,
+                    "cache_creation_reported_calls": 0,
+                }
+            ]
+
+        def totals(self):
+            return {
+                **self.by_model_rows()[0],
+                "unknown_cost_calls": 0,
+                "corrected_usage_calls": 0,
+            }
+
+    spec = panels._chat_usage_panel_spec(session=SimpleNamespace(usage_summary=_Sum()))
+    blob = _values(spec)
+    assert "subscription" in blob
+    assert "cache read 0" in blob
+    assert "partial 1/2" in blob
+    assert "cache write not reported" in blob
+    assert "processed is cumulative across calls, not current context" in blob
 
 
 def test_usage_panel_warns_when_tool_schema_shadow_budget_is_exceeded():
@@ -378,6 +417,57 @@ def test_picker_rows_wrap_long_description_capped_and_full_width():
     assert len(desc_lines) <= _PICKER_MAX_DESC_LINES
 
 
+def test_picker_rows_tag_override_replaces_current_tag():
+    # A row's "tag" key overrides the "(current)" tag text: "(default)" renders
+    # in the tag slot, and an explicit empty tag suppresses the tag even on a
+    # row flagged current (the Forge launch gate relies on both — its focused
+    # row must not echo a redundant "(current)" next to the highlight band).
+    from sylliptor_agent_cli.cli_impl.tui.app import _render_picker_rows
+
+    rows = [
+        {
+            "label": "Launch now",
+            "description": "Build 2 task(s).",
+            "value": "go",
+            "current": True,
+            "tag": "",
+        },
+        {
+            "label": "Verify: warn",
+            "description": "Failed checks are reported.",
+            "value": "verify",
+            "tag": "(default)",
+        },
+        {
+            "label": "Scope: strict",
+            "description": "Own files only.",
+            "value": "scope",
+            "current": True,
+        },
+    ]
+    rendered = _render_picker_rows(rows, 0, 60)
+    joined = " ".join("".join(t for _s, t in row) for row in rendered)
+    assert "(default)" in joined
+    # A row without a "tag" key keeps the legacy "(current)" behaviour; the
+    # launch row's explicit empty tag suppressed its own.
+    assert joined.count("(current)") == 1
+
+
+def test_picker_tag_never_orphans_onto_its_own_line():
+    # A tag that does not fit after the last description line pulls the last
+    # word of the description down with it, so the continuation reads as a
+    # natural wrap instead of a lone, misaligned "(default)" line.
+    from sylliptor_agent_cli.cli_impl.tui.app import _render_picker_rows
+
+    # width 25, label "L" → desc column at 8, desc width 17: "alpha beta gamma"
+    # (16) fits on one line, but not together with " (default)" (10).
+    rows = [{"label": "L", "description": "alpha beta gamma", "value": "x", "tag": "(default)"}]
+    rendered = _render_picker_rows(rows, 0, 25)
+    lines = ["".join(t for _s, t in row) for row in rendered]
+    assert any("gamma (default)" in line for line in lines)
+    assert not any(line.strip() == "(default)" for line in lines)
+
+
 def test_picker_hint_wraps_and_honours_linebreaks_no_clip():
     # A long, two-line hint must wrap (never clip on the right) and keep both
     # segments fully intact.
@@ -392,6 +482,227 @@ def test_picker_hint_wraps_and_honours_linebreaks_no_clip():
     # Both the keybinding line and the full status note survive (nothing truncated).
     assert "Esc cancel" in joined
     assert "enable with /subagent on" in joined
+
+
+# ------------------------------------------------- float geometry (width drift)
+
+
+def test_float_chrome_constants_match_prompt_toolkit():
+    # _FRAME_COLS / _SCROLLBAR_COLS are what every popup's content width is
+    # derived from, so pin them against what prompt_toolkit ACTUALLY paints
+    # rather than trusting the arithmetic: a Frame costs 2 content columns, and a
+    # ScrollbarMargin costs 1 more. If an upgrade changes either, the popups
+    # would silently start re-wrapping again — fail here instead.
+    from prompt_toolkit.layout.containers import Float, FloatContainer, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.layout.margins import ScrollbarMargin
+    from prompt_toolkit.widgets import Frame
+
+    from sylliptor_agent_cli.cli_impl.tui.app import _FRAME_COLS, _SCROLLBAR_COLS
+
+    outer = 60
+    plain = Window(FormattedTextControl(lambda: []))
+    scrolling = Window(FormattedTextControl(lambda: []), right_margins=[ScrollbarMargin()])
+    root = FloatContainer(
+        content=Window(),
+        floats=[
+            Float(content=Frame(plain), width=outer, height=10, top=0, left=0),
+            Float(content=Frame(scrolling), width=outer, height=10, top=12, left=0),
+        ],
+    )
+    _render_container(root, cols=100, rows=40)
+
+    assert plain.render_info is not None and scrolling.render_info is not None
+    assert plain.render_info.window_width == outer - _FRAME_COLS
+    assert scrolling.render_info.window_width == outer - _FRAME_COLS - _SCROLLBAR_COLS
+
+
+def test_every_float_content_width_derives_from_its_own_float():
+    # The bug this pins: the picker's rows were built at the HELP panel's width.
+    # The popups are deliberately different widths, so each one's content width
+    # must come from its own outer width minus its own chrome — borrowing a
+    # sibling's formula is wrong at every terminal size.
+    from sylliptor_agent_cli.cli_impl.tui.app import (
+        _FRAME_COLS,
+        _SCROLLBAR_COLS,
+        _approval_content_width_for,
+        _approval_width_for,
+        _help_content_width_for,
+        _help_panel_width_for,
+        _picker_content_width_for,
+        _picker_width_for,
+        _transcript_content_width_for,
+    )
+
+    for cols in range(40, 220):
+        assert _picker_content_width_for(cols) == _picker_width_for(cols) - _FRAME_COLS
+        assert _approval_content_width_for(cols) == _approval_width_for(cols) - _FRAME_COLS
+        # The help panel is the only framed float that also scrolls.
+        assert (
+            _help_content_width_for(cols)
+            == _help_panel_width_for(cols) - _FRAME_COLS - _SCROLLBAR_COLS
+        )
+        # The transcript is unframed but scrolls.
+        assert _transcript_content_width_for(cols) == cols - _SCROLLBAR_COLS
+
+
+def test_float_bodies_build_rows_at_their_own_content_width(monkeypatch):
+    # The wiring, not just the arithmetic: each float's body function must ask its
+    # row builder for ITS OWN content width. This is where the bug actually lived
+    # — the geometry helpers can all be right while the body still calls the wrong
+    # one. Drives the real body callables out of the real layout.
+    from sylliptor_agent_cli.cli_impl.tui import app as tui_app
+
+    cases = [
+        ("class:tui.picker", "_render_picker_rows", 2, tui_app._picker_content_width_for),
+        ("class:tui.help", "_help_rows_for_sections", 1, tui_app._help_content_width_for),
+    ]
+    for style, builder_name, width_arg, expected_width in cases:
+        for cols in (60, 80, 90, 91, 95, 100, 160):
+            seen: list[int] = []
+            real = getattr(tui_app, builder_name)
+
+            def spy(*a, _real=real, _seen=seen, _i=width_arg, **k):
+                _seen.append(a[_i])
+                return _real(*a, **k)
+
+            monkeypatch.setattr(tui_app, builder_name, spy)
+            app = _captured_app(cols)
+            control = _float_body_control(app, style)
+            with _set_app(app):
+                control.text()  # the float's real body function
+            monkeypatch.undo()
+
+            assert seen, f"{style} body never built rows"
+            assert seen[-1] == expected_width(cols), (
+                f"{style} at {cols} cols built rows {seen[-1] - expected_width(cols):+d} "
+                f"columns off its own window — prompt_toolkit would re-wrap them"
+            )
+
+
+def test_forge_planner_picker_renders_clean_at_95_columns():
+    # The reported break, pinned. At 95 columns the picker window is 74 wide, but
+    # the rows were built at the help panel's 79 — so "…together before" ran 5
+    # columns past the edge and prompt_toolkit re-wrapped it as "…together b" /
+    # "efore" at column 0, while the doubled screen rows pushed the hint line out
+    # of the box entirely.
+    from sylliptor_agent_cli.cli_impl.tui.app import (
+        _picker_content_width_for,
+        _render_picker_rows,
+    )
+
+    rows = [
+        {
+            "label": "Yes — use the planner assistant",
+            "description": "Draft and refine the plan together before building.",
+            "value": "yes",
+            "current": True,
+        },
+        {
+            "label": "No — plan it myself",
+            "description": "Enter Forge and shape the plan with /goal and /task.",
+            "value": "no",
+        },
+    ]
+    hint = "↑↓ move · Enter select · Esc cancel"
+    width = _picker_content_width_for(95)
+    rendered = _render_picker_rows(rows, 0, width, hint)
+
+    assert all(sum(len(t) for _s, t in row) == width for row in rendered)
+    lines = ["".join(t for _s, t in row) for row in rendered]
+    # The description wraps on a word boundary, under the description column —
+    # never split mid-word ("together b" / "efore") against the left edge.
+    assert not any(line.startswith("efore") for line in lines)
+    assert any("before building. (current)" in line for line in lines)
+    # The hint is still inside the box (it was clipped off by the overflow).
+    assert any("Esc cancel" in line for line in lines)
+
+
+def test_panel_builders_emit_exact_width_rows_at_every_width():
+    # The panel builders floored the RIGHT column (`max(10, width - cmd_w - gap)`)
+    # instead of shrinking the label column, so on a narrow panel they emitted
+    # rows wider than the window — which re-wrap to column 0 — even when handed a
+    # correct width. The /help hint was likewise appended raw at 42 columns.
+    from sylliptor_agent_cli.cli_impl.tui.app import (
+        _help_rows_for_sections,
+        _render_kv_panel_rows,
+    )
+
+    sections = [
+        ("Getting Started", [("/help", "commands & config"), ("/status", "session details")]),
+        ("Execution", [("/a-very-long-command-name-that-overflows", "change execution mode")]),
+    ]
+    kv = [("Session", [("a-very-long-key-name-that-overflows", "value one", "accent")])]
+    for width in range(20, 200):
+        for rows in (_help_rows_for_sections(sections, width), _render_kv_panel_rows(kv, width)):
+            assert all(sum(len(t) for _s, t in row) == width for row in rows), width
+
+
+def test_help_panel_keeps_descriptions_readable_on_a_narrow_panel():
+    # Fitting the row is not enough: one very long command must not consume the
+    # whole panel and shred the descriptions a letter per line. The command column
+    # is capped at half the panel and the command clipped into it.
+    from sylliptor_agent_cli.cli_impl.tui.app import _help_rows_for_sections
+
+    sections = [("Execution", [("/a-very-long-command-name-that-overflows", "change mode")])]
+    width = 35
+    lines = ["".join(t for _s, t in row) for row in _help_rows_for_sections(sections, width)]
+    assert any("…" in line for line in lines)  # the command gave way, clipped
+    assert any("change mode" in line for line in lines)  # the description stayed whole
+
+
+def test_approval_modal_always_shows_its_key_legend():
+    # The modal does not scroll, so a long command used to push [y]/[a]/[n] past
+    # the window height: the user was asked to consent with no visible way to
+    # answer. The body is budgeted so the legend always survives.
+    from sylliptor_agent_cli.cli_impl.tui.app import (
+        _FRAME_COLS,
+        _approval_body_budget,
+        _approval_content_width_for,
+        _render_approval_rows,
+    )
+
+    request = SimpleNamespace(
+        kind="shell_run",
+        files=[],
+        reason="Model requested a shell command.",
+        command="git log --all "
+        + "--grep=some-fairly-long-search-pattern " * 20
+        + "&& rm -rf ./build",
+    )
+    for screen_rows in (16, 20, 24, 30, 40, 60):
+        width = _approval_content_width_for(100)
+        rows = _render_approval_rows(
+            request, width, max_body_lines=_approval_body_budget(screen_rows)
+        )
+        assert all(sum(len(t) for _s, t in row) == width for row in rows)
+        # Only the first window_height rows are reachable (no scrolling).
+        window_height = max(6, min(len(rows) + _FRAME_COLS, screen_rows - 4)) - _FRAME_COLS
+        visible = rows[:window_height]
+        assert any(
+            any(style == "class:tui.approve.key.yes" for style, _t in row) for row in visible
+        ), f"[y]/[a]/[n] legend fell outside the modal at {screen_rows} screen rows"
+
+
+def test_approval_modal_elides_the_middle_not_the_tail_of_a_command():
+    # A consent prompt must not hide the end of the command: the dangerous part is
+    # as likely to be a suffix ("… && rm -rf /") as a prefix. Both ends survive and
+    # the drop is stated.
+    from sylliptor_agent_cli.cli_impl.tui.app import _render_approval_rows
+
+    request = SimpleNamespace(
+        kind="shell_run",
+        files=[],
+        reason="",
+        command="echo start " + "--padding-argument-to-force-wrapping " * 30 + "&& rm -rf /",
+    )
+    lines = [
+        "".join(t for _s, t in row) for row in _render_approval_rows(request, 60, max_body_lines=8)
+    ]
+    joined = " ".join(lines)
+    assert "echo start" in joined  # head kept
+    assert "rm -rf /" in joined  # tail kept — the part that matters most
+    assert any("more lines hidden" in line for line in lines)  # and the drop is admitted
 
 
 def test_kv_panel_renderer_clips_long_keys_and_headers_to_width():
@@ -445,6 +756,79 @@ def _run_headless(state, keys, **kwargs):
     with create_pipe_input() as pipe:
         pipe.send_text(keys)
         return run_tui(state, owl_color=False, input=pipe, output=DummyOutput(), **kwargs)
+
+
+def _captured_app(cols: int, rows: int = 40):
+    """Build the real TUI app at a fixed terminal size WITHOUT running it.
+
+    ``run_tui`` ends in ``Application.run()``; stubbing that out hands back the
+    fully-wired app so a test can drive individual pieces of the real layout.
+    """
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.data_structures import Size
+
+    class _SizedOutput(DummyOutput):
+        def get_size(self) -> Size:
+            return Size(rows=rows, columns=cols)
+
+    captured: dict = {}
+    real_run = Application.run
+    Application.run = lambda self, *a, **k: captured.__setitem__("app", self)
+    try:
+        with create_pipe_input() as pipe:
+            run_tui(
+                TuiState(model_name="m", username="t"),
+                owl_color=False,
+                input=pipe,
+                output=_SizedOutput(),
+                session_builder=_FakeSession,
+                command_runner=_runner([]),
+                background_turns=False,
+            )
+    finally:
+        Application.run = real_run
+    assert "app" in captured, "run_tui did not build an Application"
+    return captured["app"]
+
+
+def _set_app(app):
+    """get_app() inside the width helpers must resolve to THIS app's output."""
+    from prompt_toolkit.application.current import set_app
+
+    return set_app(app)
+
+
+def _float_body_control(app, style: str):
+    """The control driving the float whose body Window carries ``style``."""
+    from prompt_toolkit.layout.containers import Window
+
+    for container in app.layout.walk():
+        if isinstance(container, Window) and container.style == style:
+            return container.content
+    raise AssertionError(f"no window styled {style!r} in the layout")
+
+
+def _render_container(container, *, cols: int, rows: int) -> None:
+    """Really render ``container`` at a fixed terminal size.
+
+    Populates each Window's ``render_info``, so a test can read the width
+    prompt_toolkit actually paints into rather than trusting arithmetic.
+    """
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.application.current import set_app
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.layout import Layout
+
+    class _SizedOutput(DummyOutput):
+        def get_size(self) -> Size:
+            return Size(rows=rows, columns=cols)
+
+    with create_pipe_input() as pipe:
+        app: Application = Application(
+            layout=Layout(container), input=pipe, output=_SizedOutput(), full_screen=True
+        )
+        with set_app(app):
+            app.renderer.render(app, app.layout)
 
 
 def test_panel_provider_called_with_arg_and_opens_on_bare():
@@ -762,3 +1146,42 @@ def test_picker_long_list_navigates_to_far_row():
         background_turns=False,
     )
     assert picked["value"] == "s25"
+
+
+def test_usage_panel_marks_derived_uncached_input_and_hides_empty_cache_bits() -> None:
+    class _Sum:
+        def by_model_rows(self):
+            return [
+                {
+                    "model": "gpt-derived",
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "total_tokens": 110,
+                    "known_cost_calls": 0,
+                    "unknown_cost_count": 0,
+                    "api_usage_calls": 1,
+                    "estimate_usage_calls": 0,
+                    "input_tokens_uncached": 60,
+                    "input_tokens_uncached_reported_calls": 0,
+                    "input_tokens_uncached_derived_calls": 1,
+                    "cache_read_input_tokens": 0,
+                    "cache_read_reported_calls": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_creation_reported_calls": 0,
+                }
+            ]
+
+        def totals(self):
+            return {
+                **self.by_model_rows()[0],
+                "unknown_cost_calls": 0,
+                "corrected_usage_calls": 0,
+            }
+
+    spec = panels._chat_usage_panel_spec(session=SimpleNamespace(usage_summary=_Sum()))
+    blob = _values(spec)
+
+    assert "input uncached 60 (derived)" in blob
+    # A provider that reports no cache figures at all should not repeat
+    # "not reported" on every per-model row.
+    assert "cache r:not reported" not in blob

@@ -3,17 +3,20 @@ name: sandbox-image
 on:
   push:
     tags:
-      - "v*"
+      - "sandbox-v*"
   pull_request:
     paths:
       - .github/workflows/sandbox-image.yml
       - sandbox/**
       - .dockerignore
       - .trivyignore
+      - pyproject.toml
+      - uv.lock
+      - src/**
   workflow_dispatch:
     inputs:
       default_variant:
-        description: Variant that also receives the latest and release tags.
+        description: Variant that receives the latest alias when moving tags are promoted.
         required: false
         default: dev
         type: choice
@@ -21,11 +24,11 @@ on:
           - dev
           - base
           - server
-      release_tag:
-        description: Optional existing release image tag to repair from the selected ref.
+      publish_moving_tags:
+        description: Promote :base, :dev, :server, and :latest after all verification succeeds.
         required: false
-        default: ""
-        type: string
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -41,51 +44,80 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  validate-source:
+    name: validate release source
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      release_tag: ${{ steps.source.outputs.release_tag }}
+      sha12: ${{ steps.source.outputs.sha12 }}
+      source_date_epoch: ${{ steps.source.outputs.source_date_epoch }}
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate trusted source and isolated sandbox tag namespace
+        id: source
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_REPOSITORY: AlysisAi/Sylliptor
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${REPOSITORY}" = "${EXPECTED_REPOSITORY}"
+          test "${REPOSITORY_PRIVATE}" = "false"
+          test "${REPOSITORY_VISIBILITY}" = "public"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+
+          release_tag=""
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            test "${REF_TYPE}" = "tag"
+            [[ "${REF_NAME}" =~ ^sandbox-v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+            test "$(git rev-parse "${REF_NAME}^{commit}")" = "${GITHUB_SHA}"
+            git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${DEFAULT_BRANCH}"
+            release_tag="${REF_NAME}"
+          else
+            test "${GITHUB_REF}" = "refs/heads/${DEFAULT_BRANCH}"
+          fi
+
+          {
+            echo "release_tag=${release_tag}"
+            echo "sha12=${GITHUB_SHA::12}"
+            echo "source_date_epoch=$(git show -s --format=%ct HEAD)"
+          } >> "${GITHUB_OUTPUT}"
+
   build-scan-pr:
-    name: build dev (pr)
+    name: build, scan, and smoke dev (pr)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     permissions:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
-
-      - name: Resolve image coordinates
-        id: image
-        shell: bash
-        run: |
-          set -euo pipefail
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          echo "image=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve build version
-        id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_SHA::12}"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.image.outputs.image }}
-          tags: |
-            type=raw,value=dev
-            type=sha,format=short,prefix=dev-
-            type=raw,value=latest
-
-      - name: Build sandbox image
+      - name: Build local PR image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ./sandbox
           file: ./sandbox/Dockerfile
@@ -94,86 +126,71 @@ jobs:
           load: true
           provenance: false
           sbom: false
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=sandbox-dev
-          cache-to: type=gha,mode=max,scope=sandbox-dev
+          tags: sylliptor-sandbox-pr:${{ github.sha }}
+          cache-from: type=gha,scope=sandbox-pr-dev-amd64
+          cache-to: type=gha,mode=max,scope=sandbox-pr-dev-amd64
           build-args: |
             VARIANT=dev
             SOURCE_URL=https://github.com/${{ github.repository }}
             GIT_SHA=${{ github.sha }}
-            VERSION=${{ steps.version.outputs.version }}
+            VERSION=pr-${{ github.sha }}
 
-      - name: Run Trivy vulnerability scan
+      - name: Run blocking Trivy vulnerability scan
         id: trivy
-        uses: aquasecurity/trivy-action@v0.35.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
-          image-ref: ${{ steps.image.outputs.image }}:dev-${{ steps.version.outputs.version }}
+          image-ref: sylliptor-sandbox-pr:${{ github.sha }}
           format: sarif
-          output: trivy-dev.sarif
-          exit-code: "0"
-          ignore-unfixed: true
+          output: trivy-pr-dev-amd64.sarif
+          exit-code: "1"
+          ignore-unfixed: false
           vuln-type: os,library
           severity: HIGH,CRITICAL
           trivyignores: .trivyignore
           limit-severities-for-sarif: true
           cache: true
-          skip-dirs: node_modules,tests/fixtures
 
-      - name: Upload Trivy SARIF artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: trivy-dev-sarif
-          path: trivy-dev.sarif
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Write job summary
-        if: always()
-        env:
-          TAGS: ${{ steps.meta.outputs.tags }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-          TRIVY: ${{ steps.trivy.outcome }}
+      - name: Smoke local PR image
         shell: bash
         run: |
           set -euo pipefail
-          tags="${TAGS:-n/a}"
-          tags="${tags//$'\n'/<br>}"
-          digest="${DIGEST:-n/a}"
-          trivy="${TRIVY:-not-run}"
-          {
-            echo "## Sandbox Image"
-            echo
-            echo "| variant | platforms | tags | digest | trivy |"
-            echo "| --- | --- | --- | --- | --- |"
-            echo "| dev | linux/amd64 | ${tags} | ${digest} | ${trivy} |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          docker run --rm --platform linux/amd64 \
+            "sylliptor-sandbox-pr:${GITHUB_SHA}" \
+            sh -euc 'test "$(id -u)" = 1000; python --version; git --version; rg --version; node --version; npm --version; go version; rustc --version; cargo --version'
 
-  build-scan-publish:
-    name: build ${{ matrix.variant }}
+      - name: Upload Trivy SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trivy-pr-dev-amd64-sarif
+          path: trivy-pr-dev-amd64.sarif
+          if-no-files-found: error
+          retention-days: 30
+
+  build-verify-candidate:
+    name: build and verify ${{ matrix.variant }} candidate
     if: github.event_name != 'pull_request'
+    needs: validate-source
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     permissions:
       actions: read
-      contents: read
-      packages: write
-      id-token: write
       attestations: write
+      artifact-metadata: write
+      contents: read
+      id-token: write
+      packages: write
       security-events: write
-    outputs:
-      default_digest: ${{ steps.expose.outputs.default_digest }}
     strategy:
       fail-fast: false
       matrix:
         variant: ["base", "dev", "server"]
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Resolve image coordinates
         id: image
@@ -181,61 +198,29 @@ jobs:
         run: |
           set -euo pipefail
           owner="${GITHUB_REPOSITORY_OWNER,,}"
-          echo "image=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve build version
-        id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-          release_tag="${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || '' }}"
-          if [[ -n "${release_tag}" ]]; then
-            if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-              echo "Invalid release tag: ${release_tag}" >&2
-              exit 1
-            fi
-            if ! git ls-remote --exit-code --tags origin "refs/tags/${release_tag}" >/dev/null; then
-              echo "Release tag does not exist: ${release_tag}" >&2
-              exit 1
-            fi
-            version="${release_tag}"
-          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            version="${GITHUB_REF_NAME}"
-          else
-            version="${GITHUB_SHA::12}"
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          image="${REGISTRY}/${owner}/${IMAGE_NAME}"
+          candidate="${image}:candidate-${{ matrix.variant }}-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+          echo "candidate=${candidate}" >> "${GITHUB_OUTPUT}"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_PAT }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.image.outputs.image }}
-          tags: |
-            type=raw,value=${{ matrix.variant }}
-            type=sha,format=short,prefix=${{ matrix.variant }}-
-            type=ref,event=tag,prefix=${{ matrix.variant }}-
-            type=raw,value=${{ matrix.variant }}-${{ inputs.release_tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' }}
-            type=raw,value=latest,enable=${{ matrix.variant == env.DEFAULT_VARIANT }}
-            type=ref,event=tag,enable=${{ matrix.variant == env.DEFAULT_VARIANT }}
-            type=raw,value=${{ inputs.release_tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && matrix.variant == env.DEFAULT_VARIANT }}
-
-      - name: Build sandbox image
+      # Only the source-bound candidate namespace is written here. Consumer-facing
+      # aliases are created by the promotion job after every variant and platform passes.
+      - name: Build and push immutable multi-platform candidate
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ${{ matrix.variant == 'server' && '.' || './sandbox' }}
           file: ./sandbox/Dockerfile
@@ -243,178 +228,638 @@ jobs:
           push: true
           provenance: mode=max
           sbom: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.image.outputs.candidate }}
           cache-from: type=gha,scope=sandbox-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=sandbox-${{ matrix.variant }}
           build-args: |
             VARIANT=${{ matrix.variant }}
             SOURCE_URL=https://github.com/${{ github.repository }}
             GIT_SHA=${{ github.sha }}
-            VERSION=${{ steps.version.outputs.version }}
+            VERSION=${{ needs.validate-source.outputs.release_tag || needs.validate-source.outputs.sha12 }}
+            SOURCE_DATE_EPOCH=${{ needs.validate-source.outputs.source_date_epoch }}
 
-      - name: Expose default variant digest
-        id: expose
-        if: matrix.variant == env.DEFAULT_VARIANT
+      - name: Resolve and validate both platform manifests
+        id: platforms
+        env:
+          CANDIDATE: ${{ steps.image.outputs.candidate }}
+          EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.image.outputs.image }}
         shell: bash
-        run: echo "default_digest=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          observed="$(docker buildx imagetools inspect "${CANDIDATE}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          test "${observed}" = "${EXPECTED_DIGEST}"
+          docker buildx imagetools inspect "${CANDIDATE}" --raw > manifest.json
 
-      - name: Run Trivy vulnerability scan
-        id: trivy
-        uses: aquasecurity/trivy-action@v0.35.0
+          resolve_platform_digest() {
+            local architecture="$1"
+            jq -er --arg architecture "${architecture}" \
+              '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture) | .digest] | if length == 1 then .[0] else error("expected exactly one linux/" + $architecture + " manifest") end' \
+              manifest.json
+          }
+
+          amd64_digest="$(resolve_platform_digest amd64)"
+          arm64_digest="$(resolve_platform_digest arm64)"
+          {
+            echo "amd64_digest=${amd64_digest}"
+            echo "arm64_digest=${arm64_digest}"
+            echo "amd64_ref=${IMAGE}@${amd64_digest}"
+            echo "arm64_ref=${IMAGE}@${arm64_digest}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Validate and bind both platform SBOM predicates
+        id: sbom
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          VARIANT: ${{ matrix.variant }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sandbox-sbom
+
+          validate_sbom() {
+            local platform="$1"
+            local architecture="$2"
+            local path="sandbox-sbom/${VARIANT}-${architecture}.spdx.json"
+            local sbom_size
+            local temporary="${path}.tmp"
+
+            docker buildx imagetools inspect "${IMAGE}@${DIGEST}" \
+              --format "{{json (index .SBOM \"${platform}\").SPDX}}" \
+              | jq -S -c . > "${temporary}"
+            mv "${temporary}" "${path}"
+            jq -e '
+              type == "object"
+              and .spdxVersion == "SPDX-2.3"
+              and .SPDXID == "SPDXRef-DOCUMENT"
+              and .dataLicense == "CC0-1.0"
+              and (.documentNamespace | type == "string" and length > 0)
+              and (.creationInfo | type == "object")
+              and (.creationInfo.creators | type == "array" and length > 0)
+              and (.packages | type == "array" and length > 0)
+            ' "${path}" > /dev/null
+            sbom_size="$(stat -c '%s' "${path}")"
+            if (( sbom_size < 2 || sbom_size > 16777216 )); then
+              echo "${platform} SBOM is outside the GitHub attestation size boundary: ${sbom_size} bytes" >&2
+              exit 1
+            fi
+            echo "${architecture}_sha256=$(sha256sum "${path}" | awk '{print $1}')" \
+              >> "${GITHUB_OUTPUT}"
+          }
+
+          validate_sbom linux/amd64 amd64
+          validate_sbom linux/arm64 arm64
+
+      - name: Scan linux/amd64 candidate manifest
+        id: trivy-amd64
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
-          image-ref: ${{ steps.image.outputs.image }}:${{ matrix.variant }}-${{ steps.version.outputs.version }}
+          image-ref: ${{ steps.platforms.outputs.amd64_ref }}
           format: sarif
-          output: trivy-${{ matrix.variant }}.sarif
+          output: trivy-${{ matrix.variant }}-amd64.sarif
           exit-code: "1"
-          ignore-unfixed: true
+          ignore-unfixed: false
           vuln-type: os,library
           severity: HIGH,CRITICAL
           trivyignores: .trivyignore
           limit-severities-for-sarif: true
           cache: true
-          skip-dirs: node_modules,tests/fixtures
 
-      - name: Upload Trivy SARIF artifact
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Scan linux/arm64 candidate manifest
+        id: trivy-arm64
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
-          name: trivy-${{ matrix.variant }}-sarif
-          path: trivy-${{ matrix.variant }}.sarif
+          image-ref: ${{ steps.platforms.outputs.arm64_ref }}
+          format: sarif
+          output: trivy-${{ matrix.variant }}-arm64.sarif
+          exit-code: "1"
+          ignore-unfixed: false
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          trivyignores: .trivyignore
+          limit-severities-for-sarif: true
+          cache: true
+
+      - name: Smoke both candidate architectures
+        env:
+          AMD64_REF: ${{ steps.platforms.outputs.amd64_ref }}
+          ARM64_REF: ${{ steps.platforms.outputs.arm64_ref }}
+          VARIANT: ${{ matrix.variant }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke="test \"\$(id -u)\" = 1000; python --version; git --version; rg --version"
+          if [[ "${VARIANT}" != "base" ]]; then
+            smoke="${smoke}; node --version; npm --version; go version; rustc --version; cargo --version"
+          fi
+          if [[ "${VARIANT}" == "server" ]]; then
+            smoke="${smoke}; sylliptor --version"
+          fi
+
+          docker pull --platform linux/amd64 "${AMD64_REF}"
+          docker run --rm --platform linux/amd64 "${AMD64_REF}" sh -euc "${smoke}"
+          docker pull --platform linux/arm64 "${ARM64_REF}"
+          docker run --rm --platform linux/arm64 "${ARM64_REF}" sh -euc "${smoke}"
+
+      - name: Set up Python for end-to-end doctor
+        if: matrix.variant == 'dev'
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up locked uv runtime for end-to-end doctor
+        if: matrix.variant == 'dev'
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.11.23"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked Sylliptor environment
+        if: matrix.variant == 'dev'
+        run: uv sync --locked --no-dev
+
+      - name: Run end-to-end sandbox doctor against candidate digest
+        if: matrix.variant == 'dev'
+        env:
+          SYLLIPTOR_SHELL_SANDBOX_BACKEND: docker
+          SYLLIPTOR_SHELL_SANDBOX_CLEAR_ENV: "1"
+          SYLLIPTOR_SHELL_SANDBOX_DOCKER_IMAGE: ${{ steps.platforms.outputs.amd64_ref }}
+          SYLLIPTOR_SHELL_SANDBOX_MODE: strict
+          SYLLIPTOR_SHELL_SANDBOX_NETWORK: off
+          SYLLIPTOR_SERVER_DOCKER_IMAGE: ${{ steps.platforms.outputs.amd64_ref }}
+          SYLLIPTOR_SERVER_WORKER_BACKEND: docker
+        run: uv run --locked sylliptor sandbox doctor --smoke
+
+      - name: Upload linux/amd64 Trivy SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@4187e74d05793876e9989daffde9c3e66b4acd07 # v3
+        with:
+          sarif_file: trivy-${{ matrix.variant }}-amd64.sarif
+          category: trivy-sandbox-${{ matrix.variant }}-amd64
+
+      - name: Upload linux/arm64 Trivy SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@4187e74d05793876e9989daffde9c3e66b4acd07 # v3
+        with:
+          sarif_file: trivy-${{ matrix.variant }}-arm64.sarif
+          category: trivy-sandbox-${{ matrix.variant }}-arm64
+
+      - name: Upload Trivy SARIF artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trivy-${{ matrix.variant }}-${{ needs.validate-source.outputs.sha12 }}-sarif
+          path: trivy-${{ matrix.variant }}-*.sarif
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload Trivy SARIF to code scanning
-        if: always()
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-${{ matrix.variant }}.sarif
-          category: trivy-sandbox-${{ matrix.variant }}
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v4.1.1
-
-      - name: Attest build provenance
-        continue-on-error: true
-        uses: actions/attest-build-provenance@v2
+      - name: Attest candidate build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-name: ${{ steps.image.outputs.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
-      - name: Keyless sign pushed image
+      - name: Attest linux/amd64 SBOM predicate
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.platforms.outputs.amd64_digest }}
+          sbom-path: sandbox-sbom/${{ matrix.variant }}-amd64.spdx.json
+          push-to-registry: true
+
+      - name: Attest linux/arm64 SBOM predicate
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.platforms.outputs.arm64_digest }}
+          sbom-path: sandbox-sbom/${{ matrix.variant }}-arm64.spdx.json
+          push-to-registry: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Keyless sign verified candidate digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE: ${{ steps.image.outputs.image }}
+        shell: bash
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Record verified candidate
+        env:
+          AMD64_DIGEST: ${{ steps.platforms.outputs.amd64_digest }}
+          AMD64_SBOM_SHA256: ${{ steps.sbom.outputs.amd64_sha256 }}
+          ARM64_DIGEST: ${{ steps.platforms.outputs.arm64_digest }}
+          ARM64_SBOM_SHA256: ${{ steps.sbom.outputs.arm64_sha256 }}
+          CANDIDATE: ${{ steps.image.outputs.candidate }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          VARIANT: ${{ matrix.variant }}
         shell: bash
         run: |
           set -euo pipefail
-          while IFS= read -r tag; do
-            [[ -z "${tag}" ]] && continue
-            cosign sign --yes "${tag}@${DIGEST}"
-          done <<< "${TAGS}"
+          mkdir -p candidate-record
+          jq -n \
+            --arg candidate "${CANDIDATE}" \
+            --arg digest "${DIGEST}" \
+            --arg image "${IMAGE}" \
+            --arg amd64_digest "${AMD64_DIGEST}" \
+            --arg amd64_sbom_sha256 "${AMD64_SBOM_SHA256}" \
+            --arg arm64_digest "${ARM64_DIGEST}" \
+            --arg arm64_sbom_sha256 "${ARM64_SBOM_SHA256}" \
+            --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg run_id "${GITHUB_RUN_ID}" \
+            --arg source_ref "${GITHUB_REF}" \
+            --arg source_sha "${GITHUB_SHA}" \
+            --arg variant "${VARIANT}" \
+            '{schema_version: 2, candidate: $candidate, digest: $digest, image: $image, run_id: ($run_id | tonumber), run_attempt: ($run_attempt | tonumber), source_ref: $source_ref, source_sha: $source_sha, variant: $variant, platform_digests: {"linux/amd64": $amd64_digest, "linux/arm64": $arm64_digest}, sbom_sha256: {"linux/amd64": $amd64_sbom_sha256, "linux/arm64": $arm64_sbom_sha256}, verification: {trivy: "passed", smoke: "passed", provenance: "attested", sbom: "attested", signature: "signed"}}' \
+            > "candidate-record/${VARIANT}.json"
+
+      - name: Upload verified candidate record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sandbox-candidate-${{ matrix.variant }}-${{ github.sha }}
+          path: candidate-record/${{ matrix.variant }}.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Write job summary
-        if: always()
         env:
-          VARIANT: ${{ matrix.variant }}
-          TAGS: ${{ steps.meta.outputs.tags }}
+          CANDIDATE: ${{ steps.image.outputs.candidate }}
           DIGEST: ${{ steps.build.outputs.digest }}
-          TRIVY: ${{ steps.trivy.outcome }}
+          VARIANT: ${{ matrix.variant }}
         shell: bash
         run: |
           set -euo pipefail
-          tags="${TAGS:-n/a}"
-          tags="${tags//$'\n'/<br>}"
-          digest="${DIGEST:-n/a}"
-          trivy="${TRIVY:-not-run}"
           {
-            echo "## Sandbox Image"
+            echo "## Verified Sandbox Candidate"
             echo
-            echo "| variant | platforms | tags | digest | trivy |"
-            echo "| --- | --- | --- | --- | --- |"
-            echo "| ${VARIANT} | linux/amd64,linux/arm64 | ${tags} | ${digest} | ${trivy} |"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "| variant | platforms | candidate | digest | scan | smoke | provenance | SBOM | signature |"
+            echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+            echo "| ${VARIANT} | linux/amd64, linux/arm64 | ${CANDIDATE} | ${DIGEST} | passed | passed | attested | attested | signed |"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
-  runtime-smoke:
-    name: runtime-smoke (dev image)
+  verify-candidates:
+    name: verify promotion inputs without registry write access
     if: github.event_name != 'pull_request'
-    needs: build-scan-publish
+    needs:
+      - validate-source
+      - build-verify-candidate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     permissions:
+      attestations: read
       contents: read
       packages: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Resolve image coordinates
-        id: image
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Download all verified candidate records
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: sandbox-candidate-*-${{ github.sha }}
+          path: candidate-records
+          merge-multiple: true
+
+      - name: Verify complete records, immutable digests, signatures, and attestations
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          echo "image=${REGISTRY}/${owner}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          mapfile -t records < <(find candidate-records -maxdepth 1 -type f -name '*.json' -print | sort)
+          test "${#records[@]}" -eq 3
+          mapfile -t variants < <(jq -r '.variant' "${records[@]}" | sort -u)
+          test "${variants[*]}" = "base dev server"
 
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          expected_image="${REGISTRY}/${owner}/${IMAGE_NAME}"
+          expected_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/sandbox-image.yml@${GITHUB_REF}"
+
+          verify_platform_sbom() {
+            local image="$1"
+            local image_digest="$2"
+            local index_path="$3"
+            local record="$4"
+            local platform="$5"
+            local architecture="$6"
+            local expected_platform_digest
+            local observed_platform_digest
+            local expected_sbom_sha256
+            local sbom_path
+            local predicates_path
+
+            expected_platform_digest="$(jq -er --arg platform "${platform}" '.platform_digests[$platform]' "${record}")"
+            expected_sbom_sha256="$(jq -er --arg platform "${platform}" '.sbom_sha256[$platform]' "${record}")"
+            observed_platform_digest="$(jq -er --arg architecture "${architecture}" \
+              '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture) | .digest] | if length == 1 then .[0] else error("expected exactly one linux/" + $architecture + " manifest") end' \
+              "${index_path}")"
+            test "${observed_platform_digest}" = "${expected_platform_digest}"
+
+            sbom_path="$(mktemp)"
+            predicates_path="$(mktemp)"
+            docker buildx imagetools inspect "${image}@${image_digest}" \
+              --format "{{json (index .SBOM \"${platform}\").SPDX}}" \
+              | jq -S -c . > "${sbom_path}"
+            jq -e '
+              type == "object"
+              and .spdxVersion == "SPDX-2.3"
+              and .SPDXID == "SPDXRef-DOCUMENT"
+              and .dataLicense == "CC0-1.0"
+              and (.documentNamespace | type == "string" and length > 0)
+              and (.creationInfo | type == "object")
+              and (.creationInfo.creators | type == "array" and length > 0)
+              and (.packages | type == "array" and length > 0)
+            ' "${sbom_path}" > /dev/null
+            test "$(sha256sum "${sbom_path}" | awk '{print $1}')" = "${expected_sbom_sha256}"
+
+            gh attestation verify "oci://${image}@${expected_platform_digest}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/sandbox-image.yml" \
+              --source-ref "${GITHUB_REF}" \
+              --source-digest "${EXPECTED_SHA}" \
+              --deny-self-hosted-runners \
+              --predicate-type https://spdx.dev/Document/v2.3 \
+              --format json \
+              --jq '[.[].verificationResult.statement.predicate]' > "${predicates_path}"
+            # Exact-source reruns can leave more than one valid predicate for an unchanged
+            # platform manifest. At least one must byte-semantically match this candidate's
+            # digest-bound BuildKit SBOM; unrelated valid historical predicates are ignored.
+            jq -e --slurpfile expected "${sbom_path}" \
+              'type == "array" and length > 0 and any(.[]; . == $expected[0])' \
+              "${predicates_path}" > /dev/null
+            rm -f "${sbom_path}" "${predicates_path}"
+          }
+
+          for record in "${records[@]}"; do
+            jq -e \
+              --arg image "${expected_image}" \
+              --arg run_id "${GITHUB_RUN_ID}" \
+              --arg source_ref "${GITHUB_REF}" \
+              --arg source_sha "${EXPECTED_SHA}" \
+              '.schema_version == 2
+               and .image == $image
+               and .source_ref == $source_ref
+               and .source_sha == $source_sha
+               and .run_id == ($run_id | tonumber)
+               and (.run_attempt | type == "number" and . >= 1 and floor == .)
+               and (.variant == "base" or .variant == "dev" or .variant == "server")
+               and .candidate == ($image + ":candidate-" + .variant + "-" + $source_sha + "-" + $run_id + "-" + (.run_attempt | tostring))
+               and (.digest | test("^sha256:[0-9a-f]{64}$"))
+               and (.platform_digests | keys == ["linux/amd64", "linux/arm64"])
+               and (all(.platform_digests[]; test("^sha256:[0-9a-f]{64}$")))
+               and (.sbom_sha256 | keys == ["linux/amd64", "linux/arm64"])
+               and (all(.sbom_sha256[]; test("^[0-9a-f]{64}$")))
+               and .verification == {"trivy":"passed","smoke":"passed","provenance":"attested","sbom":"attested","signature":"signed"}' \
+              "${record}" > /dev/null
+            image="$(jq -r '.image' "${record}")"
+            candidate="$(jq -r '.candidate' "${record}")"
+            digest="$(jq -r '.digest' "${record}")"
+            variant="$(jq -r '.variant' "${record}")"
+            test "$(basename "${record}")" = "${variant}.json"
+            observed="$(docker buildx imagetools inspect "${candidate}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            test "${observed}" = "${digest}"
+            cosign verify \
+              --certificate-identity "${expected_identity}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${image}@${digest}" > /dev/null
+            gh attestation verify "oci://${image}@${digest}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/sandbox-image.yml" \
+              --source-ref "${GITHUB_REF}" \
+              --source-digest "${EXPECTED_SHA}" \
+              --deny-self-hosted-runners \
+              --predicate-type https://slsa.dev/provenance/v1 > /dev/null
+
+            index_path="$(mktemp)"
+            docker buildx imagetools inspect "${image}@${digest}" --raw > "${index_path}"
+            verify_platform_sbom "${image}" "${digest}" "${index_path}" "${record}" linux/amd64 amd64
+            verify_platform_sbom "${image}" "${digest}" "${index_path}" "${record}" linux/arm64 arm64
+            rm -f "${index_path}"
+          done
+
+  promote:
+    name: promote verified sandbox images
+    if: github.event_name != 'pull_request'
+    needs:
+      - validate-source
+      - build-verify-candidate
+      - verify-candidates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: sandbox-release
+    permissions:
+      attestations: read
+      contents: read
+      packages: write
+    steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_PAT }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull freshly published dev image by digest
-        id: dev-image
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Download all verified candidate records
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: sandbox-candidate-*-${{ github.sha }}
+          path: candidate-records
+          merge-multiple: true
+
+      - name: Reverify all candidates before any alias is changed
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          dev_tag="${{ steps.image.outputs.image }}:dev"
-          sha_tag="${{ steps.image.outputs.image }}:dev-${GITHUB_SHA::12}"
-          dev_digest="$(docker buildx imagetools inspect "${dev_tag}" --format '{{json .Manifest.Digest}}')"
-          sha_digest="$(docker buildx imagetools inspect "${sha_tag}" --format '{{json .Manifest.Digest}}')"
-          dev_digest="${dev_digest%\"}"
-          dev_digest="${dev_digest#\"}"
-          sha_digest="${sha_digest%\"}"
-          sha_digest="${sha_digest#\"}"
-          if [[ -z "${dev_digest}" || "${dev_digest}" == "null" ]]; then
-            echo "Could not resolve digest for ${dev_tag}" >&2
-            exit 1
-          fi
-          if [[ "${dev_digest}" != "${sha_digest}" ]]; then
-            echo "${dev_tag} does not match ${sha_tag}" >&2
-            exit 1
-          fi
-          image="${{ steps.image.outputs.image }}@${dev_digest}"
-          docker pull "${image}"
-          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          mapfile -t records < <(find candidate-records -maxdepth 1 -type f -name '*.json' -print | sort)
+          test "${#records[@]}" -eq 3
+          mapfile -t variants < <(jq -r '.variant' "${records[@]}" | sort -u)
+          test "${variants[*]}" = "base dev server"
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          expected_image="${REGISTRY}/${owner}/${IMAGE_NAME}"
+          expected_identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/sandbox-image.yml@${GITHUB_REF}"
 
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.11.10"
-          enable-cache: true
-          cache-dependency-glob: pyproject.toml
+          verify_platform_sbom() {
+            local image="$1"
+            local image_digest="$2"
+            local index_path="$3"
+            local record="$4"
+            local platform="$5"
+            local architecture="$6"
+            local expected_platform_digest
+            local observed_platform_digest
+            local expected_sbom_sha256
+            local sbom_path
+            local predicates_path
 
-      - name: Install sylliptor
-        run: uv pip install --system -e .
+            expected_platform_digest="$(jq -er --arg platform "${platform}" '.platform_digests[$platform]' "${record}")"
+            expected_sbom_sha256="$(jq -er --arg platform "${platform}" '.sbom_sha256[$platform]' "${record}")"
+            observed_platform_digest="$(jq -er --arg architecture "${architecture}" \
+              '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture) | .digest] | if length == 1 then .[0] else error("expected exactly one linux/" + $architecture + " manifest") end' \
+              "${index_path}")"
+            test "${observed_platform_digest}" = "${expected_platform_digest}"
 
-      - name: Run sandbox runtime smoke
+            sbom_path="$(mktemp)"
+            predicates_path="$(mktemp)"
+            docker buildx imagetools inspect "${image}@${image_digest}" \
+              --format "{{json (index .SBOM \"${platform}\").SPDX}}" \
+              | jq -S -c . > "${sbom_path}"
+            jq -e '
+              type == "object"
+              and .spdxVersion == "SPDX-2.3"
+              and .SPDXID == "SPDXRef-DOCUMENT"
+              and .dataLicense == "CC0-1.0"
+              and (.documentNamespace | type == "string" and length > 0)
+              and (.creationInfo | type == "object")
+              and (.creationInfo.creators | type == "array" and length > 0)
+              and (.packages | type == "array" and length > 0)
+            ' "${sbom_path}" > /dev/null
+            test "$(sha256sum "${sbom_path}" | awk '{print $1}')" = "${expected_sbom_sha256}"
+
+            gh attestation verify "oci://${image}@${expected_platform_digest}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/sandbox-image.yml" \
+              --source-ref "${GITHUB_REF}" \
+              --source-digest "${EXPECTED_SHA}" \
+              --deny-self-hosted-runners \
+              --predicate-type https://spdx.dev/Document/v2.3 \
+              --format json \
+              --jq '[.[].verificationResult.statement.predicate]' > "${predicates_path}"
+            # Exact-source reruns can leave more than one valid predicate for an unchanged
+            # platform manifest. At least one must byte-semantically match this candidate's
+            # digest-bound BuildKit SBOM; unrelated valid historical predicates are ignored.
+            jq -e --slurpfile expected "${sbom_path}" \
+              'type == "array" and length > 0 and any(.[]; . == $expected[0])' \
+              "${predicates_path}" > /dev/null
+            rm -f "${sbom_path}" "${predicates_path}"
+          }
+
+          for record in "${records[@]}"; do
+            jq -e \
+              --arg image "${expected_image}" \
+              --arg run_id "${GITHUB_RUN_ID}" \
+              --arg source_ref "${GITHUB_REF}" \
+              --arg source_sha "${EXPECTED_SHA}" \
+              '.schema_version == 2
+               and .image == $image
+               and .source_ref == $source_ref
+               and .source_sha == $source_sha
+               and .run_id == ($run_id | tonumber)
+               and (.run_attempt | type == "number" and . >= 1 and floor == .)
+               and (.variant == "base" or .variant == "dev" or .variant == "server")
+               and .candidate == ($image + ":candidate-" + .variant + "-" + $source_sha + "-" + $run_id + "-" + (.run_attempt | tostring))
+               and (.digest | test("^sha256:[0-9a-f]{64}$"))
+               and (.platform_digests | keys == ["linux/amd64", "linux/arm64"])
+               and (all(.platform_digests[]; test("^sha256:[0-9a-f]{64}$")))
+               and (.sbom_sha256 | keys == ["linux/amd64", "linux/arm64"])
+               and (all(.sbom_sha256[]; test("^[0-9a-f]{64}$")))
+               and .verification == {"trivy":"passed","smoke":"passed","provenance":"attested","sbom":"attested","signature":"signed"}' \
+              "${record}" > /dev/null
+            image="$(jq -r '.image' "${record}")"
+            candidate="$(jq -r '.candidate' "${record}")"
+            digest="$(jq -r '.digest' "${record}")"
+            variant="$(jq -r '.variant' "${record}")"
+            test "$(basename "${record}")" = "${variant}.json"
+            observed="$(docker buildx imagetools inspect "${candidate}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+            test "${observed}" = "${digest}"
+            cosign verify \
+              --certificate-identity "${expected_identity}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${image}@${digest}" > /dev/null
+            gh attestation verify "oci://${image}@${digest}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/sandbox-image.yml" \
+              --source-ref "${GITHUB_REF}" \
+              --source-digest "${EXPECTED_SHA}" \
+              --deny-self-hosted-runners \
+              --predicate-type https://slsa.dev/provenance/v1 > /dev/null
+
+            index_path="$(mktemp)"
+            docker buildx imagetools inspect "${image}@${digest}" --raw > "${index_path}"
+            verify_platform_sbom "${image}" "${digest}" "${index_path}" "${record}" linux/amd64 amd64
+            verify_platform_sbom "${image}" "${digest}" "${index_path}" "${record}" linux/arm64 arm64
+            rm -f "${index_path}"
+          done
+
+      - name: Promote immutable and requested moving aliases
         env:
-          SYLLIPTOR_SHELL_SANDBOX_BACKEND: docker
-          SYLLIPTOR_SHELL_SANDBOX_CLEAR_ENV: "1"
-          SYLLIPTOR_SHELL_SANDBOX_DOCKER_IMAGE: ${{ steps.dev-image.outputs.image }}
-          SYLLIPTOR_SHELL_SANDBOX_MODE: strict
-          SYLLIPTOR_SHELL_SANDBOX_NETWORK: off
-          SYLLIPTOR_SERVER_DOCKER_IMAGE: ${{ steps.dev-image.outputs.image }}
-          SYLLIPTOR_SERVER_WORKER_BACKEND: docker
-        run: sylliptor sandbox doctor --smoke
+          DEFAULT_VARIANT: ${{ env.DEFAULT_VARIANT }}
+          PUBLISH_MOVING_TAGS: ${{ github.event_name == 'push' || inputs.publish_moving_tags }}
+          RELEASE_TAG: ${{ needs.validate-source.outputs.release_tag }}
+          SHA12: ${{ needs.validate-source.outputs.sha12 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t records < <(find candidate-records -maxdepth 1 -type f -name '*.json' -print | sort)
+          for record in "${records[@]}"; do
+            image="$(jq -r '.image' "${record}")"
+            digest="$(jq -r '.digest' "${record}")"
+            variant="$(jq -r '.variant' "${record}")"
+            tags=()
+
+            append_immutable_tag() {
+              local tag="$1"
+              local existing
+              existing="$(docker buildx imagetools inspect "${image}:${tag}" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
+              if [[ -n "${existing}" && "${existing}" != "${digest}" ]]; then
+                echo "Refusing to overwrite immutable sandbox tag ${image}:${tag}: ${existing} != ${digest}" >&2
+                exit 1
+              fi
+              tags+=(--tag "${image}:${tag}")
+            }
+
+            append_immutable_tag "${variant}-${SHA12}"
+
+            if [[ -n "${RELEASE_TAG}" ]]; then
+              append_immutable_tag "${variant}-${RELEASE_TAG}"
+              if [[ "${variant}" == "${DEFAULT_VARIANT}" ]]; then
+                append_immutable_tag "${RELEASE_TAG}"
+              fi
+            fi
+            if [[ "${PUBLISH_MOVING_TAGS}" == "true" ]]; then
+              tags+=(--tag "${image}:${variant}")
+              if [[ "${variant}" == "${DEFAULT_VARIANT}" ]]; then
+                tags+=(--tag "${image}:latest")
+              fi
+            fi
+
+            docker buildx imagetools create "${tags[@]}" "${image}@${digest}"
+          done
+
+      - name: Write promotion summary
+        env:
+          PUBLISH_MOVING_TAGS: ${{ github.event_name == 'push' || inputs.publish_moving_tags }}
+          RELEASE_TAG: ${{ needs.validate-source.outputs.release_tag }}
+          SHA12: ${{ needs.validate-source.outputs.sha12 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Sandbox Promotion"
+            echo
+            echo "All base, dev, and server images passed blocking HIGH/CRITICAL scans, runtime smoke tests, exact source-bound provenance verification, and platform SBOM predicate verification on linux/amd64 and linux/arm64 before aliases were changed."
+            echo
+            echo "- source: ${GITHUB_SHA}"
+            echo "- immutable suffix: ${SHA12}"
+            echo "- release tag: ${RELEASE_TAG:-none}"
+            echo "- moving tags promoted: ${PUBLISH_MOVING_TAGS}"
+          } >> "${GITHUB_STEP_SUMMARY}"

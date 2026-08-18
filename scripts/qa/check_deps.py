@@ -144,7 +144,7 @@ def main() -> int:
 
     if missing:
         for distribution, path, line in missing:
-            relative_path = path.relative_to(PROJECT_ROOT)
+            relative_path = path.relative_to(PROJECT_ROOT).as_posix()
             print(f"{distribution} imported in {relative_path}:{line}")
         return 1
 

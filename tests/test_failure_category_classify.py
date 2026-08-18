@@ -2,8 +2,8 @@
 
 These lock the observability-spine contract: an arbitrary exception is mapped onto
 exactly one real :class:`FailureCategory` (never the old ``"llm_error"`` literal), so
-the diagnostic vocabulary joins across the chat/run path and Forge workers. A
-readable-but-permanent provider status (auth / bad-request / model) is
+the diagnostic vocabulary joins across the chat/run path, Forge workers, and Power
+candidates. A readable-but-permanent provider status (auth / bad-request / model) is
 reported as ``PROVIDER_ERROR`` and kept distinct from transient outages and from
 genuine agent-implementation failures.
 """
@@ -152,7 +152,7 @@ def test_exit_code_separates_infrastructure_from_real_failures(
     assert exit_code_for_failure(error) == expected
 
 
-def test_runner_outcome_recovers_infrastructure_nonzero_exit_code() -> None:
+def test_runner_outcome_recovers_harbor_nonzero_exit_code() -> None:
     error = RuntimeError("Command failed (exit 75): transient provider outage")
 
     assert extract_process_exit_code(error) == INFRASTRUCTURE_FAILURE_EXIT_CODE

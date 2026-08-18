@@ -27,10 +27,17 @@ class _FakeRunSession:
     def __init__(self, exit_code: int = 0) -> None:
         self.exit_code = exit_code
         self.turns: list[tuple[str, list[str] | None]] = []
+        self.cancellation_tokens: list[Any | None] = []
         self.closed = False
 
-    def run_turn(self, instruction: str, image_paths: list[str] | None = None) -> int:
+    def run_turn(
+        self,
+        instruction: str,
+        image_paths: list[str] | None = None,
+        cancellation_token: Any | None = None,
+    ) -> int:
         self.turns.append((instruction, image_paths))
+        self.cancellation_tokens.append(cancellation_token)
         return self.exit_code
 
     def close(self) -> None:
@@ -160,7 +167,7 @@ def test_require_deadline_fails_before_session_when_deadline_absent(
     assert events[-1]["payload"]["deadline_config_source"] == "absent"
 
 
-def test_default_local_run_still_allows_absent_deadline(
+def test_default_local_run_gets_the_generous_default_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -174,6 +181,30 @@ def test_default_local_run_still_allows_absent_deadline(
     monkeypatch.setattr(agent_loop, "create_session", fake_create_session)
 
     code = agent_loop.run_agent(**_run_agent_kwargs(tmp_path))
+
+    # A local run without --require-deadline is still accepted; it is no longer
+    # unbounded, but the default is generous enough not to affect real work.
+    assert code == 0
+    deadline = captured["execution_deadline"]
+    assert deadline is not None
+    assert deadline.configured_duration_seconds == 3600.0
+    assert str(deadline.source) == "runtime_default"
+
+
+def test_default_local_run_can_opt_out_of_the_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.delenv("SYLLIPTOR_RUN_DEADLINE_SECONDS", raising=False)
+
+    def fake_create_session(**kwargs: Any) -> _FakeRunSession:
+        captured.update(kwargs)
+        return _FakeRunSession()
+
+    monkeypatch.setattr(agent_loop, "create_session", fake_create_session)
+
+    code = agent_loop.run_agent(**_run_agent_kwargs(tmp_path, no_run_deadline=True))
 
     assert code == 0
     assert captured["execution_deadline"] is None
@@ -201,6 +232,7 @@ def test_run_agent_return_type_and_create_session_monkeypatch_remain_compatible(
 
     assert code == 7
     assert fake_session.turns == [("return-code probe", None)]
+    assert fake_session.cancellation_tokens == [None]
     assert fake_session.closed is True
 
 

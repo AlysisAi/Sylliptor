@@ -69,7 +69,6 @@ class SkillsEvalExecutionResult:
     completion_gate_incomplete_after_retries_count: int = 0
     forced_final_summary_count: int = 0
     verification_credit_miss_count: int = 0
-    execution_posture_fallback_count: int = 0
     session_log_path: Path | None = None
     session_artifact_root: Path | None = None
     error: str | None = None
@@ -130,7 +129,6 @@ class SkillsEvalRecord:
     completion_gate_incomplete_after_retries_count: int = 0
     forced_final_summary_count: int = 0
     verification_credit_miss_count: int = 0
-    execution_posture_fallback_count: int = 0
     error: str | None = None
 
     def observed_skill_names(self) -> tuple[str, ...]:
@@ -207,7 +205,6 @@ class SkillsEvalRecord:
             "completion_gate_incomplete_after_retries_count": self.completion_gate_incomplete_after_retries_count,
             "forced_final_summary_count": self.forced_final_summary_count,
             "verification_credit_miss_count": self.verification_credit_miss_count,
-            "execution_posture_fallback_count": self.execution_posture_fallback_count,
             "session_log_path": _relativize_path(self.session_log_path, output_dir),
             "session_artifact_root": _relativize_path(self.session_artifact_root, output_dir),
             "observed_skill_names": list(self.observed_skill_names()),

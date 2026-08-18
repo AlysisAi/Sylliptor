@@ -44,7 +44,6 @@ _DelegatedAuthResult = _wiz._DelegatedAuthResult
 _ProfileStepResult = _wiz._ProfileStepResult
 _ApiKeyStepResult = _wiz._ApiKeyStepResult
 _ModelStepResult = _wiz._ModelStepResult
-_RouterModelStepResult = _wiz._RouterModelStepResult
 _WorkspaceStepResult = _wiz._WorkspaceStepResult
 _SandboxStepResult = _wiz._SandboxStepResult
 
@@ -58,7 +57,6 @@ _PROGRESS_STAGES = (
     "connect_provider",
     "api_key",
     "model",
-    "router_model",
     "workspace",
     "sandbox_choice",
 )
@@ -68,7 +66,6 @@ _PROGRESS_LABELS = {
     "connect_provider": "Provider",
     "api_key": "API key",
     "model": "Model",
-    "router_model": "Router model",
     "workspace": "Workspace",
     "sandbox_choice": "Sandbox",
 }
@@ -80,10 +77,8 @@ _PROGRESS_ALIASES = {
     "validating_key": ("api_key", "API key"),
     "custom_model": ("model", "Model"),
     "validating_model": ("model", "Model"),
+    "model_thinking": ("model", "Reasoning"),
     "model_not_found_confirm": ("model", "Model"),
-    "custom_router_model": ("router_model", "Router model"),
-    "validating_router_model": ("router_model", "Router model"),
-    "router_model_not_found_confirm": ("router_model", "Router model"),
     "workspace_create_confirm": ("workspace", "Workspace"),
     "checking_runtime_auth": ("workspace", "Subscription"),
     "runtime_login_confirm": ("workspace", "Subscription"),
@@ -112,15 +107,6 @@ _POST_COMMIT_STAGES = frozenset(
 )
 
 
-def _merge_validation_messages(*messages: str | None) -> str:
-    merged: list[str] = []
-    for message in messages:
-        normalized = str(message or "").strip()
-        if normalized and normalized not in merged:
-            merged.append(normalized)
-    return " ".join(merged)
-
-
 # Cheap stage → interaction-mode lookup so the application's key-binding filters
 # don't have to build a full :class:`Screen` (and its row list) on every repaint.
 _STAGE_MODE: dict[str, Mode] = {
@@ -130,19 +116,17 @@ _STAGE_MODE: dict[str, Mode] = {
     "connect_provider": "list",
     "provider_advanced": "list",
     "model": "list",
-    "router_model": "list",
+    "model_thinking": "list",
     "sandbox_choice": "list",
     "custom_name": "input",
     "custom_url": "input",
     "custom_headers": "input",
     "api_key": "input",
     "custom_model": "input",
-    "custom_router_model": "input",
     "workspace": "input",
     "workspace_create_confirm": "confirm",
     "validating_key": "busy",
     "validating_model": "busy",
-    "validating_router_model": "busy",
     "committing": "busy",
     "checking_runtime_auth": "busy",
     "runtime_logging_in": "busy",
@@ -153,7 +137,6 @@ _STAGE_MODE: dict[str, Mode] = {
     "logging_in": "busy",
     "sandbox_pull_confirm": "confirm",
     "model_not_found_confirm": "confirm",
-    "router_model_not_found_confirm": "confirm",
     "login_confirm": "confirm",
     "runtime_login_confirm": "confirm",
     "cancel_confirm": "confirm",
@@ -233,7 +216,6 @@ class SetupFlow:
         self.profile_result: _ProfileStepResult | None = None
         self.api_key_result: _ApiKeyStepResult | None = None
         self.model_result: _ModelStepResult | None = None
-        self.router_model_result: _RouterModelStepResult | None = None
         self.workspace_result: _WorkspaceStepResult | None = None
         self.sandbox_result: _SandboxStepResult | None = None
         self.cfg: AppConfig | None = None
@@ -250,13 +232,14 @@ class SetupFlow:
         self._custom_url = ""
         self._custom_headers: dict[str, str] = {}
         self._last_model_not_found = ""
-        self._last_router_model_not_found = ""
         self._sandbox_diag: Any = None
         self._sandbox_plan: Any = None
         self._resume_stage = ""  # stage to return to after a cancel prompt
         self._pending_profile: ProfileSpec | None = None
         self._pending_key = ""
         self._pending_workspace_path: Path | None = None
+        self._discovered_model_options: tuple[Any, ...] = ()
+        self._model_catalog_warning = ""
 
     # ---------------------------------------------------------------- helpers
 
@@ -369,7 +352,10 @@ class SetupFlow:
             stage="provider_advanced",
             mode="list",
             title="Advanced Provider Profile",
-            subtitle="Local endpoints (Ollama, LM Studio, vLLM), custom URLs, and legacy OpenAI-compatible presets.",
+            subtitle=(
+                "Local endpoints (Ollama, LM Studio, vLLM), custom URLs, legacy "
+                "OpenAI-compatible presets, and Sylliptor account sign-in."
+            ),
             rows=rows,
             hint="↑↓ move · Enter select · Esc back",
         )
@@ -433,7 +419,10 @@ class SetupFlow:
 
     def _screen_model(self) -> Screen:
         rows: list[Row] = []
-        for value, label, description in _wiz._model_picker_rows(self.profile_result):  # type: ignore[arg-type]
+        for value, label, description in _wiz._model_picker_rows(  # type: ignore[arg-type]
+            self.profile_result,
+            discovered_models=self._discovered_model_options,
+        ):
             rows.append(Row(label=label, description=description, value=value))
         return Screen(
             stage="model",
@@ -441,7 +430,42 @@ class SetupFlow:
             title="Default Model",
             subtitle=f"Pick the model Sylliptor will use by default for {self.profile_result.label}.",  # type: ignore[union-attr]
             rows=rows,
+            status=self._model_catalog_warning,
+            status_tone="warn" if self._model_catalog_warning else "dim",
             hint="↑↓ move · 1-9 pick · Enter select · Esc back",
+        )
+
+    def _screen_model_thinking(self) -> Screen:
+        model = self.model_result.model if self.model_result is not None else ""
+        current = self.model_result.reasoning_label if self.model_result is not None else "auto"
+        labels = _wiz._setup_reasoning_labels(  # type: ignore[arg-type]
+            self.profile_result,
+            model=model,
+            current=current,
+        )
+        descriptions = {
+            "off": "disable reasoning with this model's documented NVIDIA control",
+            "low": "lower reasoning effort",
+            "medium": "balanced reasoning effort",
+            "high": "full reasoning effort",
+            "max": "maximum reasoning effort",
+            "auto": "use the NVIDIA-hosted model's default",
+        }
+        return Screen(
+            stage="model_thinking",
+            mode="list",
+            title="Reasoning Effort",
+            subtitle=f"Verified reasoning modes for {model} on NVIDIA.",
+            rows=[
+                Row(
+                    label=label,
+                    description=descriptions.get(label, "provider-documented reasoning effort"),
+                    value=label,
+                    current=label == current,
+                )
+                for label in labels
+            ],
+            hint="↑↓ move · Enter select · Esc back",
         )
 
     def _screen_custom_model(self) -> Screen:
@@ -452,41 +476,6 @@ class SetupFlow:
             subtitle="Type any model id supported by this provider.",
             input_label="Model",
             input_default=self._last_model_not_found,
-            hint="Enter next · Esc back",
-        )
-
-    def _screen_router_model(self) -> Screen:
-        rows = [
-            Row(label=label, description=description, value=value)
-            for value, label, description in _wiz._router_model_picker_rows(
-                self.profile_result,  # type: ignore[arg-type]
-                default_model_result=self.model_result,  # type: ignore[arg-type]
-                previous=self.router_model_result,
-            )
-        ]
-        return Screen(
-            stage="router_model",
-            mode="list",
-            title="Router Model",
-            subtitle=(
-                "By default the router stays synchronized with the main model. "
-                "Choose an override only if you want a different routing model."
-            ),
-            rows=rows,
-            hint="↑↓ move · 1-9 pick · Enter select · Esc back",
-        )
-
-    def _screen_custom_router_model(self) -> Screen:
-        previous = ""
-        if self.router_model_result is not None and not self.router_model_result.inherited:
-            previous = self.router_model_result.model
-        return Screen(
-            stage="custom_router_model",
-            mode="input",
-            title="Router Model",
-            subtitle="Type any model id supported by this provider.",
-            input_label="Router model",
-            input_default=self._last_router_model_not_found or previous,
             hint="Enter next · Esc back",
         )
 
@@ -528,14 +517,6 @@ class SetupFlow:
             mode="busy",
             title="Default Model",
             busy_label="Validating model…",
-        )
-
-    def _screen_validating_router_model(self) -> Screen:
-        return Screen(
-            stage="validating_router_model",
-            mode="busy",
-            title="Router Model",
-            busy_label="Validating router model…",
         )
 
     def _screen_committing(self) -> Screen:
@@ -650,27 +631,12 @@ class SetupFlow:
             hint="Y use it · N pick again · Esc back",
         )
 
-    def _screen_router_model_not_found_confirm(self) -> Screen:
-        return Screen(
-            stage="router_model_not_found_confirm",
-            mode="confirm",
-            title="Router Model",
-            subtitle="The provider reported this model is missing.",
-            lines=[
-                (
-                    f"Use custom router model '{self._last_router_model_not_found}' anyway?",
-                    "warn",
-                )
-            ],
-            hint="Y use it · N pick again · Esc back",
-        )
-
     def _screen_login_confirm(self) -> Screen:
         return Screen(
             stage="login_confirm",
             mode="confirm",
             title="Sylliptor account",
-            subtitle="Your provider is the Sylliptor-hosted MiMo endpoint.",
+            subtitle="Connect in your browser — no API key needed.",
             lines=[("Connect your Sylliptor account now?", "plain")],
             hint="Y connect · N later · Esc skip",
             confirm_default=True,
@@ -776,6 +742,12 @@ class SetupFlow:
             out.append((f"API key    {self._api_key_summary()}", self._api_key_tone()))
         if self.model_result is not None:
             out.append((f"Model      {self.model_result.model}", "plain"))
+            if (
+                self.profile_result is not None
+                and self.profile_result.preset is not None
+                and self.profile_result.preset.key in _wiz._MODEL_REASONING_SETUP_PRESET_KEYS
+            ):
+                out.append((f"Reasoning  {self.model_result.reasoning_label}", "plain"))
         elif self.cfg is not None and self.cfg.execution.backend == "native":
             try:
                 from ...profiles import active_subscription_selection_ready, get_active_profile
@@ -792,13 +764,6 @@ class SetupFlow:
                 out.append((f"Model      {self.cfg.model}", "plain"))
                 if active is not None and active.reasoning_effort is not None:
                     out.append((f"Reasoning  {active.reasoning_effort}", "plain"))
-        if self.router_model_result is not None:
-            router_model = (
-                "inherits default"
-                if self.router_model_result.inherited
-                else self.router_model_result.model
-            )
-            out.append((f"Router     {router_model}", "plain"))
         if self.workspace_result is not None:
             out.append((f"Workspace  {self.workspace_result.workspace}", "plain"))
         if self.sandbox_result is not None:
@@ -905,8 +870,8 @@ class SetupFlow:
             self._choose_provider(value)
         elif self.stage == "model":
             self._choose_model(value)
-        elif self.stage == "router_model":
-            self._choose_router_model(value)
+        elif self.stage == "model_thinking":
+            self._choose_model_thinking(value)
         elif self.stage == "sandbox_choice":
             self._choose_sandbox(value)
 
@@ -922,8 +887,6 @@ class SetupFlow:
             self._submit_api_key(text)
         elif self.stage == "custom_model":
             self._submit_custom_model(text)
-        elif self.stage == "custom_router_model":
-            self._submit_custom_router_model(text)
         elif self.stage == "workspace":
             self._submit_workspace(text)
 
@@ -943,11 +906,6 @@ class SetupFlow:
                 self._accept_unconfirmed_model()
             else:
                 self._goto("model")
-        elif self.stage == "router_model_not_found_confirm":
-            if yes:
-                self._accept_unconfirmed_router_model()
-            else:
-                self._goto("router_model")
         elif self.stage == "workspace_create_confirm":
             if yes:
                 self._accept_workspace_path(
@@ -993,13 +951,23 @@ class SetupFlow:
             "api_key": "custom_headers" if custom_profile else "connect_provider",
             "model": "api_key",
             "custom_model": "model",
-            "router_model": "model",
-            "custom_router_model": "router_model",
+            "model_thinking": "model",
             "workspace": (
                 "connect_provider"
                 if self.execution_result is not None
                 and self.execution_result.backend == "delegated"
-                else "router_model"
+                else (
+                    "model_thinking"
+                    if self.model_result is not None
+                    and self.profile_result is not None
+                    and _wiz._setup_reasoning_labels(
+                        self.profile_result,
+                        model=self.model_result.model,
+                        current=self.model_result.reasoning_label,
+                    )
+                    != ("auto",)
+                    else "model"
+                )
             ),
             "workspace_create_confirm": "workspace",
         }.get(self.stage)
@@ -1021,9 +989,6 @@ class SetupFlow:
             if self.stage == "model_not_found_confirm":
                 self._goto("model")
                 return
-            if self.stage == "router_model_not_found_confirm":
-                self._goto("router_model")
-                return
             return
         self._set_status("", "dim")
         self._goto(prev)
@@ -1040,29 +1005,9 @@ class SetupFlow:
     def _goto(self, stage: str, *, reset_index: bool = True, keep_status: bool = False) -> None:
         self.stage = stage
         if reset_index:
-            self.index = self._router_model_index() if stage == "router_model" else 0
+            self.index = 0
         if not keep_status:
             self._set_status("", "dim")
-
-    def _router_model_index(self) -> int:
-        if (
-            self.router_model_result is None
-            or self.profile_result is None
-            or self.model_result is None
-        ):
-            return 0
-        rows = _wiz._router_model_picker_rows(
-            self.profile_result,
-            default_model_result=self.model_result,
-            previous=self.router_model_result,
-        )
-        values = [value for value, _label, _description in rows]
-        selected = (
-            _wiz._INHERIT_DEFAULT_MODEL_VALUE
-            if self.router_model_result.inherited
-            else self.router_model_result.model
-        )
-        return values.index(selected) if selected in values else 0
 
     def _finish(self, success: bool) -> None:
         self.success = success
@@ -1092,7 +1037,8 @@ class SetupFlow:
                 self.profile_result = None
                 self.api_key_result = None
                 self.model_result = None
-                self.router_model_result = None
+                self._discovered_model_options = ()
+                self._model_catalog_warning = ""
             self.execution_result = selected
             self._goto("workspace")
             return
@@ -1101,7 +1047,8 @@ class SetupFlow:
             self.profile_result = None
             self.api_key_result = None
             self.model_result = None
-            self.router_model_result = None
+            self._discovered_model_options = ()
+            self._model_catalog_warning = ""
         self.execution_result = selected
         self._choose_provider(value)
 
@@ -1122,9 +1069,25 @@ class SetupFlow:
         if self.profile_result is not None and new != self.profile_result:
             self.api_key_result = None
             self.model_result = None
-            self.router_model_result = None
+            self._discovered_model_options = ()
+            self._model_catalog_warning = ""
         self.profile_result = new
         warning = (preset.setup_warning or "").strip()
+        if self._hosted_mimo():
+            # Browser login supplies the credential and selects the hosted
+            # default, so setup can continue directly to the workspace.
+            self.api_key_result = _ApiKeyStepResult(
+                api_key="",
+                validation_status="skipped",
+                validation_message="Sylliptor uses browser sign-in — no API key.",
+            )
+            self.model_result = _ModelStepResult(model="deepseek-v4-flash")
+            self._goto("workspace")
+            self._set_status(
+                "Sylliptor account: you'll sign in after setup.",
+                "ok",
+            )
+            return
         self._goto("api_key")
         if warning:
             self._set_status(warning, "warn")
@@ -1159,7 +1122,8 @@ class SetupFlow:
         if self.profile_result is not None and new != self.profile_result:
             self.api_key_result = None
             self.model_result = None
-            self.router_model_result = None
+            self._discovered_model_options = ()
+            self._model_catalog_warning = ""
         self.profile_result = new
         self._goto("api_key")
 
@@ -1225,6 +1189,7 @@ class SetupFlow:
             self.api_key_result = _ApiKeyStepResult(
                 api_key=value, validation_status="validated", validation_message=message
             )
+            self._load_provider_model_catalog(value)
             self._goto("model")
             if message:
                 self._set_status(message, "warn")
@@ -1233,6 +1198,7 @@ class SetupFlow:
             self.api_key_result = _ApiKeyStepResult(
                 api_key=value, validation_status=status, validation_message=message
             )
+            self._load_provider_model_catalog(value)
             self._goto("model")
             self._set_status(
                 (message or "")
@@ -1250,6 +1216,10 @@ class SetupFlow:
             self.api_key_result = _ApiKeyStepResult(
                 api_key=value, validation_status="failed", validation_message=message
             )
+            self._discovered_model_options = ()
+            self._model_catalog_warning = (
+                "Live model discovery was skipped because the provider rejected the API key."
+            )
             self._goto("model")
             self._set_status("Continuing with the last key. Fix it later in /config.", "warn")
             return
@@ -1258,6 +1228,14 @@ class SetupFlow:
             f"Key validation failed: {message or 'provider rejected the key'} (attempt {self._key_attempts}/{_MAX_KEY_ATTEMPTS})",
             "err",
         )
+
+    def _load_provider_model_catalog(self, api_key: str) -> None:
+        options, warning = _wiz._discover_setup_provider_models(  # type: ignore[arg-type]
+            self.profile_result,
+            api_key=api_key,
+        )
+        self._discovered_model_options = options
+        self._model_catalog_warning = warning
 
     # ----------------------------------------------------------- model step
 
@@ -1285,11 +1263,48 @@ class SetupFlow:
         self.model_result = _ModelStepResult(model=model, custom=custom)
         self._goto("validating_model")
 
+    def _advance_after_model_validation(self) -> None:
+        if self.model_result is None or self.profile_result is None:
+            self._goto("workspace")
+            return
+        labels = _wiz._setup_reasoning_labels(
+            self.profile_result,
+            model=self.model_result.model,
+            current=self.model_result.reasoning_label,
+        )
+        if labels == ("auto",):
+            self.model_result = replace(self.model_result, reasoning_label="auto")
+            self._goto("workspace")
+            preset = self.profile_result.preset
+            if preset is not None and preset.key == _wiz._NVIDIA_PRESET_KEY:
+                self._set_status(
+                    "No verified reasoning control is known for this NVIDIA-hosted model; "
+                    "the provider default will be used.",
+                    "warn",
+                )
+            return
+        self._goto("model_thinking")
+
+    def _choose_model_thinking(self, value: str) -> None:
+        if self.model_result is None:
+            self._goto("model")
+            return
+        labels = _wiz._setup_reasoning_labels(  # type: ignore[arg-type]
+            self.profile_result,
+            model=self.model_result.model,
+            current=self.model_result.reasoning_label,
+        )
+        if value not in labels:
+            self._set_status("That reasoning effort is not supported by this model.", "err")
+            return
+        self.model_result = replace(self.model_result, reasoning_label=value)
+        self._goto("workspace")
+
     def _run_validating_model(self) -> None:
         key = self.api_key_result
         if key is None or not key.api_key or key.validation_status == "failed":
             # Nothing to validate against; accept the model and move on.
-            self._goto("router_model")
+            self._advance_after_model_validation()
             return
         self._report("Validating model…")
         validation = _wiz._validate_api_key(
@@ -1310,14 +1325,14 @@ class SetupFlow:
                 self._set_status(validation.message or "Model not found at this provider.", "err")
             return
         if validation.status == "validated":
-            self._goto("router_model")
+            self._advance_after_model_validation()
             self._set_status("Model validated.", "ok")
             return
         if validation.status == "failed":
-            self._goto("router_model")
+            self._advance_after_model_validation()
             self._set_status(validation.message or "Provider rejected the key.", "err")
             return
-        self._goto("router_model")
+        self._advance_after_model_validation()
         if validation.message:
             self._set_status(validation.message, "warn")
 
@@ -1330,120 +1345,7 @@ class SetupFlow:
             self.api_key_result = replace(
                 self.api_key_result, validation_status="inconclusive", validation_message=warning
             )
-        self._goto("router_model")
-        self._set_status(warning, "warn")
-
-    # ---------------------------------------------------- router model step
-
-    def _choose_router_model(self, value: str) -> None:
-        if value == _wiz._INHERIT_DEFAULT_MODEL_VALUE:
-            self.router_model_result = _RouterModelStepResult()
-            self._goto("workspace")
-            return
-        if value == _wiz._CUSTOM_MODEL_VALUE:
-            self._goto("custom_router_model")
-            return
-        self._set_router_model(value, custom=False)
-
-    def _submit_custom_router_model(self, text: str) -> None:
-        model = text.strip()
-        if not model:
-            self._set_status(
-                "Router model is required when not inheriting the default model.",
-                "err",
-            )
-            return
-        self._set_router_model(model, custom=True)
-
-    def _set_router_model(self, model: str, *, custom: bool) -> None:
-        preset = self.profile_result.preset if self.profile_result else None
-        if preset is not None:
-            model = canonical_model_alias_for_preset(preset, model)
-        model = model.strip()
-        if not model:
-            self._set_status(
-                "Router model is required when not inheriting the default model.",
-                "err",
-            )
-            return
-        self.router_model_result = _RouterModelStepResult(
-            model=model,
-            custom=custom,
-            inherited=False,
-        )
-        self._goto("validating_router_model")
-
-    def _run_validating_router_model(self) -> None:
-        key = self.api_key_result
-        if key is None or not key.api_key or key.validation_status == "failed":
-            self._goto("workspace")
-            return
-        self._report("Validating router model…")
-        validation = _wiz._validate_api_key(
-            profile=self.profile_result.profile,  # type: ignore[union-attr]
-            api_key=key.api_key,
-            model=self.router_model_result.model,  # type: ignore[union-attr]
-            suggested_models=_wiz._suggested_models(self.profile_result),  # type: ignore[arg-type]
-        )
-        if validation.status == "model_not_found":
-            self._last_router_model_not_found = self.router_model_result.model  # type: ignore[union-attr]
-            if self.router_model_result is not None and self.router_model_result.custom:
-                self._goto("router_model_not_found_confirm")
-            else:
-                self._goto("router_model")
-                self._set_status(
-                    validation.message or "Router model not found at this provider.",
-                    "err",
-                )
-            return
-        preserve_prior_warning = key.validation_status == "inconclusive" and validation.status in {
-            "validated",
-            "inconclusive",
-        }
-        self.api_key_result = replace(
-            key,
-            validation_status=("inconclusive" if preserve_prior_warning else validation.status),
-            validation_message=(
-                _merge_validation_messages(key.validation_message, validation.message)
-                if preserve_prior_warning
-                else validation.message
-            ),
-        )
-        if validation.status == "validated":
-            self._goto("workspace")
-            if preserve_prior_warning:
-                self._set_status(
-                    "Router model validated; the default-model warning still applies.",
-                    "warn",
-                )
-            else:
-                self._set_status("Router model validated.", "ok")
-            return
-        if validation.status == "failed":
-            self._goto("workspace")
-            self._set_status(validation.message or "Provider rejected the key.", "err")
-            return
-        self._goto("workspace")
-        if validation.message:
-            self._set_status(validation.message, "warn")
-
-    def _accept_unconfirmed_router_model(self) -> None:
-        warning = (
-            f"Router model '{self._last_router_model_not_found}' was not confirmed; "
-            "provider reported it missing and you chose to use it anyway."
-        )
-        if self.api_key_result is not None:
-            prior_warning = (
-                self.api_key_result.validation_message
-                if self.api_key_result.validation_status == "inconclusive"
-                else ""
-            )
-            self.api_key_result = replace(
-                self.api_key_result,
-                validation_status="inconclusive",
-                validation_message=_merge_validation_messages(prior_warning, warning),
-            )
-        self._goto("workspace")
+        self._advance_after_model_validation()
         self._set_status(warning, "warn")
 
     # ------------------------------------------------------- workspace step
@@ -1509,7 +1411,6 @@ class SetupFlow:
                     profile_result=self.profile_result,  # type: ignore[arg-type]
                     api_key_result=self.api_key_result,  # type: ignore[arg-type]
                     model_result=self.model_result,  # type: ignore[arg-type]
-                    router_model_result=self.router_model_result,  # type: ignore[arg-type]
                     workspace_result=self.workspace_result,  # type: ignore[arg-type]
                     console=sink,
                 )

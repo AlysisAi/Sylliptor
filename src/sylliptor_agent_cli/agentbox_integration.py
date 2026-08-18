@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 import re
+import tomllib
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from .agentbox_client import AgentBoxClient
 from .tools.registry import iter_builtin_tool_metadata
 from .usage_tracker import UsageRecord
 
@@ -17,6 +20,87 @@ _INLINE_CODE_RE = re.compile(r"`[^`]*`")
 _FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
 _WORD_RE = re.compile(r"\s+")
 _TOOL_CATEGORY_BY_NAME: dict[str, AgentBoxToolCategory] | None = None
+
+
+@dataclass(frozen=True)
+class _AgentBoxSettings:
+    plane_url: str
+    token: str
+    org_id: str | None
+    person_id: str | None
+    machine_id: str | None
+    agent_id: str | None
+    queue_dir: str | None
+    task_detail: Literal["topic", "category"]
+
+
+def _load_agentbox_settings() -> _AgentBoxSettings | None:
+    config = _read_agentbox_config()
+    runtime = config.get("runtime", {})
+    sylliptor = runtime.get("sylliptor", {}) if isinstance(runtime, dict) else {}
+    if not isinstance(sylliptor, dict):
+        sylliptor = {}
+
+    plane_url = _env_or_config("AGENTBOX_PLANE_URL", config, "plane_url")
+    token = _env_or_config("AGENTBOX_TOKEN", config, "machine_token")
+    if plane_url is None or token is None:
+        return None
+
+    machine_id = _env_or_config("AGENTBOX_MACHINE_ID", config, "machine_id")
+    agent_id = _env_or_config("AGENTBOX_AGENT_ID", sylliptor, "agent_id")
+    if agent_id is None and machine_id is not None:
+        agent_id = f"{machine_id}_sylliptor"
+
+    return _AgentBoxSettings(
+        plane_url=plane_url,
+        token=token,
+        org_id=_env_or_config("AGENTBOX_ORG_ID", config, "org_id"),
+        person_id=_env_or_config("AGENTBOX_PERSON_ID", config, "person_id"),
+        machine_id=machine_id,
+        agent_id=agent_id,
+        queue_dir=_sdk_queue_dir(config),
+        task_detail=(
+            "category"
+            if _env_or_config("AGENTBOX_TASK_DETAIL", config, "task_detail") == "category"
+            else "topic"
+        ),
+    )
+
+
+def _read_agentbox_config() -> dict[str, Any]:
+    configured_path = _text(os.environ.get("AGENTBOX_CONFIG"))
+    if configured_path is not None:
+        path = Path(configured_path).expanduser()
+    else:
+        home = Path(os.environ.get("AGENTBOX_HOME", Path.home() / ".agentbox"))
+        path = home.expanduser() / "config.toml"
+    try:
+        with path.open("rb") as handle:
+            parsed = tomllib.load(handle)
+        return parsed if isinstance(parsed, dict) else {}
+    except (OSError, tomllib.TOMLDecodeError, TypeError):
+        return {}
+
+
+def _env_or_config(env_name: str, config: dict[str, Any], config_name: str) -> str | None:
+    return _text(os.environ.get(env_name)) or _text(config.get(config_name))
+
+
+def _sdk_queue_dir(config: dict[str, Any]) -> str | None:
+    explicit = _text(os.environ.get("AGENTBOX_QUEUE_DIR"))
+    if explicit is not None:
+        return str(Path(explicit).expanduser())
+    connector_queue = _text(config.get("queue_dir"))
+    if connector_queue is None:
+        return None
+    return str(Path(connector_queue).expanduser().parent / "sdk-queue")
+
+
+def _text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 class AgentBoxTelemetry:
@@ -36,23 +120,21 @@ class AgentBoxTelemetry:
     def from_env(cls, *, root: Path, runtime_version: str) -> AgentBoxTelemetry | None:
         if os.environ.get("AGENTBOX_ENABLED", "").strip().lower() not in _TRUE_VALUES:
             return None
-        plane_url = os.environ.get("AGENTBOX_PLANE_URL", "").strip()
-        token = os.environ.get("AGENTBOX_TOKEN", "").strip()
-        if not plane_url or not token:
-            return None
-        try:
-            from agentbox_sdk import AgentBox  # type: ignore[import-not-found]
-        except Exception:
+        settings = _load_agentbox_settings()
+        if settings is None:
             return None
 
-        queue_dir = os.environ.get("AGENTBOX_QUEUE_DIR") or None
         try:
-            client = AgentBox(
-                token=token,
-                plane_url=plane_url,
-                agent_id=os.environ.get("AGENTBOX_AGENT_ID", "sylliptor"),
+            client = AgentBoxClient(
+                token=settings.token,
+                plane_url=settings.plane_url,
+                org_id=settings.org_id,
+                person_id=settings.person_id,
+                machine_id=settings.machine_id,
+                agent_id=settings.agent_id,
                 runtime_version=runtime_version,
-                queue_dir=queue_dir,
+                queue_dir=settings.queue_dir,
+                task_detail=settings.task_detail,
             )
             telemetry = cls(client=client, root=root)
             telemetry.start_session()

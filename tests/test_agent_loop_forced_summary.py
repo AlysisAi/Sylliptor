@@ -10,6 +10,7 @@ from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.execution_deadline import ExecutionDeadline
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse, ToolCall
+from sylliptor_agent_cli.llm.types import AssistantResponsePhase
 from sylliptor_agent_cli.session_store import read_session_events
 from sylliptor_agent_cli.surface.noop_surface import NoopSurface
 
@@ -736,9 +737,24 @@ def test_repeated_non_final_progress_accepts_after_single_nudge(
     repeated_progress_text = "I will implement search next."
     client = _ScriptedClient(
         [
-            LLMResponse(content=repeated_progress_text, tool_calls=[], raw={}),
-            LLMResponse(content=repeated_progress_text, tool_calls=[], raw={}),
-            LLMResponse(content=repeated_progress_text, tool_calls=[], raw={}),
+            LLMResponse(
+                content=repeated_progress_text,
+                tool_calls=[],
+                raw={},
+                assistant_phase=AssistantResponsePhase.COMMENTARY,
+            ),
+            LLMResponse(
+                content=repeated_progress_text,
+                tool_calls=[],
+                raw={},
+                assistant_phase=AssistantResponsePhase.COMMENTARY,
+            ),
+            LLMResponse(
+                content=repeated_progress_text,
+                tool_calls=[],
+                raw={},
+                assistant_phase=AssistantResponsePhase.COMMENTARY,
+            ),
         ],
     )
     session.client = client  # type: ignore[assignment]
@@ -784,9 +800,24 @@ def test_non_final_progress_continuation_cap_accepts_second_final(
     final_progress_text = "I will update the parser next."
     client = _ScriptedClient(
         [
-            LLMResponse(content="I will inspect the parser next.", tool_calls=[], raw={}),
-            LLMResponse(content=final_progress_text, tool_calls=[], raw={}),
-            LLMResponse(content=final_progress_text, tool_calls=[], raw={}),
+            LLMResponse(
+                content="I will inspect the parser next.",
+                tool_calls=[],
+                raw={},
+                assistant_phase=AssistantResponsePhase.COMMENTARY,
+            ),
+            LLMResponse(
+                content=final_progress_text,
+                tool_calls=[],
+                raw={},
+                assistant_phase=AssistantResponsePhase.COMMENTARY,
+            ),
+            LLMResponse(
+                content=final_progress_text,
+                tool_calls=[],
+                raw={},
+                assistant_phase=AssistantResponsePhase.COMMENTARY,
+            ),
         ],
     )
     session.client = client  # type: ignore[assignment]

@@ -238,3 +238,140 @@ def test_fs_list_default_is_bounded_and_reports_counts(tmp_path: Path) -> None:
     assert result["returned_count"] == 150
     assert result["max_results"] == 150
     assert result["truncated"] is True
+
+
+def test_fs_read_withholds_large_derived_artifact_content(tmp_path: Path) -> None:
+    path = tmp_path / "package-lock.json"
+    path.write_text('{"lockfileVersion": 3}\n' + "x" * 30_000, encoding="utf-8")
+
+    result = fs_read(root=tmp_path, path="package-lock.json")
+
+    assert result["derived_artifact"] is True
+    assert result["derived_artifact_reason"] == "dependency lockfile"
+    assert result["truncated"] is True
+    assert result["size_bytes"] == path.stat().st_size
+    assert len(result["content"].encode("utf-8")) <= 1_000
+    assert "allow_derived=true" in result["note"]
+
+
+def test_fs_read_allow_derived_returns_full_content(tmp_path: Path) -> None:
+    body = '{"lockfileVersion": 3}\n' + "x" * 5_000
+    (tmp_path / "package-lock.json").write_bytes(body.encode("utf-8"))
+
+    result = fs_read(root=tmp_path, path="package-lock.json", allow_derived=True)
+
+    assert "derived_artifact" not in result
+    assert result["truncated"] is False
+    assert result["content"] == body
+
+
+def test_fs_read_small_derived_artifact_is_returned_whole(tmp_path: Path) -> None:
+    body = "tiny lock contents\n"
+    (tmp_path / "yarn.lock").write_bytes(body.encode("utf-8"))
+
+    result = fs_read(root=tmp_path, path="yarn.lock")
+
+    assert "derived_artifact" not in result
+    assert result["content"] == body
+    assert result["truncated"] is False
+
+
+def test_fs_read_withholds_generated_dir_content(tmp_path: Path) -> None:
+    generated = tmp_path / "dist"
+    generated.mkdir()
+    (generated / "bundle.js").write_text("x" * 30_000, encoding="utf-8")
+
+    result = fs_read(root=tmp_path, path="dist/bundle.js")
+
+    assert result["derived_artifact"] is True
+    assert result["derived_artifact_reason"] == "generated or vendored path"
+
+
+def test_fs_read_lines_byte_ceiling_bounds_enormous_single_line(tmp_path: Path) -> None:
+    (tmp_path / "generated.js").write_text("y" * 200_000 + "\n", encoding="utf-8")
+
+    result = fs_read_lines(root=tmp_path, path="generated.js", start_line=1)
+
+    assert result["byte_truncated"] is True
+    assert result["line_clipped"] is True
+    assert result["truncated"] is True
+    assert result["end_line"] == 1
+    assert len(result["content"].encode("utf-8")) <= 48_000
+    assert "max_bytes" in result
+
+    small = fs_read_lines(root=tmp_path, path="generated.js", start_line=1, max_bytes=500)
+    assert len(small["content"].encode("utf-8")) <= 500
+    assert small["byte_truncated"] is True
+
+
+def test_fs_read_derived_stub_honors_explicit_max_bytes(tmp_path: Path) -> None:
+    """The head sample is bounded by the caller's ceiling, not only the fixed
+    1000-byte stub size, and the reported bytes never exceed max_bytes."""
+    (tmp_path / "package-lock.json").write_text("{}" + "x" * 60_000, encoding="utf-8")
+
+    for limit in (1, 10, 100):
+        stub = fs_read(root=tmp_path, path="package-lock.json", max_bytes=limit)
+        assert stub["derived_artifact"] is True
+        assert stub["bytes_read"] <= limit
+        assert len(stub["content"].encode("utf-8")) <= limit
+        assert stub["max_bytes"] == limit
+
+    default_stub = fs_read(root=tmp_path, path="package-lock.json")
+    assert default_stub["bytes_read"] <= 1000
+
+
+def test_fs_read_lines_clip_never_exceeds_ceiling_on_multibyte_text(tmp_path: Path) -> None:
+    """Clipping at a UTF-8 boundary drops the partial character instead of
+    substituting U+FFFD, which would re-encode to three bytes and overshoot
+    a one-byte ceiling."""
+    (tmp_path / "emoji.txt").write_text("你好世界" * 5000 + "\n", encoding="utf-8")
+
+    for limit in (1, 2, 3, 4, 5, 500):
+        clipped = fs_read_lines(
+            root=tmp_path,
+            path="emoji.txt",
+            start_line=1,
+            max_bytes=limit,
+            include_line_numbers=False,
+        )
+        payload = clipped["content"].encode("utf-8")
+        assert len(payload) <= limit, f"max_bytes={limit} produced {len(payload)} bytes"
+        assert "�" not in clipped["content"]
+        assert clipped["line_clipped"] is True
+
+
+def test_fs_read_lines_byte_ceiling_stops_between_lines(tmp_path: Path) -> None:
+    lines = [f"line-{index} " + "z" * 30_000 for index in range(1, 11)]
+    (tmp_path / "wide.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = fs_read_lines(
+        root=tmp_path,
+        path="wide.txt",
+        start_line=1,
+        max_bytes=65_000,
+    )
+
+    assert result["byte_truncated"] is True
+    assert "line_clipped" not in result
+    assert result["truncated"] is True
+    assert result["end_line"] == 2
+    assert result["total_lines"] is None
+    assert len(result["content"].encode("utf-8")) <= 65_000
+
+
+def test_fs_read_lines_normal_reads_have_no_byte_truncation_keys(tmp_path: Path) -> None:
+    (tmp_path / "normal.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    result = fs_read_lines(root=tmp_path, path="normal.txt", start_line=1)
+
+    assert "byte_truncated" not in result
+    assert "line_clipped" not in result
+    assert "note" not in result
+    assert result["total_lines"] == 3
+
+
+def test_fs_read_lines_rejects_invalid_max_bytes(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("a\n", encoding="utf-8")
+
+    with pytest.raises(FsError, match="max_bytes"):
+        fs_read_lines(root=tmp_path, path="a.txt", start_line=1, max_bytes=0)

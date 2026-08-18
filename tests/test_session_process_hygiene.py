@@ -25,10 +25,8 @@ posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX process-group beh
 
 def _make_session(tmp_path: Path, *, runtime_kind: RuntimeKind, session_id: str):
     sessions_dir = tmp_path / "sessions"
-    cfg = AppConfig(model="test-model", routing_mode="code_only")
-    cfg.extra_fields = {"shell_sandbox": {"mode": "off"}}
     session = create_session(
-        cfg=cfg,
+        cfg=AppConfig(model="test-model", routing_mode="code_only"),
         root=tmp_path,
         mode="auto",
         yes=True,
@@ -326,7 +324,10 @@ def test_real_interactive_survivor_is_reported_then_reaped_at_close(tmp_path: Pa
 
 
 @posix_only
-def test_session_shell_runner_places_commands_in_their_own_group(tmp_path: Path) -> None:
+def test_session_shell_runner_places_commands_in_their_own_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_SHELL_SANDBOX_MODE", "off")
     session, _sessions_dir = _make_session(
         tmp_path, runtime_kind=RuntimeKind.ONE_SHOT, session_id="reap-runner"
     )

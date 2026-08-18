@@ -20,6 +20,7 @@ GEMINI_GENERATE_CONTENT_PROVIDER_METADATA_KEY = "gemini_generate_content"
 GEMINI_INTERACTIONS_PROVIDER_METADATA_KEY = "gemini_interactions"
 MISTRAL_PROVIDER_METADATA_KEY = "mistral"
 MOONSHOT_PROVIDER_METADATA_KEY = "moonshot"
+QWEN_PROVIDER_METADATA_KEY = "qwen"
 MISTRAL_CONTENT_CHUNKS_KEY = "content_chunks"
 TOOL_CALL_PROVIDER_METADATA_KEY = "_tool_calls"
 DEEPSEEK_REASONING_CONTENT_KEY = "reasoning_content"
@@ -38,6 +39,9 @@ STATEFUL_PROVIDER_METADATA_KEYS = frozenset(
         # Kimi requires reasoning_content to be replayed for same-route
         # multi-turn and tool continuations, including ordinary K3 replies.
         MOONSHOT_PROVIDER_METADATA_KEY,
+        # Qwen reasoning is retained privately so model contracts that require
+        # preserved thinking can replay it on later same-route assistant turns.
+        QWEN_PROVIDER_METADATA_KEY,
     }
 )
 _HIERARCHICAL_URL_RE = re.compile(

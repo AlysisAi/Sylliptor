@@ -8,85 +8,214 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: python-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build:
-    name: build and validate
+  validate-release-source:
+    name: Validate immutable public release source
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag matches package version and official source
+        shell: bash
+        env:
+          EXPECTED_REPOSITORY: AlysisAi/Sylliptor
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$REPOSITORY_PRIVATE" = "false"
+          test "$REPOSITORY_VISIBILITY" = "public"
+          git check-ref-format --branch "$DEFAULT_BRANCH" > /dev/null
+          test "$GITHUB_REF_TYPE" = "tag"
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          source_commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
+          test "$source_commit" = "$GITHUB_SHA"
+          test "$tag_commit" = "$GITHUB_SHA"
+          git fetch --no-tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/${DEFAULT_BRANCH}"
+          version="$(python -c 'import tomllib; from pathlib import Path; print(tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+  build:
+    name: Build, validate, and attest
+    runs-on: ubuntu-latest
+    needs: validate-release-source
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
-          cache: pip
 
-      - name: Validate tag matches package version
-        run: |
-          python - <<'PY'
-          import os
-          import tomllib
-          from pathlib import Path
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.23"
 
-          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
-          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
-          if tag != version:
-              raise SystemExit(f"tag v{tag} does not match package version {version}")
-          PY
+      - name: Install frozen development and build dependencies
+        run: uv sync --frozen --no-editable --extra dev
 
-      - name: Install package
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
-          python -m pip install build twine pipx
+      - name: Reject vulnerable or unapproved locked dependencies
+        run: uv run --frozen --no-sync python scripts/release/audit_locked_dependencies.py
 
       - name: Lint
-        run: ruff check .
+        run: uv run --frozen --no-sync ruff check .
 
       - name: Format check
-        run: ruff format --check .
+        run: uv run --frozen --no-sync ruff format --check .
 
       - name: Test
-        run: pytest -q
+        run: uv run --frozen --no-sync pytest -q
 
-      - name: Build distributions
+      - name: Build deterministic distributions from the frozen environment
+        shell: bash
         run: |
-          python -m build
-          python -m twine check dist/*
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          uv build --clear --no-create-gitignore --no-build-isolation --no-sources --out-dir dist/python
 
-      - name: Smoke install wheel
-        env:
-          PIPX_HOME: ${{ runner.temp }}/pipx-home
-          PIPX_BIN_DIR: ${{ runner.temp }}/pipx-bin
-        run: |
-          python -m pipx install dist/*.whl
-          "$PIPX_BIN_DIR/sylliptor" --help
-          "$PIPX_BIN_DIR/sylliptor" --version
+      - name: Validate archive identity, inventory, and clean installation
+        run: >-
+          uv run --frozen --no-sync python
+          scripts/release/validate_python_distributions.py dist/python
 
-      - name: Upload distributions
-        uses: actions/upload-artifact@v7
+      - name: Export the locked runtime dependency SBOM
+        run: >-
+          uv export --frozen --no-dev --format cyclonedx1.5
+          --output-file dist/sylliptor-agent-cli.cdx.json
+
+      - name: Attest build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
         with:
-          name: python-distributions
-          path: dist/*
+          subject-path: dist/python/*
+
+      - name: Attest the CycloneDX dependency inventory
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: dist/python/*
+          sbom-path: dist/sylliptor-agent-cli.cdx.json
+
+      - name: Upload validated release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: python-release-candidate-${{ github.sha }}
+          path: dist
           if-no-files-found: error
+          retention-days: 14
 
   publish-pypi:
-    name: publish to PyPI
+    name: Publish attested distributions to PyPI
     runs-on: ubuntu-latest
     needs: build
+    timeout-minutes: 15
     environment: pypi
     permissions:
       contents: read
       id-token: write
+      attestations: read
 
     steps:
-      - name: Download distributions
-        uses: actions/download-artifact@v8
+      - name: Check out the exact attestation policy
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          name: python-distributions
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download exact release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: python-release-candidate-${{ github.sha }}
           path: dist
 
+      - name: Verify source-bound provenance before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          artifacts=(dist/python/*)
+          test "${#artifacts[@]}" -eq 2
+          for artifact in "${artifacts[@]}"; do
+            provenance_receipt="$(mktemp)"
+            gh attestation verify "$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --predicate-type "https://slsa.dev/provenance/v1" \
+              --deny-self-hosted-runners \
+              --format json > "$provenance_receipt"
+            python scripts/release/validate_github_attestation_receipt.py \
+              "$provenance_receipt" "$artifact" \
+              --predicate-type "https://slsa.dev/provenance/v1"
+
+            sbom_receipt="$(mktemp)"
+            gh attestation verify "$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --predicate-type "https://cyclonedx.org/bom" \
+              --deny-self-hosted-runners \
+              --format json > "$sbom_receipt"
+            python scripts/release/validate_github_attestation_receipt.py \
+              "$sbom_receipt" "$artifact" \
+              --predicate-type "https://cyclonedx.org/bom" \
+              --expected-predicate dist/sylliptor-agent-cli.cdx.json
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Publish distributions to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/python
+
+  github-release:
+    name: Attach distributions and SBOM to GitHub release
+    runs-on: ubuntu-latest
+    needs: publish-pypi
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download exact release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: python-release-candidate-${{ github.sha }}
+          path: dist
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/python/*
+            dist/sylliptor-agent-cli.cdx.json
+          generate_release_notes: true

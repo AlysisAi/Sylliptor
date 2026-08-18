@@ -19,7 +19,7 @@ Start with the [root README](../README.md) for installation and first use. Use t
 - [Security model](security_model.md): review trust boundaries, HTTP protections, MCP boundaries, hooks, plugins, and fullaccess mode.
 - [Server mode](server.md): start the HTTP API and configure authentication, uploads, job queues, and workers.
 - [Forge](forge.md): plan, execute, verify, and review larger coding tasks.
-- [Subagents](subagents.md): delegate focused read-only exploration, review, and testing strategy work.
+- [Subagents](subagents.md): delegate focused exploration, implementation, debugging, review, and test planning.
 
 ## Extension Guides
 

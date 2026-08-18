@@ -47,11 +47,9 @@ from ...reasoning_contracts import (
     ALWAYS_ON,
     OFF_SWAPS_MODEL,
     UNKNOWN_CONTRACT,
-    WIRE_REASONING_EFFORT,
-    WIRE_THINKING_ADAPTIVE,
-    WIRE_THINKING_LEVEL,
     ReasoningContract,
     reasoning_contract_for,
+    reasoning_labels_allowed_by_contract,
 )
 from ...sandbox_settings import normalize_sandbox_mode
 from ...web_search_adapters import normalize_web_search_adapter
@@ -65,7 +63,6 @@ from ..config_menu import (
     _ADVANCED_PROVIDER_PRESETS_VALUE,
     _CLEAR_KEY_PENDING,
     _CUSTOM_MODEL_VALUE,
-    _INHERIT_DEFAULT_MODEL_VALUE,
     _MISSING_REQUIRED,
     _ROLE_TEMPERATURE_FIELDS,
     ANTHROPIC_PROMPT_CACHE_TTLS,
@@ -97,8 +94,6 @@ from ..config_menu import (
     _resolved_cache_policy_for_state,
     _role_description,
     _role_label,
-    _router_model_picker_subtitle,
-    _router_model_rows,
     _runtime_setup_rows,
     _sandbox_mode_env_override,
     _temperature_controls_available,
@@ -112,6 +107,10 @@ from .setup_flow import Mode, Row, Screen, Tone
 # The literal a user types in a profile-edit field to keep a value that tripped the
 # accidental-secret guard (mirrors ``config_menu._SECRET_FORCE_TOKEN``).
 _SECRET_FORCE_TOKEN = "force"
+
+# The Sylliptor account uses browser login and activates the native hosted
+# profile; it is not a delegated provider runtime.
+_SYLLIPTOR_CONNECTION_ID = "sylliptor"
 
 # Sentinel row values on the top-level menu for the two trailing action rows.
 _SAVE = "__save__"
@@ -143,28 +142,7 @@ def _thinking_labels_allowed_by_contract(
     selection is never hidden (the user must always be able to see and change
     it), and an unknown contract leaves the list untouched.
     """
-    if contract is UNKNOWN_CONTRACT:
-        return labels
-    # ``values`` are effort words only on effort-style wires; on toggle wires
-    # (thinking_type / enable_thinking) they describe the toggle itself and
-    # must not be used to filter effort labels.
-    effort_wires = {WIRE_REASONING_EFFORT, WIRE_THINKING_LEVEL, WIRE_THINKING_ADAPTIVE}
-    filter_by_values = bool(contract.values) and contract.wire in effort_wires
-    out: list[str] = []
-    for label in labels:
-        fold = label.casefold()
-        if label == current:
-            out.append(label)
-            continue
-        if fold == "off":
-            if contract.mode == ALWAYS_ON and contract.off != OFF_SWAPS_MODEL:
-                continue
-            out.append(label)
-            continue
-        if filter_by_values and fold not in contract.values:
-            continue
-        out.append(label)
-    return out
+    return reasoning_labels_allowed_by_contract(contract, labels, current=current)
 
 
 def _cache_mode_subtitle(state: Any) -> str:
@@ -197,17 +175,13 @@ def _pretty_key_source(source: str | None) -> str:
 
 def _short_preset_description(preset: Any) -> str:
     if preset.key == "sylliptor":
-        return "hosted MiMo — Sylliptor account"
+        return "hosted models — Sylliptor account"
     short = _NATIVE_PROTOCOL_SHORT.get(preset.protocol)
     if short:
         return short
     host = urlparse(preset.base_url).netloc
     return host or "any OpenAI-compatible base URL"
 
-
-_SEARCH_ROUTER_MODELS = "__search_router_models__"
-_ROUTER_INLINE_MODEL_LIMIT = 40
-_ROUTER_SEARCH_RESULT_LIMIT = 100
 
 # stage → interaction mode, so the overlay's key-binding filters don't have to
 # build a full :class:`Screen` on every repaint.
@@ -227,6 +201,7 @@ _STAGE_MODE: dict[str, Mode] = {
     "workspace_action": "list",
     "switching": "busy",
     "sandbox": "list",
+    "personas": "list",
     "model": "list",
     "custom_model": "input",
     "model_base_url": "input",
@@ -241,11 +216,6 @@ _STAGE_MODE: dict[str, Mode] = {
     "cache_anthropic_ttl": "list",
     "cache_compaction_enabled": "list",
     "cache_compaction_min_trigger": "input",
-    "limits_router_loading": "busy",
-    "limits_router_model": "list",
-    "limits_router_search": "input",
-    "limits_custom_router_model": "input",
-    "limits_routing": "list",
     "subagent_field": "input",
     "forge_field": "input",
     "api_key": "input",
@@ -278,6 +248,7 @@ _PREV: dict[str, str] = {
     "workspace_path": "workspace",
     "workspace_action": "workspace",
     "sandbox": "menu",
+    "personas": "menu",
     "model": "menu",
     "custom_model": "model",
     "model_base_url": "model",
@@ -292,10 +263,6 @@ _PREV: dict[str, str] = {
     "cache_anthropic_ttl": "cache_anthropic_enabled",
     "cache_compaction_enabled": "cache_anthropic_ttl",
     "cache_compaction_min_trigger": "cache_compaction_enabled",
-    "limits_router_model": "menu",
-    "limits_router_search": "limits_router_model",
-    "limits_custom_router_model": "limits_router_model",
-    "limits_routing": "limits_router_model",
     "api_key": "menu",
     "api_key_clear_confirm": "api_key",
     "provider": "menu",
@@ -327,6 +294,7 @@ _BREADCRUMB: dict[str, str] = {
     "workspace_action": "project",
     "switching": "saving",
     "sandbox": "sandbox",
+    "personas": "personas",
     "model": "default model",
     "custom_model": "default model",
     "model_base_url": "default model",
@@ -341,11 +309,6 @@ _BREADCRUMB: dict[str, str] = {
     "cache_anthropic_ttl": "context & cache",
     "cache_compaction_enabled": "context & cache",
     "cache_compaction_min_trigger": "context & cache",
-    "limits_router_loading": "routing",
-    "limits_router_model": "routing",
-    "limits_router_search": "routing",
-    "limits_custom_router_model": "routing",
-    "limits_routing": "routing",
     "subagent_field": "subagent overrides",
     "forge_field": "forge overrides",
     "api_key": "api key",
@@ -354,10 +317,6 @@ _BREADCRUMB: dict[str, str] = {
     "cancel_confirm": "configuration",
 }
 
-_ROUTING_ROWS = (
-    ("auto", "Auto", "Pick code or chat path per request intent"),
-    ("code_only", "Code-only", "Always treat the request as a code task"),
-)
 _THINKING_DESCRIPTIONS = {
     "off": "no extra reasoning tokens",
     "minimal": "minimal reasoning budget",
@@ -472,8 +431,6 @@ class ConfigFlow:
         self._subscription_action_outcome: tuple[str, ProviderAccountStatus | None, str] | None = (
             None
         )
-        self._router_catalog_error = ""
-        self._router_search_query = ""
         # Save outcome recorded by the blocking I/O step (:meth:`_perform_save`) and
         # applied as a stage transition by :meth:`apply_save_outcome`. Splitting the
         # two lets the overlay run the I/O on a worker while every renderer-visible
@@ -589,6 +546,7 @@ class ConfigFlow:
             Row(label="Workspace", kind="header"),
             Row(label="Project", description=self._short_workspace(), value="workspace"),
             Row(label="Sandbox", description=self._short_sandbox(), value="sandbox"),
+            Row(label="Personas", description=self._short_personas(), value="personas"),
             Row(label="", kind="spacer"),
             Row(label="Model", kind="header"),
             Row(label="Model Access", description=access_desc, value="execution", tone=access_tone),
@@ -616,7 +574,6 @@ class ConfigFlow:
             Row(label="Behavior", kind="header"),
             Row(label="Web Search", description=self._short_web_search(), value="web_search"),
             Row(label="Context & Cache", description=self._short_cache(), value="cache"),
-            Row(label="Routing", description=self._short_routing(), value="router"),
             Row(label="Advanced", description=self._short_advanced(), value="advanced"),
             Row(label="", kind="spacer"),
             Row(label="Save & exit", description="write changes to disk and close", value=_SAVE),
@@ -705,9 +662,6 @@ class ConfigFlow:
         compaction = _cache_aware_summary_text(self.state).split(" · ")[0]
         return f"{mode} · {compaction}"
 
-    def _short_routing(self) -> str:
-        return str(self.state.fields.get("routing_mode", "auto") or "auto")
-
     def _short_advanced(self) -> str:
         sub = self._subagent_override_summary()
         forge = _override_summary_text(self.state.forge_role_models)
@@ -743,13 +697,24 @@ class ConfigFlow:
     def _screen_execution_runtime(self) -> Screen:
         rows = [
             Row(
+                label="Sylliptor Pro",
+                description="Browser sign-in — no API key needed.",
+                value=_SYLLIPTOR_CONNECTION_ID,
+                current=(
+                    self.state.execution_backend == "native"
+                    and self.state.active_profile == _SYLLIPTOR_CONNECTION_ID
+                ),
+            ),
+        ]
+        rows.extend(
+            Row(
                 label=label,
                 description=description,
                 value=runtime_id,
                 current=runtime_id == self.state.execution_runtime,
             )
             for runtime_id, label, description in _runtime_setup_rows()
-        ]
+        )
         return Screen(
             stage="execution_runtime",
             mode="list",
@@ -761,6 +726,22 @@ class ConfigFlow:
 
     def _refresh_subscription_account_status(self) -> ProviderAccountStatus:
         provider_id = self._subscription_provider_id or self.state.execution_runtime
+        if provider_id == _SYLLIPTOR_CONNECTION_ID:
+            from ... import account_login
+
+            login = account_login.login_status(self.cfg)
+            status = ProviderAccountStatus(
+                connected=login.logged_in,
+                verified=login.logged_in,
+                account_label=("Sylliptor account" if login.logged_in else None),
+                detail=(
+                    "Hosted model access is ready."
+                    if login.logged_in
+                    else "Sign in with your browser — no API key needed."
+                ),
+            )
+            self._subscription_account_status = status
+            return status
         try:
             status = create_provider_auth(provider_id).account_status()
         except (ProviderAuthError, ValueError) as exc:
@@ -788,6 +769,15 @@ class ConfigFlow:
                     label="Disconnect account",
                     description="Remove locally stored subscription credentials.",
                     value="disconnect",
+                )
+            )
+        provider_id = self._subscription_provider_id or self.state.execution_runtime
+        if status.connected and provider_id == _SYLLIPTOR_CONNECTION_ID:
+            rows.append(
+                Row(
+                    label="Done — start chatting",
+                    description="Close configuration and return to chat.",
+                    value="chat",
                 )
             )
         rows.append(Row(label="Back", description="Return to configuration.", value="back"))
@@ -845,9 +835,6 @@ class ConfigFlow:
         return f"current: {cur} · switch project or set a default"
 
     def _subagent_override_summary(self) -> str:
-        # The router has its own first-class Routing section. Keep it
-        # out of the Advanced/Subagent count even though it shares role_models
-        # storage with the internal subagent roles.
         values = {role: self.state.role_models.get(role, "") for role in ROLE_ORDER}
         if _temperature_controls_available(self.state):
             values.update(
@@ -1026,6 +1013,50 @@ class ConfigFlow:
             busy_label="Saving and switching project…",
         )
 
+    _PERSONA_ORDER = ("code", "architect", "ask", "debug")
+    _PERSONA_ROWS = (
+        ("code", "Code (default)", "Implementation work; keeps your execution mode."),
+        ("architect", "Architect", "Plans and designs; writes markdown documents only."),
+        ("ask", "Ask", "Read-only questions with inspection tools."),
+        ("debug", "Debug", "Reproduce-before-fix; keeps your execution mode."),
+    )
+
+    def _current_default_persona(self) -> str:
+        persona = str(self.state.fields.get("default_persona") or "code").strip().lower()
+        return persona if persona in self._PERSONA_ORDER else "code"
+
+    def _short_personas(self) -> str:
+        return self._current_default_persona()
+
+    def _persona_index(self) -> int:
+        return self._PERSONA_ORDER.index(self._current_default_persona())
+
+    def _screen_personas(self) -> Screen:
+        current = self._current_default_persona()
+        rows = [
+            Row(label=label, description=description, value=value, current=current == value)
+            for value, label, description in self._PERSONA_ROWS
+        ]
+        return Screen(
+            stage="personas",
+            mode="list",
+            title="Personas",
+            subtitle=(
+                "The persona chat starts in. Switch live with /persona or Tab; "
+                "per-persona model roles via persona_models.<persona>."
+            ),
+            rows=rows,
+            hint="",
+        )
+
+    def _choose_personas(self, value: str) -> None:
+        persona = str(value or "code").strip().lower()
+        if persona not in self._PERSONA_ORDER:
+            persona = "code"
+        self.state.fields["default_persona"] = persona
+        self._goto("menu")
+        self._set_status(f"Default persona: {persona}. Save to apply.", "ok")
+
     def _screen_sandbox(self) -> Screen:
         current = normalize_sandbox_mode(self.state.fields.get("sandbox_mode", "strict"))
         rows = [
@@ -1097,6 +1128,9 @@ class ConfigFlow:
             ]
             status = "No models advertised yet — sign in first (/login) or type a name."
             status_tone = "warn"
+        elif self.state._provider_model_catalog_warning:
+            status = self.state._provider_model_catalog_warning
+            status_tone = "warn"
         return Screen(
             stage="model",
             mode="list",
@@ -1162,6 +1196,11 @@ class ConfigFlow:
             if _active_subscription_profile(self.state) is not None
             else "Reasoning effort. Some providers ignore this until they add native support."
         )
+        if preset is not None and preset.key == "nvidia" and contract is UNKNOWN_CONTRACT:
+            subtitle = (
+                "No verified reasoning control is known for this NVIDIA-hosted model; "
+                "Auto sends no guessed parameter."
+            )
         if contract.mode == ALWAYS_ON:
             subtitle += "  Reasoning cannot be disabled on this model."
         return Screen(
@@ -1343,113 +1382,6 @@ class ConfigFlow:
             hint="Enter save · Esc back",
         )
 
-    def _screen_limits_router_model(self) -> Screen:
-        rows = self._router_model_screen_rows()
-        subtitle = _router_model_picker_subtitle(self.state)
-        if self._router_search_query:
-            subtitle += f' Filter: "{self._router_search_query}".'
-        return Screen(
-            stage="limits_router_model",
-            mode="list",
-            title="Router Model",
-            subtitle=subtitle,
-            rows=rows,
-            hint="",
-        )
-
-    def _router_model_screen_rows(self) -> list[Row]:
-        raw_rows = _router_model_rows(self.state)
-        current = str(self.state.role_models.get("router", "") or "").strip()
-        inherit_row = raw_rows[0] if raw_rows else None
-        custom_row = next((row for row in raw_rows if row[0] == _CUSTOM_MODEL_VALUE), None)
-        candidates = [
-            row
-            for row in raw_rows
-            if row[0] not in {_INHERIT_DEFAULT_MODEL_VALUE, _CUSTOM_MODEL_VALUE}
-        ]
-        query = self._router_search_query.strip().casefold()
-        if query:
-            matches = [
-                row for row in candidates if query in " ".join(str(part) for part in row).casefold()
-            ]
-            description = f"{len(matches)} match(es)"
-            if len(matches) > _ROUTER_SEARCH_RESULT_LIMIT:
-                description += f"; showing first {_ROUTER_SEARCH_RESULT_LIMIT}, refine the filter"
-            visible = [inherit_row] if inherit_row is not None else []
-            visible.append((_SEARCH_ROUTER_MODELS, "Change model search", description))
-            visible.extend(matches[:_ROUTER_SEARCH_RESULT_LIMIT])
-            if custom_row is not None:
-                visible.append(custom_row)
-        elif len(candidates) > _ROUTER_INLINE_MODEL_LIMIT:
-            visible = [inherit_row] if inherit_row is not None else []
-            visible.append(
-                (
-                    _SEARCH_ROUTER_MODELS,
-                    f"Search all {len(candidates)} provider models",
-                    "Filter by model id, name, or description",
-                )
-            )
-            visible.extend(candidates[:_ROUTER_INLINE_MODEL_LIMIT])
-            if custom_row is not None:
-                visible.append(custom_row)
-        else:
-            visible = list(raw_rows)
-        return [
-            Row(
-                label=label,
-                description=description,
-                value=value,
-                current=(value == current if current else value == _INHERIT_DEFAULT_MODEL_VALUE),
-            )
-            for value, label, description in visible
-        ]
-
-    def _screen_limits_router_search(self) -> Screen:
-        return Screen(
-            stage="limits_router_search",
-            mode="input",
-            title="Search Router Models",
-            subtitle="Filter the complete live and curated catalog by id, name, or description.",
-            input_label="Model search (blank clears filter)",
-            input_default=self._router_search_query,
-            hint="Enter search · Esc back",
-        )
-
-    def _screen_limits_router_loading(self) -> Screen:
-        return Screen(
-            stage="limits_router_loading",
-            mode="busy",
-            title="Router Model",
-            subtitle="Checking the active provider for every available routing model.",
-            busy_label="Loading provider model catalog...",
-        )
-
-    def _screen_limits_custom_router_model(self) -> Screen:
-        return Screen(
-            stage="limits_custom_router_model",
-            mode="input",
-            title="Router Model",
-            subtitle="Type any model id supported by the active provider.",
-            input_label="Router model",
-            input_default=str(self.state.role_models.get("router", "") or ""),
-            hint="Enter next · Esc back",
-        )
-
-    def _screen_limits_routing(self) -> Screen:
-        current = self.state.fields["routing_mode"]
-        rows = [
-            Row(label=label, description=desc, value=value, current=value == current)
-            for value, label, desc in _ROUTING_ROWS
-        ]
-        return Screen(
-            stage="limits_routing",
-            mode="list",
-            title="Routing",
-            subtitle="How the agent routes requests.",
-            rows=rows,
-            hint="",
-        )
-
     def _screen_subagent_field(self) -> Screen:
         role, kind = self._sub_steps[self._sub_i]
         label = _role_label(role)
@@ -1597,7 +1529,7 @@ class ConfigFlow:
             stage="provider_add_preset_advanced",
             mode="list",
             title="Advanced provider preset",
-            subtitle="Compatibility, local, custom, and legacy providers.",
+            subtitle="Compatibility, local, custom, legacy, and account sign-in providers.",
             rows=rows,
             hint="",
         )
@@ -1756,6 +1688,7 @@ class ConfigFlow:
             "workspace": self._choose_workspace,
             "workspace_action": self._choose_workspace_action,
             "sandbox": self._choose_sandbox,
+            "personas": self._choose_personas,
             "model": self._choose_model,
             "model_thinking": self._choose_thinking,
             "web_search_policy": self._choose_web_search_policy,
@@ -1764,8 +1697,6 @@ class ConfigFlow:
             "cache_anthropic_enabled": self._choose_cache_anthropic_enabled,
             "cache_anthropic_ttl": self._choose_cache_anthropic_ttl,
             "cache_compaction_enabled": self._choose_cache_compaction_enabled,
-            "limits_router_model": self._choose_router_model,
-            "limits_routing": self._choose_routing,
             "provider": self._choose_provider_action,
             "provider_switch": self._choose_provider_switch,
             "provider_add_preset": self._choose_preset,
@@ -1820,7 +1751,6 @@ class ConfigFlow:
             return
         if self.stage == "forge_field":
             self.state.forge_role_models = dict(self._forge_snapshot)
-            self.state._sync_active_profile_router_maps()
             self._goto("forge_roles")
             return
         if self.stage in {"subagent_roles", "forge_roles"}:
@@ -1839,7 +1769,6 @@ class ConfigFlow:
             "cancel_confirm",
             "done",
             "saving",
-            "limits_router_loading",
             "subscription_connecting",
             "subscription_disconnecting",
         }:
@@ -1878,15 +1807,14 @@ class ConfigFlow:
             self._goto("web_search_policy", index=self._web_search_policy_index())
         elif value == "cache":
             self._goto("cache_mode", index=self._cache_mode_index())
-        elif value == "router":
-            self._router_search_query = ""
-            self._goto("limits_router_loading")
         elif value == "workspace":
             self._goto("workspace")
         elif value == "advanced":
             self._goto("advanced")
         elif value == "sandbox":
             self._goto("sandbox", index=self._sandbox_index())
+        elif value == "personas":
+            self._goto("personas", index=self._persona_index())
 
     def _execution_backend_index(self) -> int:
         return 1 if self.state.execution_backend == "delegated" else 0
@@ -1913,6 +1841,11 @@ class ConfigFlow:
         self._goto("execution_runtime", index=index)
 
     def _choose_execution_runtime(self, value: str) -> None:
+        if value == _SYLLIPTOR_CONNECTION_ID:
+            self._subscription_provider_id = _SYLLIPTOR_CONNECTION_ID
+            self._subscription_account_status = None
+            self._goto("subscription_account")
+            return
         known = {runtime_id for runtime_id, _label, _description in _runtime_setup_rows()}
         if value not in known:
             self._set_status(f"Unknown AI subscription connection: {value}", "err")
@@ -1923,6 +1856,9 @@ class ConfigFlow:
         self._goto("subscription_account")
 
     def _choose_subscription_account(self, value: str) -> None:
+        if value == "chat":
+            self._finish(True)
+            return
         if value == "back":
             self._goto("menu")
             return
@@ -2097,6 +2033,11 @@ class ConfigFlow:
 
     def _choose_thinking(self, value: str) -> None:
         self.state.set_thinking_label(value)
+        if self._preset_setup_chain:
+            self._complete_preset_setup_chain(
+                model=str(self.state.fields.get("model", "") or "").strip()
+            )
+            return
         self._goto("model_timeout")
 
     def _submit_model_timeout(self, text: str) -> None:
@@ -2224,11 +2165,25 @@ class ConfigFlow:
         """End the add-provider chain after the model is chosen.
 
         Selecting a model normally advances to base URL / thinking / timeout. When
-        we arrived here via "Add provider preset" we skip those (the profile already
-        carries them) and land back on the provider screen, fully configured.
+        we arrived here via "Add provider preset" we skip fields already carried by
+        the profile. NVIDIA remains on the chain for one more step because reasoning
+        controls differ between models hosted behind the same endpoint.
         """
         if not self._preset_setup_chain:
             return False
+        preset = _active_preset(self.state)
+        if preset is not None and preset.key == "nvidia":
+            labels = _thinking_labels_for_state(self.state, model=model)
+            if self.state.thinking_label not in labels:
+                self.state.set_thinking_label("auto")
+            self._goto("model_thinking", index=self._thinking_index())
+            return True
+        self._complete_preset_setup_chain(model=model)
+        return True
+
+    def _complete_preset_setup_chain(self, *, model: str) -> None:
+        """Finish an active add-provider chain and return to its provider screen."""
+
         self._preset_setup_chain = False
         self._goto("provider")
         diag = self._provider_diag_first()
@@ -2236,69 +2191,6 @@ class ConfigFlow:
             self._set_status(f"Provider ready · model {model}. Provider diagnostic: {diag}", "warn")
         else:
             self._set_status(f"Provider ready · default model {model}. Save to apply.", "ok")
-        return True
-
-    # ----------------------------------------------------------- limits
-
-    def _choose_router_model(self, value: str) -> None:
-        if value == _SEARCH_ROUTER_MODELS:
-            self._goto("limits_router_search")
-            return
-        if value == _CUSTOM_MODEL_VALUE:
-            if _active_subscription_profile(self.state) is not None:
-                self._set_status(
-                    "Subscription router models must come from the connected account catalog.",
-                    "err",
-                )
-                return
-            self._goto("limits_custom_router_model")
-            return
-        if value == _INHERIT_DEFAULT_MODEL_VALUE:
-            self.state.set_role_model("router", "")
-        else:
-            allowed = {
-                row_value for row_value, _label, _description in _router_model_rows(self.state)
-            }
-            if value not in allowed:
-                self._set_status(f"Unknown router model: {value}", "err")
-                return
-            self.state.set_role_model("router", value)
-        self._goto("limits_routing", index=self._routing_index())
-
-    def _submit_limits_router_search(self, text: str) -> None:
-        self._router_search_query = text.strip()
-        self._goto("limits_router_model", index=0)
-
-    def _submit_limits_custom_router_model(self, text: str) -> None:
-        if _active_subscription_profile(self.state) is not None:
-            self._goto("limits_router_model", index=self._router_model_index())
-            self._set_status(
-                "Subscription router models must come from the connected account catalog.",
-                "err",
-            )
-            return
-        model = text.strip() or str(self.state.role_models.get("router", "") or "").strip()
-        if not model:
-            self._set_status("Router model is required; choose inherit to use the default.", "err")
-            return
-        self.state.set_role_model("router", model)
-        self._goto("limits_routing", index=self._routing_index())
-
-    def _router_model_index(self) -> int:
-        order = [row.value for row in self._router_model_screen_rows()]
-        current = str(self.state.role_models.get("router", "") or "").strip()
-        selected = current or _INHERIT_DEFAULT_MODEL_VALUE
-        return order.index(selected) if selected in order else 0
-
-    def _choose_routing(self, value: str) -> None:
-        self.state.set_routing_mode(value)
-        self._goto("menu")
-        self._set_status("Routing updated. Save to apply.", "ok")
-
-    def _routing_index(self) -> int:
-        current = self.state.fields.get("routing_mode", "auto")
-        order = [value for value, _label, _desc in _ROUTING_ROWS]
-        return order.index(current) if current in order else 0
 
     # ----------------------------------------------------- subagent overrides
 
@@ -2398,14 +2290,10 @@ class ConfigFlow:
         return names.index(active) if active in names else 0
 
     def _choose_provider_switch(self, value: str) -> None:
-        router_reset = self.state.set_active_profile_name(value)
+        self.state.set_active_profile_name(value)
         self._goto("provider")
         diag = self._provider_diag_first()
         notices = [f"Active profile: {value}."]
-        if router_reset:
-            notices.append(
-                "Router overrides (including Forge) now inherit this provider's default."
-            )
         staged_profile = self.state.staged_api_key_target_profile()
         if staged_profile and staged_profile != value:
             notices.append(f"The unsaved API key remains bound to {staged_profile}.")
@@ -2633,27 +2521,19 @@ class ConfigFlow:
         if self.stage in {"subscription_connecting", "subscription_disconnecting"}:
             self._perform_subscription_account_action()
             return
-        if self.stage == "limits_router_loading":
-            self._router_catalog_error = ""
-            _router_model_rows(self.state)
-            return
         self.perform_save()
 
     def apply_busy_outcome(self) -> None:
         if self.stage in {"subscription_connecting", "subscription_disconnecting"}:
             self._apply_subscription_account_outcome()
             return
-        if self.stage == "limits_router_loading":
-            self._goto("limits_router_model", index=self._router_model_index())
-            if self._router_catalog_error:
-                self._set_status(self._router_catalog_error, "warn")
-            elif self.state.model_catalog_warning:
-                self._set_status(self.state.model_catalog_warning, "warn")
-            return
         self.apply_save_outcome()
 
     def _perform_subscription_account_action(self) -> None:
         provider_id = self._subscription_provider_id or self.state.execution_runtime
+        if provider_id == _SYLLIPTOR_CONNECTION_ID:
+            self._perform_sylliptor_account_action()
+            return
         try:
             adapter = create_provider_auth(provider_id)
             if self.stage == "subscription_connecting":
@@ -2671,10 +2551,43 @@ class ConfigFlow:
         except (ProviderAuthError, ValueError) as exc:
             self._subscription_action_outcome = ("error", None, str(exc))
 
+    def _perform_sylliptor_account_action(self) -> None:
+        from ... import account_login
+
+        try:
+            if self.stage == "subscription_connecting":
+                if self._subscription_switch_account:
+                    account_login.logout(self.cfg)
+                result = account_login.login(
+                    self.cfg, timeout_s=300, output_write=lambda _message: None
+                )
+                self._sylliptor_login_result = result
+                status = ProviderAccountStatus(
+                    connected=True,
+                    verified=True,
+                    account_label=result.email or "Sylliptor account",
+                    detail="Hosted model access is ready.",
+                )
+                self._subscription_action_outcome = ("connected", status, "")
+            else:
+                account_login.logout(self.cfg)
+                status = ProviderAccountStatus(
+                    connected=False,
+                    verified=False,
+                    detail="Key revoked and removed from this machine.",
+                )
+                self._subscription_action_outcome = ("disconnected", status, "")
+        except (account_login.SylliptorLoginError, ConfigError) as exc:
+            self._subscription_action_outcome = ("error", None, str(exc))
+
     def _apply_subscription_account_outcome(self) -> None:
         outcome = self._subscription_action_outcome
         self._subscription_action_outcome = None
         self._subscription_switch_account = False
+        provider_id = self._subscription_provider_id or self.state.execution_runtime
+        if provider_id == _SYLLIPTOR_CONNECTION_ID:
+            self._apply_sylliptor_account_outcome(outcome)
+            return
         if outcome is None:
             self._goto("subscription_account")
             self._set_status("Subscription account action did not complete.", "err")
@@ -2697,6 +2610,46 @@ class ConfigFlow:
         else:
             detail = str(status.detail or "Disconnected locally.").strip()
             self._set_status(f"{detail} The subscription profile remains selected.", "warn")
+
+    def _apply_sylliptor_account_outcome(
+        self, outcome: tuple[str, ProviderAccountStatus | None, str] | None
+    ) -> None:
+        if outcome is None:
+            self._goto("subscription_account")
+            self._set_status("Sylliptor account action did not complete.", "err")
+            return
+        kind, status, message = outcome
+        if kind == "error" or status is None:
+            self._subscription_account_status = None
+            self._goto("subscription_account")
+            self._set_status(message or "Sylliptor account action failed.", "err")
+            return
+        self._subscription_account_status = status
+        # Account actions update credentials on disk. Mark the configuration as
+        # changed so closing the overlay reloads the live session safely.
+        self.saved = True
+        self.changes_count = max(int(getattr(self, "changes_count", 0) or 0), 1)
+        if kind == "connected":
+            result = getattr(self, "_sylliptor_login_result", None)
+            self._sylliptor_login_result = None
+            from ...profiles import get_profile
+
+            profile = get_profile(self.cfg, _SYLLIPTOR_CONNECTION_ID)
+            if profile is not None:
+                self.state.profiles[_SYLLIPTOR_CONNECTION_ID] = profile.to_dict()
+            self.state.active_profile = _SYLLIPTOR_CONNECTION_ID
+            self.state.set_execution_backend("native")
+            model = str(getattr(result, "model", "") or "").strip()
+            if model:
+                self.state.fields["model"] = model
+            self._goto("subscription_account")
+            self._set_status("Sylliptor connected. Esc to exit config.", "ok")
+        else:
+            self._goto("subscription_account")
+            self._set_status(
+                "Logged out. Hosted requests will be refused until you sign in again.",
+                "warn",
+            )
 
     def _run_saving(self) -> None:
         self.perform_save()
@@ -2753,9 +2706,6 @@ class ConfigFlow:
                 None,
                 message or "Subscription account action failed.",
             )
-            return
-        if self.stage == "limits_router_loading":
-            self._router_catalog_error = message or "Provider model catalog could not be loaded."
             return
         self.set_save_failure(message)
 

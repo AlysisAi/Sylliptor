@@ -98,7 +98,10 @@ def test_same_batch_duplicate_fs_read_lines_is_short_circuited(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    (tmp_path / "demo.txt").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+    # Keep the fixture byte-exact across hosts. ``Path.write_text`` performs
+    # newline translation on Windows, while this assertion intentionally
+    # verifies that the cached result preserves the file's original bytes.
+    (tmp_path / "demo.txt").write_bytes(b"one\ntwo\nthree\nfour\n")
     counts = _patch_read_counters(monkeypatch)
     client = _ScriptedClient(
         [
@@ -171,7 +174,9 @@ def test_same_batch_read_lines_reuses_earlier_full_fs_read_when_untruncated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    (tmp_path / "demo.txt").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+    # The assertion below verifies byte-preserving reuse, so avoid Windows
+    # text-mode newline translation in the fixture itself.
+    (tmp_path / "demo.txt").write_bytes(b"one\ntwo\nthree\nfour\n")
     counts = _patch_read_counters(monkeypatch)
     client = _ScriptedClient(
         [
@@ -216,7 +221,7 @@ def test_same_batch_read_lines_reuses_broader_prior_read_lines_range(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    (tmp_path / "demo.txt").write_text("one\ntwo\nthree\nfour\nfive\n", encoding="utf-8")
+    (tmp_path / "demo.txt").write_bytes(b"one\ntwo\nthree\nfour\nfive\n")
     counts = _patch_read_counters(monkeypatch)
     client = _ScriptedClient(
         [

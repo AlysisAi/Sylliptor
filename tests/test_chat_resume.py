@@ -112,6 +112,223 @@ def test_load_chat_resume_messages_uses_latest_compacted_snapshot(tmp_path: Path
     assert all("old raw" not in str(message.get("content") or "") for message in loaded)
 
 
+_SYNTHETIC_TOOL_RESULT_CONTENT = "[tool result unavailable after session resume]"
+
+
+def _assert_resume_tool_pairing(messages: list[dict[str, Any]]) -> None:
+    call_ids = {
+        str(call.get("id") or "").strip()
+        for message in messages
+        if str(message.get("role") or "") == "assistant"
+        for call in (message.get("tool_calls") or [])
+        if isinstance(call, dict)
+    }
+    result_ids = {
+        str(message.get("tool_call_id") or "").strip()
+        for message in messages
+        if str(message.get("role") or "") == "tool"
+    }
+    assert call_ids == result_ids
+
+
+def test_load_chat_resume_messages_keeps_tool_pairing_across_compacted_snapshot(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "resume-snapshot-open-tool-turn.jsonl"
+    assistant_with_open_call = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "fs_read", "arguments": "{}"},
+            }
+        ],
+    }
+    events = [
+        {
+            "type": "conversation_summary_updated",
+            "payload": {
+                "active_conversation_messages": [
+                    {"role": "user", "content": "Read the file"},
+                    assistant_with_open_call,
+                ]
+            },
+        },
+        {
+            "type": "tool_result",
+            "payload": {
+                "name": "fs_read",
+                "tool_call_id": "call_1",
+                "content": "real replayed result",
+                "step": 1,
+            },
+        },
+        {"type": "user_message", "payload": {"content": "Thanks"}},
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    synthesized: list[str] = []
+    loaded = cli_mod._load_chat_resume_messages(log_path, synthesized_tool_results=synthesized)
+
+    assert loaded == [
+        {"role": "user", "content": "Read the file"},
+        assistant_with_open_call,
+        {"role": "tool", "tool_call_id": "call_1", "content": "real replayed result"},
+        {"role": "user", "content": "Thanks"},
+    ]
+    assert synthesized == []
+    _assert_resume_tool_pairing(loaded)
+
+
+def test_load_chat_resume_messages_synthesizes_result_for_snapshot_orphan(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "resume-snapshot-orphan.jsonl"
+    assistant_with_open_call = {
+        "role": "assistant",
+        "content": "Let me check.",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "fs_read", "arguments": "{}"},
+            }
+        ],
+    }
+    events = [
+        {
+            "type": "conversation_summary_updated",
+            "payload": {
+                "active_conversation_messages": [
+                    {"role": "user", "content": "Read the file"},
+                    assistant_with_open_call,
+                ]
+            },
+        },
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    synthesized: list[str] = []
+    loaded = cli_mod._load_chat_resume_messages(log_path, synthesized_tool_results=synthesized)
+
+    assert loaded == [
+        {"role": "user", "content": "Read the file"},
+        assistant_with_open_call,
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": _SYNTHETIC_TOOL_RESULT_CONTENT,
+        },
+    ]
+    assert synthesized == ["call_1"]
+    _assert_resume_tool_pairing(loaded)
+
+
+def test_load_chat_resume_messages_repairs_midstream_dropped_tool_result(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "resume-midstream-orphan.jsonl"
+    events = [
+        {"type": "user_message", "payload": {"content": "Run both tools"}},
+        {
+            "type": "assistant_message",
+            "payload": {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "tc-a",
+                            "type": "function",
+                            "function": {"name": "fs_read", "arguments": "{}"},
+                        },
+                        {
+                            "id": "tc-b",
+                            "type": "function",
+                            "function": {"name": "fs_list", "arguments": "{}"},
+                        },
+                    ],
+                }
+            },
+        },
+        {
+            "type": "tool_result",
+            "payload": {"name": "fs_read", "tool_call_id": "tc-a", "content": "alpha", "step": 1},
+        },
+        # Rendered content is empty, so replay drops this result.
+        {
+            "type": "tool_result",
+            "payload": {"name": "fs_list", "tool_call_id": "tc-b", "content": "", "step": 2},
+        },
+        {"type": "final", "payload": {"content": "All done"}},
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    synthesized: list[str] = []
+    loaded = cli_mod._load_chat_resume_messages(log_path, synthesized_tool_results=synthesized)
+
+    assert synthesized == ["tc-b"]
+    assert loaded[2] == {"role": "tool", "tool_call_id": "tc-a", "content": "alpha"}
+    assert loaded[3] == {
+        "role": "tool",
+        "tool_call_id": "tc-b",
+        "content": _SYNTHETIC_TOOL_RESULT_CONTENT,
+    }
+    assert loaded[4] == {"role": "assistant", "content": "All done"}
+    _assert_resume_tool_pairing(loaded)
+
+
+def test_load_chat_resume_messages_leaves_fully_paired_transcript_unchanged(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "resume-fully-paired.jsonl"
+    assistant_message = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "tc-read",
+                "type": "function",
+                "function": {"name": "fs_read", "arguments": "{}"},
+            }
+        ],
+    }
+    events = [
+        {"type": "session_start", "payload": {"mode": "auto"}},
+        {"type": "user_message", "payload": {"content": "Read the file."}},
+        {"type": "assistant_message", "payload": {"message": assistant_message}},
+        {
+            "type": "tool_result",
+            "payload": {
+                "name": "fs_read",
+                "tool_call_id": "tc-read",
+                "content": "file body",
+                "step": 1,
+            },
+        },
+        {"type": "final", "payload": {"content": "Read it."}},
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    synthesized: list[str] = []
+    loaded = cli_mod._load_chat_resume_messages(log_path, synthesized_tool_results=synthesized)
+
+    assert loaded == [
+        {"role": "user", "content": "Read the file."},
+        assistant_message,
+        {"role": "tool", "tool_call_id": "tc-read", "content": "file body"},
+        {"role": "assistant", "content": "Read it."},
+    ]
+    assert synthesized == []
+    assert all(
+        _SYNTHETIC_TOOL_RESULT_CONTENT not in str(message.get("content") or "")
+        for message in loaded
+    )
+    _assert_resume_tool_pairing(loaded)
+
+
 def test_load_chat_resume_messages_uses_shaped_tool_result_content(tmp_path: Path) -> None:
     log_path = tmp_path / "resume-shaped-tool-result.jsonl"
     shaped_content = json.dumps(
@@ -1159,6 +1376,188 @@ def test_resume_chat_session_inserts_pinned_resume_context_before_history(
     assert system_note_payloads[-1]["resume_context_chars"] > 0
 
 
+def _make_resume_current_session(*, sessions_dir: Path, root: Path) -> _FakeSession:
+    current = _FakeSession()
+    current.cfg = AppConfig(model="test-model", max_steps=10)
+    current.root = root
+    current.mode = "review"
+    current.yes = True
+    current.max_steps = 5
+    current.console = None
+    current.surface = object()
+    current.store = _FakeStore(sessions_dir=sessions_dir, session_id="current-session")
+    current.client = SimpleNamespace(api_key="override-key")
+    current.usage_role = "main"
+    current.tool_output_offloader = None
+    current.conversation_compactor = None
+    current.messages = []
+    current.close = lambda: None
+    return current
+
+
+def _make_resume_create_session_factory(
+    *,
+    sessions_dir: Path,
+    conversation_compactor: Any = None,
+):
+    def fake_create_session(**kwargs):  # type: ignore[no-untyped-def]
+        new_session = _FakeSession()
+        new_session.cfg = kwargs["cfg"]
+        new_session.root = kwargs["root"]
+        new_session.mode = kwargs["mode"]
+        new_session.yes = kwargs["yes"]
+        new_session.max_steps = kwargs["max_steps"]
+        new_session.console = kwargs["console"]
+        new_session.surface = kwargs["surface"]
+        new_session.store = _FakeStore(
+            sessions_dir=sessions_dir,
+            session_id=kwargs["session_id_override"],
+            enabled=not kwargs["no_log"],
+        )
+        new_session.client = SimpleNamespace(api_key="override-key")
+        new_session.usage_role = kwargs["usage_role"]
+        new_session.tool_output_offloader = None
+        new_session.conversation_compactor = conversation_compactor
+        new_session.messages = [{"role": "system", "content": "startup"}]
+        new_session.pinned_prefix_len = 1
+        return new_session
+
+    return fake_create_session
+
+
+def _chat_resume_note_payloads(store: _FakeStore) -> list[dict[str, object]]:
+    return [
+        payload
+        for event_type, payload in store.notes
+        if event_type == "system_note" and payload.get("message") == "chat_resume"
+    ]
+
+
+def test_resume_chat_session_reports_synthesized_tool_results(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    target_id = "resume-orphaned-tool-call"
+    target_events = [
+        {
+            "type": "session_start",
+            "payload": {"mode": "review", "active_workdir_relpath": "."},
+        },
+        {"type": "user_message", "payload": {"content": "Run the tool"}},
+        {
+            "type": "assistant_message",
+            "payload": {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-orphan",
+                            "type": "function",
+                            "function": {"name": "fs_read", "arguments": "{}"},
+                        }
+                    ],
+                }
+            },
+        },
+    ]
+    (sessions_dir / f"{target_id}.jsonl").write_text(
+        "\n".join(json.dumps(ev) for ev in target_events) + "\n",
+        encoding="utf-8",
+    )
+
+    current = _make_resume_current_session(sessions_dir=sessions_dir, root=tmp_path)
+    monkeypatch.setattr(
+        cli_mod,
+        "create_session",
+        _make_resume_create_session_factory(sessions_dir=sessions_dir),
+    )
+
+    ok, message, loaded_history = cli_mod._resume_chat_session(
+        session=current,
+        target_session_id=target_id,
+    )
+
+    assert ok is True
+    assert "Resumed session:" in message
+    assert loaded_history[-1] == {
+        "role": "tool",
+        "tool_call_id": "call-orphan",
+        "content": _SYNTHETIC_TOOL_RESULT_CONTENT,
+    }
+    _assert_resume_tool_pairing(loaded_history)
+    note_payloads = _chat_resume_note_payloads(current.store)
+    assert note_payloads
+    assert note_payloads[-1]["synthesized_tool_results"] == 1
+    assert note_payloads[-1]["synthesized_tool_result_ids"] == ["call-orphan"]
+    assert note_payloads[-1]["compaction_memory_reinjected"] is False
+
+
+def test_resume_chat_session_reinjects_restored_compaction_memory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    target_id = "resume-with-compaction-memory"
+    target_events = [
+        {
+            "type": "session_start",
+            "payload": {"mode": "review", "active_workdir_relpath": "."},
+        },
+        {"type": "user_message", "payload": {"content": "Continue the task"}},
+        {"type": "assistant_message", "payload": {"content": "Continuing."}},
+    ]
+    (sessions_dir / f"{target_id}.jsonl").write_text(
+        "\n".join(json.dumps(ev) for ev in target_events) + "\n",
+        encoding="utf-8",
+    )
+
+    class _FakeResumeCompactor:
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(
+                memory_message_index=None,
+                pins_message_index=None,
+                pinned_prefix_len=0,
+            )
+            self.reinject_inputs: list[list[dict[str, Any]]] = []
+
+        def reinject_context_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            self.reinject_inputs.append(list(messages))
+            self.state.memory_message_index = len(messages)
+            return [*messages, {"role": "user", "content": "<<<MEMORY-REINJECTED>>>"}]
+
+    compactor = _FakeResumeCompactor()
+    current = _make_resume_current_session(sessions_dir=sessions_dir, root=tmp_path)
+    monkeypatch.setattr(
+        cli_mod,
+        "create_session",
+        _make_resume_create_session_factory(
+            sessions_dir=sessions_dir,
+            conversation_compactor=compactor,
+        ),
+    )
+
+    ok, message, loaded_history = cli_mod._resume_chat_session(
+        session=current,
+        target_session_id=target_id,
+    )
+
+    assert ok is True
+    assert loaded_history
+    # Reinjection ran after the replayed history was already extended in.
+    assert compactor.reinject_inputs
+    assert any(
+        str(msg.get("content") or "") == "Continue the task" for msg in compactor.reinject_inputs[0]
+    )
+    assert current.messages[-1] == {"role": "user", "content": "<<<MEMORY-REINJECTED>>>"}
+    note_payloads = _chat_resume_note_payloads(current.store)
+    assert note_payloads
+    assert note_payloads[-1]["compaction_memory_reinjected"] is True
+
+
 def test_resume_chat_session_reports_active_workdir_restore_failure(
     tmp_path: Path,
     monkeypatch,
@@ -2044,6 +2443,10 @@ def test_classic_resume_explicit_id_survives_fully_filtered_candidates(
         return True, "Resumed.", []
 
     chat_impl_mod._sync_cli_globals(cli_mod)
+    # Prime the facade-to-command dependency sync exactly as an earlier classic
+    # command does in the full suite.  The direct resume override must survive a
+    # later dispatch regardless of whether this test runs first or after chat.
+    chat_commands_mod._sync_command_globals(chat_impl_mod.__dict__)
     monkeypatch.setattr(cli_mod, "_resume_chat_session", fake_resume, raising=False)
     monkeypatch.setattr(chat_commands_mod, "_resume_chat_session", fake_resume, raising=False)
 

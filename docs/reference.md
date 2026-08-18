@@ -1,415 +1,197 @@
 # Reference
 
-This page is a compact reference for the main Sylliptor CLI surface,
-configuration model, runtime modes, and extension points. For deeper subsystem
-details, follow the linked guides.
+This is a compact map of Sylliptor's interactive commands, execution modes,
+configuration, and extension points.
 
-## What Sylliptor Does
+## Start A Session
 
-Sylliptor runs local coding sessions from a terminal. A session binds to a
-workspace, sends user turns to the configured model provider, exposes a
-controlled set of tools, and stores local logs and artifacts for review.
+Launch `sylliptor` from the project you want to work on. The first launch opens
+setup; later launches open the interactive session directly.
 
-Core capabilities include:
+Sylliptor binds the workspace before exposing local tools. In a Git repository,
+the repository root becomes the workspace and the launch directory remains the
+focus directory. Use `/pwd` to see both.
 
-- interactive chat and one-shot commands
-- filesystem, search, git, shell, web, and verification tools
-- workspace-aware execution modes
-- optional MCP, skills, plugins, hooks, custom tools, and subagents
-- Forge planning and execution workflows
-- local session logs and feedback bundles
+## Interactive Commands
 
-## Commands
+- `/help`: show every command available in the current view
+- `/status`: show the model, mode, workspace, and runtime state
+- `/pwd`: show the workspace and active work directory
+- `/login`: connect a Sylliptor account or supported subscription
+- `/logout`: disconnect the Sylliptor account
+- `/config`: change the connection, model, and session settings
+- `/persona`: switch between Code, Architect, Ask, and Debug
+- `/mode`: change the execution mode
+- `/usage`: show token and cost usage
+- `/stream on|off`: toggle streaming
+- `/trace off|compact|full`: change the amount of progress detail shown
+- `/image <path>`: attach an image to the next turn
+- `/subagent`: choose or control a focused helper agent
+- `/skill`: list discovered skills
+- `/plan <task>`: draft a plan for review
+- `/forge [resume]`: enter or resume Forge
+- `/report [text]`: create a local feedback bundle
+- `/exit`: leave the session
 
-Common entrypoints:
+Forge has its own on-screen actions for editing a goal and plan, running tasks,
+reviewing results, and returning to the normal session.
 
-```bash
-sylliptor
-sylliptor chat
-sylliptor run "Explain this repository."
-sylliptor setup
-sylliptor tools
-sylliptor auth list
-sylliptor update check
-```
+## Personas
 
-Workspace selection:
+- `code`: implementation work with the tools allowed by the current mode
+- `architect`: plans and design, with writes limited to Markdown
+- `ask`: read-only questions and explanations
+- `debug`: reproduce-first investigation and bug fixing
 
-```bash
-sylliptor chat --path /path/to/project
-sylliptor run --path /path/to/project "Summarize the codebase."
-sylliptor run --path ./new-app --create-path "Scaffold a minimal project."
-```
-
-Provider and credentials:
-
-```bash
-sylliptor config set base_url "https://api.openai.com/v1"
-sylliptor config set model "gpt-4.1-mini"
-sylliptor config set-api-key
-sylliptor run --api-key-stdin "Hello"
-sylliptor run --api-key-env OTHER_API_KEY --base-url "https://example.com/v1" --model "your-model" "Hello"
-```
-
-Forge:
-
-```bash
-sylliptor forge plan --path .
-sylliptor forge show --path .
-sylliptor forge status --path .
-sylliptor forge exec T01 --path . --mode review
-sylliptor forge swarm --path . --parallel 3 --mode auto --verify warn
-```
+A persona can narrow access, but it cannot raise the session above its current
+execution mode. Project-specific personas can be added under
+`.sylliptor_personas/*.md`.
 
 ## Execution Modes
 
-Execution mode controls the default approval posture.
+- `readonly`: inspect only; write, shell, and verification tools are unavailable
+- `review`: ask before writes and shell commands
+- `auto`: apply routine changes with fewer prompts while dangerous operations
+  remain blocked
+- `fullaccess`: remove mode-level prompts in a trusted workspace; the denylist
+  and audit log still apply
 
-- `readonly`: inspect-only mode. Write tools, shell commands, and verification
-  are not available.
-- `review`: preview or ask before writes and shell commands.
-- `auto`: allow routine edits with fewer prompts while still blocking dangerous
-  operations.
-- `fullaccess`: remove mode-level write and shell prompts for trusted
-  workspaces.
+Use `/mode` for the current session and `/config` for the default. The
+`autonomous` step-budget policy has no fixed step limit, but execution modes,
+approvals, deadlines, sandbox policy, and provider limits still apply.
 
-Set the default mode:
+Session policy records a `runtime_kind`, such as `interactive_chat`, `one_shot`,
+or `forge_exec`. Extension systems use it when deciding which tools and catalogs
+can be exposed.
 
-```bash
-sylliptor config set default_mode review
-```
+## Connections And Configuration
 
-Override per command:
+Use `/login` for account and supported subscription connections. Use `/config`
+for API-key providers, model selection, execution defaults, web search, tools,
+and subagents.
 
-```bash
-sylliptor run --mode readonly "Explain this repository."
-sylliptor chat --mode auto
-```
+Common configuration keys include:
 
-The default `autonomous` step-budget policy has no fixed step limit. Set
-`--max-steps` for one command, or restore configured limits with:
-
-```bash
-sylliptor config set step_budget_policy limited
-```
-
-Execution modes, approvals, deadlines, sandbox policy, and provider limits
-still apply.
-
-Session policy also records a `runtime_kind` such as `interactive_chat`,
-`one_shot`, or `forge_exec`; extension systems use that runtime kind when
-deciding which tools or catalogs may be exposed.
-
-## Workspace Binding
-
-`sylliptor chat` and `sylliptor run` bind a workspace before the session starts.
-The requested path is the current directory or `--path`.
-
-- Inside a Git repository, Sylliptor binds to the repository root and keeps the
-  starting directory as the focus directory.
-- Plain directories bind to the requested directory.
-- Missing paths require `--create-path`.
-- Broad paths such as a home directory require an explicit override.
-- The filesystem root is blocked as a workspace root.
-
-In chat, relative file, search, and shell paths default to the active workdir
-inside the bound workspace. Use `/pwd` to inspect the current workspace root,
-focus directory, and active workdir.
-
-## Chat Slash Commands
-
-Common interactive commands:
-
-- `/help`: show chat commands
-- `/status`: show mode, model, workspace, and runtime state
-- `/pwd`: show workspace and active workdir
-- `/mode`: inspect or change execution mode
-- `/config`: open the configuration menu
-- `/usage`: show token and cost usage
-- `/stream on|off`: toggle streaming
-- `/trace off|compact|full`: control reasoning/tool progress detail
-- `/image <path>`: attach an image to the next turn
-- `/subagent on|off|status`: control subagent availability
-- `/skill`: list discovered skills
-- `/plan <task>`: draft a plan for review and approval
-- `/forge [resume]`: enter or resume Forge for the workspace
-- `/report [text]`: create a local feedback bundle
-- `/exit`: quit chat
-
-Forge mode has its own command surface for goal, task, plan, review, and
-execution actions. See [Forge](forge.md).
-
-## Configuration
-
-Configuration is stored in the platform-specific Sylliptor config directory.
-Use `sylliptor config menu` or `/config` in chat for interactive edits.
-
-Common keys:
-
-- `base_url`
-- `model`
-- `default_mode`
-- `max_steps`
-- `task_max_steps`
-- `step_budget_policy`
+- `base_url` and `model`
+- `default_mode` and `default_persona`
+- `max_steps`, `task_max_steps`, and `step_budget_policy`
 - `stream`
-- `routing_mode`
-- `route_arbitration_enabled`
-- `evidence_v2_enabled`
-- `regression_baseline_enabled`
-- `turn_contract_v2_enabled`
-- `process_reaping_enabled`
-- `workspace_provisioning_enabled`
-- `role_models.router`
-- `subagents_enabled`
+- `subagents_enabled` and `subagent_timeout_s`
 - `custom_tools_enabled`
-- `web_search_mode`
-- `web_search_policy`
-- `web_search_adapter`
-- `web_search_base_url`
-- `web_search_model`
-- `web_search_timeout_s`
-- `session_log_dir`
+- `web_search_policy`, `web_search_adapter`, and related web-search settings
 - `verify_commands`
-- `update_check_enabled`
-- `update_check_interval_hours`
-- `update_check_timeout_s`
-- `update_prompt_enabled`
+- `session_log_dir`
+- `update_check_enabled` and `update_prompt_enabled`
 - `prompt_cache_mode`
 
-Useful environment overrides:
+Common environment overrides include `SYLLIPTOR_API_KEY`,
+`SYLLIPTOR_CONFIG_DIR`, `SYLLIPTOR_BASE_URL`, `SYLLIPTOR_MODEL`,
+`SYLLIPTOR_LLM_TIMEOUT_S`, and the provider-specific web-search variables.
 
-- `SYLLIPTOR_API_KEY`
-- `SYLLIPTOR_CONFIG_DIR`: overrides the user config directory used for `config.json`, `credentials.json`, and the MCP OAuth token store.
-- `SYLLIPTOR_BASE_URL`
-- `SYLLIPTOR_MODEL`
-- `SYLLIPTOR_MODEL_ROUTER`
-- `SYLLIPTOR_LLM_TIMEOUT_S`
-- `SYLLIPTOR_ROUTING_MODE`
-- `SYLLIPTOR_WEB_SEARCH_API_KEY`
-- `SYLLIPTOR_WEB_SEARCH_BASE_URL`
-- `SYLLIPTOR_WEB_SEARCH_MODEL`
-- `SYLLIPTOR_WEB_SEARCH_TIMEOUT_S`
-- `SYLLIPTOR_WEB_SEARCH_KEYLESS`
-- `SYLLIPTOR_UPDATE_PROMPT_ENABLED`
-- `TAVILY_API_KEY`
+Profiles group a protocol, endpoint, credential source, and default model.
+Native OpenAI, Anthropic, and Gemini protocols are supported; other providers
+and gateways can use an OpenAI-compatible profile. Presets are starting points,
+not hard constraints. See [Providers and models](providers.md).
 
-`role_models.router` overrides the model used for lightweight routing. Leave it
-unset to inherit `model`, or set it to a smaller/cheaper model while keeping the
-main coding model stronger.
+## Automation Commands
 
-## Profiles
+The interactive workflow is the normal entry point. These commands remain
+available for scripts and CI:
 
-Profiles group provider settings such as protocol, base URL, API key source,
-default model, and provider notes.
+| Command | Use |
+| --- | --- |
+| `sylliptor run` | Run one bounded instruction. |
+| `sylliptor forge plan` | Create or update a Forge plan. |
+| `sylliptor forge exec` | Run one planned task. |
+| `sylliptor forge swarm` | Run ready tasks in parallel. |
+| `sylliptor tools` | Show the current tool catalog and readiness. |
+| `sylliptor sessions` | Inspect retained session records. |
+| `sylliptor update` | Check for or apply an update with confirmation. |
 
-Useful commands:
-
-```bash
-sylliptor profile presets
-sylliptor profile preset <provider-preset>
-sylliptor profile set-key <profile> --stdin
-sylliptor profile use <profile>
-sylliptor profile list
-```
-
-OpenAI, Anthropic, and Gemini profiles can use their native API protocols.
-Other provider and gateway profiles use the OpenAI-compatible protocol.
-
-Subscription-backed connections are managed separately from static API keys:
-
-```bash
-sylliptor auth list
-sylliptor auth login openai-codex
-sylliptor auth status openai-codex
-sylliptor auth logout openai-codex
-```
-
-Choose the subscription model in `/config`. See
-[Providers and models](providers.md) for details.
-
-Presets are convenience templates, not hard constraints. Custom profiles can
-point at model provider endpoints.
+Use each command's `--help` output for flags and machine-oriented options.
 
 ## Built-In Tools
 
-The built-in tool surface depends on mode, runtime kind, workspace binding,
-sandbox readiness, and configuration.
+The available tool surface depends on the execution mode, `runtime_kind`,
+workspace, sandbox readiness, and configuration. It can include:
 
-Common tool families:
-
-- filesystem reads, writes, edits, moves, copies, and deletes
-- repository text search and symbol lookup
-- compact repository mapping and focused test discovery
-- git history inspection
-- shell command execution, background terminals, and durable service helpers
-- verification command execution
+- filesystem reads and edits
+- repository search and symbol lookup
+- Git history inspection
+- shell commands and background terminals
+- verification
 - web fetch and optional web search
 - session history and local artifacts
-- constrained static workspace previews
+- constrained workspace previews
 
-Use:
-
-```bash
-sylliptor tools
-```
-
-for the current built-in tool catalog and configuration-dependent availability.
-
-## Web Access
-
-`web_fetch` retrieves one specific HTTP(S) URL. It is for targeted page or
-document retrieval. Use it for URLs explicitly provided by the user, returned
-by search, or discovered from trusted fetched or local content.
-
-`web_search` is a discovery tool. In auto mode it can use a supported provider
-adapter, configured external backend, or keyless DDGS fallback. Set
-`web_search_policy=off` to remove it from the model's tools.
-
-Other chat provider profiles can still be valid model providers without being
-native `web_search` backends.
+`web_fetch` retrieves a known HTTP(S) page. `web_search` discovers pages through
+a supported provider adapter, configured backend, or the public fallback. Web
+search can be disabled in `/config`.
 
 ## Verification
 
-Verification commands can be inferred from the workspace, provided by config, or
-passed explicitly:
+Sylliptor can infer verification commands from the workspace or use commands
+saved in configuration. When verification is enabled, the agent can run the
+selected checks and keep the complete output in local artifacts.
 
-```bash
-sylliptor run --verify-cmd "pytest -q" "Fix the failing test."
-sylliptor chat --verify-cmd "npm test"
-```
-
-When enabled, the `verify_run` tool lets the agent run the selected verification
-commands and return a compact result while retaining full output in local
-artifacts.
-
-Forge can make verification authoritative for task gates. See [Forge](forge.md).
+Forge can make verification authoritative for task gates. Normal sessions use
+it as evidence that the requested work is complete.
 
 ## Extensions
 
-Sylliptor supports several extension points:
-
-- [MCP](mcp.md): connect external Model Context Protocol servers.
-- [Skills](skills.md): use reusable instruction bundles rooted at `SKILL.md`.
-- [Skills lifecycle](skills_lifecycle.md): scaffold, validate, install, enable,
-  disable, and remove skills.
-- [Plugins](plugins.md): package skills, tools, MCP servers, and hooks.
-- [Custom tools](custom_tools.md): add trusted Python tools with manifests.
-- [Lifecycle hooks](hooks.md): run deterministic command hooks around sessions
-  and tool calls.
-- [Subagents](subagents.md): delegate focused exploration, review, and testing
-  strategy work from normal chat and one-shot flows.
+- [MCP](mcp.md): connect external Model Context Protocol servers
+- [Skills](skills.md): use reusable instruction bundles rooted at `SKILL.md`
+- [Plugins](plugins.md): bundle skills, tools, MCP servers, and hooks
+- [Custom tools](custom_tools.md): add trusted Python tools with manifests
+- [Lifecycle hooks](hooks.md): run deterministic actions around sessions and
+  tool calls
+- [Subagents](subagents.md): delegate focused exploration, implementation,
+  debugging, review, and test planning
 
 Each extension type has its own trust boundary. Project-local executable
-extension points generally require explicit trust before they affect execution.
-
-## One-Shot Runs
-
-`sylliptor run` is optimized for a single bounded instruction. It includes
-guardrails for execution-style repository tasks, but it is not meant to replace
-interactive refinement.
-
-Use `sylliptor run` for focused tasks such as:
-
-- explain this repository
-- summarize a file or module
-- make a small targeted change
-- run a specific verification command
-
-Prefer `sylliptor chat` or Forge for ambiguous, exploratory, or highly
-iterative work.
+extensions generally require explicit trust before they can run.
 
 ## Forge
 
-Forge is the plan-driven workflow for larger tasks. It creates a structured
-plan, executes scoped tasks, records verification/review evidence, and keeps run
-artifacts under the workspace runtime directory.
-
-Use Forge when a change benefits from:
-
-- an explicit plan
-- scoped task boundaries
-- review or verification gates
-- batch execution
-- local PR-style task flow
+Forge creates a structured plan for larger work, executes scoped tasks, records
+verification and review evidence, and keeps run artifacts inside the workspace.
+Use it when a change benefits from explicit task boundaries or parallel work.
 
 See [Forge](forge.md).
 
-## Sessions And Logs
+## Sessions, Feedback, And Updates
 
-Sylliptor stores session logs locally as JSONL. Session commands include:
+Session logs are stored locally as JSONL. Session inspection defaults to the
+current local owner. Feedback reports create local bundles for review; they do
+not upload an archive or submit a GitHub issue automatically.
 
-```bash
-sylliptor sessions list
-sylliptor sessions show <session_id>
-sylliptor sessions score <session_id>
-sylliptor sessions score --latest 5
-```
-
-Session pickers and implicit latest-session operations default to the current
-local owner. Show all retained sessions with:
-
-```bash
-sylliptor sessions list --all
-```
-
-Feedback bundles can be created from retained session artifacts:
-
-```bash
-sylliptor report create --path .
-sylliptor report create "expected X, got Y" --path . --latest
-```
-
-Sylliptor prepares local artifacts for review. It does not submit GitHub issues
-or upload archives automatically.
-
-## Updates
-
-Sylliptor checks for newer releases in a non-blocking, cache-backed way when
-enabled. It never installs updates silently.
-
-Interactive launches may prompt when a cached check finds a newer release.
-Set `update_prompt_enabled=false` to disable only that prompt.
-
-```bash
-sylliptor update check
-sylliptor update
-sylliptor update --dry-run
-```
-
-The update command detects common install styles such as `pipx`, `uv`, virtual
-environments, and pip installs, then shows the exact upgrade command before
-running it.
+Update checks run in the background when enabled. Sylliptor never installs an
+update silently and shows the exact upgrade command before asking for approval.
 
 ## Troubleshooting
 
-- If `sylliptor chat` shows a network or model error, verify the API key, base
-  URL, model name, and network access.
-- If provider setup fails, run `sylliptor doctor providers` for redacted
-  provider diagnostics.
-- If shell commands cannot run, check the selected execution mode and sandbox
-  setup.
-- If web search is unavailable, run `sylliptor tools` and check `web_search`
-  readiness.
-- If the workspace is not what you expected, run `/pwd` in chat or start again
-  with `--path`.
-- If clipboard image paste does not work, install a supported clipboard backend
-  for your platform.
+- For a network or model error, check the active connection in `/config`.
+- If provider setup fails, use the redacted provider diagnostics from the CLI.
+- If shell commands cannot run, check `/mode` and the sandbox setup.
+- If web search is unavailable, check the tool status and web-search settings.
+- If the workspace is unexpected, use `/pwd` and restart from the intended
+  project directory.
+- If image paste does not work, install a supported clipboard backend for the
+  platform.
 
 ## Detailed Guides
 
-- [Architecture](architecture.md): high-level system structure.
-- [Quickstart](quickstart.md): first setup and first run.
-- [Providers and models](providers.md): model access and subscription login.
-- [Credentials](credentials.md): API key precedence and storage.
-- [Security model](security_model.md): trust boundaries and sandboxing.
-- [Shell sandbox](shell_sandbox.md): Docker and Bubblewrap setup.
-- [Server mode](server.md): HTTP API operation.
-- [Forge](forge.md): plan-driven workflows.
-- [MCP](mcp.md): external server integration.
-- [Skills](skills.md): reusable instruction bundles.
-- [Skills lifecycle](skills_lifecycle.md): skill authoring, validation, installation, and removal.
-- [Subagents](subagents.md): focused helper agents for exploration, review, and testing strategy.
-- [Plugins](plugins.md): trusted extension bundles.
-- [Custom tools](custom_tools.md): trusted Python tool authoring.
-- [Lifecycle hooks](hooks.md): command-based policy and automation.
+- [Architecture](architecture.md): high-level system structure
+- [Quickstart](quickstart.md): installation and first use
+- [Providers and models](providers.md): model access and login
+- [Credentials](credentials.md): API key precedence and storage
+- [Security model](security_model.md): trust boundaries and sandboxing
+- [Shell sandbox](shell_sandbox.md): Docker and Bubblewrap setup
+- [Server mode](server.md): HTTP API operation
+- [Forge](forge.md): plan-driven workflows
+- [MCP](mcp.md): external server integration
+- [Skills](skills.md): reusable instruction bundles
+- [Subagents](subagents.md): focused helper agents
+- [Plugins](plugins.md): trusted extension bundles
+- [Custom tools](custom_tools.md): trusted Python tool authoring
+- [Lifecycle hooks](hooks.md): command-based policy and automation

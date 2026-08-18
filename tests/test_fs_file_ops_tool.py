@@ -79,12 +79,11 @@ def test_fs_mkdir_success(tmp_path: Path) -> None:
 
 def test_fs_mkdir_nested_creation_with_parents_true(tmp_path: Path) -> None:
     tools = _build_tools(tmp_path)
-    rel_path = os.fspath(Path("a") / "b" / "c")
 
     result = tools["fs_mkdir"].run({"path": "a/b/c", "parents": True})
 
     assert result == {
-        "path": rel_path,
+        "path": "a/b/c",
         "created": True,
         "already_exists": False,
         "parents": True,
@@ -132,7 +131,6 @@ def test_fs_move_success(tmp_path: Path) -> None:
     source.write_text("alpha\n", encoding="utf-8")
     expected_size = len(source.read_bytes())
     tools = _build_tools(tmp_path)
-    destination = os.fspath(Path("nested") / "new.txt")
 
     result = tools["fs_move"].run(
         {
@@ -143,7 +141,7 @@ def test_fs_move_success(tmp_path: Path) -> None:
 
     assert result == {
         "source_path": "old.txt",
-        "destination_path": destination,
+        "destination_path": "nested/new.txt",
         "moved": True,
         "overwritten": False,
         "bytes": expected_size,
@@ -157,7 +155,6 @@ def test_fs_copy_success(tmp_path: Path) -> None:
     source.write_text("alpha\n", encoding="utf-8")
     expected_size = len(source.read_bytes())
     tools = _build_tools(tmp_path)
-    destination = os.fspath(Path("nested") / "new.txt")
 
     result = tools["fs_copy"].run(
         {
@@ -168,7 +165,7 @@ def test_fs_copy_success(tmp_path: Path) -> None:
 
     assert result == {
         "source_path": "old.txt",
-        "destination_path": destination,
+        "destination_path": "nested/new.txt",
         "copied": True,
         "overwritten": False,
         "bytes": expected_size,
@@ -224,6 +221,27 @@ def test_fs_delete_missing_source(tmp_path: Path) -> None:
         tools["fs_delete"].run({"path": "missing.txt"})
 
 
+def test_fs_delete_in_use_permission_error_preserves_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "in-use.txt"
+    target.write_text("busy\n", encoding="utf-8")
+    tools = _build_tools(tmp_path)
+    original_replace = os.replace
+
+    def locked_replace(source: object, destination: object) -> None:
+        if Path(source).resolve() == target.resolve():
+            raise PermissionError("file is in use")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", locked_replace)
+
+    with pytest.raises(PermissionError, match="file is in use"):
+        tools["fs_delete"].run({"path": "in-use.txt"})
+    assert target.read_text(encoding="utf-8") == "busy\n"
+
+
 def test_fs_move_overwrite_false_blocks_existing_destination(tmp_path: Path) -> None:
     (tmp_path / "old.txt").write_text("old\n", encoding="utf-8")
     (tmp_path / "new.txt").write_text("new\n", encoding="utf-8")
@@ -270,6 +288,69 @@ def test_file_ops_reject_root_escape(
 
     with pytest.raises(AgentRuntimeError, match="Path escapes root"):
         tools[tool_name].run(arguments)
+
+
+def test_agent_runtime_error_preserves_runtime_error_constructor_shapes() -> None:
+    empty_error = AgentRuntimeError()
+    multi_arg_error = AgentRuntimeError("first", "second")
+    payload_error = AgentRuntimeError("blocked", result_payload={"error_code": "example"})
+
+    assert empty_error.args == ()
+    assert multi_arg_error.args == ("first", "second")
+    assert payload_error.args == ("blocked",)
+    assert payload_error.result_payload == {"error_code": "example"}
+
+
+def test_fs_write_root_escape_carries_structured_recovery_payload(tmp_path: Path) -> None:
+    tools = _build_tools(tmp_path)
+
+    with pytest.raises(AgentRuntimeError, match="Path escapes root") as exc_info:
+        tools["fs_write"].run({"path": "/git/server/hooks/post-receive", "content": "#!/bin/sh\n"})
+
+    payload = exc_info.value.result_payload
+    assert payload is not None
+    assert payload["error_code"] == "path_escapes_workspace"
+    assert payload["attempted_path"] == "/git/server/hooks/post-receive"
+    assert payload["tool_name"] == "fs_write"
+    assert payload["workspace_root"] == os.fspath(tmp_path.resolve())
+    actions = {action["action"] for action in payload["suggested_next_actions"]}
+    assert "use_workspace_relative_path" in actions
+    assert "use_shell_run_if_policy_allows" in actions
+
+
+def test_fs_read_root_escape_carries_read_recovery_payload(tmp_path: Path) -> None:
+    tools = _build_tools(tmp_path)
+
+    with pytest.raises(AgentRuntimeError, match="Path escapes root") as exc_info:
+        tools["fs_read"].run({"path": "/etc/passwd"})
+
+    payload = exc_info.value.result_payload
+    assert payload is not None
+    assert payload["error_code"] == "path_escapes_workspace"
+    assert payload["tool_name"] == "fs_read"
+    assert payload["requires_user_confirmation"] is False
+    assert {action["action"] for action in payload["suggested_next_actions"]} == {
+        "use_workspace_relative_path",
+        "ask_user_for_accessible_input",
+        "explain_boundary",
+    }
+
+
+def test_shell_run_cwd_escape_carries_cwd_recovery_payload(tmp_path: Path) -> None:
+    tools = _build_tools(tmp_path)
+
+    with pytest.raises(AgentRuntimeError, match="Path escapes root") as exc_info:
+        tools["shell_run"].run({"cmd": "pwd", "cwd": "/etc"})
+
+    payload = exc_info.value.result_payload
+    assert payload is not None
+    assert payload["error_code"] == "path_escapes_workspace"
+    assert payload["tool_name"] == "shell_run"
+    assert {action["action"] for action in payload["suggested_next_actions"]} == {
+        "use_workspace_relative_cwd",
+        "pass_external_path_as_argument_if_policy_allows",
+        "ask_or_explain_boundary",
+    }
 
 
 @pytest.mark.parametrize(

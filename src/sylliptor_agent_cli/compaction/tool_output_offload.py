@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..secret_redaction import redact_secrets
 from ..session_artifacts import SessionArtifactLayout
 from ..tools.registry import summarize_tool_output_chunk
 
@@ -48,6 +52,115 @@ def _path_is_under_root(*, path: Path, root: Path | None) -> bool:
     return True
 
 
+def _is_link_like(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        attributes = int(getattr(path.lstat(), "st_file_attributes", 0) or 0)
+        return bool(attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)))
+    except OSError:
+        return True
+
+
+def _has_safe_directory_ancestors(*, path: Path, root: Path) -> bool:
+    """Require every existing descendant of root to be a real contained directory."""
+
+    root_abs = root.resolve()
+    try:
+        relative = path.absolute().relative_to(root_abs)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    current = root_abs
+    for component in relative.parts:
+        current = current / component
+        try:
+            exists = current.exists()
+        except OSError:
+            return False
+        if not exists:
+            continue
+        if _is_link_like(current) or not current.is_dir():
+            return False
+        try:
+            current.resolve().relative_to(root_abs)
+        except (OSError, RuntimeError, ValueError):
+            return False
+    return True
+
+
+def _ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        # Windows ACLs are not represented completely by POSIX mode bits.
+        pass
+
+
+def _atomic_private_write_text(
+    path: Path,
+    content: str,
+    *,
+    containment_root: Path | None = None,
+) -> None:
+    """Publish one complete private artifact or leave the old path untouched."""
+
+    if containment_root is not None and not _has_safe_directory_ancestors(
+        path=path.parent,
+        root=containment_root,
+    ):
+        raise OSError("tool output artifact directory is not safely contained")
+    _ensure_private_directory(path.parent)
+    if containment_root is not None and not _has_safe_directory_ancestors(
+        path=path.parent,
+        root=containment_root,
+    ):
+        raise OSError("tool output artifact directory is not safely contained")
+    fd, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        try:
+            os.chmod(temp_path, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            fd = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        # A directory fsync makes the rename durable on filesystems that support it.
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = -1
+        if directory_fd >= 0:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class ToolOutputOffloader:
     def __init__(
         self,
@@ -60,6 +173,7 @@ class ToolOutputOffloader:
     ) -> None:
         self._artifact_layout = artifact_layout
         self._session_artifact_root = artifact_layout.filesystem_root.resolve()
+        self._session_component = _safe_component(artifact_layout.filesystem_root.name)
         self._workspace_root = workspace_root.resolve() if workspace_root is not None else None
         self._threshold_chars = max(1, int(threshold_chars))
         self._preview_chars = max(1, int(preview_chars))
@@ -73,10 +187,24 @@ class ToolOutputOffloader:
             return self._artifact_layout
         if self._workspace_root is None or not self._workspace_artifacts_enabled:
             return self._artifact_layout
-        return SessionArtifactLayout(
-            filesystem_root=self._workspace_root / ".sylliptor",
-            locator_prefix=".sylliptor",
+        workspace_session_root = (
+            self._workspace_root / ".sylliptor" / "sessions" / self._session_component
         )
+        if not _has_safe_directory_ancestors(
+            path=workspace_session_root,
+            root=self._workspace_root,
+        ):
+            return self._artifact_layout
+        return SessionArtifactLayout(
+            filesystem_root=workspace_session_root,
+            locator_prefix=f".sylliptor/sessions/{self._session_component}",
+        )
+
+    @property
+    def artifact_root(self) -> Path:
+        """Session-scoped root containing offloaded outputs."""
+
+        return self._storage_layout().filesystem_root.resolve()
 
     @staticmethod
     def _full_output_guidance(
@@ -125,12 +253,12 @@ class ToolOutputOffloader:
             "tool_call_id": tool_call_id,
             "step": step,
             "offloaded": bool(offloaded),
-            "summary": summarize_tool_output_chunk(tool_name, content_json),
-            "preview": preview_text,
+            "summary": str(redact_secrets(summarize_tool_output_chunk(tool_name, content_json))),
+            "preview": str(redact_secrets(preview_text)),
             "preview_chars": preview_chars,
             "original_chars": original_chars,
             "content_truncated": original_chars > preview_chars,
-            "raw_saved_in_session_log": True,
+            "raw_saved_in_session_log": False,
         }
         if transcript_shaped and not offloaded:
             payload["transcript_shaped"] = True
@@ -151,7 +279,7 @@ class ToolOutputOffloader:
                 artifact_location=artifact_location,
             )
         if error:
-            payload["error"] = error
+            payload["error"] = str(redact_secrets(error))
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
     def _artifact_path(self, *, tool_name: str, tool_call_id: str, step: int) -> Path:
@@ -159,8 +287,11 @@ class ToolOutputOffloader:
         safe_call_id = _safe_component(tool_call_id)
         filename = f"step{max(0, int(step))}_{safe_tool}_{safe_call_id}.json"
         storage_layout = self._storage_layout()
-        candidate = storage_layout.artifact_fs_path("tool_outputs", filename).resolve()
-        candidate.relative_to(storage_layout.filesystem_root.resolve())
+        storage_root = storage_layout.filesystem_root.resolve()
+        candidate = storage_layout.artifact_fs_path("tool_outputs", filename)
+        candidate.parent.resolve().relative_to(storage_root)
+        if candidate.is_symlink():
+            raise ValueError("tool output artifact path cannot be a symlink")
         return candidate
 
     def maybe_offload(
@@ -224,15 +355,20 @@ class ToolOutputOffloader:
             )
             artifact_abs.parent.mkdir(parents=True, exist_ok=True)
             payload = {
+                "schema_version": 1,
                 "tool_name": tool_name,
                 "tool_call_id": tool_call_id,
                 "step": step,
-                "result": result,
                 "content_json": content_json,
             }
-            artifact_abs.write_text(
+            _atomic_private_write_text(
+                artifact_abs,
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
+                containment_root=(
+                    self._workspace_root
+                    if _path_is_under_root(path=artifact_abs, root=self._workspace_root)
+                    else None
+                ),
             )
             storage_layout = self._storage_layout()
             artifact_ref = storage_layout.model_reference_for_path(
@@ -274,6 +410,7 @@ class ToolOutputOffloader:
                 error=None,
             )
         except Exception as exc:
+            safe_error = str(redact_secrets(str(exc)))
             fallback_preview, fallback_preview_chars = _truncated_preview(
                 content_json,
                 self._preview_chars,
@@ -288,7 +425,7 @@ class ToolOutputOffloader:
                 preview_chars=fallback_preview_chars,
                 offloaded=False,
                 transcript_shaped=True,
-                error=str(exc),
+                error=safe_error,
             )
             return OffloadResult(
                 content_for_message=content_for_message,
@@ -301,5 +438,5 @@ class ToolOutputOffloader:
                 original_chars=original_chars,
                 preview_chars=fallback_preview_chars,
                 message_chars=len(content_for_message),
-                error=str(exc),
+                error=safe_error,
             )

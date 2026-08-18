@@ -4,13 +4,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
-
-import sylliptor_agent_cli.agent_loop as agent_loop_mod
+from sylliptor_agent_cli.agent.tools_assembly import ToolDef
 from sylliptor_agent_cli.agent.turn.core import _spec_faithfulness_advisory_message
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.llm.openai_compat import LLMResponse, ToolCall
+from sylliptor_agent_cli.llm.types import AssistantResponsePhase
 from sylliptor_agent_cli.session_store import read_session_events
 
 _LIVE_BG_LINE_1 = (
@@ -57,6 +56,18 @@ class _FakeTerminalManager:
         pass
 
 
+class _FakeDurableServiceManager:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = dict(payload)
+
+    def status(self, service_id: str) -> dict[str, Any]:
+        assert service_id == self.payload["service_id"]
+        return dict(self.payload)
+
+    def list_active(self) -> list[dict[str, Any]]:
+        return [dict(self.payload)]
+
+
 def _event_payloads(path: Path, event_type: str) -> list[dict[str, Any]]:
     return [
         dict(event.get("payload") or {})
@@ -70,22 +81,6 @@ def _controller_details(path: Path) -> list[str]:
         str(payload.get("detail") or "")
         for payload in _event_payloads(path, "controller_intervention")
     ]
-
-
-def _route_decision(route: str, execution_posture: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        route=route,
-        execution_posture=execution_posture,
-        confidence=0.99,
-        language="",
-        script="",
-        explicit_language_override=False,
-        language_source="default",
-        decision_source="test",
-        execution_posture_source="test",
-        tool_family="none",
-        tool_candidates=(),
-    )
 
 
 def _create_one_shot_session(tmp_path: Path, *, session_id: str):
@@ -172,6 +167,61 @@ def test_clean_one_shot_final_gets_one_spec_advisory_then_accepts(tmp_path: Path
     assert _event_payloads(log_path, "completion_gate_accepted_with_open_problems") == []
 
 
+def test_ready_durable_outcome_finishes_without_redundant_spec_advisory(
+    tmp_path: Path,
+) -> None:
+    sessions_dir, session = _create_one_shot_session(
+        tmp_path,
+        session_id="ready-durable-outcome-no-spec-advisory",
+    )
+    payload = {
+        "service_id": "svc_ready",
+        "ownership": "DURABLE_SERVICE",
+        "status": "running",
+        "alive": True,
+        "readiness": {"type": "tcp", "status": "ready", "port": 8080},
+    }
+    session.durable_service_manager = _FakeDurableServiceManager(payload)  # type: ignore[assignment]
+    session.tools["shell_service_start"] = ToolDef(
+        name="shell_service_start",
+        description="Start a durable local service.",
+        parameters={"type": "object", "properties": {}},
+        run=lambda _args: dict(payload),
+    )
+    session.tool_list = [tool.as_openai_tool() for tool in session.tools.values()]
+    final_text = "Hosted locally at http://localhost:8080."
+    client = _RecordingClient(
+        [
+            LLMResponse(
+                content="Starting the durable service.",
+                tool_calls=[
+                    ToolCall(
+                        id="tc-service",
+                        name="shell_service_start",
+                        arguments={"cmd": "python -m http.server 8080"},
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content=final_text, tool_calls=[], raw={}),
+        ]
+    )
+    session.client = client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Keep the service running on port 8080.")
+    finally:
+        session.close()
+
+    log_path = sessions_dir / "ready-durable-outcome-no-spec-advisory.jsonl"
+    assert exit_code == 0
+    assert client.calls == 2
+    assert "spec_faithfulness_advisory" not in _controller_details(log_path)
+    assert _event_payloads(log_path, "completion_gate_nudge") == []
+    final_events = _event_payloads(log_path, "final")
+    assert final_events[-1]["content"] == final_text
+
+
 def test_one_shot_finalization_advisory_mentions_live_background_process(
     tmp_path: Path,
 ) -> None:
@@ -228,114 +278,79 @@ def test_one_shot_finalization_advisory_mentions_live_background_process(
     )
 
 
-def test_problem_final_after_clarification_advisory_still_gets_checklist(
-    tmp_path: Path,
-) -> None:
-    sessions_dir, session = _create_one_shot_session(
-        tmp_path,
-        session_id="clarification-then-problem-checklist",
-    )
-    client = _RecordingClient(
-        [
-            LLMResponse(
-                content="Which output path should I use?",
-                tool_calls=[],
-                raw={},
-            ),
-            LLMResponse(content="Completed work.", tool_calls=[], raw={}),
-            LLMResponse(content="Completed work.", tool_calls=[], raw={}),
-        ]
-    )
-    session.client = client  # type: ignore[assignment]
-
-    try:
-        exit_code = session.run_turn("Create the requested output file.")
-    finally:
-        session.close()
-
-    log_path = sessions_dir / "clarification-then-problem-checklist.jsonl"
-    details = _controller_details(log_path)
-    assert exit_code == 0
-    assert details.count("one_shot_clarification_advisory") == 1
-    assert details.count("completion_gate_checklist") == 1
-    assert _event_payloads(log_path, "completion_gate_accepted_with_open_problems")
-
-
-@pytest.mark.parametrize(
-    ("case_id", "final_text", "clarification_expected", "suppression_expected"),
-    [
-        (
-            "confident-summary-with-what",
-            "Summary: what it does is produce answer.txt with the computed value. "
-            "The output file exists at the requested path.",
-            False,
-            True,
+def test_assistant_prose_does_not_change_completion_gate_decisions(tmp_path: Path) -> None:
+    texts = {
+        "which-file": "Which file?",
+        "file-name": "I need the file name before continuing.",
+        "arabic": "أي ملف يجب أن أستخدم؟",
+        "greek": "Ποιο αρχείο να χρησιμοποιήσω;",
+        "japanese": "どのファイルを使いますか？",
+        "armenian": "Ո՞ր ֆայլն օգտագործեմ՞",
+        "below-300": "Should this remain under three hundred characters?",
+        "above-300": "Which file? " + ("This sentence is declarative. " * 20),
+        "rhetorical": (
+            "What about edge cases? The implementation description remains a declarative "
+            "answer and does not request a controller exception."
         ),
-        (
-            "question-ending",
-            "I need one detail: which directory should I use?",
-            True,
-            False,
-        ),
-        (
-            "long-rhetorical-question",
-            (
-                "Report: what about edge cases? The implementation handles the documented "
-                "inputs, writes the expected artifact, preserves existing files, and records "
-                "the verification notes. The remaining details describe behavior rather than "
-                "ask for user input. "
-                "This paragraph is intentionally long enough to exceed the short-question "
-                "guard so a rhetorical question in the middle of a final report does not turn "
-                "the whole response into a clarification request. "
-                "The final answer is declarative and does not ask the user for anything."
-            ),
-            False,
-            True,
-        ),
-        ("short-question", "Which file?", True, False),
-    ],
-)
-def test_clarification_classifier_question_shape_guard(
-    tmp_path: Path,
-    case_id: str,
-    final_text: str,
-    clarification_expected: bool,
-    suppression_expected: bool,
-) -> None:
-    sessions_dir, session = _create_one_shot_session(
-        tmp_path,
-        session_id=f"clarification-guard-{case_id}",
-    )
-    client = _RecordingClient(
-        [
-            LLMResponse(content=final_text, tool_calls=[], raw={}),
-            LLMResponse(content="Finished.", tool_calls=[], raw={}),
-            LLMResponse(content="Finished.", tool_calls=[], raw={}),
-        ]
-    )
-    session.client = client  # type: ignore[assignment]
+        "markdown-code": "The example is `value = predicate ? left : right` and is complete.",
+        "fenced-code": "Result:\n```text\nready?\n```\nThe report is complete.",
+        "ascii-semicolon": "The command completed; the result is recorded.",
+        "question-then-explanation": "Which file? " + ("The explanation continues. " * 30),
+    }
+    signatures: dict[str, tuple[Any, ...]] = {}
 
-    try:
-        exit_code = session.run_turn("Create the requested output file.")
-    finally:
-        session.close()
+    for case_id, final_text in texts.items():
+        case_root = tmp_path / case_id
+        case_root.mkdir()
+        sessions_dir, session = _create_one_shot_session(case_root, session_id=case_id)
+        client = _RecordingClient(
+            [
+                LLMResponse(content=final_text, tool_calls=[], raw={}),
+                LLMResponse(content="Finished.", tool_calls=[], raw={}),
+                LLMResponse(content="Finished.", tool_calls=[], raw={}),
+            ]
+        )
+        session.client = client  # type: ignore[assignment]
 
-    log_path = sessions_dir / f"clarification-guard-{case_id}.jsonl"
-    details = _controller_details(log_path)
-    suppressed = [
-        event
-        for event in _event_payloads(log_path, "controller_intervention")
-        if event.get("detail") == "clarification_suppressed_by_guard"
-    ]
+        try:
+            exit_code = session.run_turn("Create the requested output file.")
+        finally:
+            session.close()
 
-    assert exit_code == 0
-    assert bool(details.count("one_shot_clarification_advisory")) is clarification_expected
-    assert bool(suppressed) is suppression_expected
-    for event in suppressed:
-        metadata = event["metadata"]
-        assert metadata["text_len"] == len(final_text.strip())
-        assert metadata["ends_with_question"] is False
-        assert event["headline_counted"] is False
+        log_path = sessions_dir / f"{case_id}.jsonl"
+        decision_events = []
+        for event in read_session_events(log_path):
+            event_type = str(event.get("type") or "")
+            if event_type not in {
+                "one_shot_completion_gate_failed",
+                "completion_gate_nudge",
+                "completion_gate_accepted_with_open_problems",
+                "completion_gate_blocker_accepted",
+            }:
+                continue
+            payload = dict(event.get("payload") or {})
+            assert "clarification_response" not in payload
+            assert "clarification_allows_completion" not in payload
+            decision_events.append(
+                (
+                    event_type,
+                    payload.get("stage"),
+                    tuple(payload.get("problems") or payload.get("remaining_problems") or ()),
+                    payload.get("blocked_response"),
+                    payload.get("blocked_response_allows_completion"),
+                    payload.get("verification_expected"),
+                )
+            )
+
+        assert exit_code == 0
+        assert client.calls == 2
+        assert _controller_details(log_path).count("completion_gate_checklist") == 1
+        assert _event_payloads(log_path, "completion_gate_blocker_accepted") == []
+        signatures[case_id] = tuple(decision_events)
+
+    baseline = signatures["which-file"]
+    assert baseline
+    assert all(signature == baseline for signature in signatures.values())
 
 
 def test_continuation_nudge_does_not_starve_clean_final_spec_advisory(
@@ -351,6 +366,7 @@ def test_continuation_nudge_does_not_starve_clean_final_spec_advisory(
                 content="I will inspect the repo, make the edit, and then verify it.",
                 tool_calls=[],
                 raw={},
+                assistant_phase=AssistantResponsePhase.COMMENTARY,
             ),
             LLMResponse(
                 content="",
@@ -391,14 +407,8 @@ def test_continuation_nudge_does_not_starve_clean_final_spec_advisory(
 
 def test_read_only_chat_final_does_not_get_spec_advisory(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
-    monkeypatch.setattr(
-        agent_loop_mod,
-        "_route_turn",
-        lambda **_kwargs: _route_decision("repo", "execute"),
-    )
     sessions_dir = tmp_path / "sessions"
     session = create_session(
         cfg=AppConfig(model="test-model", routing_mode="auto"),

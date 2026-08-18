@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.litellm_static_provider import BUNDLED_MODEL_CATALOG_SOURCE
+from sylliptor_agent_cli.llm.types import BillingMode, CostSource, LLMUsage
 from sylliptor_agent_cli.model_registry import ModelMeta, ModelRegistry
 from sylliptor_agent_cli.request_estimation import (
     estimate_request_token_breakdown,
@@ -613,7 +614,7 @@ def test_build_usage_record_separates_cache_read_write_and_marks_cost_unknown() 
     assert record.cache_cost_pricing_missing is True
 
     payload = record.to_payload()
-    assert payload["usage_schema_version"] == 5
+    assert payload["usage_schema_version"] == 6
     assert payload["usage_source_detail"] == "provider_response"
     assert payload["usage_confidence"] == "reported"
     assert payload["output_includes_reasoning"] is True
@@ -695,6 +696,119 @@ def test_kimi_k3_cached_tokens_use_global_moonshot_discount() -> None:
 
     assert record.cache_cost_pricing_missing is False
     assert record.cost_usd == (20 * 0.000003) + (80 * 0.0000003) + (10 * 0.000015)
+
+
+def test_provider_reported_total_cost_overrides_catalog_token_estimate() -> None:
+    registry = _FakeRegistry(
+        {
+            "sonar-pro": ModelMeta(
+                model_name="sonar-pro",
+                context_window_tokens=200000,
+                max_output_tokens=8192,
+                input_cost_per_token=0.000003,
+                output_cost_per_token=0.000015,
+                raw_metadata={},
+                source=BUNDLED_MODEL_CATALOG_SOURCE,
+            )
+        }
+    )
+    api_usage = LLMUsage(
+        prompt_tokens=8,
+        completion_tokens=439,
+        total_tokens=447,
+        provider_cost_usd=0.012609,
+    )
+
+    record = build_usage_record(
+        role="main",
+        requested_model="sonar-pro",
+        response_model="sonar-pro",
+        messages=[{"role": "user", "content": "hello"}],
+        response_content="world",
+        response_tool_calls=[],
+        api_prompt_tokens=8,
+        api_completion_tokens=439,
+        api_total_tokens=447,
+        api_usage=api_usage,
+        registry=registry,  # type: ignore[arg-type]
+    )
+
+    assert record.cost_usd == 0.012609
+    assert record.provider_cost_usd == 0.012609
+    assert record.cost_source == CostSource.PROVIDER_REPORTED.value
+
+
+def test_subscription_usage_is_not_presented_as_zero_cost() -> None:
+    registry = _FakeRegistry(
+        {
+            "gpt-subscription": ModelMeta(
+                model_name="gpt-subscription",
+                context_window_tokens=200000,
+                max_output_tokens=8192,
+                input_cost_per_token=0.0,
+                output_cost_per_token=0.0,
+                raw_metadata={},
+                source=BUNDLED_MODEL_CATALOG_SOURCE,
+            )
+        }
+    )
+    record = build_usage_record(
+        role="main",
+        requested_model="gpt-subscription",
+        response_model="gpt-subscription",
+        messages=[{"role": "user", "content": "hello"}],
+        response_content="world",
+        response_tool_calls=[],
+        api_prompt_tokens=100,
+        api_completion_tokens=10,
+        api_total_tokens=110,
+        registry=registry,  # type: ignore[arg-type]
+        billing_mode=BillingMode.SUBSCRIPTION.value,
+    )
+
+    assert record.cost_usd is None
+    assert record.billing_mode == BillingMode.SUBSCRIPTION.value
+    assert record.cost_source == CostSource.SUBSCRIPTION.value
+
+    summary = UsageSummary()
+    summary.add_record(record)
+    totals = summary.totals()
+    assert totals["subscription_calls"] == 1
+    assert totals["unknown_cost_calls"] == 0
+    assert totals["known_cost_calls"] == 0
+
+
+def test_usage_summary_preserves_cache_reporting_coverage() -> None:
+    summary = UsageSummary()
+    base = dict(
+        timestamp="2026-07-31T00:00:00+00:00",
+        role="main",
+        requested_model="model",
+        response_model="model",
+        prompt_tokens=10,
+        completion_tokens=1,
+        total_tokens=11,
+        input_cost_per_token=None,
+        output_cost_per_token=None,
+        cost_usd=None,
+        usage_source="api",
+    )
+    summary.add_record(UsageRecord(**base))
+    summary.add_record(
+        UsageRecord(
+            **base,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+            input_tokens_uncached=10,
+        )
+    )
+
+    row = summary.by_model_rows()[0]
+    assert row["api_usage_calls"] == 2
+    assert row["cache_read_input_tokens"] == 0
+    assert row["cache_read_reported_calls"] == 1
+    assert row["cache_creation_reported_calls"] == 1
+    assert row["input_tokens_uncached_reported_calls"] == 1
 
 
 def test_build_usage_record_records_prompt_estimate_calibration() -> None:
@@ -1917,3 +2031,64 @@ def test_format_usd_hud_rounding() -> None:
     assert format_usd(0.00004, style="hud") == "$0.000"
     assert format_usd(0.00149, style="hud") == "$0.001"
     assert format_usd(1.239, style="hud") == "$1.239"
+
+
+def test_derived_uncached_tokens_are_not_counted_as_provider_reported() -> None:
+    summary = UsageSummary()
+    base = dict(
+        timestamp="2026-07-31T00:00:00+00:00",
+        role="main",
+        requested_model="model",
+        response_model="model",
+        prompt_tokens=100,
+        completion_tokens=1,
+        total_tokens=101,
+        input_cost_per_token=None,
+        output_cost_per_token=None,
+        cost_usd=None,
+        usage_source="api",
+    )
+    summary.add_record(UsageRecord(**base, input_tokens_uncached=30))
+    summary.add_record(
+        UsageRecord(**base, input_tokens_uncached=20, input_tokens_uncached_derived=True)
+    )
+
+    totals = summary.totals()
+    assert totals["input_tokens_uncached"] == 50
+    assert totals["input_tokens_uncached_reported_calls"] == 1
+    assert totals["input_tokens_uncached_derived_calls"] == 1
+
+
+def test_build_usage_record_marks_host_derived_uncached_tokens() -> None:
+    registry = _FakeRegistry(
+        {
+            "model": ModelMeta(
+                model_name="model",
+                context_window_tokens=200000,
+                max_output_tokens=8192,
+                input_cost_per_token=None,
+                output_cost_per_token=None,
+                raw_metadata={},
+                source=BUNDLED_MODEL_CATALOG_SOURCE,
+            )
+        }
+    )
+    record = build_usage_record(
+        role="main",
+        requested_model="model",
+        response_model="model",
+        messages=[{"role": "user", "content": "hello"}],
+        response_content="world",
+        response_tool_calls=[],
+        api_prompt_tokens=100,
+        api_completion_tokens=10,
+        api_total_tokens=110,
+        api_cache_read_input_tokens=40,
+        registry=registry,  # type: ignore[arg-type]
+    )
+
+    # The provider reported a cache read but never an uncached figure; the host
+    # computed it, so it must not be presented as provider-reported.
+    assert record.input_tokens_uncached == 60
+    assert record.input_tokens_uncached_derived is True
+    assert record.to_payload()["input_tokens_uncached_derived"] is True

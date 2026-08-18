@@ -61,6 +61,10 @@ class _ChatClientFactory(Protocol):
     def __call__(self, **kwargs: Any) -> Any: ...
 
 
+class _WebSearchProbe(Protocol):
+    def __call__(self, **kwargs: Any) -> dict[str, Any]: ...
+
+
 @dataclass(frozen=True)
 class ProviderDiagnostics:
     profile_name: str
@@ -374,6 +378,330 @@ def validate_active_provider_live(
         model=model,
         status="failed",
         message="Provider returned an empty response to the live validation prompt.",
+    )
+
+
+@dataclass(frozen=True)
+class WebSearchLiveValidation:
+    """Result of exercising the enabled web_search tool end-to-end once.
+
+    Static readiness checks only prove the configuration parses; they cannot
+    catch a gateway that rejects real search requests. This probe issues one
+    minimal call through the resolved adapter and reports what actually served
+    it, so "ready" always means "a real call worked".
+    """
+
+    mode: str
+    configured_adapter: str
+    resolved_adapter: str
+    backend_used: str
+    fallback_used: bool
+    status: str
+    message: str
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "passed"
+
+    def rows(self) -> tuple[tuple[str, str], ...]:
+        return (
+            ("web_search_mode", self.mode),
+            ("configured_adapter", self.configured_adapter),
+            ("resolved_adapter", self.resolved_adapter or "(none)"),
+            ("backend_used", self.backend_used or "(none)"),
+            ("fallback_used", "yes" if self.fallback_used else "no"),
+            ("status", self.status),
+            ("message", self.message),
+        )
+
+
+_WEB_SEARCH_PROBE_QUERY = "current UTC date"
+
+
+def _cfg_with_web_search_probe_overrides(
+    cfg: AppConfig,
+    *,
+    timeout_s: float,
+    adapter: str | None = None,
+) -> AppConfig:
+    update: dict[str, Any] = {"web_search_timeout_s": float(timeout_s)}
+    if adapter:
+        update["web_search_adapter"] = adapter
+    return cfg.model_copy(update=update)
+
+
+def validate_web_search_live(
+    cfg: AppConfig,
+    *,
+    timeout_s: float = 15.0,
+    search_fn: _WebSearchProbe | None = None,
+) -> WebSearchLiveValidation:
+    """Issue one real, minimal web_search call through the resolved adapter.
+
+    The caller is responsible for confirmation (the probe makes live requests
+    and may incur provider cost). Reports the adapter that was chosen, whether
+    an external fallback served the call, and the failing adapter's error
+    verbatim (URL-redacted) when something breaks.
+    """
+
+    mode = resolve_web_search_mode(cfg)
+    configured_adapter = resolve_web_search_adapter(cfg)
+    policy = resolve_web_search_policy(cfg)
+    profile = get_active_profile(cfg)
+    api_key = _resolve_active_profile_api_key(cfg, profile.name)
+    search_status = resolve_web_search_runtime_status(cfg=cfg, api_key=api_key.key)
+    resolved_adapter = search_status.provider or ""
+    if policy == "off" or mode == "off" or not search_status.registration_ready:
+        return WebSearchLiveValidation(
+            mode=mode,
+            configured_adapter=configured_adapter,
+            resolved_adapter=resolved_adapter,
+            backend_used="",
+            fallback_used=False,
+            status="skipped",
+            message=(
+                "web_search is not enabled or not configured: "
+                f"{_redact_url_text(search_status.summary)}"
+            ),
+        )
+    if search_fn is None:
+        from .tools.web_search import web_search
+
+        search_fn = web_search
+    # Mirror web_search()'s own override resolution (env adapter/provider
+    # overrides included), not just the config field: fallback only happens
+    # when no explicit adapter override pins the backend.
+    try:
+        from .tools.web_search import _resolve_provider_override
+
+        provider_override, _override_error = _resolve_provider_override(cfg=cfg, strict=False)
+    except Exception:  # noqa: BLE001 - treat unknown override state as pinned.
+        provider_override = resolved_adapter
+
+    def _probe(probe_cfg: AppConfig) -> dict[str, Any]:
+        return search_fn(
+            query=_WEB_SEARCH_PROBE_QUERY,
+            cfg=probe_cfg,
+            api_key=api_key.key,
+            max_sources=1,
+        )
+
+    # Pin the resolved adapter first so a hard failure surfaces its own error
+    # instead of being silently masked by an in-call fallback. Env adapter
+    # overrides can defeat the pin, so the actually-used backend is compared
+    # against the resolved adapter instead of being assumed.
+    try:
+        result = _probe(
+            _cfg_with_web_search_probe_overrides(
+                cfg,
+                timeout_s=timeout_s,
+                adapter=resolved_adapter,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - report any probe failure verbatim.
+        resolved_error = _redact_url_text(str(exc))
+    else:
+        backend_used = str(result.get("backend_adapter") or resolved_adapter)
+        fallback_used = bool(backend_used) and backend_used != resolved_adapter
+        return WebSearchLiveValidation(
+            mode=mode,
+            configured_adapter=configured_adapter,
+            resolved_adapter=resolved_adapter,
+            backend_used=backend_used,
+            fallback_used=fallback_used,
+            status="passed",
+            message=(
+                f"web_search served {int(result.get('source_count') or 0)} source(s) "
+                f"via {backend_used}."
+                + (
+                    f" The resolved adapter {resolved_adapter} did not serve the probe; "
+                    "an in-call fallback did."
+                    if fallback_used
+                    else ""
+                )
+            ),
+        )
+
+    can_fall_back = mode == "auto" and provider_override is None
+    if can_fall_back:
+        try:
+            fallback_result = _probe(_cfg_with_web_search_probe_overrides(cfg, timeout_s=timeout_s))
+        except Exception as exc:  # noqa: BLE001 - combined failure is the report.
+            return WebSearchLiveValidation(
+                mode=mode,
+                configured_adapter=configured_adapter,
+                resolved_adapter=resolved_adapter,
+                backend_used="",
+                fallback_used=False,
+                status="failed",
+                message=(
+                    f"{resolved_adapter} failed: {resolved_error}; "
+                    f"fallback backends also failed: {_redact_url_text(str(exc))}"
+                ),
+            )
+        backend_used = str(fallback_result.get("backend_adapter") or "")
+        fallback_used = bool(backend_used) and backend_used != resolved_adapter
+        return WebSearchLiveValidation(
+            mode=mode,
+            configured_adapter=configured_adapter,
+            resolved_adapter=resolved_adapter,
+            backend_used=backend_used,
+            fallback_used=fallback_used,
+            status="passed",
+            message=(
+                f"{resolved_adapter} failed ({resolved_error}); "
+                f"fallback {backend_used} served the probe."
+                if fallback_used
+                else (
+                    f"web_search served the probe via {backend_used} after an "
+                    f"initial {resolved_adapter} failure ({resolved_error})."
+                )
+            ),
+        )
+    return WebSearchLiveValidation(
+        mode=mode,
+        configured_adapter=configured_adapter,
+        resolved_adapter=resolved_adapter,
+        backend_used="",
+        fallback_used=False,
+        status="failed",
+        message=f"{resolved_adapter} failed: {resolved_error}",
+    )
+
+
+@dataclass(frozen=True)
+class ReasoningSuppressionReport:
+    """Whether a reasoning-off request actually suppressed provider reasoning.
+
+    Latency-sensitive internal calls are issued with enable_thinking=False,
+    but some gateways ignore the flag and burn reasoning tokens anyway. This
+    makes the per-provider behavior visible instead of assumed.
+    """
+
+    profile_name: str
+    provider_key: str
+    protocol: str
+    model: str
+    outcome: str
+    reasoning_tokens: int | None
+    message: str
+
+    def rows(self) -> tuple[tuple[str, str], ...]:
+        return (
+            ("profile", self.profile_name),
+            ("provider_key", self.provider_key),
+            ("protocol", self.protocol),
+            ("model", self.model or "(missing)"),
+            ("reasoning_off_outcome", self.outcome),
+            (
+                "reasoning_tokens",
+                "(not reported)" if self.reasoning_tokens is None else str(self.reasoning_tokens),
+            ),
+            ("message", self.message),
+        )
+
+
+def probe_reasoning_suppression_live(
+    cfg: AppConfig,
+    *,
+    timeout_s: float = 15.0,
+    client_factory: _ChatClientFactory | None = None,
+) -> ReasoningSuppressionReport:
+    """Send one reasoning-off request and report whether reasoning was suppressed.
+
+    Mirrors how internal latency-sensitive clients are built (enable_thinking
+    False, empty reasoning effort) and inspects usage reasoning-token details
+    on the response. The caller is responsible for confirmation.
+    """
+
+    profile = get_active_profile(cfg)
+    base_url = resolve_effective_base_url(cfg=cfg, profile=profile)
+    protocol = str(profile.protocol or OPENAI_COMPAT_PROTOCOL).strip()
+    model = str(profile.default_model or getattr(cfg, "model", "") or "").strip()
+    provider_key = (
+        resolve_model_provider_key(
+            cfg=cfg,
+            model_name=model,
+            base_url=base_url,
+            profile_name=profile.name,
+        )
+        or profile_provider_family(profile)
+        or profile.name
+    )
+
+    def _report(outcome: str, message: str, reasoning_tokens: int | None = None):
+        return ReasoningSuppressionReport(
+            profile_name=profile.name,
+            provider_key=str(provider_key or ""),
+            protocol=protocol,
+            model=model,
+            outcome=outcome,
+            reasoning_tokens=reasoning_tokens,
+            message=message,
+        )
+
+    if not model:
+        return _report("skipped", "Active profile has no model configured.")
+    api_key = _resolve_active_profile_api_key(cfg, profile.name)
+    if not api_key.key and not profile.auth_provider:
+        return _report("skipped", "Active profile has no API key.")
+    try:
+        if client_factory is None:
+            from .llm.factory import make_llm_client
+
+            client_factory = make_llm_client
+        client = client_factory(
+            cfg=cfg,
+            api_key=api_key.key or "",
+            model=model,
+            timeout_s=timeout_s,
+            temperature=0.0,
+            profile=profile,
+            enable_thinking=False,
+            reasoning_effort="",
+        )
+        response = client.chat(
+            messages=[{"role": "user", "content": "Reply with only: ok"}],
+            max_tokens=20,
+        )
+    except Exception as exc:  # noqa: BLE001 - probe failures become the report.
+        return _report("failed", _classify_live_validation_error(str(exc), model=model))
+
+    usage = getattr(response, "usage", None)
+    reasoning_tokens = getattr(usage, "reasoning_tokens", None)
+    visible_reasoning = bool(getattr(response, "reasoning", ()) or ())
+    if isinstance(reasoning_tokens, int) and reasoning_tokens > 0:
+        return _report(
+            "ignored",
+            (
+                f"Provider returned {reasoning_tokens} reasoning token(s) despite "
+                "enable_thinking=false; latency-sensitive internal calls (e.g. routing) "
+                "will pay reasoning latency on this provider."
+            ),
+            reasoning_tokens,
+        )
+    if visible_reasoning:
+        return _report(
+            "ignored",
+            (
+                "Provider returned a reasoning trace despite enable_thinking=false; "
+                "latency-sensitive internal calls (e.g. routing) will pay reasoning "
+                "latency on this provider."
+            ),
+            reasoning_tokens if isinstance(reasoning_tokens, int) else None,
+        )
+    if isinstance(reasoning_tokens, int):
+        return _report(
+            "suppressed",
+            "Provider honored enable_thinking=false (0 reasoning tokens).",
+            reasoning_tokens,
+        )
+    return _report(
+        "not_reported",
+        (
+            "Provider does not report reasoning token details; suppression cannot be "
+            "verified from usage data."
+        ),
     )
 
 

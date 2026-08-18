@@ -137,6 +137,13 @@ def test_rich_surface_tool_and_forge_renderables_ascii_safe_on_cp1252_stream(
         "sylliptor_agent_cli.surface.rich_surface.Prompt.ask",
         lambda *_args, **_kwargs: "n",
     )
+    # Force the line-based fallback path this test stubs: on hosts with a real
+    # /dev/tty (e.g. a tmux-run suite) the inline selector would otherwise open
+    # the terminal and block forever waiting for a human keypress.
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.surface.rich_surface.RichSurface._uses_inline_approval_selector",
+        lambda self: False,
+    )
 
     surface.on_user_message("please inspect │")
     surface.on_progress_update("Planner update · running │")

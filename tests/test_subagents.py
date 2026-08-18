@@ -2212,6 +2212,8 @@ def test_subagent_live_tool_events_are_forwarded_to_parent_surface(
     result = tools["subagent_run"].run({"name": "explorer", "task": "Inspect README"})
 
     assert result["result"] == "nested trace complete"
+    assert result["effects"] == ["delegate", "read_workspace"]
+    assert result["touched_repo_paths"] == []
     assert parent_surface.lifecycle_order.index(
         "subagent_start"
     ) < parent_surface.lifecycle_order.index("tool_start")
@@ -2229,6 +2231,166 @@ def test_subagent_live_tool_events_are_forwarded_to_parent_surface(
     assert len(parent_surface.subagent_ends) == 1
     assert parent_surface.subagent_ends[0].status == "success"
     assert parent_surface.subagent_ends[0].steps_completed == 1
+
+
+def test_subagent_runtime_shell_mutations_are_reported_to_the_child_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_shell_run(**kwargs: Any) -> dict[str, Any]:
+        (tmp_path / "shell-created.txt").write_text("created\n", encoding="utf-8")
+        return {
+            "cmd": kwargs["cmd"],
+            "effective_cmd": kwargs["cmd"],
+            "cwd": str(tmp_path),
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(agent_loop, "shell_run", _fake_shell_run)
+    tools = build_tools(
+        root=tmp_path,
+        console=None,
+        surface=NoopSurface(),
+        store=_RecordingStore(),  # type: ignore[arg-type]
+        mode="auto",
+        yes=True,
+        cfg=AppConfig(model="test-model"),
+        api_key="test-key",
+        subagent_depth=1,
+        runtime_kind=RuntimeKind.SUBAGENT,
+    )
+
+    result = tools["shell_run"].run({"cmd": "generate output"})
+
+    assert result["touched_repo_paths"] == ["shell-created.txt"]
+    assert result["material_touched_repo_paths"] == ["shell-created.txt"]
+
+
+@pytest.mark.parametrize(
+    ("termination", "expected_status"),
+    [
+        ("success", None),
+        ("nonzero", None),
+        ("exception", None),
+        ("cancelled", "cancelled"),
+        ("missing_final", "degraded"),
+    ],
+)
+def test_subagent_reconciles_workspace_mutations_across_terminal_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    termination: str,
+    expected_status: str | None,
+) -> None:
+    class _MutatingSubSession(_FakeSubSession):
+        def run_turn(self, task: str) -> int:
+            self.run_calls.append(task)
+            (tmp_path / "child-created.txt").write_text("created\n", encoding="utf-8")
+            cache_path = tmp_path / ".pytest_cache" / "v" / "cache" / "nodeids"
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text("cache\n", encoding="utf-8")
+            if termination == "exception":
+                raise RuntimeError("child exploded")
+            if termination == "cancelled":
+                raise RuntimeError("cancelled_by_user")
+            return 1 if termination == "nonzero" else 0
+
+    fake_sub_session = _MutatingSubSession(
+        tools={
+            "fs_read": ToolDef(
+                name="fs_read",
+                description="read",
+                parameters={"type": "object", "properties": {}, "required": []},
+                run=lambda _args: {"ok": True},
+            )
+        },
+        messages=(
+            [{"role": "user", "content": "No final report was emitted."}]
+            if termination == "missing_final"
+            else [{"role": "assistant", "content": "Subagent final answer"}]
+        ),
+        store_events=[] if termination == "missing_final" else None,
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "create_session",
+        lambda **_kwargs: fake_sub_session,
+    )
+    recording_store = _RecordingStore()
+    registry = {
+        "sandboxed": SubagentDefinition(
+            name="sandboxed",
+            description="sandboxed test agent",
+            system_prompt="You are sandboxed.",
+            mode="auto",
+        )
+    }
+    tools = _build_main_tools(
+        tmp_path=tmp_path,
+        subagents_enabled=True,
+        mode="auto",
+        subagent_registry=registry,
+        store=recording_store,
+    )
+
+    result = tools["subagent_run"].run({"name": "sandboxed", "task": "Run task"})
+
+    assert result["touched_repo_paths"] == ["child-created.txt"]
+    assert result["effects"] == ["delegate", "write_workspace"]
+    if expected_status is not None:
+        assert result["status"] == expected_status
+    end_payload = _last_store_event_payload(recording_store, "subagent_end")
+    assert end_payload["touched_repo_paths"] == ["child-created.txt"]
+    assert end_payload["effects"] == ["delegate", "write_workspace"]
+
+
+def test_non_editing_subagent_workspace_mutation_is_degraded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _MutatingDebuggerSession(_FakeSubSession):
+        def run_turn(self, task: str) -> int:
+            self.run_calls.append(task)
+            (tmp_path / "debugger-created.txt").write_text("unexpected\n", encoding="utf-8")
+            return 0
+
+    fake_sub_session = _MutatingDebuggerSession(
+        tools={
+            "fs_read": ToolDef(
+                name="fs_read",
+                description="read",
+                parameters={"type": "object", "properties": {}, "required": []},
+                run=lambda _args: {"ok": True},
+            )
+        },
+        messages=[{"role": "assistant", "content": "Diagnosis complete"}],
+    )
+    monkeypatch.setattr(
+        agent_loop,
+        "create_session",
+        lambda **_kwargs: fake_sub_session,
+    )
+    recording_store = _RecordingStore()
+    tools = _build_main_tools(
+        tmp_path=tmp_path,
+        subagents_enabled=True,
+        mode="auto",
+        subagent_registry={"debugger": built_in_subagents()["debugger"]},
+        store=recording_store,
+    )
+
+    result = tools["subagent_run"].run({"name": "debugger", "task": "Diagnose failure"})
+
+    assert result["status"] == "degraded"
+    assert result["failure_category"] == "workspace_mutation"
+    assert result["error_code"] == "unexpected_workspace_mutation"
+    assert result["touched_repo_paths"] == ["debugger-created.txt"]
+    end_payload = _last_store_event_payload(recording_store, "subagent_end")
+    assert end_payload["status"] == "degraded"
+    assert end_payload["error_code"] == "unexpected_workspace_mutation"
 
 
 def test_subagent_review_mode_non_interactive_fails_fast_without_approval_prompt(
@@ -2456,6 +2618,7 @@ def test_subagent_loader_discovers_project_and_user_agent_directories(
         "---\n"
         "name: project-agent\n"
         "description: Project custom agent\n"
+        "allow_workspace_writes: false\n"
         "allow_tools:\n"
         "  - fs_read\n"
         "---\n"
@@ -2500,6 +2663,8 @@ def test_subagent_loader_discovers_project_and_user_agent_directories(
     assert registry["user-agent"].mode == "readonly"
     assert registry["project-agent"].prompt_trust == "untrusted"
     assert registry["user-agent"].prompt_trust == "untrusted"
+    assert registry["project-agent"].allow_workspace_writes is False
+    assert registry["user-agent"].allow_workspace_writes is True
 
 
 def test_built_in_subagents_allow_navigation_tools() -> None:
@@ -2523,11 +2688,13 @@ def test_built_in_subagents_allow_navigation_tools() -> None:
     assert registry["frontend-engineer"].allow_tools == ()
     assert registry["frontend-engineer"].deny_tools == ("image_generate",)
     assert registry["debugger"].mode == "auto"
+    assert registry["debugger"].allow_workspace_writes is False
     assert "shell_run" in registry["debugger"].allow_tools
     assert "verify_run" in registry["debugger"].allow_tools
     assert "fs_write" not in registry["debugger"].allow_tools
     assert "git_apply_patch" not in registry["debugger"].allow_tools
     assert registry["visual-designer"].mode == "auto"
+    assert registry["visual-designer"].allow_workspace_writes is True
     assert "image_generate" in registry["visual-designer"].allow_tools
     assert "fs_write" not in registry["visual-designer"].allow_tools
     assert "shell_run" not in registry["visual-designer"].allow_tools
@@ -2632,6 +2799,37 @@ def test_parallel_subagent_prelaunch_requires_resolved_readonly_definition() -> 
         deadline_can_start=True,
     )
 
+    review_override_calls = [
+        _subagent_tool_call("call-1", name="implementer", mode="review"),
+        _subagent_tool_call("call-2", name="frontend-engineer", mode="review"),
+    ]
+    assert not _can_prelaunch_parallel_subagent_batch(
+        tool_calls=review_override_calls,
+        turn_tools={"subagent_run": object()},
+        subagent_registry=registry,
+        failed_tool_call_counts={},
+        hook_dispatcher=None,
+        subagent_policy_reason="repo_execution_turn",
+        deadline_can_start=True,
+    )
+
+    custom_review_registry = dict(registry)
+    custom_review_registry["explorer"] = SubagentDefinition(
+        name="explorer",
+        description="approval-capable custom reviewer",
+        system_prompt="Review and optionally edit.",
+        mode="review",
+    )
+    assert not _can_prelaunch_parallel_subagent_batch(
+        tool_calls=tool_calls,
+        turn_tools={"subagent_run": object()},
+        subagent_registry=custom_review_registry,
+        failed_tool_call_counts={},
+        hook_dispatcher=None,
+        subagent_policy_reason="repo_execution_turn",
+        deadline_can_start=True,
+    )
+
 
 def test_subagent_tool_schema_includes_name_enum_when_registry_is_available(
     tmp_path: Path,
@@ -2682,15 +2880,15 @@ def test_subagent_loader_supports_claude_style_tool_aliases(tmp_path: Path) -> N
     assert alias_agent.deny_tools == ("search_rg",)
 
 
-def test_custom_tool_aliases_and_allowlist_launch(
+def test_custom_claude_style_allowlist_and_tool_aliases_launch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project_agents = tmp_path / ".sylliptor_agents"
     project_agents.mkdir(parents=True, exist_ok=True)
-    (project_agents / "tool_alias_runtime.md").write_text(
+    (project_agents / "claude_alias_runtime.md").write_text(
         "---\n"
-        "name: tool-alias-runtime\n"
+        "name: claude-alias-runtime\n"
         "tools:\n"
         "  - read_file\n"
         "  - search_rg\n"
@@ -2729,7 +2927,7 @@ def test_custom_tool_aliases_and_allowlist_launch(
     )
 
     result = tools["subagent_run"].run(
-        {"name": "tool-alias-runtime", "task": "Inspect the repository"}
+        {"name": "claude-alias-runtime", "task": "Inspect the repository"}
     )
 
     assert "error" not in result, result
@@ -2828,20 +3026,11 @@ def test_create_session_exposes_visual_designer_only_when_generation_is_enabled(
         assert "visual-designer" in subagent_context
         assert "visual-designer" in session.subagent_registry
         assert "image_generate" in session.tools
-        route_context = agent_loop._turn_route_context(
-            session,
-            had_active_workspace_task_before_turn=False,
-        )
-        assert route_context is not None
-        capabilities = route_context.to_payload()["artifact_capabilities"]
-        assert capabilities[0]["name"] == "image_generation"
-        assert capabilities[0]["status"] == "available"
-        assert "reason" not in capabilities[0]
     finally:
         session.close()
 
 
-def test_readonly_session_gives_router_and_executor_the_same_grounded_image_blocker(
+def test_readonly_session_grounds_image_blocker_in_subagent_context(
     tmp_path: Path,
 ) -> None:
     session = create_session(
@@ -2860,22 +3049,12 @@ def test_readonly_session_gives_router_and_executor_the_same_grounded_image_bloc
             for message in session.messages
             if "<subagent_context>" in str(message.get("content") or "")
         )
-        route_context = agent_loop._turn_route_context(
-            session,
-            had_active_workspace_task_before_turn=False,
-        )
-        assert route_context is not None
-        image_capability = route_context.to_payload()["artifact_capabilities"][0]
-
         assert "subagent_run" not in session.tools
         assert "image_generate" not in session.tools
         assert "- visual-designer |" not in subagent_context.split("unavailable_agents:", 1)[0]
         assert "visual-designer | unavailable:" in subagent_context
         assert "current session mode" in subagent_context
         assert "Switch to `review`, `auto`, or `fullaccess` mode" in subagent_context
-        assert image_capability["status"] == "unavailable"
-        assert image_capability["reason"] in subagent_context
-        assert image_capability["resolution"] in subagent_context
     finally:
         session.close()
 
@@ -3016,7 +3195,11 @@ def test_create_session_omits_subagent_system_guidance_when_subagents_unavailabl
         nested_session.close()
 
 
-def test_subagent_policy_can_soft_disable_explicit_requests_for_managed_execution() -> None:
+def test_subagent_policy_never_reports_unavailable_without_semantic_contract() -> None:
+    # Router-free path: no semantic contract exists, so no turn carries an
+    # explicit delegation request and the "unavailable" escalation (previously
+    # reserved for explicit requests) can never fire — managed and strict
+    # runtimes both get a silent "off".
     registry = {
         "explorer": SubagentDefinition(
             name="explorer",
@@ -3043,7 +3226,9 @@ def test_subagent_policy_can_soft_disable_explicit_requests_for_managed_executio
         repo_turn_execution_intent="plan_or_analysis_only",
     )
 
-    assert strict_policy.unavailable is True
+    assert strict_policy.unavailable is False
+    assert strict_policy.level == "off"
+    assert strict_policy.reason == "subagents_disabled"
     assert managed_policy.unavailable is False
     assert managed_policy.level == "off"
     assert managed_policy.reason == "subagents_disabled"

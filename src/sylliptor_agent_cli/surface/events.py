@@ -14,6 +14,8 @@ Engine event inventory (migration targets; current call sites are intentionally 
   cli_impl/chat.py.
 - mode_changed: /mode, /plan on/off readonly overlay, and Forge UI transitions in
   cli_impl/chat.py.
+- persona_changed: persona-mode transitions (user-initiated /mode persona switches and
+  approved model switch_mode proposals) applied through the chat loop's persona primitive.
 - plan_node_updated: task creation/status/validation/reconciliation updates in forge.py,
   cli_impl/forge.py, cli_impl/chat.py, plan_assistant.py, and plan_reconciliation.py.
 - swarm_worker_state_changed: scheduler batches, worker task starts/ends, merge/retry state,
@@ -168,6 +170,17 @@ class ModeChanged:
 
 
 @dataclass(frozen=True, slots=True)
+class PersonaChanged:
+    type: ClassVar[Literal["persona_changed"]] = "persona_changed"
+    persona: str
+    effective_mode: str
+    source: str = "user"
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_dict(self)
+
+
+@dataclass(frozen=True, slots=True)
 class PlanNodeUpdated:
     type: ClassVar[Literal["plan_node_updated"]] = "plan_node_updated"
     node_id: str
@@ -186,6 +199,29 @@ class SwarmWorkerStateChanged:
     worker_id: str
     state: str
     role: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _to_dict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentStateChanged:
+    """Read-only lifecycle projection for one model-managed child turn.
+
+    ``subagent_run_id`` is correlation only, never an authority token.  The
+    owning parent session remains the sole cancellation/approval boundary.
+    """
+
+    type: ClassVar[Literal["subagent_state_changed"]] = "subagent_state_changed"
+    subagent_run_id: str
+    name: str
+    mode: str
+    state: str
+    subagent_session_id: str | None = None
+    description: str = ""
+    elapsed_ms: int | None = None
+    steps_completed: int | None = None
+    error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _to_dict(self)
@@ -291,8 +327,10 @@ Event: TypeAlias = (
     | ToolCallCompleted
     | StatusUpdate
     | ModeChanged
+    | PersonaChanged
     | PlanNodeUpdated
     | SwarmWorkerStateChanged
+    | SubagentStateChanged
     | VerifyGateResult
     | ReviewGateDecision
     | ErrorRaised

@@ -6,7 +6,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -150,6 +150,40 @@ SCOPE_CLASS_SCRATCH_ARTIFACT = "scratch_diagnostic_artifact"
 SCOPE_CLASS_LIKELY_MISSING_SCOPE = "likely_legitimate_missing_scope"
 SCOPE_CLASS_DANGEROUS_UNRELATED = "dangerous_unrelated_path"
 SCOPE_CLASS_FORBIDDEN = "forbidden_path_violation"
+SCOPE_CLASS_ADJACENT = "adjacent_to_declared_scope"
+SCOPE_CLASS_PROTECTED = "protected_path"
+
+# Triage buckets an out-of-scope change falls into. ``adjacent`` is work the plan should
+# plainly have declared and is safe to amend into the task scope; ``protected`` is never
+# amendable; ``unrelated`` is a plan defect a human or replanner has to resolve.
+SCOPE_TRIAGE_ADJACENT = "adjacent"
+SCOPE_TRIAGE_PROTECTED = "protected"
+SCOPE_TRIAGE_UNRELATED = "unrelated"
+
+SCOPE_ADJACENT_NEW_FILE_IN_SCOPE_DIR = "new_file_in_declared_scope_directory"
+SCOPE_ADJACENT_SIBLING_TEST = "sibling_test_file_for_declared_path"
+SCOPE_ADJACENT_GENERATED_ARTIFACT = "generated_artifact_of_declared_path"
+
+_SCOPE_TRIAGE_BY_CLASSIFICATION = {
+    SCOPE_CLASS_ADJACENT: SCOPE_TRIAGE_ADJACENT,
+    SCOPE_CLASS_EXPECTED_COMPANION: SCOPE_TRIAGE_ADJACENT,
+    SCOPE_CLASS_SCRATCH_ARTIFACT: SCOPE_TRIAGE_ADJACENT,
+    SCOPE_CLASS_PROTECTED: SCOPE_TRIAGE_PROTECTED,
+    SCOPE_CLASS_FORBIDDEN: SCOPE_TRIAGE_PROTECTED,
+    SCOPE_CLASS_LIKELY_MISSING_SCOPE: SCOPE_TRIAGE_UNRELATED,
+    SCOPE_CLASS_DANGEROUS_UNRELATED: SCOPE_TRIAGE_UNRELATED,
+}
+
+# Paths no task scope may ever cover, amendment or not: agent-internal runtime state and
+# version-control metadata.
+_PROTECTED_SCOPE_PREFIXES = tuple(sorted({*_AGENT_INTERNAL_SCOPE_PREFIXES, ".git", ".hg", ".svn"}))
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:/")
+# Directories whose contents are vendored or built, never "adjacent" source work.
+_NON_ADJACENT_DIR_NAMES = frozenset({"node_modules", "vendor", "dist", "build", "target"})
+_TEST_FILENAME_STEM_PREFIXES = ("test_", "test-")
+_TEST_FILENAME_STEM_SUFFIXES = ("_test", "-test", ".test", ".spec", "_spec")
+_GENERATED_ARTIFACT_NAME_SUFFIXES = (".map", ".lock", ".sum", ".snap")
+_GENERATED_ARTIFACT_NAME_MARKERS = (".generated.", ".g.", ".min.", ".pb.", "_pb2.", ".d.ts")
 
 
 @dataclass(frozen=True)
@@ -191,16 +225,50 @@ class ScopeViolationDiagnostic:
     recommended_action: str
     allowed: bool = False
     source_path: str | None = None
+    suggested_pattern: str = ""
+
+    @property
+    def triage(self) -> str:
+        """Which of adjacent/protected/unrelated this diagnostic belongs to."""
+        return _SCOPE_TRIAGE_BY_CLASSIFICATION.get(self.classification, SCOPE_TRIAGE_UNRELATED)
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "path": self.path,
             "classification": self.classification,
+            "triage": self.triage,
             "reason_code": self.reason_code,
             "evidence": self.evidence,
             "recommended_action": self.recommended_action,
             "allowed": self.allowed,
         }
+        if self.source_path is not None:
+            payload["source_path"] = self.source_path
+        if self.suggested_pattern:
+            payload["suggested_pattern"] = self.suggested_pattern
+        return payload
+
+
+@dataclass(frozen=True)
+class ScopeAmendment:
+    """One write_scope entry an adjacent change earned for its task."""
+
+    path: str
+    pattern: str
+    reason_code: str
+    evidence: str
+    suggested_pattern: str = ""
+    source_path: str | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "path": self.path,
+            "pattern": self.pattern,
+            "reason_code": self.reason_code,
+            "evidence": self.evidence,
+        }
+        if self.suggested_pattern:
+            payload["suggested_pattern"] = self.suggested_pattern
         if self.source_path is not None:
             payload["source_path"] = self.source_path
         return payload
@@ -214,6 +282,22 @@ class ScopeAssessment:
     effective_changed_files: list[str]
     expanded_allowed_scope: list[str]
     companion_expansions: list[ScopeCompanionExpansion]
+    in_scope_paths: list[str] = field(default_factory=list)
+    adjacent_paths: list[str] = field(default_factory=list)
+    amendments: list[ScopeAmendment] = field(default_factory=list)
+    suggested_scope_patterns: list[str] = field(default_factory=list)
+
+    @property
+    def protected_paths(self) -> list[str]:
+        return [item.path for item in self.diagnostics if item.triage == SCOPE_TRIAGE_PROTECTED]
+
+    @property
+    def unrelated_paths(self) -> list[str]:
+        return [
+            item.path
+            for item in self.diagnostics
+            if item.triage == SCOPE_TRIAGE_UNRELATED and not item.allowed
+        ]
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -223,6 +307,10 @@ class ScopeAssessment:
             "effective_changed_files": self.effective_changed_files,
             "expanded_allowed_scope": self.expanded_allowed_scope,
             "companion_expansions": [item.to_payload() for item in self.companion_expansions],
+            "in_scope_paths": self.in_scope_paths,
+            "adjacent_paths": self.adjacent_paths,
+            "amendments": [item.to_payload() for item in self.amendments],
+            "suggested_scope_patterns": self.suggested_scope_patterns,
         }
 
 
@@ -852,6 +940,21 @@ _PYPROJECT_LOCKFILE_RULES = (
     ("uv.lock", "[tool.uv]", "uv"),
     ("pdm.lock", "[tool.pdm]", "pdm"),
 )
+# Package-manager lockfiles are the companion-expansion rules' business: those rules know
+# which lockfile actually belongs to a declared manifest, so the generic sibling-artifact
+# rule below must not second-guess them (a pnpm project seeing package-lock.json is a
+# signal, not an adjacent change).
+_MANAGED_LOCKFILE_NAMES = frozenset(
+    {
+        *_NODE_LOCKFILE_NAMES,
+        _CARGO_LOCK_FILENAME,
+        *(lock_name for lock_name, _marker, _tool in _PYPROJECT_LOCKFILE_RULES),
+        "Pipfile.lock",
+        "constraints.txt",
+        "requirements.lock",
+        "requirements.lock.txt",
+    }
+)
 
 
 def _package_manager_from_package_json(package_json: Path) -> str | None:
@@ -1249,28 +1352,288 @@ def _companion_source_for_path(
     return None
 
 
+def is_protected_scope_path(path: str) -> bool:
+    """True for paths no task scope may cover: agent-internal state, VCS metadata, escapes.
+
+    A protected path is never amendable. It blocks in strict mode no matter how plausible
+    the change looks, which is the point: scope triage may relax the *plan*, never the
+    workspace boundary.
+    """
+    cleaned = _normalize_path(path).rstrip("/")
+    if not cleaned:
+        return False
+    if (
+        cleaned.startswith("/")
+        or cleaned == ".."
+        or cleaned.startswith("../")
+        or _WINDOWS_ABSOLUTE_PATH_RE.match(cleaned) is not None
+    ):
+        return True
+    if is_agent_internal_scope_path(cleaned):
+        return True
+    parts = PurePosixPath(cleaned).parts
+    return bool(parts) and parts[0] in _PROTECTED_SCOPE_PREFIXES
+
+
+def _static_glob_prefix_dir(pattern: str) -> str:
+    """Directory portion of ``pattern`` before its first globbed segment.
+
+    ``src/**`` and ``src/*.py`` both anchor on ``src``; a bare ``**`` anchors on nothing
+    and must not turn the whole repository into declared-scope territory.
+    """
+    parts = PurePosixPath(pattern).parts
+    static: list[str] = []
+    for part in parts:
+        if _has_glob(part):
+            break
+        static.append(part)
+    if len(static) == len(parts):
+        # No globbed segment at all: the last element is the declared leaf, not a dir.
+        static = static[:-1]
+    return PurePosixPath(*static).as_posix() if static else ""
+
+
+def declared_scope_directories(allowed_patterns: list[str]) -> set[str]:
+    """Directories the declared scope already reaches into.
+
+    A declared file implies its directory; a glob implies its static prefix. Both are the
+    basis for calling a neighbouring path "adjacent" rather than unrelated.
+    """
+    directories: set[str] = set()
+    for pattern in allowed_patterns:
+        normalized = _normalize_path(pattern or "").rstrip("/")
+        if not normalized:
+            continue
+        directory = (
+            _static_glob_prefix_dir(normalized)
+            if _has_glob(normalized)
+            else PurePosixPath(normalized).parent.as_posix()
+        )
+        if directory and directory not in {".", "/"}:
+            directories.add(directory)
+    return directories
+
+
+def _path_is_under_declared_directory(path: str, directories: Collection[str]) -> str | None:
+    parent = PurePosixPath(path).parent.as_posix()
+    if parent in {"", "."}:
+        return None
+    for directory in directories:
+        if parent == directory or parent.startswith(directory + "/"):
+            return directory
+    return None
+
+
+def _path_can_be_adjacent(path: str) -> bool:
+    """Shared guard: hidden, escaping and vendored/built paths are never adjacent."""
+    if not path or path.startswith(".") or path.startswith("../"):
+        return False
+    pure = PurePosixPath(path)
+    if any(part in _NON_ADJACENT_DIR_NAMES for part in pure.parts):
+        return False
+    return "." in pure.name
+
+
 def _likely_legitimate_missing_scope(path: str, *, allowed_patterns: list[str]) -> bool:
     normalized = _normalize_path(path).rstrip("/")
-    if not normalized:
+    if not _path_can_be_adjacent(normalized):
         return False
-    if normalized.startswith(".") or normalized.startswith("../"):
-        return False
-    pure = PurePosixPath(normalized)
-    if any(part in {"node_modules", "vendor", "dist", "build", "target"} for part in pure.parts):
-        return False
-    leaf = pure.name
-    if "." not in leaf:
-        return False
-    extension = leaf.rsplit(".", 1)[1].casefold()
+    extension = PurePosixPath(normalized).name.rsplit(".", 1)[1].casefold()
     if extension not in _INFERRED_FILE_EXTENSIONS:
         return False
-    allowed_dirs = {
-        PurePosixPath(pattern).parent.as_posix()
+    return (
+        _path_is_under_declared_directory(normalized, declared_scope_directories(allowed_patterns))
+        is not None
+    )
+
+
+def _filename_stem(name: str) -> str:
+    return name.rsplit(".", 1)[0] if "." in name else name
+
+
+def _test_filename_subjects(name: str) -> set[str]:
+    """Stems a test filename could be testing (``test_mod.py`` -> ``{mod}``)."""
+    stem = _filename_stem(name)
+    subjects: set[str] = set()
+    for prefix in _TEST_FILENAME_STEM_PREFIXES:
+        if stem.casefold().startswith(prefix):
+            subjects.add(stem[len(prefix) :])
+    for suffix in _TEST_FILENAME_STEM_SUFFIXES:
+        if stem.casefold().endswith(suffix):
+            subjects.add(stem[: -len(suffix)])
+    return {item.casefold() for item in subjects if item}
+
+
+def _sibling_test_source(path: str, *, declared_files: Collection[str]) -> str | None:
+    """Declared file this path is a test for, if it reads as one."""
+    subjects = _test_filename_subjects(PurePosixPath(path).name)
+    if not subjects:
+        return None
+    for declared in declared_files:
+        declared_stem = _filename_stem(PurePosixPath(declared).name).casefold()
+        if declared_stem and declared_stem in subjects:
+            return declared
+    return None
+
+
+def _generated_artifact_source(path: str, *, declared_files: Collection[str]) -> str | None:
+    """Declared file this path is a generated sibling artifact of, if any."""
+    pure = PurePosixPath(path)
+    name = pure.name
+    if name in _MANAGED_LOCKFILE_NAMES:
+        return None
+    looks_generated = name.casefold().endswith(_GENERATED_ARTIFACT_NAME_SUFFIXES) or any(
+        marker in name.casefold() for marker in _GENERATED_ARTIFACT_NAME_MARKERS
+    )
+    if not looks_generated:
+        return None
+    for declared in declared_files:
+        declared_pure = PurePosixPath(declared)
+        if declared_pure.parent != pure.parent or declared_pure.name == name:
+            continue
+        stem = _filename_stem(declared_pure.name)
+        if stem and name.startswith(stem) and name[len(stem) : len(stem) + 1] in {".", "_", "-"}:
+            return declared
+    return None
+
+
+def _declared_scope_files(allowed_patterns: list[str]) -> list[str]:
+    return [
+        _normalize_path(pattern).rstrip("/")
         for pattern in allowed_patterns
-        if pattern and not _has_glob(pattern)
-    }
-    parent = pure.parent.as_posix()
-    return parent in allowed_dirs or any(parent.startswith(item + "/") for item in allowed_dirs)
+        if pattern and not _has_glob(pattern) and "." in PurePosixPath(pattern).name
+    ]
+
+
+def _adjacent_scope_classification(
+    path: str,
+    *,
+    allowed_patterns: list[str],
+    scope_directories: Collection[str],
+    declared_files: Collection[str],
+    new_paths: Collection[str] | None,
+) -> tuple[str, str, str | None] | None:
+    """Classify ``path`` as adjacent to the declared scope, or return None.
+
+    Returns ``(reason_code, evidence, source_path)``. Rule order matters: the test and
+    generated-artifact rules hold for edits as well as creations, while "new file in a
+    declared directory" only holds for files the task actually created -- editing an
+    existing neighbouring module is a scope question, not a bookkeeping gap.
+    """
+    if not _path_can_be_adjacent(path):
+        return None
+
+    test_source = _sibling_test_source(path, declared_files=declared_files)
+    if test_source is not None:
+        return (
+            SCOPE_ADJACENT_SIBLING_TEST,
+            f"{path} is a sibling test file for declared scope path {test_source}",
+            test_source,
+        )
+
+    artifact_source = _generated_artifact_source(path, declared_files=declared_files)
+    if artifact_source is not None:
+        return (
+            SCOPE_ADJACENT_GENERATED_ARTIFACT,
+            f"{path} is a generated artifact of declared scope path {artifact_source}",
+            artifact_source,
+        )
+
+    covering_directory = _path_is_under_declared_directory(path, scope_directories)
+    if covering_directory is None:
+        return None
+    extension = PurePosixPath(path).name.rsplit(".", 1)[1].casefold()
+    if extension not in _INFERRED_FILE_EXTENSIONS:
+        return None
+    if new_paths is not None and path not in new_paths:
+        return None
+    created = "created" if new_paths is not None else "wrote"
+    return (
+        SCOPE_ADJACENT_NEW_FILE_IN_SCOPE_DIR,
+        f"{path} was {created} under {covering_directory}/, already covered by write_scope "
+        f"{allowed_patterns or ['(none)']}",
+        None,
+    )
+
+
+def suggested_scope_pattern_for(path: str) -> str:
+    """Directory-level glob covering ``path`` (the path itself when it sits at the root).
+
+    Directory globs are what the planner is asked to write (see plan_validation R3/R4), so
+    they are also what a scope-fix suggestion offers.
+    """
+    normalized = _normalize_path(path).rstrip("/")
+    if not normalized:
+        return ""
+    parent = PurePosixPath(normalized).parent.as_posix()
+    if parent in {"", "."}:
+        return normalized
+    return f"{parent}/**"
+
+
+def suggested_scope_patterns_for(paths: Collection[str], *, limit: int = 20) -> list[str]:
+    """Deduplicated directory-level globs covering ``paths``, in first-seen order."""
+    patterns: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        pattern = suggested_scope_pattern_for(path)
+        if not pattern or pattern in seen:
+            continue
+        seen.add(pattern)
+        patterns.append(pattern)
+        if len(patterns) >= limit:
+            break
+    return patterns
+
+
+def apply_scope_amendments(
+    task: dict[str, Any], amendments: Collection[ScopeAmendment]
+) -> list[str]:
+    """Add amendment patterns to ``task['write_scope']``; return what was actually added.
+
+    The task dict is the plan's own task object, so mutating it here is what makes the
+    amendment outlive the run once the plan is saved.
+    """
+    if not amendments:
+        return []
+    existing_raw = task.get("write_scope")
+    existing = (
+        [str(item).strip() for item in existing_raw] if isinstance(existing_raw, list) else []
+    )
+    existing = [item for item in existing if item]
+    known = {_scope_pattern_identity_key(item).casefold() for item in existing}
+    added: list[str] = []
+    for amendment in amendments:
+        pattern = _normalize_path(amendment.pattern).rstrip("/")
+        identity = _scope_pattern_identity_key(pattern).casefold()
+        if not pattern or identity in known:
+            continue
+        known.add(identity)
+        existing.append(pattern)
+        added.append(pattern)
+    if added:
+        task["write_scope"] = existing
+    return added
+
+
+def describe_scope_violations(
+    diagnostics: Collection[ScopeViolationDiagnostic],
+    *,
+    limit: int = 20,
+) -> list[str]:
+    """One ``path (triage/classification): evidence`` line per blocking diagnostic.
+
+    Bounded, because this ends up inside an error string that ends up inside a report: a
+    task that rewrote a thousand files should not produce a thousand-line failure message.
+    """
+    blocking = [item for item in diagnostics if not item.allowed]
+    lines = [
+        f"{item.path} ({item.triage}/{item.classification}): {item.evidence}"
+        for item in blocking[:limit]
+    ]
+    if len(blocking) > limit:
+        lines.append(f"+{len(blocking) - limit} more")
+    return lines
 
 
 def assess_scope_changes(
@@ -1280,7 +1643,21 @@ def assess_scope_changes(
     task: dict[str, Any] | None = None,
     root: Path | None = None,
     extra_diagnostics: list[ScopeViolationDiagnostic] | None = None,
+    amend_adjacent: bool = False,
+    new_paths: Collection[str] | None = None,
 ) -> ScopeAssessment:
+    """Classify every change against the declared scope.
+
+    With ``amend_adjacent`` set, changes that are plainly adjacent to the declared scope --
+    a new file in a directory the scope already reaches, a sibling test file, a generated
+    artifact of a declared file -- stop blocking and become :class:`ScopeAmendment` records
+    the caller applies to the task. Protected paths block regardless, and genuinely
+    unrelated paths keep blocking with a suggested scope patch attached.
+
+    ``new_paths`` narrows the "new file in a declared directory" rule to files the task
+    actually created; pass ``None`` when creation cannot be determined and the rule falls
+    back to covering edits too.
+    """
     expanded_patterns = _expand_support_file_patterns(allowed_patterns, root=root)
     ancestor_dirs = set(ancestor_directory_scope_patterns(allowed_patterns, root=root))
     companion_expansions = companion_expansions_for_patterns(allowed_patterns, root=root)
@@ -1299,9 +1676,18 @@ def assess_scope_changes(
         seen.add(rel)
         normalized.append(rel)
 
+    scope_directories = declared_scope_directories(allowed_patterns)
+    declared_files = _declared_scope_files(allowed_patterns)
+    normalized_new_paths = (
+        {_normalize_path(item).rstrip("/") for item in new_paths} if new_paths is not None else None
+    )
+
     diagnostics: list[ScopeViolationDiagnostic] = list(extra_diagnostics or [])
     blocking_paths: list[str] = []
     effective_changed_files: list[str] = []
+    in_scope_paths: list[str] = []
+    adjacent_paths: list[str] = []
+    amendments: list[ScopeAmendment] = []
     for rel in normalized:
         identity_key = _scope_pattern_identity_key(rel).casefold()
         forbidden_record = forbidden_by_identity.get(identity_key)
@@ -1312,6 +1698,23 @@ def assess_scope_changes(
                     classification=SCOPE_CLASS_FORBIDDEN,
                     reason_code=forbidden_record.reason_code,
                     evidence=forbidden_record.evidence,
+                    recommended_action="reject_hard",
+                    allowed=False,
+                )
+            )
+            blocking_paths.append(rel)
+            effective_changed_files.append(rel)
+            continue
+        if is_protected_scope_path(rel):
+            diagnostics.append(
+                ScopeViolationDiagnostic(
+                    path=rel,
+                    classification=SCOPE_CLASS_PROTECTED,
+                    reason_code="protected_or_system_path",
+                    evidence=(
+                        f"{rel} is a protected agent-internal, version-control or "
+                        "out-of-workspace path that no task scope may cover"
+                    ),
                     recommended_action="reject_hard",
                     allowed=False,
                 )
@@ -1343,6 +1746,43 @@ def assess_scope_changes(
             effective_changed_files.append(rel)
             continue
         if _path_matches_any_pattern(rel, expanded_patterns, root=root):
+            in_scope_paths.append(rel)
+            effective_changed_files.append(rel)
+            continue
+        adjacency = _adjacent_scope_classification(
+            rel,
+            allowed_patterns=allowed_patterns,
+            scope_directories=scope_directories,
+            declared_files=declared_files,
+            new_paths=normalized_new_paths,
+        )
+        if adjacency is not None and amend_adjacent:
+            reason_code, evidence, source_path = adjacency
+            amendments.append(
+                ScopeAmendment(
+                    path=rel,
+                    # The exact path, not the directory glob: an amendment grants only what
+                    # the task actually earned. The glob is offered as planner advice.
+                    pattern=rel,
+                    reason_code=reason_code,
+                    evidence=evidence,
+                    suggested_pattern=suggested_scope_pattern_for(rel),
+                    source_path=source_path,
+                )
+            )
+            adjacent_paths.append(rel)
+            diagnostics.append(
+                ScopeViolationDiagnostic(
+                    path=rel,
+                    classification=SCOPE_CLASS_ADJACENT,
+                    reason_code=reason_code,
+                    evidence=evidence,
+                    recommended_action="amend_scope_and_continue",
+                    allowed=True,
+                    source_path=source_path,
+                    suggested_pattern=suggested_scope_pattern_for(rel),
+                )
+            )
             effective_changed_files.append(rel)
             continue
         if _likely_legitimate_missing_scope(rel, allowed_patterns=allowed_patterns):
@@ -1361,6 +1801,7 @@ def assess_scope_changes(
                 evidence=f"{rel} is not covered by allowed scope {allowed_patterns or ['(none)']}",
                 recommended_action=recommended_action,
                 allowed=False,
+                suggested_pattern=suggested_scope_pattern_for(rel),
             )
         )
         blocking_paths.append(rel)
@@ -1373,6 +1814,17 @@ def assess_scope_changes(
         effective_changed_files=effective_changed_files,
         expanded_allowed_scope=expanded_patterns,
         companion_expansions=companion_expansions,
+        in_scope_paths=in_scope_paths,
+        adjacent_paths=adjacent_paths,
+        amendments=amendments,
+        # Protected paths are deliberately absent: no scope patch may legitimise them.
+        suggested_scope_patterns=suggested_scope_patterns_for(
+            [
+                item.path
+                for item in diagnostics
+                if not item.allowed and item.triage == SCOPE_TRIAGE_UNRELATED
+            ]
+        ),
     )
 
 

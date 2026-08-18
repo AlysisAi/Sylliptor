@@ -90,6 +90,7 @@ class ServerSettings:
     default_base_url: str | None
     allow_client_model: bool
     allow_client_base_url: bool
+    worker_machine_events: bool = True
 
     @property
     def allow_unauthenticated_localhost_only(self) -> bool:
@@ -190,6 +191,13 @@ def resolve_server_settings(
         field_name="SYLLIPTOR_SERVER_ALLOW_CLIENT_MODEL",
         default=True,
     )
+    # Forge worker jobs run with --machine so job status comes from the worker's own
+    # terminal event instead of being inferred from an exit code.
+    worker_machine_events = _parse_bool(
+        env_get("SYLLIPTOR_SERVER_MACHINE_EVENTS"),
+        field_name="SYLLIPTOR_SERVER_MACHINE_EVENTS",
+        default=True,
+    )
 
     return ServerSettings(
         host=host_value,
@@ -205,4 +213,5 @@ def resolve_server_settings(
         default_base_url=default_base_url,
         allow_client_model=allow_client_model,
         allow_client_base_url=allow_client_base_url,
+        worker_machine_events=worker_machine_events,
     )

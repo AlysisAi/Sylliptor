@@ -28,6 +28,74 @@ def _assistant_texts(t: TuiTranscript) -> list[str]:
 # ------------------------- finish_assistant idempotency -------------------------
 
 
+def test_restart_assistant_clears_live_block_for_restream():
+    # The live path: the client's retry recorder fires the stream_restart hook
+    # BEFORE the retry restreams, so the abandoned tokens vanish immediately
+    # instead of doubling until finish_assistant's collapse.
+    gen_a = "Hi! Ready to help with your ci-gate repo. What would you like to work on?"
+    gen_b = "Hi! Ready to help with the ci-gate repo. What would you like to work on?"
+    t = TuiTranscript()
+    t.begin_turn()
+    t.stream_assistant(gen_a)
+    t.restart_assistant()
+    assert _assistant_texts(t) == [""]
+    t.stream_assistant(gen_b)
+    t.finish_assistant(gen_b)
+    assert _assistant_texts(t) == [gen_b]
+
+
+def test_restart_assistant_without_open_block_is_a_noop():
+    t = TuiTranscript()
+    t.begin_turn()
+    t.restart_assistant()
+    assert _assistant_texts(t) == []
+
+
+def test_provider_retry_restream_collapses_to_final_reply():
+    # A mid-stream transport failure abandons generation A after its tokens
+    # rendered; the provider retry re-runs the request and generation B streams
+    # into the SAME open block. Wordings differ ("your" vs "the"), so the
+    # verbatim dedupe can never catch it — finish_assistant must snap the
+    # block to the authoritative final text.
+    gen_a = "Hi! Ready to help with your ci-gate repo. What would you like to work on?"
+    gen_b = "Hi! Ready to help with the ci-gate repo. What would you like to work on?"
+    t = TuiTranscript()
+    t.begin_turn()
+    t.stream_assistant(gen_a)
+    t.stream_assistant(gen_b)
+    t.finish_assistant(gen_b)
+    assert _assistant_texts(t) == [gen_b]
+
+
+def test_double_retry_restream_collapses_to_final_reply():
+    t = TuiTranscript()
+    t.begin_turn()
+    t.stream_assistant("Attempt one. ")
+    t.stream_assistant("Attempt two. ")
+    t.stream_assistant("Attempt three.")
+    t.finish_assistant("Attempt three.")
+    assert _assistant_texts(t) == ["Attempt three."]
+
+
+def test_tail_fragment_final_does_not_truncate_streamed_answer():
+    # Pathological provider: final text is only the last chunk of the stream.
+    # The >=25% guard must keep the full streamed block intact.
+    t = TuiTranscript()
+    t.begin_turn()
+    long_reply = "Step one does A. Step two does B. Step three does C. Finally, run the tests."
+    t.stream_assistant(long_reply)
+    t.finish_assistant("run the tests.")
+    assert _assistant_texts(t) == [long_reply]
+
+
+def test_matching_final_leaves_streamed_block_untouched():
+    t = TuiTranscript()
+    t.begin_turn()
+    t.stream_assistant("The answer is X.")
+    t.finish_assistant("The answer is X.")
+    assert _assistant_texts(t) == ["The answer is X."]
+
+
 def test_finish_after_trace_does_not_duplicate_streamed_answer():
     # stream answer -> tool trace closes the block -> message_done re-emits it.
     t = TuiTranscript()

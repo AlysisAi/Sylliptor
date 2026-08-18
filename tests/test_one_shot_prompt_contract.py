@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from sylliptor_agent_cli.agent.turn_contract import TurnOutcome, TurnSemantics
 from sylliptor_agent_cli.agent_loop import (
     _SYSTEM_PROMPT_ONE_SHOT_SECTION,
-    _classify_one_shot_repo_turn_intent,
+    SYSTEM_PROMPT,
     _completion_gate_nudge_message,
 )
 
@@ -30,6 +31,8 @@ def test_one_shot_prompt_rejects_generic_clarification_bailouts() -> None:
     assert "Do not ask a generic clarification question" in _SYSTEM_PROMPT_ONE_SHOT_SECTION
     assert "safe best effort" in _SYSTEM_PROMPT_ONE_SHOT_SECTION
     assert "destructive alternatives require the user's choice" in _SYSTEM_PROMPT_ONE_SHOT_SECTION
+    assert "proceed safely or call report_blocker" in _SYSTEM_PROMPT_ONE_SHOT_SECTION
+    assert "never ask a question and wait" in _SYSTEM_PROMPT_ONE_SHOT_SECTION
 
 
 def test_one_shot_prompt_mentions_requirement_review_and_root_fixing() -> None:
@@ -44,8 +47,10 @@ def test_one_shot_prompt_protects_existing_tests_and_requires_execution_evidence
         _SYSTEM_PROMPT_ONE_SHOT_SECTION
     )
     assert "New test files are allowed" in _SYSTEM_PROMPT_ONE_SHOT_SECTION
-    assert "after the last source edit" in _SYSTEM_PROMPT_ONE_SHOT_SECTION
-    assert "observing its output and exit code" in _SYSTEM_PROMPT_ONE_SHOT_SECTION
+    # The execution-evidence rule lives once, in the base prompt's final
+    # response requirements, and applies to one-shot runs through composition.
+    assert "after your last source edit" in SYSTEM_PROMPT
+    assert "observing its output and exit code" in SYSTEM_PROMPT
 
 
 def test_no_material_edits_nudge_is_implementation_first() -> None:
@@ -67,15 +72,7 @@ def test_verification_not_attempted_nudge_is_verification_first() -> None:
     assert "this checklist is advisory" in message
 
 
-def test_plan_and_advice_only_intents_remain_non_execution() -> None:
-    assert (
-        _classify_one_shot_repo_turn_intent("Plan only: how should we fix the parser?")
-        == "plan_or_analysis_only"
-    )
-    assert (
-        _classify_one_shot_repo_turn_intent(
-            "Explain how the parser works without modifying anything."
-        )
-        == "advisory_non_execution"
-    )
-    assert _classify_one_shot_repo_turn_intent("Fix the parser bug.") == "execute"
+def test_semantic_outcomes_drive_execution_posture() -> None:
+    assert TurnSemantics(outcome=TurnOutcome.PLAN).execution_posture == "plan_or_analysis_only"
+    assert TurnSemantics(outcome=TurnOutcome.INSPECT).execution_posture == "advisory_non_execution"
+    assert TurnSemantics(outcome=TurnOutcome.CHANGE).execution_posture == "execute"

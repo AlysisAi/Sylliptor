@@ -39,10 +39,27 @@ def _usage_source_pair(row: dict[str, Any]) -> str:
     return f"{provider}/{fallback}"
 
 
+def _print_hidden_owner_notice(console: Any, hidden_count: int) -> None:
+    """Say how many sessions the owner filter removed.
+
+    Silence here is what made "my session is gone" indistinguishable from "your
+    session is filtered": an empty list looks the same either way, so the count is
+    printed whenever anything was dropped -- including when nothing is left.
+    """
+    if hidden_count <= 0:
+        return
+    suffix = "" if hidden_count == 1 else "s"
+    console.print(
+        f"[dim]{hidden_count} session{suffix} from other accounts hidden. "
+        "Use --all-owners to include.[/dim]"
+    )
+
+
 @sessions_app.command("list")
 def sessions_list(
-    show_all: bool = typer.Option(
+    all_owners: bool = typer.Option(
         False,
+        "--all-owners",
         "--all",
         help="Include sessions recorded by other accounts (hidden by default).",
     ),
@@ -51,7 +68,7 @@ def sessions_list(
     cfg = _patchable("load_config", load_config)()
     sessions_dir = resolve_sessions_dir(cfg)
     all_infos = _patchable("list_sessions", list_sessions)(sessions_dir)
-    infos = all_infos if show_all else filter_sessions_to_local_owner(all_infos)
+    infos = all_infos if all_owners else filter_sessions_to_local_owner(all_infos)
     hidden_count = len(all_infos) - len(infos)
 
     table = _Table(title=f"Sessions ({sessions_dir})")
@@ -60,12 +77,7 @@ def sessions_list(
     for info in infos[:200]:
         table.add_row(info.session_id, os.fspath(info.path))
     console.print(table)
-    if hidden_count:
-        suffix = "" if hidden_count == 1 else "s"
-        console.print(
-            f"[dim]{hidden_count} session{suffix} recorded by a different account "
-            "hidden. Use --all to include.[/dim]"
-        )
+    _print_hidden_owner_notice(console, hidden_count)
 
 
 @sessions_app.command("show")
@@ -155,6 +167,11 @@ def sessions_score(
         min=0,
         help="Score latest N sessions (ignored when session_id is provided).",
     ),
+    all_owners: bool = typer.Option(
+        False,
+        "--all-owners",
+        help="Include sessions recorded by other accounts when picking the latest ones.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     console = _console()
@@ -173,12 +190,14 @@ def sessions_score(
             raise typer.Exit(code=2)
         target_paths = [path]
     else:
-        infos = filter_sessions_to_local_owner(
-            _patchable("list_sessions", list_sessions)(sessions_dir)
-        )
+        all_infos = _patchable("list_sessions", list_sessions)(sessions_dir)
+        infos = all_infos if all_owners else filter_sessions_to_local_owner(all_infos)
+        hidden_count = len(all_infos) - len(infos)
         if not infos:
             console.print(f"No sessions owned by this account found in {sessions_dir}")
+            _print_hidden_owner_notice(console, hidden_count)
             return
+        _print_hidden_owner_notice(console, hidden_count)
         count = latest if latest > 0 else 1
         target_paths = [info.path for info in infos[:count]]
 

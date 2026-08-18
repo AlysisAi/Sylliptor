@@ -409,7 +409,8 @@ def test_token_store_keyring_read_failure_logs_without_leaking_tokens(
             "alpha", _record(access_token="secret-access", refresh_token="secret-refresh")
         )
 
-    assert "keyring read failed" in caplog.text
+    assert "OS keyring is unavailable" in caplog.text
+    assert "reason=read-failed" in caplog.text
     assert "secret-access" not in caplog.text
     assert "secret-refresh" not in caplog.text
 
@@ -432,9 +433,104 @@ def test_token_store_keyring_write_failure_logs_without_leaking_tokens(
             "alpha", _record(access_token="secret-access", refresh_token="secret-refresh")
         )
 
-    assert "keyring write failed" in caplog.text
+    assert "OS keyring is unavailable" in caplog.text
+    assert "reason=write-failed" in caplog.text
     assert "secret-access" not in caplog.text
     assert "secret-refresh" not in caplog.text
+
+
+def test_token_store_falls_back_when_the_keyring_silently_discards_the_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``keyring.backends.null`` accepts writes and drops them.
+
+    Claiming the keyring key source against such a backend produces an envelope
+    that no later process can decrypt, so the write must fall back instead.
+    """
+
+    cfg_dir = tmp_path / "cfg"
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(cfg_dir))
+    monkeypatch.setattr(token_store_mod, "_get_keyring_password", lambda service, account: None)
+    monkeypatch.setattr(
+        token_store_mod,
+        "_set_keyring_password",
+        lambda service, account, password: None,
+    )
+    monkeypatch.setattr(token_store_mod, "_platform_system", lambda: "Linux")
+
+    with caplog.at_level("WARNING", logger=token_store_mod.__name__):
+        save_oauth_token_record(
+            "alpha", _record(access_token="secret-access", refresh_token="secret-refresh")
+        )
+
+    assert "reason=write-not-persisted" in caplog.text
+    assert "secret-access" not in caplog.text
+    outcome = token_store_mod.last_keyring_outcome()
+    assert outcome is not None and outcome.available is False
+    _assert_encrypted_envelope(
+        expected_key_source=token_store_mod.KEY_SOURCE_FILESYSTEM,
+        forbidden_values=("secret-access", "secret-refresh"),
+    )
+    # The credentials survive a second process reading the same store.
+    assert load_oauth_token_record("alpha") is not None
+
+
+def test_keyring_availability_rejects_placeholder_backends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keyring
+    import keyring.backends.fail
+    import keyring.backends.null
+
+    for backend in (keyring.backends.null.Keyring, keyring.backends.fail.Keyring):
+        monkeypatch.setattr(keyring, "get_keyring", backend)
+        outcome = token_store_mod.keyring_availability()
+        assert outcome.available is False
+        assert outcome.reason == "unusable-backend"
+        assert outcome.backend == f"{backend.__module__}.{backend.__name__}"
+
+
+def test_planned_key_source_reports_the_fallback_without_creating_key_material(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_path = tmp_path / "oauth_tokens.json"
+    monkeypatch.setattr(
+        token_store_mod,
+        "keyring_availability",
+        lambda: token_store_mod.KeyringOutcome(available=False, reason="unusable-backend"),
+    )
+    monkeypatch.setattr(token_store_mod, "_platform_system", lambda: "Linux")
+
+    assert token_store_mod.planned_key_source() == token_store_mod.KEY_SOURCE_FILESYSTEM
+    assert not token_store_mod.filesystem_master_key_path(store_path).exists()
+    assert not store_path.exists()
+
+    monkeypatch.setattr(token_store_mod, "_platform_system", lambda: "Windows")
+    assert token_store_mod.planned_key_source() == token_store_mod.KEY_SOURCE_DPAPI
+    assert not token_store_mod.dpapi_master_key_path(store_path).exists()
+
+    monkeypatch.setattr(
+        token_store_mod,
+        "keyring_availability",
+        lambda: token_store_mod.KeyringOutcome(available=True, backend="test.Backend"),
+    )
+    assert token_store_mod.planned_key_source() == token_store_mod.KEY_SOURCE_KEYRING
+
+
+def test_stored_key_source_reads_the_envelope_without_decrypting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg_dir = tmp_path / "cfg"
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(cfg_dir))
+    _disable_keyring(monkeypatch)
+    monkeypatch.setattr(token_store_mod, "_platform_system", lambda: "Linux")
+    save_oauth_token_record("alpha", _record(access_token="a", refresh_token="r"))
+    path = mcp_oauth_token_store_path()
+
+    assert token_store_mod.stored_key_source(path) == token_store_mod.KEY_SOURCE_FILESYSTEM
+    assert token_store_mod.stored_key_source(tmp_path / "absent.json") is None
+    (tmp_path / "broken.json").write_text("{not json", encoding="utf-8")
+    assert token_store_mod.stored_key_source(tmp_path / "broken.json") is None
 
 
 def test_token_store_windows_dpapi_fallback_round_trip(

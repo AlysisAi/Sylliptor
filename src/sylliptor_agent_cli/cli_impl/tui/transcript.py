@@ -14,6 +14,8 @@ import threading
 import time
 from collections.abc import Callable
 
+from .forge_status import forge_status_bucket, forge_status_is_terminal
+
 # (role, text) — role drives styling in the app: "user" | "assistant" | "reasoning"
 # | "trace" | "error" | "warn" | "info" | "system".
 Entry = tuple[str, str]
@@ -43,7 +45,14 @@ class TuiTranscript:
         # bottom of the transcript while ``/execute plan`` runs the swarm on a
         # worker thread. ``None`` when no run is active. Shape:
         #   {"run_id", "tasks": [{"id","title","status"}], "active": str|None,
+        #    "active_map": {task_id: {"started": float, "phase": str,
+        #                             "message": str}},
         #    "phase": str, "message": str, "started": float, "done": bool}
+        # ``active`` is the MOST-RECENT task the swarm touched (drives the single
+        # bottom phase line, kept for back-compat); ``active_map`` tracks EVERY
+        # currently-running task so the renderer can spin them all and show a
+        # per-task elapsed timer. A task is pruned from ``active_map`` the moment
+        # its status turns terminal (done/failed/obsolete).
         self._forge: dict[str, object] | None = None
         self._invalidate: Callable[[], None] = invalidate or (lambda: None)
 
@@ -189,6 +198,16 @@ class TuiTranscript:
             self._status = None
         self._touch()
 
+    def restart_assistant(self) -> None:
+        """Clear the open streamed block: a transport retry is about to
+        restream the reply from scratch, so the abandoned generation's tokens
+        must not remain in front of it."""
+        with self._lock:
+            if self._assistant_index is not None:
+                role, _current = self.entries[self._assistant_index]
+                self.entries[self._assistant_index] = (role, "")
+        self._touch()
+
     def finish_assistant(self, text: str = "") -> None:
         with self._lock:
             self._close_reasoning_locked()
@@ -196,6 +215,27 @@ class TuiTranscript:
                 role, current = self.entries[self._assistant_index]
                 if not current and text:
                     self.entries[self._assistant_index] = (role, text)
+                elif current and text:
+                    cur_norm = _normalize_visible(current)
+                    txt_norm = _normalize_visible(text)
+                    if (
+                        cur_norm != txt_norm
+                        and cur_norm.endswith(txt_norm)
+                        and len(txt_norm) * 4 >= len(cur_norm)
+                    ):
+                        # A provider-level retry restreamed the reply into the
+                        # same live block: a mid-stream failure abandons
+                        # generation A after its tokens are already visible,
+                        # the transport retry re-runs the request, and
+                        # generation B streams into the same open block — the
+                        # block ends up "A + B" (wordings can differ, so the
+                        # verbatim dedupe below never catches it). The final
+                        # text is authoritative — it is exactly what the
+                        # session history keeps — so when the block ends with
+                        # it and carries an abandoned prefix, snap to the
+                        # final. The >=25% length guard keeps a pathological
+                        # tail-fragment final from truncating a legit block.
+                        self.entries[self._assistant_index] = (role, text)
             elif text.strip():
                 # A multi-step turn can re-emit the same answer after its live
                 # block was already closed by an intervening tool/trace line (which
@@ -246,6 +286,7 @@ class TuiTranscript:
                     for tid, title, status in tasks
                 ],
                 "active": None,
+                "active_map": {},
                 "phase": "execute",
                 "message": "Starting…",
                 "started": time.monotonic(),
@@ -253,6 +294,24 @@ class TuiTranscript:
                 "ok": True,
             }
         self._touch()
+
+    def _forge_reconcile_active_map_locked(self) -> None:
+        """Keep ``active_map`` in step with the current task statuses.
+
+        Adds a per-task start stamp when a task enters a running state (so a
+        status-driven run — not just an event-driven one — gets a live timer),
+        and prunes any task whose status has turned terminal so a finished row
+        stops spinning. Caller holds the lock."""
+        if self._forge is None:
+            return
+        active_map: dict = self._forge["active_map"]  # type: ignore[assignment]
+        for task in self._forge["tasks"]:  # type: ignore[index]
+            tid = task["id"]
+            status = str(task.get("status") or "")
+            if forge_status_is_terminal(status):
+                active_map.pop(tid, None)
+            elif forge_status_bucket(status) == "running" and tid not in active_map:
+                active_map[tid] = {"started": time.monotonic(), "phase": "", "message": ""}
 
     def forge_update_statuses(self, statuses: dict[str, str]) -> None:
         """Update task statuses (keyed by task id) from the latest plan snapshot."""
@@ -263,6 +322,7 @@ class TuiTranscript:
                 new_status = statuses.get(task["id"])
                 if new_status:
                     task["status"] = str(new_status)
+            self._forge_reconcile_active_map_locked()
         self._touch()
 
     def forge_sync_tasks(self, tasks: list[tuple[str, str, str]]) -> None:
@@ -286,6 +346,7 @@ class TuiTranscript:
                     }
                     self._forge["tasks"].append(new_row)  # type: ignore[union-attr]
                     existing[str(tid)] = new_row
+            self._forge_reconcile_active_map_locked()
         self._touch()
 
     def forge_set_active(self, task_id: str | None, phase: str = "", message: str = "") -> None:
@@ -295,12 +356,37 @@ class TuiTranscript:
             if self._forge is None:
                 return
             if task_id is not None:
-                self._forge["active"] = str(task_id)
+                tid = str(task_id)
+                self._forge["active"] = tid
+                # Upsert into the live worker set: a first sighting stamps its
+                # start (for the per-task timer); later events only refresh the
+                # phase/message. A terminal task is never (re)added — a late event
+                # after completion must not resurrect a finished row.
+                active_map: dict = self._forge["active_map"]  # type: ignore[assignment]
+                if not forge_status_is_terminal(self._forge_task_status_locked(tid)):
+                    entry = active_map.get(tid)
+                    if entry is None:
+                        entry = {"started": time.monotonic(), "phase": "", "message": ""}
+                        active_map[tid] = entry
+                    if phase:
+                        entry["phase"] = str(phase)
+                    if message:
+                        entry["message"] = str(message)
             if phase:
                 self._forge["phase"] = str(phase)
             if message:
                 self._forge["message"] = str(message)
         self._touch()
+
+    def _forge_task_status_locked(self, task_id: str) -> str:
+        """Current status of ``task_id`` in the live view (''  if unknown).
+        Caller holds the lock."""
+        if self._forge is None:
+            return ""
+        for task in self._forge["tasks"]:  # type: ignore[index]
+            if task["id"] == task_id:
+                return str(task.get("status") or "")
+        return ""
 
     def forge_finish(self, statuses: dict[str, str], summary: str = "", ok: bool = True) -> None:
         """Apply final task statuses and mark the run done (table stays visible).
@@ -315,6 +401,7 @@ class TuiTranscript:
                 if new_status:
                     task["status"] = str(new_status)
             self._forge["active"] = None
+            self._forge["active_map"] = {}  # run over: no live workers
             self._forge["done"] = True
             self._forge["ok"] = bool(ok)
             self._forge["phase"] = "done"
@@ -336,6 +423,10 @@ class TuiTranscript:
                 "run_id": self._forge["run_id"],
                 "tasks": [dict(task) for task in self._forge["tasks"]],  # type: ignore[union-attr]
                 "active": self._forge["active"],
+                "active_map": {
+                    tid: dict(info)
+                    for tid, info in self._forge["active_map"].items()  # type: ignore[union-attr]
+                },
                 "phase": self._forge["phase"],
                 "message": self._forge["message"],
                 "started": self._forge["started"],

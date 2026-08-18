@@ -1625,6 +1625,77 @@ def test_trace_callback_only_changes_visibility_when_thinking_is_on_by_default()
     assert [item.text for item in response.reasoning] == ["Provider summary."]
 
 
+def test_opus_5_thinks_by_default_unlike_opus_4_8() -> None:
+    # Omitting `thinking` runs adaptive on Opus 5 but nothing at all on Opus 4.8,
+    # so auto mode must only ask for summary visibility on the former.
+    captured: dict[str, dict[str, object]] = {}
+
+    def handler_for(model: str):
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured[model] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "id": f"msg_{model}",
+                    "model": model,
+                    "role": "assistant",
+                    "type": "message",
+                    "content": [{"type": "text", "text": "Done."}],
+                },
+            )
+
+        return handler
+
+    for model in ("claude-opus-5", "claude-opus-4-8"):
+        AnthropicMessagesClient(
+            base_url="https://api.anthropic.com/v1",
+            api_key="test-key",
+            model=model,
+            transport=httpx.MockTransport(handler_for(model)),
+        ).chat(
+            messages=[{"role": "user", "content": "hello"}],
+            on_reasoning_delta=lambda _text: None,
+        )
+
+    assert captured["claude-opus-5"]["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert "thinking" not in captured["claude-opus-4-8"]
+    # Effort stays provider-owned in auto mode on both.
+    assert "output_config" not in captured["claude-opus-5"]
+    assert "output_config" not in captured["claude-opus-4-8"]
+
+
+def test_opus_5_thinking_off_never_ships_an_effort_that_would_400() -> None:
+    # Opus 5 rejects disabled thinking at xhigh/max. Asking for both must fall
+    # back to the server default effort rather than emitting the illegal pair.
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_opus5_off",
+                "model": "claude-opus-5",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Done."}],
+            },
+        )
+
+    AnthropicMessagesClient(
+        base_url="https://api.anthropic.com/v1",
+        api_key="test-key",
+        model="claude-opus-5",
+        enable_thinking=False,
+        reasoning_effort="xhigh",
+        transport=httpx.MockTransport(handler),
+    ).chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert captured["thinking"] == {"type": "disabled"}
+    assert "output_config" not in captured
+    assert "temperature" not in captured  # sampling params are a 400 on Opus 5
+
+
 def test_buffered_thinking_uses_summarized_display_and_preserves_opaque_blocks() -> None:
     captured: dict[str, object] = {}
     reasoning_deltas: list[str] = []

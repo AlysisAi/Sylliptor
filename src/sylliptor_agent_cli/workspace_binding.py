@@ -29,6 +29,7 @@ class WorkspaceAction:
     CHAT = "chat"
     FORGE = "forge"
     FORGE_PLAN = "forge_plan"
+    FORGE_RUN = "forge_run"
     SWARM = "swarm"
 
 
@@ -142,6 +143,15 @@ def workspace_policy(action: str) -> WorkspacePolicy:
             interactive_guarded_resolution=True,
             interactive_allow_use_current=False,
         )
+    if normalized == WorkspaceAction.FORGE_RUN:
+        # Same strength as swarm: both execute plan tasks and mutate the workspace.
+        # It gets its own action so the guard message names the command the user ran.
+        return WorkspacePolicy(
+            action=WorkspaceAction.FORGE_RUN,
+            allow_guarded_override=True,
+            interactive_guarded_resolution=False,
+            interactive_allow_use_current=False,
+        )
     if normalized == WorkspaceAction.SWARM:
         return WorkspacePolicy(
             action=WorkspaceAction.SWARM,
@@ -163,6 +173,8 @@ def workspace_action_label(action: str) -> str:
         return "Forge"
     if normalized == WorkspaceAction.FORGE_PLAN:
         return "forge plan"
+    if normalized == WorkspaceAction.FORGE_RUN:
+        return "forge run"
     if normalized == WorkspaceAction.SWARM:
         return "forge swarm"
     return "chat/run startup"
@@ -185,12 +197,12 @@ def workspace_policy_violation_message(
         return (
             f"{label} requires a narrower workspace than {root_label}: {detail}. {common_guidance}"
         )
-    if policy.action == WorkspaceAction.SWARM:
+    if policy.action in {WorkspaceAction.FORGE_RUN, WorkspaceAction.SWARM}:
         return (
             f"{label} requires a healthy workspace. Current binding for {requested_label} is "
             f"guarded: {detail}. {common_guidance} "
-            "Pass --allow-broad-workspace only if you intentionally want swarm to operate on "
-            "this broad workspace."
+            f"Pass --allow-broad-workspace only if you intentionally want {label} to operate "
+            "on this broad workspace."
         )
     if policy.action == WorkspaceAction.FORGE_PLAN:
         return (

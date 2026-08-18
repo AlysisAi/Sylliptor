@@ -66,9 +66,10 @@ def _load_frames(*, color_enabled: bool, stream: Any | None) -> list[list[str]]:
             theme=theme,
         )
         frames = _crop_owl_logo_frames(frames)
-        # White silhouette (no background box): brighten the owl's own pixels on
-        # dark/neutral terminals. A genuinely light terminal keeps native grays.
-        if color_enabled and theme != "light":
+        # White silhouette (no background box) on a confirmed dark terminal.
+        # Light terminals keep the asset's dark grays; neutral frames were
+        # stripped to the terminal's own foreground by the shared loader.
+        if color_enabled and theme == "dark":
             frames = _whiten_frames(frames)
     except Exception:
         return []

@@ -173,6 +173,7 @@ def test_one_shot_python_repo_keeps_existing_repo_native_pytest(
                 raw={},
             ),
             LLMResponse(content="Updated src/app.py and pytest passes.", tool_calls=[], raw={}),
+            LLMResponse(content="Updated src/app.py and pytest passes.", tool_calls=[], raw={}),
         ]
     )  # type: ignore[assignment]
 

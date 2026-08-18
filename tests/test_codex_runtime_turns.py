@@ -215,6 +215,10 @@ def test_resume_turn_rejects_option_shaped_or_non_uuid_session_id(
     def fail_popen(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("Codex must not start for an invalid session id")
 
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.agent_runtimes.codex_cli._resolve_executable",
+        lambda _configured: None,
+    )
     monkeypatch.setattr(subprocess, "Popen", fail_popen)
 
     with pytest.raises(ValueError, match="must be UUIDs"):
@@ -260,7 +264,7 @@ def test_turn_timeout_cleans_process_tree_and_returns_partial_events(
 
     def fake_terminate(process: _TimeoutPopen) -> None:
         terminated.append(process)
-        process.returncode = -signal.SIGKILL
+        process.returncode = -getattr(signal, "SIGKILL", signal.SIGTERM)
 
     monkeypatch.setattr(
         "sylliptor_agent_cli.agent_runtimes.codex_cli._terminate_process_tree",

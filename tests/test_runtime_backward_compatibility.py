@@ -75,9 +75,16 @@ def test_run_agent_uses_patchable_create_session_and_returns_int(
     calls: dict[str, Any] = {}
 
     class _FakeSession:
-        def run_turn(self, instruction: str, *, image_paths=None) -> int:  # type: ignore[no-untyped-def]
+        def run_turn(  # type: ignore[no-untyped-def]
+            self,
+            instruction: str,
+            *,
+            image_paths=None,
+            cancellation_token=None,
+        ) -> int:
             calls["instruction"] = instruction
             calls["image_paths"] = image_paths
+            calls["cancellation_token"] = cancellation_token
             return 7
 
         def close(self) -> None:
@@ -103,6 +110,7 @@ def test_run_agent_uses_patchable_create_session_and_returns_int(
     assert isinstance(code, int)
     assert code == 7
     assert calls["instruction"] == "Do the task."
+    assert calls["cancellation_token"] is None
     assert calls["closed"] is True
     assert calls["create_session_kwargs"]["crash_diagnostic_log_path"] is None
 

@@ -10,6 +10,7 @@ from .events import (
     MessageDelta,
     MessageEnd,
     ModeChanged,
+    PersonaChanged,
     PlanNodeUpdated,
     PromptForInput,
     ReviewGateDecision,
@@ -139,6 +140,9 @@ class Surface(Protocol):
     def emit_mode_changed(self, mode: str) -> None:
         _ = mode
 
+    def emit_persona_changed(self, persona: str, effective_mode: str, source: str = "user") -> None:
+        _ = (persona, effective_mode, source)
+
     def emit_plan_node_updated(
         self,
         node_id: str,
@@ -256,6 +260,8 @@ class Surface(Protocol):
             )
         elif event.type == ModeChanged.type:
             self.emit_mode_changed(event.mode)
+        elif event.type == PersonaChanged.type:
+            self.emit_persona_changed(event.persona, event.effective_mode, event.source)
         elif event.type == PlanNodeUpdated.type:
             self.emit_plan_node_updated(
                 event.node_id,

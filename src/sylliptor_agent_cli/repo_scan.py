@@ -4,7 +4,7 @@ import json
 import os
 import re
 import shlex
-import sys
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -17,6 +17,7 @@ from .file_classification import (
 )
 from .runtime_artifacts import RUNTIME_ARTIFACT_DIR_NAMES
 from .workspace_context import WorkspaceContext
+from .workspace_provisioning import detect_declared_test_runner
 
 REPO_SCAN_SCHEMA_VERSION = 1
 _MAX_TOP_LEVEL_ENTRIES = 18
@@ -182,7 +183,6 @@ def scan_workspace(*, context: WorkspaceContext) -> RepoScanResult:
         root=root,
         search_dirs=search_dirs,
         manifests=manifests,
-        readme_paths=readme_paths,
     )
     observed_paths = _observed_paths(
         top_level_entries=top_level_entries,
@@ -589,7 +589,6 @@ def _infer_test_commands(
     root: Path,
     search_dirs: list[Path],
     manifests: list[dict[str, str]],
-    readme_paths: list[str],
 ) -> list[str]:
     commands: list[str] = []
 
@@ -631,32 +630,11 @@ def _infer_test_commands(
     if python_test_command is not None:
         commands.append(python_test_command)
 
-    commands.extend(_readme_doctest_commands(root=root, readme_paths=readme_paths))
+    # Doctest over README/docs files is deliberately never inferred: it asserts
+    # that the prose examples still render, not that the code works, so it is
+    # never an authoritative verification surface for a change to the code.
 
     return _unique_nonempty(commands)
-
-
-def _readme_doctest_commands(*, root: Path, readme_paths: list[str]) -> list[str]:
-    commands: list[str] = []
-    for rel_path in readme_paths[:_MAX_README_EXCERPTS]:
-        path = root / rel_path
-        text = _read_text_excerpt(path)
-        if not re.search(r"(?m)^\s*>>>", text):
-            continue
-        commands.append(shlex.join([sys.executable, "-m", "doctest", rel_path]))
-        commands.append(
-            shlex.join(
-                [
-                    sys.executable,
-                    "-m",
-                    "pytest",
-                    f"--doctest-glob={Path(rel_path).name}",
-                    "-q",
-                    rel_path,
-                ]
-            )
-        )
-    return commands
 
 
 def _preferred_make_target(path: Path) -> str | None:
@@ -702,6 +680,28 @@ def _python_test_command(
     return None
 
 
+def detect_fallback_test_commands(*, root: Path) -> list[str]:
+    """Last-resort runner detection for a workspace with no usable command.
+
+    Deliberately *not* part of the primary inference above, which stays
+    conservative on purpose: a repo that declares pytest but ships no tests
+    should not advertise a verification contract it cannot honour. This chain is
+    consulted only once the selected command has turned out to be unusable, when
+    the alternative is running with no verification surface at all -- there, a
+    runner the repo declares (or one ``unittest`` can discover) is strictly
+    better than nothing, and a runner that collects zero tests is reported as
+    skipped rather than passed.
+    """
+    workspace_root = Path(root)
+    if detect_declared_test_runner(workspace_root) is not None:
+        return ["pytest -q"]
+    if _directory_has_python_test_layout_signal(workspace_root, allow_tests_dir_hint=False):
+        return ["pytest -q"]
+    if _directory_has_unittest_discovery_signal(workspace_root):
+        return ["python -m unittest discover"]
+    return []
+
+
 def _python_test_search_dirs(*, root: Path, search_dirs: list[Path]) -> list[Path]:
     focused: list[Path] = []
     workspace_roots: list[Path] = []
@@ -743,7 +743,40 @@ def _is_python_test_signal_file(name: str) -> bool:
     return lowered.endswith(".py") and (lowered.startswith("test_") or lowered.endswith("_test.py"))
 
 
-def _tests_dir_has_python_signal(tests_dir: Path) -> bool:
+def _is_unittest_discovery_signal_file(name: str) -> bool:
+    """Mirror ``unittest discover``'s own default pattern, ``test*.py``.
+
+    Deliberately the runner's rule rather than a hand-written guess at what a
+    test module looks like: the point of this layer is "would ``unittest``
+    collect anything here", and only ``unittest``'s pattern answers that. A
+    helper module that happens to match collects zero tests, which the verifier
+    already reports as skipped rather than passed.
+    """
+    lowered = str(name or "").strip().casefold()
+    return lowered.startswith("test") and lowered.endswith(".py")
+
+
+def _directory_has_unittest_discovery_signal(directory: Path) -> bool:
+    try:
+        for candidate in sorted(directory.iterdir(), key=lambda path: path.name.casefold()):
+            if candidate.is_file():
+                if _is_unittest_discovery_signal_file(candidate.name):
+                    return True
+                continue
+            if not candidate.is_dir() or candidate.name != "tests":
+                continue
+            if _tests_dir_has_python_signal(candidate, match=_is_unittest_discovery_signal_file):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _tests_dir_has_python_signal(
+    tests_dir: Path,
+    *,
+    match: Callable[[str], bool] = _is_python_test_signal_file,
+) -> bool:
     seen_dirs = 0
     seen_files = 0
     try:
@@ -759,7 +792,7 @@ def _tests_dir_has_python_signal(tests_dir: Path) -> bool:
                 seen_files += 1
                 if seen_files > _MAX_PYTHON_TEST_SIGNAL_FILES:
                     return False
-                if _is_python_test_signal_file(filename):
+                if match(filename):
                     return True
             _ = current_root
     except OSError:

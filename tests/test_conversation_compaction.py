@@ -7,6 +7,12 @@ from pathlib import Path
 from typing import Any
 
 import sylliptor_agent_cli.compaction.conversation_compactor as compactor_mod
+from sylliptor_agent_cli.agent.turn_contract import (
+    TurnEffect,
+    TurnOutcome,
+    TurnRelation,
+    TurnSemantics,
+)
 from sylliptor_agent_cli.agent_loop import (
     AgentSession,
     create_session,
@@ -28,6 +34,28 @@ def _summary(*, decisions: list[str]) -> dict[str, Any]:
         "open_threads": [],
         "next_steps": [],
     }
+
+
+def _workspace_change_semantics(
+    instruction: str,
+    *,
+    relation: TurnRelation,
+) -> TurnSemantics:
+    return TurnSemantics(
+        outcome=TurnOutcome.CHANGE,
+        relation=relation,
+        requested_effects=(TurnEffect.READ_WORKSPACE, TurnEffect.WRITE_WORKSPACE),
+        evidence_quotes=(instruction,),
+    )
+
+
+def _explain_prior_semantics(instruction: str) -> TurnSemantics:
+    return TurnSemantics(
+        outcome=TurnOutcome.ANSWER,
+        relation=TurnRelation.EXPLAIN_PRIOR,
+        requested_effects=(TurnEffect.READ_WORKSPACE,),
+        evidence_quotes=(instruction,),
+    )
 
 
 class _FakeMainClient:
@@ -303,9 +331,14 @@ def test_repo_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: Path)
 
     try:
         original_pinned_prefix_len = session.pinned_prefix_len
+        first_instruction = "Fix src/app.py without changing the output shape."
         refreshed = refresh_session_task_brief_message(
             session,
-            pending_instruction="Fix src/app.py without changing the output shape.",
+            pending_instruction=first_instruction,
+            turn_semantics=_workspace_change_semantics(
+                first_instruction,
+                relation=TurnRelation.NEW,
+            ),
         )
         session.messages.append(
             {
@@ -313,9 +346,14 @@ def test_repo_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: Path)
                 "content": "Fix src/app.py without changing the output shape.",
             }
         )
+        refinement = "Also preserve unknown values like pending."
         refreshed = refresh_session_task_brief_message(
             session,
-            pending_instruction="Also preserve unknown values like pending.",
+            pending_instruction=refinement,
+            turn_semantics=_workspace_change_semantics(
+                refinement,
+                relation=TurnRelation.REFINE,
+            ),
         )
         session.messages.append(
             {
@@ -323,9 +361,11 @@ def test_repo_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: Path)
                 "content": "Also preserve unknown values like pending.",
             }
         )
+        explanation = "Can you explain more about src/app.py?"
         refreshed = refresh_session_task_brief_message(
             session,
-            pending_instruction="Can you explain more about src/app.py?",
+            pending_instruction=explanation,
+            turn_semantics=_explain_prior_semantics(explanation),
         )
         _append_turns(session, count=7, prefix="old")
         compacted, changed = session.conversation_compactor.compact_now(
@@ -345,14 +385,14 @@ def test_repo_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: Path)
         if str(message.get("content") or "").startswith("<task_brief>")
     ]
 
-    assert refreshed is True
+    assert refreshed is False
     assert changed is True
     assert session.pinned_prefix_len == original_pinned_prefix_len
     assert len(task_brief_messages) == 1
     assert "current_focus:" in task_brief_messages[0]
     assert "- Fix src/app.py without changing the output shape." in task_brief_messages[0]
     assert "- Also preserve unknown values like pending." in task_brief_messages[0]
-    assert "- Can you explain more about src/app.py?" in task_brief_messages[0]
+    assert "- Can you explain more about src/app.py?" not in task_brief_messages[0]
 
 
 def test_plain_dir_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: Path) -> None:
@@ -376,9 +416,14 @@ def test_plain_dir_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: 
 
     try:
         original_pinned_prefix_len = session.pinned_prefix_len
+        first_instruction = "Create timer.py here without changing the JSON output shape."
         refreshed = refresh_session_task_brief_message(
             session,
-            pending_instruction="Create timer.py here without changing the JSON output shape.",
+            pending_instruction=first_instruction,
+            turn_semantics=_workspace_change_semantics(
+                first_instruction,
+                relation=TurnRelation.NEW,
+            ),
         )
         session.messages.append(
             {
@@ -386,9 +431,14 @@ def test_plain_dir_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: 
                 "content": "Create timer.py here without changing the JSON output shape.",
             }
         )
+        refinement = "Also preserve unknown values like pending."
         refreshed = refresh_session_task_brief_message(
             session,
-            pending_instruction="Also preserve unknown values like pending.",
+            pending_instruction=refinement,
+            turn_semantics=_workspace_change_semantics(
+                refinement,
+                relation=TurnRelation.REFINE,
+            ),
         )
         session.messages.append(
             {
@@ -396,9 +446,11 @@ def test_plain_dir_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: 
                 "content": "Also preserve unknown values like pending.",
             }
         )
+        explanation = "Can you explain `timer.py` more?"
         refreshed = refresh_session_task_brief_message(
             session,
-            pending_instruction="Can you explain `timer.py` more?",
+            pending_instruction=explanation,
+            turn_semantics=_explain_prior_semantics(explanation),
         )
         _append_turns(session, count=7, prefix="old")
         compacted, changed = session.conversation_compactor.compact_now(
@@ -418,7 +470,7 @@ def test_plain_dir_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: 
         if str(message.get("content") or "").startswith("<task_brief>")
     ]
 
-    assert refreshed is True
+    assert refreshed is False
     assert changed is True
     assert session.pinned_prefix_len == original_pinned_prefix_len
     assert len(task_brief_messages) == 1
@@ -427,7 +479,7 @@ def test_plain_dir_task_brief_stays_in_pinned_prefix_after_compaction(tmp_path: 
         "- Create timer.py here without changing the JSON output shape." in task_brief_messages[0]
     )
     assert "- Also preserve unknown values like pending." in task_brief_messages[0]
-    assert "- Can you explain `timer.py` more?" in task_brief_messages[0]
+    assert "- Can you explain `timer.py` more?" not in task_brief_messages[0]
 
 
 def test_maybe_compact_does_not_compact_below_trigger_threshold(tmp_path: Path) -> None:
@@ -1891,3 +1943,156 @@ def test_compactor_restores_summary_pins_and_history_index_for_resume(tmp_path: 
         assert resumed.conversation_compactor.state.pins == expected_pins
     finally:
         resumed.close()
+
+
+def test_reinject_context_messages_restores_memory_and_pins_after_resume(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_cfg()
+    sessions_dir = tmp_path / "logs"
+    session_id = "compaction-resume-reinject"
+    seed = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+    )
+    try:
+        memory_dir = _compaction_session_dir(seed) / "memory"
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        (memory_dir / "summary.json").write_text(
+            json.dumps(_summary(decisions=["resume-restored-decision"])),
+            encoding="utf-8",
+        )
+        (memory_dir / "pins.json").write_text(
+            json.dumps(
+                {
+                    "pins": [
+                        {
+                            "kind": "context",
+                            "text": "resume-restored pin",
+                            "reasons": ["seed"],
+                            "source": {},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+    finally:
+        seed.close()
+
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+        session_source="resume",
+    )
+    try:
+        compactor = session.conversation_compactor
+        assert compactor is not None
+        assert compactor.state.summary["decisions"] == ["resume-restored-decision"]
+        assert len(compactor.state.pins) == 1
+        assert compactor.state.memory_message_index is None
+        assert compactor.state.pins_message_index is None
+
+        session.messages.append({"role": "user", "content": "resumed history turn"})
+        session.messages[:] = compactor.reinject_context_messages(session.messages)
+
+        memory_index = compactor.state.memory_message_index
+        pins_index = compactor.state.pins_message_index
+        assert memory_index is not None
+        assert pins_index is not None
+        assert pins_index >= compactor.state.pinned_prefix_len
+        assert memory_index == pins_index + 1
+        memory_content = str(session.messages[memory_index]["content"])
+        pins_content = str(session.messages[pins_index]["content"])
+        assert memory_content.startswith(MEMORY_MARKER)
+        assert "resume-restored-decision" in memory_content
+        assert pins_content.startswith(PINS_MARKER)
+        assert "resume-restored pin" in pins_content
+        assert session.messages[-1] == {"role": "user", "content": "resumed history turn"}
+
+        # Reinjecting again must not duplicate the marker messages.
+        session.messages[:] = compactor.reinject_context_messages(session.messages)
+        memory_count = sum(
+            1 for msg in session.messages if str(msg.get("content") or "").startswith(MEMORY_MARKER)
+        )
+        pins_count = sum(
+            1 for msg in session.messages if str(msg.get("content") or "").startswith(PINS_MARKER)
+        )
+        assert memory_count == 1
+        assert pins_count == 1
+    finally:
+        session.close()
+
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    reinjected_events = [
+        event
+        for event in events
+        if isinstance(event, dict)
+        and str(event.get("type") or "") == "compaction_context_reinjected"
+    ]
+    assert len(reinjected_events) == 2
+    payload = reinjected_events[-1].get("payload")
+    assert isinstance(payload, dict)
+    assert payload["summary_restored"] is True
+    assert payload["pins_count"] == 1
+    assert isinstance(payload["memory_message_index"], int)
+    assert isinstance(payload["pins_message_index"], int)
+
+
+def test_reinject_context_messages_without_restored_state_is_a_no_op(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_cfg()
+    sessions_dir = tmp_path / "logs"
+    session_id = "compaction-resume-reinject-empty"
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=2,
+        no_log=False,
+        api_key_override="x",
+        session_log_dir_override=sessions_dir,
+        session_id_override=session_id,
+        session_source="resume",
+    )
+    try:
+        compactor = session.conversation_compactor
+        assert compactor is not None
+        assert compactor.state.summary == {}
+        assert compactor.state.pins == []
+
+        before = list(session.messages)
+        result = compactor.reinject_context_messages(session.messages)
+
+        assert result is session.messages
+        assert session.messages == before
+        assert compactor.state.memory_message_index is None
+        assert compactor.state.pins_message_index is None
+        assert not any(
+            str(msg.get("content") or "").startswith((MEMORY_MARKER, PINS_MARKER))
+            for msg in session.messages
+        )
+    finally:
+        session.close()
+
+    events = list(read_session_events(sessions_dir / f"{session_id}.jsonl"))
+    assert not any(
+        isinstance(event, dict) and str(event.get("type") or "") == "compaction_context_reinjected"
+        for event in events
+    )

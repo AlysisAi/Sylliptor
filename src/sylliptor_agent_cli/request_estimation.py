@@ -266,12 +266,13 @@ def estimate_request_token_breakdown(
         content = message.get("content")
         content_text = content if isinstance(content, str) else ""
 
-        if content_text.startswith(_MEMORY_MARKER):
-            memory_messages.append(message)
-            continue
-        if content_text.startswith(_PINS_MARKER):
-            pins_messages.append(message)
-            continue
+        if str(message.get("role") or "") == "user":
+            if content_text.startswith(_MEMORY_MARKER):
+                memory_messages.append(message)
+                continue
+            if content_text.startswith(_PINS_MARKER):
+                pins_messages.append(message)
+                continue
 
         if str(message.get("role") or "") == "tool" or message.get("tool_calls"):
             inline_tool_messages.append(message)

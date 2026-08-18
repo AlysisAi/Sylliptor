@@ -27,6 +27,27 @@ class UsageSource(StrEnum):
     MIXED = "mixed"
 
 
+class BillingMode(StrEnum):
+    """How the selected route is paid for from the user's perspective."""
+
+    METERED_API = "metered_api"
+    SUBSCRIPTION = "subscription"
+    INCLUDED = "included"
+    LOCAL = "local"
+    UNKNOWN = "unknown"
+
+
+class CostSource(StrEnum):
+    """Provenance of a per-call dollar amount."""
+
+    PROVIDER_REPORTED = "provider_reported"
+    CATALOG_ESTIMATE = "catalog_estimate"
+    SUBSCRIPTION = "subscription"
+    INCLUDED = "included"
+    LOCAL = "local"
+    UNKNOWN = "unknown"
+
+
 class ReasoningOutputKind(StrEnum):
     """Visibility class for provider-produced reasoning output.
 
@@ -63,6 +84,7 @@ class UsageContract:
     response_usage_confidence: UsageConfidence = UsageConfidence.REPORTED
     normalized_output_includes_reasoning: bool = True
     input_token_count_strategy: str = "none"
+    billing_mode: BillingMode = BillingMode.METERED_API
 
     @property
     def response_usage_authoritative(self) -> bool:
@@ -104,11 +126,17 @@ class LLMUsage:
     total_tokens: int | None
     cached_prompt_tokens: int | None = None
     input_tokens_uncached: int | None = None
+    # True when the uncached figure was computed from other reported counts
+    # rather than sent by the provider, so display can avoid claiming it as
+    # provider-reported.
+    input_tokens_uncached_derived: bool = False
     cache_read_input_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
     cache_creation_5m_input_tokens: int | None = None
     cache_creation_1h_input_tokens: int | None = None
     reasoning_tokens: int | None = None
+    provider_cost_usd: float | None = None
+    provider_cost_currency: str | None = None
     raw_provider_usage: dict[str, Any] | None = None
     source: UsageSource = UsageSource.PROVIDER_RESPONSE
     confidence: UsageConfidence = UsageConfidence.REPORTED

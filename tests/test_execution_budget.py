@@ -456,7 +456,7 @@ def test_managed_execution_startup_headroom_reduces_first_request_below_trigger(
         managed_execution_startup_headroom=True,
         leading_sections=[
             "## Execution Knowledge\n"
-            + "Carry forward the exact forge execution contract and reporting invariants.\n" * 64
+            + "Carry forward the exact forge execution contract and reporting invariants.\n" * 16
         ],
     )
 
@@ -496,7 +496,7 @@ def test_managed_execution_startup_headroom_reduces_first_request_below_trigger(
 def test_managed_execution_startup_headroom_skips_adjustment_when_request_already_fits(
     tmp_path,
 ) -> None:
-    cfg = AppConfig(model="managed-16k")
+    cfg = AppConfig(model="managed-8k")
     cfg.extra_fields = {
         "compaction": {
             "trigger_ratio": 0.85,
@@ -504,8 +504,8 @@ def test_managed_execution_startup_headroom_skips_adjustment_when_request_alread
         },
         "model_metadata_overrides": {
             "models": {
-                "managed-16k": {
-                    "context_window_tokens": 16384,
+                "managed-8k": {
+                    "context_window_tokens": 11264,
                     "max_output_tokens": 1024,
                     "supports_vision": False,
                 }
@@ -536,7 +536,7 @@ def test_managed_execution_startup_headroom_skips_adjustment_when_request_alread
         task=task,
         root=tmp_path,
         cfg=cfg,
-        role_model="managed-16k",
+        role_model="managed-8k",
         mode="auto",
         yes=True,
         non_interactive=True,

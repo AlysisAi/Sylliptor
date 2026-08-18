@@ -15,7 +15,7 @@ from sylliptor_agent_cli.llm.protocols import (
     get_provider_protocol_capabilities,
     resolve_reasoning_trace_capability,
 )
-from sylliptor_agent_cli.llm.types import ReasoningOutputKind
+from sylliptor_agent_cli.llm.types import BillingMode, ReasoningOutputKind
 
 
 def test_supported_llm_protocols_include_native_foundation_values() -> None:
@@ -141,6 +141,10 @@ def test_reasoning_trace_capabilities_only_mark_safe_summaries_as_displayable() 
         provider_key="moonshot",
         protocol=OPENAI_COMPAT_PROTOCOL,
     )
+    nvidia = resolve_reasoning_trace_capability(
+        provider_key="nvidia",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+    )
     unknown = resolve_reasoning_trace_capability(
         provider_key="custom",
         protocol=OPENAI_COMPAT_PROTOCOL,
@@ -160,8 +164,46 @@ def test_reasoning_trace_capabilities_only_mark_safe_summaries_as_displayable() 
     assert mistral.continuation_state == "sensitive"
     assert moonshot.adapter == "moonshot_reasoning"
     assert moonshot.continuation_state == "sensitive"
+    assert nvidia.adapter == "nvidia_reasoning"
+    assert nvidia.output_kind == ReasoningOutputKind.PROVIDER_REASONING
+    assert nvidia.continuation_state == "sensitive"
+    assert nvidia.has_safe_summary is False
     assert unknown.adapter == "openai_compat_passive"
     assert unknown.has_safe_summary is False
+
+
+def test_nvidia_nim_protocol_capabilities_are_conservative() -> None:
+    capabilities = get_provider_protocol_capabilities(
+        provider_key="nvidia",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+    )
+
+    assert capabilities is not None
+    assert capabilities.supports_streaming is True
+    assert capabilities.supports_tool_calling is True
+    assert capabilities.supports_forced_tool_choice is True
+    assert capabilities.supports_structured_outputs is False
+    assert capabilities.supports_provider_hosted_web_search_adapter is False
+    assert capabilities.default_web_search_adapter == "auto"
+    assert capabilities.usage_contract.response_usage_confidence.value == "reported"
+
+
+def test_zai_coding_plan_capabilities_preserve_subscription_semantics() -> None:
+    capabilities = get_provider_protocol_capabilities(
+        provider_key="zai_coding_plan",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+    )
+
+    assert capabilities is not None
+    assert capabilities.supports_streaming is True
+    assert capabilities.supports_tool_calling is True
+    assert capabilities.supports_structured_outputs is True
+    assert capabilities.supports_provider_hosted_web_search_adapter is False
+    assert capabilities.reasoning_trace.adapter == "openai_compat_passive"
+    assert capabilities.reasoning_trace.has_safe_summary is False
+    assert capabilities.cache_strategy == "implicit_provider"
+    assert capabilities.usage_contract.billing_mode == BillingMode.SUBSCRIPTION
+    assert capabilities.usage_contract.response_usage_confidence.value == "reported"
 
 
 def test_custom_profile_can_select_a_safe_structured_summary_adapter() -> None:

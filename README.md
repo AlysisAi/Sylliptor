@@ -34,19 +34,20 @@
 ## Why Sylliptor
 
 - **Forge** — Plan, dispatch parallel workers, verify each task, ship.
+- **Personas** — Switch between coding, architecture, questions, and debugging without leaving the session.
 - **Cross-run memory** — Failures become structured issues the next run avoids.
-- **Bring your own model** — OpenAI, Anthropic, DeepSeek, Qwen, Gemini, Mistral, OpenRouter, xAI.
+- **Flexible model access** — Connect your own provider, a supported subscription, or a Sylliptor account.
 - **Sandboxed by default** — Docker or Bubblewrap. An always-on denylist refuses `rm -rf /`, `curl | sh`, and `sudo` — even in `fullaccess`.
 
 ## How Forge Works
 
-Type `/forge` in chat (or run `sylliptor forge plan`), describe what you want, and Forge:
+Type `/forge`, describe what you want, and Forge:
 
 1. Asks 1–3 clarifying questions if the ask is vague.
 2. Writes `plan.json` with explicit tasks and runnable file scope.
 3. On `/execute plan`, dispatches a swarm of workers that run tasks in parallel.
 4. Verifies each task before marking it done. Failures become `issue` entries the next attempt sees.
-5. Merges to `main` when everything passes.
+5. Integrates verified task changes into the branch where Forge started.
 
 All plans, traces, and per-task artifacts persist under `.sylliptor/runs/<run_id>/`. Resume any time with `/forge resume`.
 
@@ -74,49 +75,43 @@ python -m pip install sylliptor-agent-cli
 
 ```bash
 pipx install sylliptor-agent-cli
-export SYLLIPTOR_API_KEY="YOUR_KEY"
-sylliptor config set model "your-model"
-sylliptor chat
+cd /path/to/project
+sylliptor
 ```
 
-On a fresh install, running `sylliptor` opens a guided setup wizard for connection, default model, optional router model, and workspace. Re-run anytime:
+The first launch guides you through connecting a model and choosing a workspace. After that, Sylliptor opens directly into an interactive session.
 
-```bash
-sylliptor setup
-```
+Use `/login` to connect an account or supported subscription, and `/config` to change the provider, model, or other session defaults.
 
-Configure a provider endpoint and model:
+## Inside Sylliptor
 
-```bash
-sylliptor config set base_url "your-base-url"
-sylliptor config set model "your-model"
-```
-
-Per-command key, endpoint, and model overrides:
-
-```bash
-sylliptor run --api-key-env OTHER_API_KEY --base-url "your-base-url" --model "your-model" "Summarize this project."
-```
-
-## Core Commands
-
-| Command | Use |
+| Command | What it does |
 | --- | --- |
-| `sylliptor` | Start setup or interactive chat. |
-| `sylliptor setup` | Configure API key, model, and workspace defaults. |
-| `sylliptor run "..."` | Run a one-shot task in the current workspace. |
-| `sylliptor chat` | Start an interactive coding session. |
-| `sylliptor forge plan` | Create or update a Forge plan from the CLI. |
-| `sylliptor forge exec` | Execute a Forge task non-interactively. |
-| `sylliptor forge swarm` | Run Forge tasks across parallel workers. |
-| `sylliptor tools` | Show built-in tools and readiness. |
-| `sylliptor sandbox doctor --smoke` | Check sandbox readiness. |
+| `/login` | Connect a Sylliptor account or supported subscription. |
+| `/config` | Change the model and session settings. |
+| `/persona` | Switch between Code, Architect, Ask, and Debug. |
+| `/mode` | Change the execution mode. |
+| `/forge` | Plan and run larger work. |
+| `/subagent` | Delegate a focused task. |
+| `/status` | Show the current model, mode, and workspace. |
+| `/help` | See every available command. |
 
-Useful chat commands include `/help`, `/status`, `/mode`, `/config`, `/plan`, `/forge`, `/skill`, `/subagent`, `/terminals`, `/resume`.
+You can ask naturally for the work you want. Sylliptor inspects the workspace, proposes a plan when needed, makes changes within the selected mode, and verifies the result.
+
+## Personas
+
+Personas change how Sylliptor approaches a task without changing the safety rules underneath it. Open `/persona` to choose:
+
+- **Code** for implementation work.
+- **Architect** for plans and design decisions.
+- **Ask** for read-only questions and explanations.
+- **Debug** for reproduce-first investigation and fixes.
+
+You can switch at any time during a normal session.
 
 ## Execution Modes
 
-Choose a mode per command with `--mode`, change it in chat with `/mode`, or set the default with `sylliptor config set default_mode <mode>`.
+Open `/mode` to choose how much Sylliptor can do without asking first.
 
 | Mode | Behavior |
 | --- | --- |
@@ -124,12 +119,6 @@ Choose a mode per command with `--mode`, change it in chat with `/mode`, or set 
 | `review` | Default safe mode. Previews and asks before file writes and shell commands. |
 | `auto` | Applies changes with fewer prompts. Hard denylist still applies. |
 | `fullaccess` | No mode-level approval prompts. Denylist + audit log still active. |
-
-```bash
-sylliptor run --mode readonly "Find risky areas in this codebase."
-sylliptor run --mode review "Implement the failing test fix."
-sylliptor chat --mode auto
-```
 
 ## Sandbox & Safety
 
@@ -174,30 +163,16 @@ Run as an HTTP service with [Server mode](docs/server.md) — worker jobs, uploa
 
 ## Configuration & Credentials
 
-API keys can come from per-command options, `SYLLIPTOR_API_KEY` or persisted credentials.
-
-```bash
-sylliptor config show
-sylliptor config set-api-key
-sylliptor config clear-api-key
-```
-
-Provider profiles switch between configured endpoints:
-
-```bash
-sylliptor profile presets
-sylliptor profile use openai
-sylliptor profile list
-```
+Open `/login` to connect an account or supported subscription. Use `/config` for API-key providers, model selection, and session defaults. Credentials are stored outside the project.
 
 See [Credentials](docs/credentials.md) for key resolution and storage details.
 See [Providers and models](docs/providers.md) for additional connection options.
 
 ## Workspace Behavior
 
-`sylliptor run` and `sylliptor chat` bind a workspace before the session starts. The requested path is `--path` or the current directory. In a git repository, Sylliptor binds to the repository root while preserving the starting directory as the focus directory.
+Sylliptor binds a workspace when the session starts. In a git repository, it uses the repository root while preserving the directory where you launched it as the focus directory.
 
-Missing paths require `--create-path`. Broad directories such as `~` require an explicit override. `/` is blocked as a workspace root.
+Broad directories such as your home directory require explicit confirmation. The filesystem root is blocked as a workspace.
 
 ## Project Links
 

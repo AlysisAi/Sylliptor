@@ -157,6 +157,42 @@ def test_validate_skill_bundle_accepts_valid_bundle_and_rejects_invalid_utf8(
     assert any("UTF-8" in issue.message for issue in broken.issues)
 
 
+def test_inaccessible_skill_bundle_is_reported_without_breaking_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    bundle = _write_skill_bundle(
+        workspace / ".sylliptor_skills" / "blocked",
+        name="blocked",
+        description="A bundle whose metadata cannot be inspected.",
+    )
+    blocked_entry = (bundle / "SKILL.md").resolve()
+    original_is_symlink = Path.is_symlink
+
+    def _permission_denied_for_entry(path: Path) -> bool:
+        if path == blocked_entry:
+            raise PermissionError("access denied by test")
+        return original_is_symlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", _permission_denied_for_entry)
+
+    validation = validate_skill_bundle(bundle)
+    discovered = discover_skills(
+        focus_path=workspace,
+        workspace_root=workspace,
+        user_config_dir=tmp_path / "empty-user-config",
+        home_dir=tmp_path / "empty-home",
+    )
+
+    assert validation.valid is False
+    assert len(validation.errors) == 1
+    assert "Failed to inspect skill bundle" in validation.errors[0].message
+    assert discovered.skills == {}
+    assert len(discovered.issues) == 1
+    assert "Failed to inspect skill bundle" in discovered.issues[0].message
+
+
 def test_install_skill_bundle_from_local_dir_records_managed_install(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

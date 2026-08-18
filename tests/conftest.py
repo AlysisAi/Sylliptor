@@ -37,6 +37,21 @@ _FORGE_WATCHDOG_CHILD_PROCESS_SCAN_LIMIT = 25
 _FORGE_WATCHDOG_GIT_PROBE_TIMEOUT_S = 0.2
 
 
+@pytest.fixture(scope="session", autouse=True)
+def isolate_terminal_ownership_records(tmp_path_factory: pytest.TempPathFactory):
+    """Never let background-process crash markers from tests reach the real user profile."""
+    key = "SYLLIPTOR_TERMINAL_OWNERSHIP_DIR"
+    previous = os.environ.get(key)
+    os.environ[key] = os.fspath(tmp_path_factory.mktemp("terminal-ownership"))
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
 class OAuthFixtureServer:
     def __init__(self) -> None:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _OAuthFixtureHandler)
@@ -412,6 +427,20 @@ def block_live_ddgs_network(monkeypatch: pytest.MonkeyPatch):
         _blocked,
     )
     yield
+
+
+@pytest.fixture(autouse=True)
+def reset_keyring_observations():
+    """The credential store warns once per distinct keyring degradation.
+
+    That state is process-global, so without a reset the first test to observe a
+    fallback would silence the assertions of every later one.
+    """
+    from sylliptor_agent_cli.mcp.token_store import reset_keyring_observations as _reset
+
+    _reset()
+    yield
+    _reset()
 
 
 @pytest.fixture(autouse=True)

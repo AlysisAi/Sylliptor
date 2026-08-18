@@ -106,7 +106,11 @@ def _load_owl_logo_frames(
         frames = []
     if not frames:
         return []
-    if not color_enabled:
+    if not color_enabled or theme == "neutral":
+        # With no reliable background signal, use the terminal's default
+        # foreground. Terminal profiles are expected to keep that readable on
+        # their own background; retaining the asset's fixed gray ramp would
+        # instead make the owl disappear on one side of the light/dark divide.
         return [[stripAnsi(line) for line in frame] for frame in frames]
     return frames
 
@@ -451,52 +455,42 @@ def printWelcome(
             ]
 
         if owl_frames:
-            side_by_side_layouts = [(indent, gap)]
-            if indent or visibleLength(gap) > 1:
-                side_by_side_layouts.append(("", " "))
-            for left_indent, middle_gap in side_by_side_layouts:
-                right_width = max(
-                    safe_line_width
-                    - visibleLength(left_indent)
-                    - logo_width
-                    - visibleLength(middle_gap),
-                    1,
-                )
-                detail_lines = welcome_detail_lines(right_width)
-                required_side_by_side_width = (
-                    visibleLength(left_indent) + logo_width + visibleLength(middle_gap)
-                )
-                required_side_by_side_width += max(
-                    (visibleLength(line) for line in detail_lines),
-                    default=0,
-                )
-                if safe_line_width < required_side_by_side_width:
-                    continue
+            right_width = max(
+                safe_line_width - visibleLength(indent) - logo_width - visibleLength(gap),
+                1,
+            )
+            detail_lines = welcome_detail_lines(right_width)
+            required_side_by_side_width = visibleLength(indent) + logo_width + visibleLength(gap)
+            required_side_by_side_width += max(
+                (visibleLength(line) for line in detail_lines),
+                default=0,
+            )
+            if safe_line_width >= required_side_by_side_width:
                 right_start = max((len(logo_frame) - len(detail_lines)) // 2, 0)
                 rendered_lines = []
                 total_rows = max(len(logo_frame), right_start + len(detail_lines))
                 for row_index in range(total_rows):
                     row = logo_frame[row_index] if row_index < len(logo_frame) else ""
-                    line = f"{left_indent}{padLine(row, logo_width)}"
+                    line = f"{indent}{padLine(row, logo_width)}"
                     right_index = row_index - right_start
                     if 0 <= right_index < len(detail_lines):
-                        line = f"{line}{middle_gap}{detail_lines[right_index]}"
+                        line = f"{line}{gap}{detail_lines[right_index]}"
                     rendered_lines.append(_clip_visible_line(line.rstrip(), safe_line_width))
                 return rendered_lines
-
-            rendered_lines = []
-            rendered_lines.extend(
-                _clip_visible_line(f"{indent}{row.rstrip()}".rstrip(), safe_line_width)
-                for row in logo_frame
-            )
-            rendered_lines.append("")
-            full_detail_width = max(safe_line_width - visibleLength(indent), 1)
-            full_detail_lines = welcome_detail_lines(full_detail_width)
-            rendered_lines.extend(
-                _clip_visible_line(f"{indent}{line}".rstrip(), safe_line_width)
-                for line in full_detail_lines
-            )
-            return rendered_lines
+            else:
+                rendered_lines = []
+                rendered_lines.extend(
+                    _clip_visible_line(f"{indent}{row.rstrip()}".rstrip(), safe_line_width)
+                    for row in logo_frame
+                )
+                rendered_lines.append("")
+                full_detail_width = max(safe_line_width - visibleLength(indent), 1)
+                full_detail_lines = welcome_detail_lines(full_detail_width)
+                rendered_lines.extend(
+                    _clip_visible_line(f"{indent}{line}".rstrip(), safe_line_width)
+                    for line in full_detail_lines
+                )
+                return rendered_lines
 
         context_line = _welcome_context_line(
             workspace=workspace,
@@ -686,13 +680,15 @@ def _chat_command_sections(*, ui_mode: str = "chat") -> list[tuple[str, list[tup
                     ("/pwd", "show active workdir, focus dir, and workspace root"),
                     ("/usage", "token count & cost; /usage hud on|off toggles HUD"),
                     ("/mode", "change execution mode"),
+                    ("/persona", "switch persona (code, architect, ask, debug)"),
+                    ("/stream", "toggle streaming"),
                     ("/trace", "reasoning detail (off/compact/full)"),
                 ],
             ),
             (
                 "Context",
                 [
-                    ("/ctx", "context window left"),
+                    ("/context", "context window left"),
                     ("/compact [focus]", "force compaction"),
                     ("/resume [id]", "continue previous session"),
                     ("/report [text]", "create feedback bundle + issue draft"),
@@ -704,11 +700,11 @@ def _chat_command_sections(*, ui_mode: str = "chat") -> list[tuple[str, list[tup
                 [
                     ("/login", "choose Sylliptor or an AI subscription connection"),
                     (
-                        "/subagent [name] [task]",
+                        "/subagent",
                         "no args opens picker; /subagent on|off|status toggles delegation",
                     ),
                     (
-                        "/skill [name] [task]",
+                        "/skill",
                         "no args lists; <name> shows info; <name> <task> attaches",
                     ),
                     ("/image [path]", "add image (path, clipboard, Ctrl+Alt+V)"),
@@ -735,6 +731,8 @@ def _chat_command_sections(*, ui_mode: str = "chat") -> list[tuple[str, list[tup
             "Execution",
             [
                 ("/mode", "change execution mode"),
+                ("/persona", "switch persona (code, architect, ask, debug)"),
+                ("/ask <question>", "one read-only turn; mode restored afterwards"),
                 (
                     "/plan <task>",
                     "default planning path: draft, review, approve, then execute; bare /plan shows usage",
@@ -753,7 +751,7 @@ def _chat_command_sections(*, ui_mode: str = "chat") -> list[tuple[str, list[tup
         (
             "Context",
             [
-                ("/ctx", "context window left"),
+                ("/context", "context window left"),
                 ("/compact [focus]", "force compaction"),
                 ("/clear", "wipe conversation (keeps session id + log; Ctrl+L clears terminal)"),
                 ("/resume [id]", "continue previous session"),
@@ -765,11 +763,11 @@ def _chat_command_sections(*, ui_mode: str = "chat") -> list[tuple[str, list[tup
             "Tools & Subagents",
             [
                 (
-                    "/subagent [name] [task]",
+                    "/subagent",
                     "no args opens picker; /subagent on|off|status toggles delegation",
                 ),
                 (
-                    "/skill [name] [task]",
+                    "/skill",
                     "no args lists; <name> shows info; <name> <task> attaches",
                 ),
                 ("/image [path]", "add image (path, clipboard, Ctrl+Alt+V)"),
@@ -883,6 +881,9 @@ def _session_build_tools_kwargs(*, session: Any, mode: str) -> dict[str, Any]:
         "mode": mode,
         "yes": bool(getattr(session, "yes", False)),
         "cfg": cfg,
+        # Carried across tool rebuilds so an active switch_mode coordination
+        # cell (and the tool itself) survives /mode and persona transitions.
+        "persona_switch_state": getattr(session, "persona_switch_state", None),
         "api_key": str(getattr(session, "api_key", "") or "") or None,
         "max_steps": max_steps,
         "no_log": bool(getattr(session, "no_log", False)),
@@ -891,6 +892,7 @@ def _session_build_tools_kwargs(*, session: Any, mode: str) -> dict[str, Any]:
         "model_registry": getattr(session, "model_registry", None),
         "deny_write_prefixes": getattr(session, "deny_write_prefixes", None),
         "allow_write_globs": getattr(session, "allow_write_globs", None),
+        "persona_allow_write_globs": getattr(session, "persona_allow_write_globs", None),
         "non_interactive": bool(getattr(session, "non_interactive", False)),
         "shell_runner": getattr(session, "shell_runner", None),
         "terminal_manager": getattr(session, "terminal_manager", None),

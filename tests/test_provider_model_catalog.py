@@ -93,8 +93,13 @@ def test_gemini_catalog_paginates_filters_and_normalizes_models() -> None:
             id="gemini-next",
             label="Gemini Next",
             description="Fast routing model",
+            chat_compatibility="chat",
         ),
-        ProviderModelOption(id="gemma-router", label="Gemma Router"),
+        ProviderModelOption(
+            id="gemma-router",
+            label="Gemma Router",
+            chat_compatibility="chat",
+        ),
     )
     assert len(requests) == 2
     assert requests[0].url.path == "/v1beta/models"
@@ -161,11 +166,13 @@ def test_anthropic_catalog_uses_native_headers_and_cursor_pagination() -> None:
             id="claude-fast",
             label="Claude Fast",
             description="200,000 input tokens · 16,000 max output tokens",
+            chat_compatibility="chat",
         ),
         ProviderModelOption(
             id="claude-strong",
             label="Claude Strong",
             description="Best for hard tasks",
+            chat_compatibility="chat",
         ),
     )
     assert len(requests) == 2
@@ -178,7 +185,7 @@ def test_anthropic_catalog_uses_native_headers_and_cursor_pagination() -> None:
     assert requests[0].headers["x-workspace"] == "alpha"
 
 
-def test_openai_style_catalog_filters_clear_non_chat_models_and_deduplicates() -> None:
+def test_openai_style_catalog_classifies_capabilities_without_name_guessing() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -237,9 +244,18 @@ def test_openai_style_catalog_filters_clear_non_chat_models_and_deduplicates() -
 
     assert models == (
         ProviderModelOption(id="chat-a", label="Chat A", description="quick"),
-        ProviderModelOption(id="gpt-image-chat", label="gpt-image-chat"),
+        ProviderModelOption(id="gpt-image-1", label="gpt-image-1"),
+        ProviderModelOption(
+            id="gpt-image-chat",
+            label="gpt-image-chat",
+            chat_compatibility="chat",
+        ),
         ProviderModelOption(id="unknown-new-model", label="unknown-new-model"),
     )
+    assert models[0].chat_compatibility == "unknown"
+    assert models[1].chat_compatibility == "unknown"
+    assert models[2].chat_compatibility == "chat"
+    assert models[3].chat_compatibility == "unknown"
     assert len(requests) == 1
     assert requests[0].url.path == "/api/v1/models"
     assert requests[0].headers.get_list("authorization") == ["Bearer profile-override"]
@@ -271,6 +287,7 @@ def test_openai_style_catalog_accepts_a_root_list_and_public_endpoint() -> None:
 
     assert models == (
         ProviderModelOption(id="local-chat", label="local-chat"),
+        ProviderModelOption(id="whisper-1", label="whisper-1"),
         ProviderModelOption(id="local-second", label="Local Second"),
     )
 

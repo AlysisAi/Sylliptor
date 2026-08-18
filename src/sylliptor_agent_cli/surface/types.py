@@ -57,6 +57,7 @@ class SubagentStartEvent:
     # What the subagent is for (the definition's description). Surfaces may show a
     # condensed form so the user knows what agent they just entered.
     description: str = ""
+    subagent_run_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +69,7 @@ class SubagentEndEvent:
     steps_completed: int
     subagent_session_id: str | None = None
     error: str | None = None
+    subagent_run_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import builtins
 
+import pytest
+
 import sylliptor_agent_cli.litellm_static_provider as provider_mod
 import sylliptor_agent_cli.model_registry as model_registry_mod
 from sylliptor_agent_cli.config import AppConfig
@@ -522,12 +524,104 @@ def test_built_in_deepseek_v4_metadata_beats_fallback_when_bundled_catalog_lags(
     assert meta.model_name == "deepseek-v4-pro"
     assert meta.context_window_tokens == 1_000_000
     assert meta.max_output_tokens == 384_000
+    assert meta.supports_reasoning is True
     assert meta.input_cost_per_token == 0.000000435
     assert meta.output_cost_per_token == 0.00000087
     assert meta.field_sources["context_window_tokens"] == "built_in"
     assert meta.field_sources["max_output_tokens"] == "built_in"
     assert registry.last_error is None
     assert not any("fallback context/max_output" in warning for warning in meta.warnings)
+
+
+def test_official_qwen38_max_metadata_fills_the_unbundled_catalog_gap() -> None:
+    cfg = AppConfig(
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        model="qwen3.8-max",
+    )
+
+    meta = ModelRegistry(cfg=cfg).get("qwen3.8-max")
+
+    assert meta.context_window_tokens == 1_048_576
+    assert meta.max_output_tokens == 131_072
+    assert meta.supports_vision is True
+    assert meta.supports_reasoning is True
+    assert meta.input_cost_per_token is None
+    assert meta.output_cost_per_token is None
+    assert meta.cache_read_input_cost_per_token is None
+    assert meta.field_sources["context_window_tokens"] == ("official_provider_model_catalog:qwen")
+    assert (
+        "https://help.aliyun.com/en/model-studio/text-generation-model/"
+        in (meta.raw_metadata["catalog_sources"])
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "context_window"),
+    [
+        ("nvidia/nemotron-3-super-120b-a12b", 1_048_576),
+        ("nvidia/nemotron-3-ultra-550b-a55b", 1_048_576),
+        ("nvidia/nemotron-3-nano-30b-a3b", 262_144),
+    ],
+)
+def test_official_nvidia_nim_metadata_covers_hosted_nemotron_models(
+    model: str,
+    context_window: int,
+) -> None:
+    cfg = AppConfig(base_url="https://integrate.api.nvidia.com/v1", model=model)
+
+    meta = ModelRegistry(cfg=cfg).get(model)
+
+    assert meta.context_window_tokens == context_window
+    assert meta.max_output_tokens == 32_768
+    assert meta.supports_vision is False
+    assert meta.supports_reasoning is True
+    # Free Endpoint access is an account/endpoint entitlement, not a durable
+    # per-token price contract; unknown is more honest than encoding zero.
+    assert meta.input_cost_per_token is None
+    assert meta.output_cost_per_token is None
+    assert meta.field_sources["context_window_tokens"] == (
+        f"{OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE}:nvidia"
+    )
+    assert meta.raw_metadata["catalog_sources"]
+    assert model in meta.raw_metadata["catalog_sources"][0]
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["deepseek-ai/deepseek-v4-pro", "deepseek-ai/deepseek-v4-flash"],
+)
+def test_official_nvidia_catalog_covers_hosted_deepseek_models(model: str) -> None:
+    cfg = AppConfig(base_url="https://integrate.api.nvidia.com/v1", model=model)
+
+    meta = ModelRegistry(cfg=cfg).get(model)
+
+    assert meta.context_window_tokens == 1_048_576
+    assert meta.max_output_tokens == 16_384
+    assert meta.supports_reasoning is True
+    assert meta.field_sources["context_window_tokens"] == (
+        f"{OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE}:nvidia"
+    )
+    assert meta.raw_metadata["catalog_sources"] == [f"https://build.nvidia.com/{model}"]
+
+
+def test_official_zai_coding_plan_metadata_covers_glm_53() -> None:
+    cfg = AppConfig(
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        model="glm-5.3",
+    )
+
+    meta = ModelRegistry(cfg=cfg).get("glm-5.3")
+
+    assert meta.context_window_tokens == 1_000_000
+    assert meta.max_output_tokens == 131_072
+    assert meta.supports_vision is False
+    assert meta.supports_reasoning is True
+    assert meta.input_cost_per_token is None
+    assert meta.output_cost_per_token is None
+    assert meta.field_sources["context_window_tokens"] == (
+        f"{OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE}:zai_coding_plan"
+    )
+    assert meta.raw_metadata["catalog_sources"] == ["https://docs.z.ai/guides/llm/glm-5.3"]
 
 
 def test_official_moonshot_k3_metadata_preserves_large_input_budget() -> None:
@@ -559,6 +653,109 @@ def test_official_moonshot_k26_metadata_overrides_stale_bundled_capacity() -> No
     assert meta.field_sources["max_output_tokens"] == (
         f"{OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE}:moonshot"
     )
+
+
+def test_official_anthropic_metadata_covers_opus_5_absent_from_the_snapshot() -> None:
+    # Opus 5 postdates the pinned litellm mirror. Without the official-provider
+    # layer it would silently fall back to 128K/8K on a 1M/128K model.
+    assert (
+        resolve_litellm_static_metadata(
+            "claude-opus-5",
+            base_url="https://api.anthropic.com/v1",
+            provider_hint="anthropic",
+        ).context_window_tokens
+        is None
+    )
+
+    cfg = AppConfig(base_url="https://api.anthropic.com/v1", model="claude-opus-5")
+    meta = ModelRegistry(cfg=cfg).get("claude-opus-5")
+
+    assert meta.context_window_tokens == 1_128_000
+    assert meta.max_output_tokens == 128_000
+    assert meta.supports_reasoning is True
+    assert meta.input_cost_per_token == 0.000005
+    assert meta.output_cost_per_token == 0.000025
+    assert meta.field_sources["context_window_tokens"] == (
+        f"{OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE}:anthropic"
+    )
+    assert meta.warnings == ()
+
+    # Same capacity as the sibling the bundled snapshot does know about.
+    sibling = ModelRegistry(
+        cfg=AppConfig(base_url="https://api.anthropic.com/v1", model="claude-opus-4-8")
+    ).get("claude-opus-4-8")
+    assert (meta.context_window_tokens, meta.max_output_tokens) == (
+        sibling.context_window_tokens,
+        sibling.max_output_tokens,
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "input_cost", "output_cost", "cache_read_cost"),
+    [
+        ("gemini-3.7-flash", 0.00000075, 0.00000375, 0.000000075),
+        ("gemini-3.6-flash", 0.00000075, 0.00000375, 0.000000075),
+        ("gemini-3.5-flash-lite", 0.0000003, 0.0000025, 0.00000003),
+    ],
+)
+def test_official_gemini_metadata_covers_models_newer_than_snapshot(
+    model: str,
+    input_cost: float,
+    output_cost: float,
+    cache_read_cost: float,
+) -> None:
+    cfg = AppConfig(
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+        model=model,
+    )
+
+    meta = ModelRegistry(cfg=cfg).get(model)
+
+    assert meta.context_window_tokens == 1_048_576
+    assert meta.max_output_tokens == 65_536
+    assert meta.supports_vision is True
+    assert meta.supports_reasoning is True
+    assert meta.input_cost_per_token == input_cost
+    assert meta.output_cost_per_token == output_cost
+    assert meta.cache_read_input_cost_per_token == cache_read_cost
+    assert meta.reasoning_output_cost_per_token == output_cost
+    assert "https://ai.google.dev/gemini-api/docs/pricing" in (meta.raw_metadata["catalog_sources"])
+    assert meta.field_sources["context_window_tokens"] == (
+        f"{OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE}:gemini"
+    )
+    assert not any("fallback context/max_output" in warning for warning in meta.warnings)
+
+
+def test_official_xai_metadata_covers_grok_46_newer_than_snapshot() -> None:
+    assert (
+        resolve_litellm_static_metadata(
+            "grok-4.6",
+            base_url="https://api.x.ai/v1",
+            provider_hint="xai",
+        ).context_window_tokens
+        is None
+    )
+
+    cfg = AppConfig(base_url="https://api.x.ai/v1", model="grok-4.6")
+    meta = ModelRegistry(cfg=cfg).get("grok-4.6")
+
+    assert meta.context_window_tokens == 500_000
+    assert meta.max_output_tokens == 62_500
+    assert meta.supports_vision is True
+    assert meta.supports_reasoning is True
+    assert meta.input_cost_per_token == 0.000002
+    assert meta.output_cost_per_token == 0.000006
+    assert meta.cache_read_input_cost_per_token == 0.0000005
+    assert meta.reasoning_output_cost_per_token == 0.000006
+    assert meta.raw_metadata["catalog_sources"] == [
+        "https://docs.x.ai/developers/grok-4-6",
+        "https://docs.x.ai/developers/pricing",
+    ]
+    assert meta.field_sources["context_window_tokens"] == (
+        f"{OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE}:xai"
+    )
+    assert any("shared window" in warning for warning in meta.warnings)
+    assert not any("fallback context/max_output" in warning for warning in meta.warnings)
 
 
 def test_official_moonshot_metadata_is_scoped_to_moonshot_routes() -> None:

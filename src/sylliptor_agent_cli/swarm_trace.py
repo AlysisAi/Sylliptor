@@ -93,7 +93,7 @@ def build_swarm_trace_event(
         phase=_sanitize_trace_text(phase, max_chars=80) or "swarm",
         message=_sanitize_trace_text(message),
         verbosity=normalized_verbosity,
-        task_id=str(task_id).strip() or None,
+        task_id=str(task_id or "").strip() or None,
     )
 
 
@@ -236,13 +236,6 @@ class SerializedSwarmTraceSink:
         if callable(swarm_handler):
             try:
                 swarm_handler(event)
-                return
-            except Exception:
-                pass
-        trace_handler = getattr(self.surface, "on_swarm_trace", None)
-        if callable(trace_handler):
-            try:
-                trace_handler(message, phase=event.phase, task_id=event.task_id)
                 return
             except Exception:
                 pass

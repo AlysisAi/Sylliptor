@@ -40,6 +40,7 @@ from .plan_assistant import (
     run_planner_turn,
     summarize_plan_update,
 )
+from .plan_repair import PlannerRepairReport, apply_plan_status, record_plan_repair
 from .plan_validation import (
     PlannerFailedError,
     _format_plan_acceptance_block,
@@ -1107,6 +1108,11 @@ def run_replanning_attempt(
             applied = True
             plan_changed = apply_preview.changed
             if plan_changed:
+                record_plan_repair(
+                    plan,
+                    getattr(planner_result, "repair", None) or PlannerRepairReport(),
+                )
+                apply_plan_status(plan, validation_warnings=validate_plan(plan))
                 save_plan(paths, plan)
     else:
         validation = ReplanValidationResult(

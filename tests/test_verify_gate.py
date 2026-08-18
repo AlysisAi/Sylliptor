@@ -3291,6 +3291,7 @@ def test_verification_selection_payload_marks_repo_native_selection_as_authorita
         ),
         "verification_contract_type": "repo_native",
         "verification_authoritative": True,
+        "verification_best_effort": False,
     }
 
 
@@ -3316,6 +3317,7 @@ def test_verification_selection_payload_marks_task_inferred_selection_as_non_aut
         ),
         "verification_contract_type": "task_inferred",
         "verification_authoritative": False,
+        "verification_best_effort": False,
     }
 
 
@@ -3366,6 +3368,7 @@ def test_verify_gate_can_use_docker_runner_when_enabled(tmp_path: Path, monkeypa
         "which",
         lambda name: "/usr/bin/docker" if name == "docker" else None,
     )
+    monkeypatch.setattr(sandbox_runner_mod.platform, "system", lambda: "Linux")
 
     class FakePopen:
         def __init__(self, cmd, **_kwargs):  # type: ignore[no-untyped-def]

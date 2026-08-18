@@ -4,7 +4,6 @@ import copy
 import json
 
 import httpx
-import pytest
 
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.failure_category import FailureCategory
@@ -13,10 +12,9 @@ from sylliptor_agent_cli.llm.types import LLMError, LLMResponse, ToolCall
 from sylliptor_agent_cli.plan_assistant import (
     PLANNER_SYSTEM_PROMPT,
     _assistant_tool_call_message,
-    _extract_json_object,
+    _extract_balanced_json_object,
     _plan_is_thin,
     _planner_retry_user_prompt,
-    _planner_router_chat,
     _planner_user_prompt,
     apply_guarded_planner_plan_update,
     apply_plan_update,
@@ -53,19 +51,6 @@ def _base_plan() -> dict:
     }
 
 
-def _router_payload(
-    route: str,
-    reason: str = "test",
-    *,
-    confidence: float = 0.99,
-    reply: str | None = None,
-) -> dict:
-    payload = {"route": route, "confidence": confidence, "reason": reason}
-    if route not in {"planning", "clarification_answer"}:
-        payload["reply"] = reply if reply is not None else f"{route} reply"
-    return payload
-
-
 def _question_repair_payload(
     *,
     should_replace: bool = False,
@@ -87,40 +72,10 @@ def _planner_no_update_payload(message: str = "Planner ran.") -> dict:
     }
 
 
-def _strict_metadata_cfg(
-    *,
-    planner_model: str = "planner-known",
-    router_model: str = "router-known",
-) -> AppConfig:
-    return AppConfig(
-        base_url="https://example.com/v1",
-        model=planner_model,
-        model_metadata_policy="strict",
-        extra_fields={
-            "forge_role_models": {
-                "planner": planner_model,
-                "router": router_model,
-            },
-            "model_metadata_overrides": {
-                "models": {
-                    planner_model: {
-                        "context_window_tokens": 128000,
-                        "max_output_tokens": 8192,
-                    },
-                    "router-known": {
-                        "context_window_tokens": 32000,
-                        "max_output_tokens": 2048,
-                    },
-                }
-            },
-        },
-    )
-
-
 def test_planner_usage_payload_backfills_cache_creation_from_api_usage() -> None:
     from types import SimpleNamespace
 
-    from sylliptor_agent_cli.llm.types import LLMUsage
+    from sylliptor_agent_cli.llm.types import BillingMode, LLMUsage, UsageContract
     from sylliptor_agent_cli.model_registry import ModelMeta
     from sylliptor_agent_cli.plan_assistant import _planner_usage_event_payload
 
@@ -157,6 +112,11 @@ def test_planner_usage_payload_backfills_cache_creation_from_api_usage() -> None
         request_messages=[{"role": "user", "content": "plan this"}],
         response=response,
         registry=_Reg(),  # type: ignore[arg-type]
+        client=SimpleNamespace(
+            provider_key="anthropic",
+            base_url="https://api.anthropic.com",
+            usage_contract=UsageContract(billing_mode=BillingMode.SUBSCRIPTION),
+        ),  # type: ignore[arg-type]
     )
 
     assert payload is not None
@@ -165,6 +125,8 @@ def test_planner_usage_payload_backfills_cache_creation_from_api_usage() -> None
     assert payload["cache_read_input_tokens"] == 20000
     # Uncached input must not swallow the cache-creation tokens.
     assert payload["input_tokens_uncached"] == 1000
+    assert payload["billing_mode"] == BillingMode.SUBSCRIPTION.value
+    assert payload["cost_source"] == "subscription"
 
 
 def test_assistant_tool_call_message_preserves_provider_metadata() -> None:
@@ -661,8 +623,10 @@ def test_run_planner_turn_retry_for_nonrepairable_schema_mismatch_keeps_two_mess
 
     assert result.plan_update is None
     assert result.error
-    assert [item["attempt"] for item in result.schema_failures] == [1, 2]
-    assert role_sequences == [["system", "user"], ["system", "user"]]
+    # Every attempt in the configured budget is spent, then the turn ends.
+    assert [item["attempt"] for item in result.schema_failures] == [1, 2, 3]
+    assert result.repair.terminal_state == "failed"
+    assert role_sequences == [["system", "user"]] * 3
 
 
 def test_planner_retry_user_prompt_includes_base_context_and_schema_repair_instructions() -> None:
@@ -3537,400 +3501,6 @@ def test_planner_user_prompt_requires_file_scope_for_mutating_tasks() -> None:
     )
 
 
-def test_forge_planner_router_blocks_small_talk_before_planner_call(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, requests = _mock_transport_for_payloads(
-        _router_payload(
-            "small_talk",
-            "social_greeting",
-            reply="Hi. Tell me what you want to plan.",
-        )
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="hello",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.plan_update is None
-    assert result.intent_route == "small_talk"
-    assert result.intent_reason == "social_greeting"
-    assert result.assistant_message == "Hi. Tell me what you want to plan."
-    assert result.planner_invoked is False
-    assert result.planner_router_event is not None
-    assert result.planner_router_event["route"] == "small_talk"
-    assert len(requests) == 1
-    assert "Forge planner turn" in requests[0]["messages"][0]["content"]
-
-
-def test_forge_planner_router_allows_planning_turn(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    planner_payload = {
-        "assistant_message": "Plan updated.",
-        "questions": [],
-        "plan_update": {
-            "tasks_add": [
-                {
-                    "title": "Fix login",
-                    "description": "Fix login flow and add coverage.",
-                    "acceptance_criteria": ["Login test passes"],
-                    "estimated_files": ["src/auth.py", "tests/test_auth.py"],
-                    "write_scope": ["src/auth.py", "tests/test_auth.py"],
-                }
-            ]
-        },
-    }
-    transport, requests = _mock_transport_for_payloads(
-        _router_payload("planning", "implementation_request"),
-        planner_payload,
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="Fix the login flow and add tests.",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.intent_route == "planning"
-    assert result.plan_update is not None
-    assert result.planner_invoked is True
-    assert result.planner_router_event is not None
-    assert result.planner_router_event["planner_invoked"] is True
-    assert len(requests) == 2
-    assert "Forge planner turn" in requests[0]["messages"][0]["content"]
-    assert "You are PLANNER" in requests[1]["messages"][0]["content"]
-
-
-def test_forge_planner_router_malformed_json_fail_open_to_planner(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    planner_payload = {
-        "assistant_message": "Planner still ran.",
-        "questions": ["Any constraints?"],
-        "plan_update": None,
-    }
-    transport, requests = _mock_transport_for_payloads(
-        "not json", '{"route":"bad"}', planner_payload
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="hello",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.plan_update is None
-    assert result.assistant_message == "Planner still ran."
-    assert result.fallback_reason is not None
-    assert "router_response_invalid_route" in result.fallback_reason
-    assert result.intent_route == "planning"
-    assert result.source == "router_fail_open"
-    assert result.parse_attempts == 2
-    assert result.planner_invoked is True
-    assert result.planner_router_event is not None
-    assert result.planner_router_event["fallback_reason"] == result.fallback_reason
-    assert len(requests) == 3
-
-
-def test_forge_planner_router_preserves_clarification_answers(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    planner_payload = {
-        "assistant_message": "Plan updated from clarification.",
-        "questions": [],
-        "plan_update": {
-            "requirements_append": ["Use a dark theme"],
-            "tasks_update": [
-                {
-                    "id": "T01",
-                    "description": "Update the existing task with dark-theme constraints.",
-                    "estimated_files": ["src/app.css"],
-                    "write_scope": ["src/app.css"],
-                }
-            ],
-        },
-    }
-    transport, requests = _mock_transport_for_payloads(
-        _router_payload("clarification_answer", "answers_pending_question"),
-        planner_payload,
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="dark theme",
-        transport=transport,
-        prefer_context="forge",
-        awaiting_clarification=True,
-        pending_questions=["Should the page use a light or dark theme?"],
-    )
-
-    assert result.error is None
-    assert result.intent_route == "clarification_answer"
-    assert result.plan_update is not None
-    router_prompt = requests[0]["messages"][1]["content"]
-    assert '"awaiting_clarification": true' in router_prompt
-    assert "Should the page use a light or dark theme?" in router_prompt
-
-
-def test_forge_planner_router_localizes_language_only_turn(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, _requests = _mock_transport_for_payloads(
-        _router_payload(
-            "language_override_only",
-            "language_only",
-            reply="Puedo usar español. Dime qué quieres planificar.",
-        )
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="Responde en español.",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.plan_update is None
-    assert result.intent_route == "language_override_only"
-    assert result.assistant_message == "Puedo usar español. Dime qué quieres planificar."
-
-
-def test_forge_planner_router_preserves_spanish_question_repair(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    planner_payload = {
-        "assistant_message": "Plan updated with initial website tasks.",
-        "questions": [],
-        "plan_update": {
-            "tasks_add": [
-                {
-                    "title": "Create landing page",
-                    "description": "Add a first version of the website",
-                    "acceptance_criteria": ["index.html exists"],
-                    "estimated_files": ["index.html"],
-                    "write_scope": ["index.html"],
-                }
-            ]
-        },
-    }
-    transport, _requests = _mock_transport_for_payloads(
-        _router_payload("planning", "language_plus_planning"),
-        planner_payload,
-        _question_repair_payload(
-            should_replace=True,
-            assistant_message="Necesito algunos detalles antes de cerrar el primer plan.",
-            questions=[
-                "¿Qué tipo de negocio o sitio es y para qué público?",
-                "¿Qué secciones o bloques de contenido quieres en la página?",
-                "¿Hay restricciones de estilo o técnicas que deba respetar?",
-            ],
-        ),
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan={
-            "schema_version": 1,
-            "run_id": "run_1",
-            "created_at": "2026-02-20T00:00:00+00:00",
-            "updated_at": "2026-02-20T00:00:00+00:00",
-            "project_goal": "",
-            "summary": "",
-            "requirements": [],
-            "tasks": [],
-            "assets": [],
-        },
-        transcript_tail=[],
-        user_text="Responde en español. Build me a simple one-page website for my business.",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.plan_update is None
-    assert result.intent_route == "planning"
-    assert result.assistant_message == ("Necesito algunos detalles antes de cerrar el primer plan.")
-    assert result.questions == [
-        "¿Qué tipo de negocio o sitio es y para qué público?",
-        "¿Qué secciones o bloques de contenido quieres en la página?",
-        "¿Hay restricciones de estilo o técnicas que deba respetar?",
-    ]
-
-
-def test_planner_router_llm_error_fail_open_to_planner(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, requests = _mock_transport_for_payloads(
-        (400, "router unavailable"),
-        _planner_no_update_payload("Planner ran after router failure."),
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="hello",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.assistant_message == "Planner ran after router failure."
-    assert result.fallback_reason is not None
-    assert "planner_router_request_failed" in result.fallback_reason
-    assert result.planner_router_event is not None
-    assert result.planner_router_event["fallback_reason"] == result.fallback_reason
-    assert len(requests) == 2
-
-
-def test_planner_router_repair_llm_error_fail_open_to_planner(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, requests = _mock_transport_for_payloads(
-        "not json",
-        (400, "repair unavailable"),
-        _planner_no_update_payload("Planner ran after repair failure."),
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="hello",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.assistant_message == "Planner ran after repair failure."
-    assert result.fallback_reason is not None
-    assert "planner_router_repair_request_failed" in result.fallback_reason
-    assert result.parse_attempts == 1
-    assert len(requests) == 3
-
-
-def test_planner_router_invalid_route_literal_fail_open(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, requests = _mock_transport_for_payloads(
-        {"route": "planning|clarification_answer", "confidence": 0.9, "reason": "copied"},
-        {"route": "still_bad", "confidence": 0.9, "reason": "invalid"},
-        _planner_no_update_payload("Planner ran after invalid route."),
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="hello",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.assistant_message == "Planner ran after invalid route."
-    assert result.fallback_reason is not None
-    assert "router_response_invalid_route" in result.fallback_reason
-    assert len(requests) == 3
-
-
-@pytest.mark.parametrize("route", ["small_talk", "off_topic", "language_override_only"])
-def test_planner_router_low_confidence_non_planning_falls_through(monkeypatch, route: str) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, requests = _mock_transport_for_payloads(
-        _router_payload(route, confidence=0.2, reply="low confidence reply"),
-        _planner_no_update_payload("Planner handled low confidence route."),
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="hello",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.intent_route == "planning"
-    assert result.source == "router_low_confidence_fallback"
-    assert result.fallback_reason is not None
-    assert route in result.fallback_reason
-    assert result.planner_router_event is not None
-    assert result.planner_router_event["route"] == route
-    assert result.planner_router_event["planner_invoked"] is True
-    assert len(requests) == 2
-
-
-def test_planner_router_low_confidence_command_like_stays_command_like(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, requests = _mock_transport_for_payloads(
-        _router_payload("command_like", confidence=0.1, reply="Run that command directly.")
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="/execute plan",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.intent_route == "command_like"
-    assert result.assistant_message == "Run that command directly."
-    assert result.planner_invoked is False
-    assert len(requests) == 1
-
-
-def test_planner_router_metadata_missing_fail_open(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, requests = _mock_transport_for_payloads(
-        _planner_no_update_payload("Planner ran without router metadata.")
-    )
-
-    result = run_planner_turn(
-        cfg=_strict_metadata_cfg(router_model="router-missing"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="Plan this.",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.assistant_message == "Planner ran without router metadata."
-    assert result.fallback_reason is not None
-    assert "planner_router_metadata_unavailable" in result.fallback_reason
-    assert result.planner_router_event is not None
-    assert result.planner_router_event["fallback_reason"] == result.fallback_reason
-    assert len(requests) == 1
-
-
 def test_planner_metadata_missing_stays_hard_fail(monkeypatch) -> None:
     monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
     transport, requests = _mock_transport_for_payloads()
@@ -3951,168 +3521,13 @@ def test_planner_metadata_missing_stays_hard_fail(monkeypatch) -> None:
 
     assert result.error is not None
     assert "active model metadata is incomplete" in result.assistant_message
-    assert result.planner_router_event is None
     assert requests == []
 
 
-def test_planner_router_derives_awaiting_clarification_from_pending_questions(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, requests = _mock_transport_for_payloads(
-        _router_payload("clarification_answer", "answers_pending_question"),
-        _planner_no_update_payload("Planner used pending question."),
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="dark theme",
-        transport=transport,
-        prefer_context="forge",
-        pending_questions=["Should the page use a light or dark theme?"],
-    )
-
-    assert result.error is None
-    assert result.intent_route == "clarification_answer"
-    router_prompt = requests[0]["messages"][1]["content"]
-    assert '"awaiting_clarification": true' in router_prompt
-
-
-def test_planner_router_derives_not_awaiting_when_pending_questions_empty(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, requests = _mock_transport_for_payloads(
-        _router_payload("planning", "implementation_request"),
-        _planner_no_update_payload("Planner ran."),
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="Fix login",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    router_prompt = requests[0]["messages"][1]["content"]
-    assert '"awaiting_clarification": false' in router_prompt
-
-
-@pytest.mark.parametrize(
-    ("user_text", "reply"),
-    [
-        (
-            "Γράψε docs για AuthClient και keep AuthClient API stable",
-            "Γεια. Πες μου τι θέλεις να σχεδιάσουμε.",
-        ),
-        ("مرحبا، الخطأ says AuthClient failed", "مرحبا. اكتب هدف التخطيط الذي تريده."),
-        ("こんにちは", "こんにちは。計画したい変更を教えてください。"),
-        ("नमस्ते", "नमस्ते। बताइए क्या योजना बनानी है।"),
-        ("请用中文回复", "可以。请告诉我你想规划什么。"),
-    ],
-)
-def test_planner_router_non_catalog_replies_preserve_router_text(
-    monkeypatch,
-    user_text: str,
-    reply: str,
-) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, _requests = _mock_transport_for_payloads(
-        _router_payload("small_talk", "router_generated_reply", reply=reply)
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text=user_text,
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.assistant_message == reply
-    assert "Tell me what you want" not in result.assistant_message
-
-
-def test_planner_router_confidence_threshold_cfg_override(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    transport, requests = _mock_transport_for_payloads(
-        _router_payload("small_talk", confidence=0.3, reply="cfg threshold reply")
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(
-            base_url="https://example.com/v1",
-            model="planner-model",
-            extra_fields={"planner_router_confidence_threshold": 0.2},
-        ),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="hello",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.intent_route == "small_talk"
-    assert result.assistant_message == "cfg threshold reply"
-    assert len(requests) == 1
-
-
-def test_planner_router_confidence_threshold_env_override(monkeypatch) -> None:
-    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
-    monkeypatch.setenv("SYLLIPTOR_PLANNER_ROUTER_CONFIDENCE_THRESHOLD", "0.95")
-    transport, requests = _mock_transport_for_payloads(
-        _router_payload("small_talk", confidence=0.8, reply="env threshold reply"),
-        _planner_no_update_payload("Planner ran because env threshold won."),
-    )
-
-    result = run_planner_turn(
-        cfg=AppConfig(
-            base_url="https://example.com/v1",
-            model="planner-model",
-            extra_fields={"planner_router_confidence_threshold": 0.2},
-        ),
-        api_key_override=None,
-        plan=_base_plan(),
-        transcript_tail=[],
-        user_text="hello",
-        transport=transport,
-        prefer_context="forge",
-    )
-
-    assert result.error is None
-    assert result.intent_route == "planning"
-    assert result.assistant_message == "Planner ran because env threshold won."
-    assert len(requests) == 2
-
-
-def test_planner_router_chat_uses_signature_without_typeerror_fallback() -> None:
-    class Client:
-        def chat(self, *, messages: list[dict], stream: bool = False) -> object:
-            assert stream is False
-            assert messages
-            raise TypeError("bug inside chat")
-
-    with pytest.raises(TypeError, match="bug inside chat"):
-        _planner_router_chat(
-            client=Client(),
-            messages=[{"role": "user", "content": "hello"}],
-            temperature=0.0,
-        )
-
-
 def test_balanced_json_extraction_handles_multiple_objects() -> None:
-    assert _extract_json_object('prefix {"route":"planning"} prose {"route":"off_topic"}') == (
-        '{"route":"planning"}'
+    assert (
+        _extract_balanced_json_object('prefix {"route":"planning"} prose {"route":"off_topic"}')
+        == '{"route":"planning"}'
     )
 
 
@@ -4349,6 +3764,49 @@ def test_run_planner_turn_falls_back_to_read_only_locator_when_update_is_unspeci
     assert task["estimated_files"] == []
     assert task["write_scope"] == []
     assert "Do not change files" in " ".join(task["acceptance_criteria"])
+
+
+def test_run_planner_turn_conversational_turn_does_not_synthesize_locator_task(
+    monkeypatch,
+) -> None:
+    # A conversational message must not be turned into a repository task just
+    # because the planner's clarifying question mentions repo/codebase terms.
+    monkeypatch.setenv("SYLLIPTOR_API_KEY", "k")
+
+    planner_payload = {
+        "assistant_message": "Sure - what would you like to change in your repository?",
+        "questions": ["What files or part of the codebase should we work on?"],
+        "plan_update": None,
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": json.dumps(planner_payload)}}]},
+        )
+
+    result = run_planner_turn(
+        cfg=AppConfig(base_url="https://example.com/v1", model="planner-model"),
+        api_key_override=None,
+        plan=_base_plan(),
+        transcript_tail=[],
+        user_text="can you help me",
+        workspace_context={
+            "workspace_kind": "git_repo",
+            "top_level_entries": [
+                {"path": "README.md", "kind": "file"},
+                {"path": "src", "kind": "dir"},
+            ],
+            "observed_paths": ["README.md", "src/app.py"],
+            "language_hints": ["python"],
+        },
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.error is None
+    assert result.plan_update is None
+    assert result.assistant_message == planner_payload["assistant_message"]
+    assert result.questions == planner_payload["questions"]
 
 
 def test_run_planner_turn_greenfield_locator_question_becomes_scaffold_task(

@@ -34,17 +34,21 @@ def test_get_chat_specs_match_curated_visible_surface() -> None:
     assert [spec.name for spec in get_chat_specs()] == [
         "help",
         "mode",
+        "persona",
+        "ask",
         "status",
         "terminals",
         "pwd",
         "usage",
-        "ctx",
+        "context",
         "compact",
         "clear",
         "resume",
         "stream",
         "trace",
         "config",
+        "login",
+        "logout",
         "toolbar",
         "assets",
         "image",
@@ -69,7 +73,7 @@ def test_max_completions_for_mode_covers_static_forge_surface() -> None:
 def test_get_chat_completions_filters_by_prefix() -> None:
     completer = ChatSlashCompleter(mode_provider=lambda: "chat")
 
-    assert _completion_names(completer, "/co") == ["compact", "config"]
+    assert _completion_names(completer, "/co") == ["context", "compact", "config"]
 
 
 def test_chat_completions_exclude_hidden_and_removed_commands() -> None:
@@ -78,7 +82,7 @@ def test_chat_completions_exclude_hidden_and_removed_commands() -> None:
     spec_names = {spec.name for spec in get_chat_specs()}
 
     assert "quit" not in spec_names
-    assert "context" not in spec_names
+    assert "ctx" not in spec_names
     assert "model" not in spec_names
     assert "model-info" not in spec_names
     assert "paste-image" not in spec_names

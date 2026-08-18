@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -27,6 +28,7 @@ ACCEPTED_TASK_ATTEMPT_STATUSES = frozenset({"accepted"})
 PENDING_TASK_ATTEMPT_STATUSES = frozenset({"pending"})
 REJECTED_TASK_ATTEMPT_STATUSES = frozenset({"rejected"})
 _LIFECYCLE_DERIVED_ENTRY_KINDS = frozenset({"issue", "decision", "task_attempt"})
+_KNOWLEDGE_INDEX_REBUILD_LOCK = threading.RLock()
 
 
 def _now_iso() -> str:
@@ -545,6 +547,12 @@ def _invalid_entry_error(exc: Exception) -> str:
 
 
 def rebuild_knowledge_index(paths: RunPaths) -> KnowledgeIndex:
+    """Rebuild the shared workspace index without concurrent replace races."""
+    with _KNOWLEDGE_INDEX_REBUILD_LOCK:
+        return _rebuild_knowledge_index_unlocked(paths)
+
+
+def _rebuild_knowledge_index_unlocked(paths: RunPaths) -> KnowledgeIndex:
     records: list[KnowledgeEntry] = []
     invalid_entries: list[KnowledgeIndexInvalidEntry] = []
     for path in list_workspace_knowledge_entry_paths(paths.root):
@@ -626,6 +634,12 @@ def rebuild_knowledge_index(paths: RunPaths) -> KnowledgeIndex:
 
 
 def load_knowledge_index(paths: RunPaths, *, rebuild: bool = False) -> KnowledgeIndex:
+    """Load the shared index without racing a Windows atomic replacement."""
+    with _KNOWLEDGE_INDEX_REBUILD_LOCK:
+        return _load_knowledge_index_unlocked(paths, rebuild=rebuild)
+
+
+def _load_knowledge_index_unlocked(paths: RunPaths, *, rebuild: bool = False) -> KnowledgeIndex:
     if rebuild or not paths.knowledge_index_path.exists():
         return rebuild_knowledge_index(paths)
     try:

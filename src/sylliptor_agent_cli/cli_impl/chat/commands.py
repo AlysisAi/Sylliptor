@@ -1,7 +1,6 @@
 # ruff: noqa: F821
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import os
@@ -9,9 +8,14 @@ from pathlib import Path
 from typing import Any
 
 import typer
+from rich.markdown import Markdown
 from rich.text import Text
 
+from ...config import AppConfig, ConfigError
+from ...forge_completion import build_forge_completion_report
 from ...llm.base import effective_tools_for_client
+from ...personas import is_persona_name, normalize_persona, persona_modes_enabled
+from ...plan_repair import apply_plan_status
 from ...plan_validation import PlannerFailedError, raise_for_execution_ready_plan
 from ...subagents import available_subagent_names, unavailable_builtin_subagents
 from ...surface.styles import (
@@ -25,6 +29,8 @@ from ...usage_tracker import UsageRecord, aggregate_usage_from_session_logs
 from .state import _ChatExecutionRequest, _ChatPlanModeState, _ForgeChatState
 
 _PROTECTED_COMMAND_GLOBAL_NAMES: set[str] = set()
+_SYNCED_COMMAND_GLOBAL_VALUES: dict[str, Any] = {}
+_COMMAND_SYNC_MISSING = object()
 _PATCHABLE_COMMAND_GLOBAL_NAMES: set[str] = {
     "_apply_config_menu_changes_to_session",
     "_is_non_interactive_terminal",
@@ -131,10 +137,10 @@ def _merge_forge_execution_usage_into_session(*, session: Any, paths: Any) -> in
 
 
 def _print_sylliptor_trial_models(console: Console, session: Any, *, current: str) -> None:
-    """List the models the hosted Sylliptor trial serves, when on that profile.
+    """List the models the Sylliptor account serves, when on that profile.
 
     Best-effort and silent otherwise: only runs when the active profile is the
-    hosted `sylliptor` trial, discovers the live allowlist via the proxy, and
+    hosted `sylliptor` account, discovers the live allowlist via the gateway, and
     never raises into the chat loop.
     """
     cfg = getattr(session, "cfg", None)
@@ -153,7 +159,7 @@ def _print_sylliptor_trial_models(console: Console, session: Any, *, current: st
         return
     if not models:
         return
-    console.print("Models on your Sylliptor trial:")
+    console.print("Models available with your Sylliptor account:")
     for model_id in models:
         marker = "  (current)" if model_id == current else ""
         console.print(f"  • {model_id}{marker}")
@@ -181,9 +187,20 @@ def _sync_command_globals(source_globals: dict[str, Any]) -> None:
             continue
         if name in _PROTECTED_COMMAND_GLOBAL_NAMES and name not in _PATCHABLE_COMMAND_GLOBAL_NAMES:
             continue
+        previous_synced_value = _SYNCED_COMMAND_GLOBAL_VALUES.get(name, _COMMAND_SYNC_MISSING)
+        if (
+            previous_synced_value is not _COMMAND_SYNC_MISSING
+            and module_globals.get(name, _COMMAND_SYNC_MISSING) is not previous_synced_value
+        ):
+            # Preserve an explicit override applied at the command-module
+            # compatibility surface.  Without tracking the last value injected
+            # by the facade, the next command dispatch silently replaced a
+            # monkeypatch after the first command of the process.  That made
+            # identical classic-chat calls behave differently depending on
+            # which command test ran first.
+            continue
         module_globals[name] = value
-        if name == "_resume_chat_session":
-            _PROTECTED_COMMAND_GLOBAL_NAMES.add(name)
+        _SYNCED_COMMAND_GLOBAL_VALUES[name] = value
 
 
 def _handle_chat_command(
@@ -197,6 +214,8 @@ def _handle_chat_command(
     plan_mode_state: _ChatPlanModeState,
     plan_mode_escape_supported: bool = False,
     plan_mode_action_prompt: Any | None = None,
+    forge_planner_reply_sink: Any | None = None,
+    forge_execution_report_sink: Any | None = None,
     subagent_result_sink: Any | None = None,
     subagent_notice_sink: Any | None = None,
 ) -> str | _ChatExecutionRequest:
@@ -214,6 +233,8 @@ def _handle_chat_command(
             forge_state=forge_state,
             session=session,
             console=console,
+            forge_planner_reply_sink=forge_planner_reply_sink,
+            forge_execution_report_sink=forge_execution_report_sink,
         )
         if forge_action != "unhandled":
             return forge_action
@@ -243,29 +264,21 @@ def _handle_chat_command(
             return "handled"
         forge_model = getattr(getattr(session, "client", None), "model", None)
         forge_mode = getattr(session, "mode", None)
-        enter_kwargs: dict[str, Any] = {
+        enter_kwargs = {
             "root": forge_root,
             "console": console,
             "forge_state": forge_state,
+            "model": str(forge_model) if forge_model else None,
+            "mode": str(forge_mode) if forge_mode else None,
         }
-        try:
-            enter_params = inspect.signature(_enter_forge_mode).parameters
-        except (TypeError, ValueError):
-            enter_params = {}
-        accepts_extra = any(
-            param.kind is inspect.Parameter.VAR_KEYWORD for param in enter_params.values()
-        )
-        if accepts_extra or "model" in enter_params:
-            enter_kwargs["model"] = str(forge_model) if forge_model else None
-        if accepts_extra or "mode" in enter_params:
-            enter_kwargs["mode"] = str(forge_mode) if forge_mode else None
-        if accepts_extra or "planner_assistant_default" in enter_params:
-            if parsed_forge_enter.planner_assistant_default is not None:
-                enter_kwargs["planner_assistant_default"] = (
-                    parsed_forge_enter.planner_assistant_default
-                )
-            elif bool(getattr(session, "_sylliptor_tui_interactive", False)):
-                enter_kwargs["planner_assistant_default"] = True
+        if parsed_forge_enter.planner_assistant_default is not None:
+            # Explicit choice from the TUI intro popup's "Use the planner?" prompt
+            # (or a direct ``/forge --planner`` / ``/forge --no-planner``) wins.
+            enter_kwargs["planner_assistant_default"] = parsed_forge_enter.planner_assistant_default
+        elif bool(getattr(session, "_sylliptor_tui_interactive", False)):
+            # Bare/goal/resume entry in the alt-screen TUI can't run the classic
+            # stdin plan-assistant prompt, so default it on (unchanged behavior).
+            enter_kwargs["planner_assistant_default"] = True
         _enter_forge_mode(**enter_kwargs)
         return "handled"
     if cmd == "/":
@@ -276,6 +289,30 @@ def _handle_chat_command(
         return "handled"
     if cmd in {"/status"}:
         _print_chat_status(console=console, session=session, pending_images=pending_images)
+        return "handled"
+    if cmd == "/ask":
+        remainder = arg.strip()
+        if not remainder:
+            console.print("[yellow]Usage:[/yellow] /ask <question> — one read-only turn")
+            return "handled"
+        current_mode = str(getattr(session, "mode", "review") or "review").strip().lower()
+        if current_mode == "readonly":
+            return _ChatExecutionRequest(instruction=remainder)
+        # One-turn read-only override: the existing mode machinery applies
+        # readonly before the turn and restores the previous mode afterwards,
+        # exception-safe, so "just look, don't touch" is host-enforced.
+        return _ChatExecutionRequest(
+            instruction=remainder,
+            mode_override="readonly",
+            restore_mode_after=current_mode,
+        )
+    if cmd == "/chat":
+        # Retired in favor of the Ask persona; the chat_only plumbing stays
+        # accepted-and-ignored for one release (no producer).
+        console.print(
+            "[yellow]/chat is retired.[/yellow] Use /mode ask for a persistent "
+            "read-only Q&A persona, or /ask <question> for one read-only turn."
+        )
         return "handled"
     if cmd in {"/terminals"}:
         _handle_terminals_command(arg=arg, session=session, console=console)
@@ -396,6 +433,9 @@ def _handle_chat_command(
         console.print(message)
         if resumed:
             pending_images.clear()
+            # session_start restored the base mode; the persona (and with it
+            # the narrowed mode, write scope, and model role) rides on top.
+            _reapply_resumed_persona(session=session, console=console)
             _render_chat_resume_history(
                 session=session,
                 messages=history_messages,
@@ -1063,6 +1103,13 @@ def _handle_chat_command(
             if next_mode is None:
                 return "handled"
         else:
+            if persona_modes_enabled(getattr(session, "cfg", None)) and is_persona_name(
+                arg.strip().lower(), getattr(session, "persona_registry", None)
+            ):
+                # Personas have their own command; keep the two vocabularies
+                # from blurring back together.
+                console.print(f"Personas have their own command: /persona {arg.strip().lower()}")
+                return "handled"
             next_mode = _resolve_chat_mode_alias(arg)
         if next_mode is None or next_mode not in _CHAT_MODES:
             console.print(
@@ -1084,6 +1131,10 @@ def _handle_chat_command(
                 _print_fullaccess_mode_warning(console=console)
             return "handled"
         try:
+            # An explicit execution-mode choice is the user redefining their
+            # base: restore any persona-narrowed write scope BEFORE the
+            # rebuild so the new tool surface reflects the user's own scope.
+            _clear_persona_restore(session)
             _apply_chat_effective_mode(
                 session=session,
                 next_mode=next_mode,
@@ -1095,6 +1146,59 @@ def _handle_chat_command(
         console.print(f"Mode set for this session: {_chat_mode_display(next_mode)}")
         if next_mode == "fullaccess":
             _print_fullaccess_mode_warning(console=console)
+        return "handled"
+    if cmd in {"/persona"}:
+        if not persona_modes_enabled(getattr(session, "cfg", None)):
+            console.print(
+                "Persona modes are disabled (persona_modes_enabled=false or "
+                "SYLLIPTOR_PERSONA_MODES=off)."
+            )
+            return "handled"
+        persona_registry = getattr(session, "persona_registry", None)
+        current_persona = normalize_persona(getattr(session, "persona", "code"), persona_registry)
+        persona_selection: str | None
+        if not arg:
+            persona_selection, picker_available = _select_chat_persona_interactive(
+                current_persona=current_persona,
+                console=console,
+                custom=persona_registry,
+            )
+            if not picker_available:
+                console.print(
+                    _chat_persona_panel(current_persona=current_persona, custom=persona_registry)
+                )
+                return "handled"
+            if persona_selection is None:
+                return "handled"
+        else:
+            persona_selection = arg.strip().lower()
+        if not is_persona_name(persona_selection, persona_registry):
+            console.print(
+                "[red]Invalid persona.[/red] Try: /persona code, architect, ask, debug"
+                " — or a custom persona from .sylliptor_personas."
+            )
+            return "handled"
+        # A persona is a convention layered on the gate: the clamp inside
+        # _apply_chat_persona can only keep or lower the execution mode, so
+        # this path needs no fullaccess warning and never persists
+        # default_mode.
+        if _chat_plan_mode_enabled(plan_mode_state):
+            console.print("Cannot change persona while Plan Mode is on. Use /plan off first.")
+            return "handled"
+        persona_name = normalize_persona(persona_selection, persona_registry)
+        if persona_name == current_persona:
+            console.print(f"Persona already set: {persona_name}")
+            return "handled"
+        try:
+            _apply_chat_persona(
+                session=session,
+                persona=persona_name,
+                source="user",
+            )
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[red]Failed to change persona:[/red] {e}")
+            return "handled"
+        console.print(f"Persona set for this session: {persona_name}")
         return "handled"
     if cmd in {"/plan"}:
         if _is_forge_ui_mode(forge_state.ui_mode):
@@ -1372,19 +1476,6 @@ def _handle_chat_command(
         previous_cfg = getattr(session, "cfg", None)
         copy_cfg = getattr(previous_cfg, "model_copy", None)
         if previous_cfg is None or not callable(copy_cfg):
-            client = getattr(session, "client", None)
-            legacy_store = getattr(session, "store", None)
-            legacy_session_id = str(getattr(legacy_store, "session_id", "") or "").strip()
-            if (
-                previous_cfg is None
-                and legacy_session_id
-                and client is not None
-                and hasattr(client, "model")
-            ):
-                client.model = arg
-                _refresh_chat_hud_context_cache(session)
-                console.print(f"Model set for this session: {arg}")
-                return "handled"
             console.print(
                 "[yellow]Model was not changed because this session cannot safely refresh "
                 "its provider route. Restart chat with the desired model.[/yellow]"
@@ -1472,7 +1563,10 @@ def _handle_chat_command(
 
         cfg = getattr(session, "cfg", None)
         if cfg is not None and _sylliptor_logout(cfg):
-            console.print("[green]Logged out.[/green] Your stored MiMo access key was removed.")
+            console.print(
+                "[green]Logged out.[/green] Your Sylliptor key was revoked. "
+                "Use /login to reconnect."
+            )
         else:
             console.print("You're not logged in to a Sylliptor account.")
         return "handled"
@@ -1690,6 +1784,8 @@ def _handle_forge_chat_command(
     forge_state: _ForgeChatState,
     session: Any,
     console: Console,
+    forge_planner_reply_sink: Any | None = None,
+    forge_execution_report_sink: Any | None = None,
 ) -> str:
     paths = forge_state.paths
     plan = forge_state.plan
@@ -1783,6 +1879,7 @@ def _handle_forge_chat_command(
         return "handled"
 
     if cmd in {"/execute"}:
+        forge_state.swarm_run_attempted = False
         if arg.strip().lower() != "plan":
             append_transcript_note(paths, role="user", message=trimmed)
             append_transcript_note(
@@ -2081,6 +2178,11 @@ def _handle_forge_chat_command(
                     message="Plan enrichment cleared the remaining validation warnings.",
                 )
 
+            # Stamp draft/execution_ready before the gate runs, so the plan on disk
+            # already says what the gate is about to decide.
+            status_assessment = apply_plan_status(plan, validation_warnings=validation_warnings)
+            save_plan(paths, plan)
+
             try:
                 raise_for_execution_ready_plan(plan)
             except PlannerFailedError as e:
@@ -2089,10 +2191,20 @@ def _handle_forge_chat_command(
                     console=console,
                     message=block_message,
                 )
+                _print_forge_meta(
+                    console=console,
+                    message=(
+                        "This plan is saved as a draft, not an execution-ready plan. "
+                        "Refine it with the planner or edit it, then run /execute plan again."
+                    ),
+                )
                 append_transcript_note(
                     paths,
                     role="system",
-                    message=f"Rejected /execute plan: {block_message}",
+                    message=(
+                        f"Rejected /execute plan (plan_status={status_assessment.status}): "
+                        f"{block_message}"
+                    ),
                 )
                 return "handled"
 
@@ -2116,6 +2228,26 @@ def _handle_forge_chat_command(
                 console=console,
             )
 
+            # Swarm knobs: the TUI launch gate may have chosen non-default values
+            # (stored on ``forge_state.swarm_knobs``); the classic/non-TUI path
+            # leaves it empty so the historical defaults (parallel 2 · scope strict
+            # · verify warn · no review) apply unchanged. Every value is validated
+            # and clamped here so a malformed entry can never reach ``run_swarm``.
+            _knobs = getattr(forge_state, "swarm_knobs", None) or {}
+            try:
+                _parallel = int(_knobs.get("parallel", 2))
+            except (TypeError, ValueError):
+                _parallel = 2
+            _parallel = max(1, min(_parallel, 8))
+            _scope_mode = str(_knobs.get("scope_mode", "strict")).strip().lower()
+            if _scope_mode not in {"strict", "warn"}:
+                _scope_mode = "strict"
+            _verify_mode = str(_knobs.get("verify_mode", "warn")).strip().lower()
+            if _verify_mode not in {"warn", "strict", "off"}:
+                _verify_mode = "warn"
+            _review = bool(_knobs.get("review", False))
+
+            forge_state.swarm_run_attempted = True
             try:
                 code = run_swarm(
                     paths=paths,
@@ -2126,7 +2258,7 @@ def _handle_forge_chat_command(
                     max_steps=None,
                     api_key_override=api_key_override,
                     no_log=no_log,
-                    parallel=2,
+                    parallel=_parallel,
                     base_branch=None,
                     max_tasks=None,
                     max_attempts=None,
@@ -2136,11 +2268,11 @@ def _handle_forge_chat_command(
                     retry_changes_requested=False,
                     only=None,
                     retry_merge_conflicts=False,
-                    scope_mode="strict",
-                    verify_mode="warn",
+                    scope_mode=_scope_mode,
+                    verify_mode=_verify_mode,
                     integration_mode=None,
                     verify_cmd=None,
-                    review=False,
+                    review=_review,
                     console=console,
                     trace_level=swarm_trace_level,
                     trace_sink=swarm_trace_sink,
@@ -2236,6 +2368,50 @@ def _handle_forge_chat_command(
                 ),
             )
             _print_forge_meta(console=console, message=f"Summary · {summary_path}")
+
+            # The run's actual answer: what each task did, where the files
+            # landed, whether the output is verified, and how to try it. Built
+            # deterministically from run artifacts (no model call). The TUI
+            # passes a sink so this renders as a real assistant block instead
+            # of joining the dim captured console text; classic chat prints it
+            # inline as markdown.
+            completion_report = ""
+            try:
+                completion_report = build_forge_completion_report(
+                    paths=paths,
+                    plan=plan_after_execution,
+                    run_status=run_status,
+                    run_clean=run_clean,
+                    exit_code=code,
+                )
+            except Exception:  # noqa: BLE001
+                completion_report = ""
+            if completion_report:
+                try:
+                    (paths.execution_dir / "completion_report.md").write_text(
+                        completion_report + "\n", encoding="utf-8"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                if forge_execution_report_sink is not None:
+                    try:
+                        forge_execution_report_sink(completion_report)
+                    except Exception:  # noqa: BLE001
+                        pass
+                else:
+                    console.print()
+                    console.print(Markdown(completion_report), highlight=False)
+
+            # The run just rewrote the workspace; drop the cached pre-execution
+            # scans so follow-up planner questions ("how do I run it?") are
+            # answered against what now actually exists on disk.
+            forge_state.workspace_context = None
+            if getattr(session, "planner_workspace_context", None) is not None:
+                try:
+                    session.planner_workspace_context = None
+                except Exception:  # noqa: BLE001
+                    pass
+
             append_transcript_note(
                 paths,
                 role="system",
@@ -2363,7 +2539,11 @@ def _handle_forge_chat_command(
     if cmd[:1] in "/:":
         return "unhandled"
 
-    _render_labeled_chat_message(console=console, label="You", message=trimmed)
+    # In the TUI the user line is already echoed (and the reply is routed to the
+    # assistant-markdown renderer via the sink), so skip the captured "You:" label
+    # that would otherwise double the echo as flat text.
+    if forge_planner_reply_sink is None:
+        _render_labeled_chat_message(console=console, label="You", message=trimmed)
 
     append_transcript_note(paths, role="user", message=trimmed)
 
@@ -2375,8 +2555,13 @@ def _handle_forge_chat_command(
         ).strip()
         api_key_override = planner_api_key or None
         session_stream = bool(getattr(session, "stream", False))
+        # With a reply sink (TUI) the reply is rendered as a single assistant block
+        # on completion, so suppress the token-delta trace that would otherwise
+        # spill the streaming text as separate trace lines.
         on_text_delta = (
-            _make_plan_mode_delta_trace_callback(session=session) if session_stream else None
+            _make_plan_mode_delta_trace_callback(session=session)
+            if (session_stream and forge_planner_reply_sink is None)
+            else None
         )
         stream_planner = session_stream and on_text_delta is not None
         _emit_forge_planner_trace(
@@ -2412,10 +2597,16 @@ def _handle_forge_chat_command(
                 warnings=warnings,
             ),
             api_key_override=api_key_override,
-            render_reply=lambda message, questions: _render_planner_reply(
-                console=console,
-                message=message,
-                questions=questions,
+            render_reply=(
+                forge_planner_reply_sink
+                if forge_planner_reply_sink is not None
+                else (
+                    lambda message, questions: _render_planner_reply(
+                        console=console,
+                        message=message,
+                        questions=questions,
+                    )
+                )
             ),
             selection_label="planner",
             planning_relevant=planning_relevant,

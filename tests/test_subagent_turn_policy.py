@@ -93,34 +93,22 @@ def _replace_subagent_run_with_fake(session: Any) -> list[dict[str, Any]]:
     return calls
 
 
-def test_subagent_turn_policy_requires_explicit_request_and_respects_opt_out(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_subagent_turn_policy_never_manufactures_delegation(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # Router-free path: no semantic contract exists, so a turn never derives a
+    # required_by_user delegation gate (nor a user_opt_out block) from the
+    # instruction text — in any language. Posture alone selects the advisory
+    # level: execute turns get "recommended", advisory turns get "available".
     registry = built_in_subagents()
     tools = {"subagent_run": object()}  # type: ignore[dict-item]
 
-    required = agent_loop._resolve_subagent_turn_policy(
-        instruction="Please use a subagent to inspect the parser before answering.",
-        subagents_enabled=True,
-        subagent_depth=0,
-        subagent_registry=registry,
-        turn_tools=tools,  # type: ignore[arg-type]
-        repo_turn_execution_intent="advisory_non_execution",
-    )
-    assert required.level == "required_by_user"
-    context = agent_loop._subagent_turn_context_message(required)
-    assert context is not None
-    assert "policy: required_by_user" in context
-    assert "Call subagent_run before finalizing" in context
-
     for instruction in (
+        "Please use a subagent to inspect the parser before answering.",
         "Run the explorer to map the parser.",
-        "Use the implementer for this scoped change.",
-        "Ask the debugger to isolate the failure.",
-        "Run the code-reviewer on the current diff.",
-        "Use the test strategist to identify regression cases.",
-        "Use the frontend engineer to build the responsive settings page.",
-        "Run the visual designer to create the empty-state illustration.",
+        "استخدم وكيلاً فرعياً لفحص المستودع.",
+        "Fix the parser, but do not use subagents for this one.",
+        "サブエージェントを使わずに、このリポジトリを確認してください。",
     ):
-        role_request = agent_loop._resolve_subagent_turn_policy(
+        advisory = agent_loop._resolve_subagent_turn_policy(
             instruction=instruction,
             subagents_enabled=True,
             subagent_depth=0,
@@ -128,21 +116,68 @@ def test_subagent_turn_policy_requires_explicit_request_and_respects_opt_out(tmp
             turn_tools=tools,  # type: ignore[arg-type]
             repo_turn_execution_intent="advisory_non_execution",
         )
-        assert role_request.level == "required_by_user", instruction
+        assert advisory.level == "available", instruction
+        assert advisory.reason == "repo_non_execution_turn", instruction
 
-    opted_out = agent_loop._resolve_subagent_turn_policy(
-        instruction="Fix the parser, but do not use subagents for this one.",
-        subagents_enabled=True,
+        execute = agent_loop._resolve_subagent_turn_policy(
+            instruction=instruction,
+            subagents_enabled=True,
+            subagent_depth=0,
+            subagent_registry=registry,
+            turn_tools=tools,  # type: ignore[arg-type]
+            repo_turn_execution_intent="execute",
+        )
+        assert execute.level == "recommended", instruction
+        assert execute.reason == "repo_execution_turn", instruction
+
+    context = agent_loop._subagent_turn_context_message(
+        agent_loop._resolve_subagent_turn_policy(
+            instruction="Inspect this repo and fix any issue you find.",
+            subagents_enabled=True,
+            subagent_depth=0,
+            subagent_registry=registry,
+            turn_tools=tools,  # type: ignore[arg-type]
+            repo_turn_execution_intent="execute",
+        )
+    )
+    assert context is not None
+    assert "policy: recommended" in context
+    assert "Make an explicit delegation decision" in context
+    assert "Call subagent_run before finalizing" not in context
+
+
+def test_subagent_turn_policy_reports_disabled_and_missing_tool_as_off(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    registry = built_in_subagents()
+    tools = {"subagent_run": object()}  # type: ignore[dict-item]
+
+    disabled = agent_loop._resolve_subagent_turn_policy(
+        instruction="Please use a subagent to inspect the repo.",
+        subagents_enabled=False,
         subagent_depth=0,
         subagent_registry=registry,
         turn_tools=tools,  # type: ignore[arg-type]
-        repo_turn_execution_intent="execute",
+        repo_turn_execution_intent="advisory_non_execution",
     )
-    assert opted_out.level == "off"
-    assert opted_out.reason == "user_opt_out"
+    assert disabled.level == "off"
+    assert disabled.reason == "subagents_disabled"
+    assert agent_loop._subagent_turn_context_message(disabled) is None
+
+    tool_missing = agent_loop._resolve_subagent_turn_policy(
+        instruction="Please use a subagent to inspect the repo.",
+        subagents_enabled=True,
+        subagent_depth=0,
+        subagent_registry=registry,
+        turn_tools={},
+        repo_turn_execution_intent="advisory_non_execution",
+    )
+    assert tool_missing.level == "off"
+    assert tool_missing.reason == "subagent_tool_not_exposed"
 
 
-def test_explicit_subagent_request_gets_repair_nudge_before_finalizing(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_repo_turn_injects_delegation_decision_context_and_delegation_executes(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # Router-free path: no semantic contract forces or forbids delegation. The
+    # turn gets the advisory <subagent_turn_context> (recommended on an
+    # execute-capable turn), and a model-initiated subagent_run simply runs.
     (tmp_path / "README.md").write_text("repo notes\n", encoding="utf-8")
     sessions_dir = tmp_path / "sessions"
     session = create_session(
@@ -159,7 +194,6 @@ def test_explicit_subagent_request_gets_repair_nudge_before_finalizing(tmp_path)
     subagent_calls = _replace_subagent_run_with_fake(session)
     client = _ScriptedClient(
         [
-            LLMResponse(content="I can answer directly.", tool_calls=[], raw={}),
             LLMResponse(
                 content="Delegating now.",
                 tool_calls=[
@@ -190,59 +224,22 @@ def test_explicit_subagent_request_gets_repair_nudge_before_finalizing(tmp_path)
     assert exit_code == 0
     assert len(subagent_calls) == 1
     assert subagent_calls[0]["name"] == "explorer"
-    assert len(client.calls) == 3
-    second_call_messages = "\n".join(
-        str(message.get("content") or "") for message in client.calls[1]["messages"]
+    assert len(client.calls) == 2
+    first_call_messages = "\n".join(
+        str(message.get("content") or "") for message in client.calls[0]["messages"]
     )
-    assert "The current user request explicitly asked for subagent" in second_call_messages
-    assert _event_payloads(session_path, "subagent_required_nudge")
+    assert "<subagent_turn_context>" in first_call_messages
+    assert "policy: recommended" in first_call_messages
+    assert "Make an explicit delegation decision" in first_call_messages
+    # No manufactured delegation gate exists on the router-free path.
+    assert "Call subagent_run before finalizing" not in first_call_messages
+    assert _event_payloads(session_path, "subagent_required_nudge") == []
 
 
-def test_explicit_subagent_request_accepts_final_after_required_nudge_cap(tmp_path) -> None:  # type: ignore[no-untyped-def]
-    (tmp_path / "README.md").write_text("repo notes\n", encoding="utf-8")
-    sessions_dir = tmp_path / "sessions"
-    session = create_session(
-        cfg=AppConfig(model="test-model", routing_mode="code_only"),
-        root=tmp_path,
-        mode="auto",
-        yes=True,
-        max_steps=5,
-        no_log=False,
-        api_key_override="override-key",
-        session_log_dir_override=sessions_dir,
-        enable_chat_turn_step_budget=True,
-    )
-    subagent_calls = _replace_subagent_run_with_fake(session)
-    final_text = "I inspected directly and will proceed without delegating."
-    client = _ScriptedClient(
-        [
-            LLMResponse(content=final_text, tool_calls=[], raw={}),
-            LLMResponse(content=final_text, tool_calls=[], raw={}),
-            LLMResponse(content=final_text, tool_calls=[], raw={}),
-        ]
-    )
-    session.client = client  # type: ignore[assignment]
-
-    try:
-        exit_code = session.run_turn(
-            "Please use a subagent to read README.md and tell me what it says. Do not modify files."
-        )
-        session_path = session.store.path
-    finally:
-        session.close()
-
-    assert exit_code == 0
-    assert subagent_calls == []
-    assert len(client.calls) == 3
-    nudge_events = _event_payloads(session_path, "subagent_required_nudge")
-    assert len(nudge_events) == 2
-    not_honored_events = _event_payloads(session_path, "subagent_required_not_honored")
-    assert not_honored_events
-    assert not_honored_events[-1]["content"] == final_text
-    assert _event_payloads(session_path, "subagent_required_incomplete_after_retries") == []
-
-
-def test_explicit_subagent_request_proceeds_when_subagents_disabled(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_turn_proceeds_without_subagent_gate_when_subagents_disabled(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # Router-free path: subagents disabled means the policy is silently off —
+    # no unavailable-notice message, no gate events, and the turn completes on
+    # the first model reply.
     sessions_dir = tmp_path / "sessions"
     session = create_session(
         cfg=AppConfig(model="test-model", routing_mode="code_only", subagents_enabled=False),
@@ -278,13 +275,9 @@ def test_explicit_subagent_request_proceeds_when_subagents_disabled(tmp_path) ->
     first_call_messages = "\n".join(
         str(message.get("content") or "") for message in client.calls[0]["messages"]
     )
-    assert "subagent_run is unavailable in this session (subagents_disabled)" in first_call_messages
-    events = _event_payloads(session_path, "subagent_request_unavailable")
-    assert events
-    assert events[-1]["reason"] == "subagents_disabled"
-    proceeding_events = _event_payloads(session_path, "subagent_request_unavailable_proceeding")
-    assert proceeding_events
-    assert proceeding_events[-1]["reason"] == "subagents_disabled"
+    assert "<subagent_turn_context>" not in first_call_messages
+    assert _event_payloads(session_path, "subagent_request_unavailable") == []
+    assert _event_payloads(session_path, "subagent_required_nudge") == []
 
 
 def test_interactive_repo_exploration_gets_subagent_nudge(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -341,7 +334,11 @@ def test_interactive_repo_exploration_gets_subagent_nudge(tmp_path) -> None:  # 
     assert events[-1]["consecutive_exploration_only_steps"] == 2
 
 
-def test_user_opt_out_blocks_subagent_tool_even_if_model_calls_it(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_model_initiated_subagent_call_runs_despite_opt_out_phrasing(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # Router-free path: no semantic contract exists, so opt-out phrasing in
+    # the instruction cannot manufacture a tool block — honoring "do not use
+    # subagents" is the model's job, and a subagent_run it does issue simply
+    # executes.
     (tmp_path / "README.md").write_text("repo notes\n", encoding="utf-8")
     sessions_dir = tmp_path / "sessions"
     session = create_session(
@@ -366,17 +363,13 @@ def test_user_opt_out_blocks_subagent_tool_even_if_model_calls_it(tmp_path) -> N
                         name="subagent_run",
                         arguments={
                             "name": "explorer",
-                            "task": "Inspect README.md despite the user opt-out.",
+                            "task": "Inspect README.md and report the notes.",
                         },
                     )
                 ],
                 raw={},
             ),
-            LLMResponse(
-                content="Blocked by the user request to avoid subagents.",
-                tool_calls=[],
-                raw={},
-            ),
+            LLMResponse(content="README.md contains repo notes.", tool_calls=[], raw={}),
         ]
     )
     session.client = client  # type: ignore[assignment]
@@ -388,8 +381,8 @@ def test_user_opt_out_blocks_subagent_tool_even_if_model_calls_it(tmp_path) -> N
         session.close()
 
     assert exit_code == 0
-    assert subagent_calls == []
+    assert len(subagent_calls) == 1
     tool_results = _event_payloads(session_path, "tool_result")
     assert tool_results
     assert tool_results[0]["name"] == "subagent_run"
-    assert "explicitly requested no subagents" in tool_results[0]["result"]["error"]
+    assert "error" not in (tool_results[0].get("result") or {})

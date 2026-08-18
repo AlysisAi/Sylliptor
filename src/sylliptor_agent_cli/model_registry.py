@@ -21,6 +21,7 @@ from .model_metadata_utils import (
     parse_non_negative_float,
     parse_positive_int,
 )
+from .provider_url import known_provider_key_from_base_url
 
 _INT_FIELDS = ("context_window_tokens", "max_output_tokens")
 _FLOAT_FIELDS = (
@@ -82,7 +83,195 @@ _FALLBACK_WARNING = (
     "Using fallback context/max_output; set model_metadata_overrides for best performance."
 )
 OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE = "official_provider_model_catalog"
+_OFFICIAL_PROVIDER_MODEL_SOURCES: dict[str, dict[str, tuple[str, ...]]] = {
+    "zai_coding_plan": {
+        "glm-5.3": ("https://docs.z.ai/guides/llm/glm-5.3",),
+        "glm-5-turbo": ("https://docs.z.ai/guides/llm/glm-5-turbo",),
+        "glm-4.7": ("https://docs.z.ai/guides/llm/glm-4.7",),
+    },
+    "xai": {
+        "grok-4.6": (
+            "https://docs.x.ai/developers/grok-4-6",
+            "https://docs.x.ai/developers/pricing",
+        ),
+    },
+    "gemini": {
+        model: (model_url, "https://ai.google.dev/gemini-api/docs/pricing")
+        for model, model_url in {
+            "gemini-3.7-flash": ("https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash"),
+            "gemini-3.6-flash": ("https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash"),
+            "gemini-3.5-flash-lite": (
+                "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite"
+            ),
+        }.items()
+    },
+    "qwen": {
+        "qwen3.8-max": (
+            "https://help.aliyun.com/en/model-studio/models",
+            "https://help.aliyun.com/en/model-studio/text-generation-model/",
+        ),
+    },
+    "nvidia": {
+        "nvidia/nemotron-3-super-120b-a12b": (
+            "https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/build",
+        ),
+        "nvidia/nemotron-3-ultra-550b-a55b": (
+            "https://build.nvidia.com/nvidia/nemotron-3-ultra-550b-a55b",
+        ),
+        "nvidia/nemotron-3-nano-30b-a3b": (
+            "https://build.nvidia.com/nvidia/nemotron-3-nano-30b-a3b",
+        ),
+        "deepseek-ai/deepseek-v4-pro": ("https://build.nvidia.com/deepseek-ai/deepseek-v4-pro",),
+        "deepseek-ai/deepseek-v4-flash": (
+            "https://build.nvidia.com/deepseek-ai/deepseek-v4-flash",
+        ),
+    },
+    "moonshot": {
+        model: ("https://platform.moonshot.ai/docs/pricing/chat",)
+        for model in (
+            "kimi-k3",
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k2.6",
+        )
+    },
+    "anthropic": {
+        "claude-opus-5": (
+            "https://docs.anthropic.com/en/docs/about-claude/models/overview",
+            "https://docs.anthropic.com/en/docs/about-claude/pricing",
+        ),
+    },
+}
 _OFFICIAL_PROVIDER_MODEL_METADATA: dict[str, dict[str, dict[str, Any]]] = {
+    "zai_coding_plan": {
+        # GLM-5.3 is currently exclusive to the subscription Coding Plan API;
+        # the general pay-per-token API is still marked "coming soon". Plan
+        # credits are not token prices, so this route intentionally carries no
+        # monetary cost fields.
+        "glm-5.3": {
+            "context_window_tokens": 1_000_000,
+            "max_output_tokens": 131_072,
+            "supports_vision": False,
+            "supports_reasoning": True,
+        },
+        "glm-5-turbo": {
+            "context_window_tokens": 200_000,
+            "max_output_tokens": 131_072,
+            "supports_vision": False,
+            "supports_reasoning": True,
+        },
+        "glm-4.7": {
+            "context_window_tokens": 200_000,
+            "max_output_tokens": 131_072,
+            "supports_vision": False,
+            "supports_reasoning": True,
+        },
+    },
+    "xai": {
+        # Grok 4.6 postdates the provenance-pinned LiteLLM snapshot. xAI
+        # publishes a 500K shared context with no separate text-output limit,
+        # so use the full window here and let the registry's generic
+        # shared-window policy reserve a practical output allowance. These are
+        # the base rates for prompts up to 200K tokens; xAI doubles all three
+        # rates above that threshold, which this flat-price schema cannot
+        # represent yet.
+        "grok-4.6": {
+            "context_window_tokens": 500_000,
+            "max_output_tokens": 500_000,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "input_cost_per_token": 0.000002,
+            "output_cost_per_token": 0.000006,
+            "cache_read_input_cost_per_token": 0.0000005,
+            "reasoning_output_cost_per_token": 0.000006,
+        },
+    },
+    "gemini": {
+        # These GA models postdate the provenance-pinned LiteLLM snapshot.
+        # Capacity and current standard-tier pricing are from Google's model
+        # and pricing pages. The 3.7/3.6 introductory rates expire 2026-12-31.
+        "gemini-3.7-flash": {
+            "context_window_tokens": 1_048_576,
+            "max_output_tokens": 65_536,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "input_cost_per_token": 0.00000075,
+            "output_cost_per_token": 0.00000375,
+            "cache_read_input_cost_per_token": 0.000000075,
+            "reasoning_output_cost_per_token": 0.00000375,
+        },
+        "gemini-3.6-flash": {
+            "context_window_tokens": 1_048_576,
+            "max_output_tokens": 65_536,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "input_cost_per_token": 0.00000075,
+            "output_cost_per_token": 0.00000375,
+            "cache_read_input_cost_per_token": 0.000000075,
+            "reasoning_output_cost_per_token": 0.00000375,
+        },
+        "gemini-3.5-flash-lite": {
+            "context_window_tokens": 1_048_576,
+            "max_output_tokens": 65_536,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "input_cost_per_token": 0.0000003,
+            "output_cost_per_token": 0.0000025,
+            "cache_read_input_cost_per_token": 0.00000003,
+            "reasoning_output_cost_per_token": 0.0000025,
+        },
+    },
+    "qwen": {
+        # Qwen3.8-Max is currently documented on the international QwenCloud
+        # OpenAI-compatible endpoint. Its 1M context is shared by input and
+        # output; 131,072 is the published maximum completion size. The public
+        # PAYG pricing pages have not caught up with the production model id,
+        # so costs stay unknown rather than borrowing preview-model prices.
+        "qwen3.8-max": {
+            "context_window_tokens": 1_048_576,
+            "max_output_tokens": 131_072,
+            "supports_vision": True,
+            "supports_reasoning": True,
+        },
+    },
+    "nvidia": {
+        # NVIDIA's hosted NIM catalog publishes the Nemotron 3 Super and Ultra
+        # models with 1M context. Nano's hosted endpoint currently advertises
+        # 262K. The hosted Nemotron endpoints accept up to 32,768 output tokens;
+        # 16,384 is their default, not their ceiling. NVIDIA-hosted DeepSeek V4
+        # uses a separate 16,384-token ceiling. Free Endpoint access is
+        # rate-limited prototyping, so no durable token price is encoded here.
+        "nvidia/nemotron-3-super-120b-a12b": {
+            "context_window_tokens": 1_048_576,
+            "max_output_tokens": 32_768,
+            "supports_vision": False,
+            "supports_reasoning": True,
+        },
+        "nvidia/nemotron-3-ultra-550b-a55b": {
+            "context_window_tokens": 1_048_576,
+            "max_output_tokens": 32_768,
+            "supports_vision": False,
+            "supports_reasoning": True,
+        },
+        "nvidia/nemotron-3-nano-30b-a3b": {
+            "context_window_tokens": 262_144,
+            "max_output_tokens": 32_768,
+            "supports_vision": False,
+            "supports_reasoning": True,
+        },
+        "deepseek-ai/deepseek-v4-pro": {
+            "context_window_tokens": 1_048_576,
+            "max_output_tokens": 16_384,
+            "supports_vision": False,
+            "supports_reasoning": True,
+        },
+        "deepseek-ai/deepseek-v4-flash": {
+            "context_window_tokens": 1_048_576,
+            "max_output_tokens": 16_384,
+            "supports_vision": False,
+            "supports_reasoning": True,
+        },
+    },
     "moonshot": {
         "kimi-k3": {
             "context_window_tokens": 1_048_576,
@@ -122,13 +311,33 @@ _OFFICIAL_PROVIDER_MODEL_METADATA: dict[str, dict[str, dict[str, Any]]] = {
             "output_cost_per_token": 0.000004,
             "cache_read_input_cost_per_token": 0.00000016,
         },
-    }
+    },
+    "anthropic": {
+        # Opus 5 ships ahead of the vendored litellm mirror, and that mirror is
+        # refresh-policy pinned to an upstream commit — so its capacity lives
+        # here rather than as a hand-edit that would falsify the snapshot's
+        # provenance. Drop this entry once a catalog refresh carries the model.
+        # Same shape as its siblings: 1M input + 128K output, Opus 4.8 pricing.
+        "claude-opus-5": {
+            "context_window_tokens": 1_128_000,
+            "max_output_tokens": 128_000,
+            "supports_vision": True,
+            "supports_reasoning": True,
+            "input_cost_per_token": 0.000005,
+            "output_cost_per_token": 0.000025,
+            "cache_read_input_cost_per_token": 0.0000005,
+            "cache_creation_input_cost_per_token": 0.00000625,
+            "cache_creation_5m_input_cost_per_token": 0.00000625,
+            "cache_creation_1h_input_cost_per_token": 0.00001,
+        },
+    },
 }
 _BUILT_IN_MODEL_METADATA: dict[str, dict[str, Any]] = {
     "deepseek-v4-flash": {
         "context_window_tokens": 1_000_000,
         "max_output_tokens": 384_000,
         "supports_vision": False,
+        "supports_reasoning": True,
         "input_cost_per_token": 0.00000014,
         "output_cost_per_token": 0.00000028,
     },
@@ -136,6 +345,7 @@ _BUILT_IN_MODEL_METADATA: dict[str, dict[str, Any]] = {
         "context_window_tokens": 1_000_000,
         "max_output_tokens": 384_000,
         "supports_vision": False,
+        "supports_reasoning": True,
         "input_cost_per_token": 0.000000435,
         "output_cost_per_token": 0.00000087,
     },
@@ -728,6 +938,9 @@ class ModelRegistry:
             **payload,
             "provider": normalized_provider,
             "catalog_source": OFFICIAL_PROVIDER_MODEL_CATALOG_SOURCE,
+            "catalog_sources": list(
+                _OFFICIAL_PROVIDER_MODEL_SOURCES.get(normalized_provider, {}).get(model_key, ())
+            ),
         }
         self._apply_user_scope(layer=layer, source=source, payload=payload)
         return layer
@@ -972,28 +1185,9 @@ def _provider_key_from_base_url(base_url: str | None) -> str | None:
         return None
     if not hostname:
         return None
-    if "dashscope" in hostname:
-        return "qwen"
-    if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):
-        return "openrouter"
-    if hostname == "api.openai.com":
-        return "openai"
-    if (
-        hostname.endswith(".openai.azure.com")
-        or hostname.endswith(".cognitiveservices.azure.com")
-        or hostname.endswith(".services.ai.azure.com")
-    ):
-        return "azure"
-    if hostname == "api.deepseek.com" or hostname.endswith(".deepseek.com"):
-        return "deepseek"
-    if hostname == "generativelanguage.googleapis.com":
-        return "gemini"
-    if hostname == "api.mistral.ai" or hostname.endswith(".mistral.ai"):
-        return "mistral"
-    if hostname in {"api.moonshot.ai", "api.moonshot.cn"}:
-        return "moonshot"
-    if hostname == "api.x.ai" or hostname == "x.ai" or hostname.endswith(".x.ai"):
-        return "xai"
+    known_provider = known_provider_key_from_base_url(raw)
+    if known_provider:
+        return known_provider
     parts = [
         part
         for part in hostname.split(".")

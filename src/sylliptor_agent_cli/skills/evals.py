@@ -94,7 +94,6 @@ _VERIFICATION_CREDIT_MISS_STAGES = {
     "verification_incomplete",
 }
 _FORCED_FINAL_SUMMARY_EVENT = "forced_final_summary_requested"
-_ROUTE_DECISION_EVENT = "route_decision"
 DEFAULT_SKILLS_LAUNCH_GATES: dict[str, float] = {
     "pass_rate_min": 0.80,
     "completion_gate_failure_rate_max": 0.05,
@@ -249,7 +248,6 @@ def extract_skills_eval_metrics(
     completion_gate_incomplete_after_retries_count = 0
     forced_final_summary_count = 0
     verification_credit_miss_count = 0
-    execution_posture_fallback_count = 0
 
     for event in events:
         event_type = str(event.get("type") or "")
@@ -261,8 +259,6 @@ def extract_skills_eval_metrics(
             completion_gate_incomplete_after_retries_count += 1
         elif event_type == _FORCED_FINAL_SUMMARY_EVENT:
             forced_final_summary_count += 1
-        elif event_type == _ROUTE_DECISION_EVENT and _route_decision_used_posture_fallback(payload):
-            execution_posture_fallback_count += 1
         if _event_is_verification_credit_miss(event_type=event_type, payload=payload):
             verification_credit_miss_count += 1
         if event_type == "skill_matches":
@@ -323,7 +319,6 @@ def extract_skills_eval_metrics(
         ),
         "forced_final_summary_count": forced_final_summary_count,
         "verification_credit_miss_count": verification_credit_miss_count,
-        "execution_posture_fallback_count": execution_posture_fallback_count,
     }
 
 
@@ -758,7 +753,6 @@ def render_skills_eval_summary_markdown(
             f"- completion-gate incomplete-after-retries rate: {_format_rate(summary.get('completion_gate_incomplete_after_retries_rate'))} ({summary.get('completion_gate_incomplete_after_retries_run_count', 0)} run(s), {summary.get('completion_gate_incomplete_after_retries_count', 0)} event(s))",
             f"- forced-final-summary rate: {_format_rate(summary.get('forced_final_summary_rate'))} ({summary.get('forced_final_summary_run_count', 0)} run(s), {summary.get('forced_final_summary_count', 0)} event(s))",
             f"- verification-credit miss rate: {_format_rate(summary.get('verification_credit_miss_rate'))} ({summary.get('verification_credit_miss_run_count', 0)} run(s), {summary.get('verification_credit_miss_count', 0)} event(s))",
-            f"- execution-posture fallback rate: {_format_rate(summary.get('execution_posture_fallback_rate'))} ({summary.get('execution_posture_fallback_run_count', 0)} run(s), {summary.get('execution_posture_fallback_count', 0)} event(s))",
             f"- overall pass rate (all completed modes): {_format_rate(summary.get('pass_rate_all_modes', summary.get('pass_rate')))}",
             f"- launch-candidate pass rate: {_format_rate(summary.get('pass_rate_launch_modes', summary.get('pass_rate')))}",
             f"- relevant skill usage rate (all modes): {_format_rate(summary.get('relevant_skill_usage_rate_all_modes', summary.get('relevant_skill_usage_rate')))}",
@@ -1022,7 +1016,6 @@ def run_skills_eval_suite(
                     ),
                     forced_final_summary_count=execution.forced_final_summary_count,
                     verification_credit_miss_count=execution.verification_credit_miss_count,
-                    execution_posture_fallback_count=execution.execution_posture_fallback_count,
                     session_log_path=execution.session_log_path,
                     session_artifact_root=execution.session_artifact_root,
                     error=execution.error,
@@ -1274,7 +1267,6 @@ def _launch_runtime_summary(records: Sequence[SkillsEvalRecord]) -> dict[str, ob
             "completion_gate_incomplete_after_retries_count",
             "forced_final_summary_count",
             "verification_credit_miss_count",
-            "execution_posture_fallback_count",
         ),
     )
 
@@ -1309,13 +1301,6 @@ def _event_is_verification_credit_miss(*, event_type: str, payload: Mapping[str,
     except (TypeError, ValueError):
         verification_attempt_count = 0
     return verification_attempt_count > 0
-
-
-def _route_decision_used_posture_fallback(payload: Mapping[str, Any]) -> bool:
-    return any(
-        str(payload.get(key) or "").strip() == "fallback"
-        for key in ("execution_posture_source", "router_execution_posture_source")
-    )
 
 
 def _max_rate_gate(*, actual: object, threshold: float, description: str) -> dict[str, object]:

@@ -220,7 +220,10 @@ def test_temporarily_clamp_client_timeout_restores_original_value() -> None:
     client = type("Client", (), {"timeout_s": 60.0})()
 
     with temporarily_clamp_client_timeout(client, deadline, reserve_seconds=1.0):
-        assert math.isclose(client.timeout_s, 4.0)
+        # Outside the finalization window the clamp also protects the
+        # finalization reserve (1.0s here), not only the cleanup reserve:
+        # 5.0 remaining - 1.0 cleanup - 1.0 finalization reserve = 3.0.
+        assert math.isclose(client.timeout_s, 3.0)
 
     assert client.timeout_s == 60.0
 

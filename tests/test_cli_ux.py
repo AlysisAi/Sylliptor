@@ -149,13 +149,53 @@ def test_no_args_interactive_defaults_to_chat(monkeypatch) -> None:
     }
 
 
+def test_config_set_cannot_bypass_subscription_model_and_effort_menu(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "cfg"))
+    save_config(_subscription_cfg())
+
+    result = CliRunner().invoke(
+        sylliptor_app,
+        ["config", "set", "model", "not-in-catalog"],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 2
+    assert "/config" in result.output and "Default Model" in result.output
+    assert load_config().model == "gpt-codex-test"
+
+
+def test_run_rejects_blank_instruction_before_agent_call(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def _unexpected_run_impl(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("blank run instruction reached agent execution")
+
+    monkeypatch.setattr(chat_facade, "run_impl", _unexpected_run_impl)
+    runner = CliRunner()
+
+    for instruction in ("", "   "):
+        result = runner.invoke(
+            sylliptor_app,
+            ["run", "--path", str(tmp_path / "repo"), "--create-path", instruction],
+            env=_env(tmp_path),
+        )
+
+        assert result.exit_code == 1
+        assert "Missing argument 'INSTRUCTION'" in result.output
+        assert "instruction is empty" in result.output
+
+
 def test_setup_wizard_saves_config(monkeypatch, tmp_path: Path) -> None:
     _patch_setup_wizard_dependencies(monkeypatch)
     runner = CliRunner()
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\n1\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
+        input=f"\n1\n1\npersisted-key\n7\ngpt-5-nano\n1\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
@@ -172,7 +212,7 @@ def test_setup_wizard_can_persist_api_key(monkeypatch, tmp_path: Path) -> None:
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\n1\npersisted-key\n6\ngpt-5-nano\n1\n{tmp_path}\n",
+        input=f"\n1\n1\npersisted-key\n7\ngpt-5-nano\n1\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
@@ -580,7 +620,8 @@ def test_chat_help_panel_uses_compact_text_on_narrow_terminal(monkeypatch) -> No
     assert "/usage  token count & cost; /usage hud on|off toggles HUD" in panel.renderable
     assert "/subagents" not in panel.renderable
     assert "/skills" not in panel.renderable
-    assert "/context" not in panel.renderable
+    assert "/context  context window left" in panel.renderable
+    assert "/ctx" not in panel.renderable
     assert (
         "/clear  wipe conversation (keeps session id + log; Ctrl+L clears terminal)"
         in panel.renderable
@@ -598,11 +639,13 @@ def test_chat_visible_command_lists_match_curated_surface() -> None:
         "/help",
         "/login",
         "/mode",
+        "/persona",
+        "/ask",
         "/status",
         "/terminals",
         "/pwd",
         "/usage",
-        "/ctx",
+        "/context",
         "/compact",
         "/clear",
         "/resume",
@@ -1234,13 +1277,16 @@ def test_tui_login_runs_auth_then_relaunches_chat(
     assert relaunched[0]["base_url"] is None
 
 
-def test_tui_routing_restart_preserves_cli_connection_overrides(
+def test_tui_routing_mode_change_applies_in_place_without_restart(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    # Router-free path: routing_mode is a deprecated no-op, so a routing-only
+    # /config save reloads live instead of restarting the TUI session.
     from prompt_toolkit.application import current as prompt_toolkit_current
 
     from sylliptor_agent_cli.cli_impl import tui as tui_pkg
+    from sylliptor_agent_cli.cli_impl.chat import loop as chat_loop_mod
     from sylliptor_agent_cli.cli_impl.commands import startup as startup_mod
 
     relaunched: list[dict[str, object]] = []
@@ -1271,6 +1317,13 @@ def test_tui_routing_restart_preserves_cli_connection_overrides(
             close=lambda: None,
         )
 
+    applied: list[object] = []
+    monkeypatch.setattr(
+        chat_loop_mod,
+        "_apply_config_menu_changes_to_session",
+        lambda *, session, cfg: applied.append(cfg),
+    )
+
     def _run_tui(_state: object, **kwargs: object) -> tuple[tuple[str, str], list[object]]:
         session_builder = kwargs["session_builder"]
         assert callable(session_builder)
@@ -1283,8 +1336,8 @@ def test_tui_routing_restart_preserves_cli_connection_overrides(
         on_config_saved = kwargs["on_config_saved"]
         assert callable(on_config_saved)
         assert on_config_saved() is True
-        assert exits == [("restart_routing_config", os.fspath(tmp_path.resolve()))]
-        return exits[-1], []
+        assert exits == []
+        return ("quit", ""), []
 
     monkeypatch.setattr(
         prompt_toolkit_current,
@@ -1325,10 +1378,11 @@ def test_tui_routing_restart_preserves_cli_connection_overrides(
     )
 
     assert result.exit_code == 0, result.output
-    assert len(relaunched) == 1
-    assert relaunched[0]["path"] == tmp_path.resolve()
-    assert relaunched[0]["model"] == "cli-model"
-    assert relaunched[0]["base_url"] == base_url
+    assert relaunched == []
+    assert len(applied) == 1
+    assert getattr(applied[0], "routing_mode", "") == "code_only"
+    assert getattr(applied[0], "model", "") == "cli-model"
+    assert getattr(applied[0], "base_url", "") == base_url
 
 
 def test_one_shot_run_checks_subscription_readiness_before_launch(
@@ -1376,18 +1430,12 @@ def test_chat_command_sections_describe_forge_workspace_safe_resume_contract() -
         == "wipe conversation (keeps session id + log; Ctrl+L clears terminal)"
     )
     assert (
-        tools_rows["/subagent [name] [task]"]
+        tools_rows["/subagent"]
         == "no args opens picker; /subagent on|off|status toggles delegation"
     )
-    assert (
-        tools_rows["/skill [name] [task]"]
-        == "no args lists; <name> shows info; <name> <task> attaches"
-    )
+    assert tools_rows["/skill"] == "no args lists; <name> shows info; <name> <task> attaches"
     forge_tools_rows = dict(cli_mod._chat_command_sections(ui_mode="forge")[3][1])
-    assert (
-        forge_tools_rows["/skill [name] [task]"]
-        == "no args lists; <name> shows info; <name> <task> attaches"
-    )
+    assert forge_tools_rows["/skill"] == "no args lists; <name> shows info; <name> <task> attaches"
     assert "/forge [resume]" in tools_rows
     assert "fresh run by default" in tools_rows["/forge [resume]"]
     assert "same-workspace re-entry resumes session-local state" in tools_rows["/forge [resume]"]
@@ -1403,7 +1451,7 @@ def test_chat_command_sections_describe_forge_workspace_safe_resume_contract() -
 def test_chat_command_registry_keeps_hidden_commands_known() -> None:
     hidden_commands = {
         "/cd",
-        "/context",
+        "/ctx",
         "/model-info",
         "/model",
         "/plan mode",
@@ -1659,6 +1707,18 @@ def test_dark_owl_frames_reuse_light_artwork_when_uncolored() -> None:
     assert dark_frames == light_frames
 
 
+def test_neutral_owl_frames_inherit_terminal_foreground() -> None:
+    frames = welcome_mod._load_owl_logo_frames(
+        stream=None,
+        color_enabled=True,
+        theme="neutral",
+    )
+
+    output = "\n".join(line for frame in frames for line in frame)
+    assert "\x1b[" not in output
+    assert "█" in output
+
+
 def test_dark_owl_panel_remaps_pale_grays() -> None:
     frame = [["\x1b[38;5;247m░\x1b[0m \x1b[38;5;244m▒\x1b[0m"]]
 
@@ -1700,34 +1760,6 @@ def test_print_welcome_banner_keeps_compact_owl_beside_text_at_80_columns(monkey
     owl_index = next(i for i, line in enumerate(plain_lines) if "█" in line)
     brand_index = next(i for i, line in enumerate(plain_lines) if "Sylliptor" in line)
     assert owl_index == brand_index
-
-
-def test_print_welcome_banner_keeps_dark_panel_owl_left_at_80_columns(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        cli_mod.shutil,
-        "get_terminal_size",
-        lambda fallback=(80, 20): os.terminal_size((80, 20)),
-    )
-    monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.delenv("OWL_THEME", raising=False)
-    monkeypatch.setenv("COLORFGBG", "15;0")
-
-    banner = cli_mod.printWelcome(
-        workspace=Path.home() / "myproject",
-        model="anthropic/opus-4.7",
-        version="0.8.2",
-    )
-    plain_lines = [cli_mod.stripAnsi(line) for line in banner.splitlines()]
-    plain = "\n".join(plain_lines)
-
-    assert "\x1b[48;5;231m" in banner
-    assert all(len(line) < 80 for line in plain_lines)
-    assert "..." not in plain
-    assert "model opus-4.7   version 0.8.2" in plain
-    assert any("\u2588" in line and "Sylliptor" in line for line in plain_lines)
-    assert any("\u2588" in line and "workspace ~/myproject" in line for line in plain_lines)
 
 
 def test_print_welcome_banner_keeps_long_context_off_terminal_edge_at_80_columns(
@@ -2162,6 +2194,7 @@ def test_home_run_action_forwards_plain_defaults(monkeypatch) -> None:
         "yes": False,
         "benchmark": False,
         "deadline_seconds": None,
+        "no_deadline": False,
         "require_deadline": False,
         "diagnostic_log": None,
     }
@@ -2220,7 +2253,7 @@ def test_setup_wizard_reprompts_invalid_workspace(monkeypatch, tmp_path: Path) -
     result = runner.invoke(
         sylliptor_app,
         ["setup"],
-        input=f"\n1\n1\npersisted-key\n6\ngpt-5-nano\n1\n/does/not/exist\n{tmp_path}\n",
+        input=f"\n1\n1\npersisted-key\n7\ngpt-5-nano\n1\n/does/not/exist\n{tmp_path}\n",
         env=_env(tmp_path),
     )
     assert result.exit_code == 0
@@ -2270,6 +2303,7 @@ def test_home_run_action_accepts_numeric_shortcut(monkeypatch) -> None:
         "yes": False,
         "benchmark": False,
         "deadline_seconds": None,
+        "no_deadline": False,
         "require_deadline": False,
         "diagnostic_log": None,
     }

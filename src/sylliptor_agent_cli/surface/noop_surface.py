@@ -136,6 +136,9 @@ class NoopSurface:
     def emit_mode_changed(self, mode: str) -> None:
         _ = mode
 
+    def emit_persona_changed(self, persona: str, effective_mode: str, source: str = "user") -> None:
+        _ = (persona, effective_mode, source)
+
     def emit_plan_node_updated(
         self,
         node_id: str,

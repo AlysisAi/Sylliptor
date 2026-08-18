@@ -390,6 +390,7 @@ def _run_default_run_action(instruction: str) -> None:
         yes=False,
         benchmark=False,
         deadline_seconds=None,
+        no_deadline=False,
         require_deadline=False,
         diagnostic_log=None,
     )
@@ -657,13 +658,80 @@ def _chat_turn_usage_style(session: Any) -> str:
     return "dim"
 
 
-def _format_usage_cost_for_display(*, known_cost: float | None, unknown_calls: int) -> str:
-    if known_cost is None:
-        return f"unknown ({unknown_calls} unmetered)" if unknown_calls > 0 else "unknown"
-    known = format_usd(known_cost, style="table")
+def _format_usage_billing_for_display(row: dict[str, Any], *, compact: bool = False) -> str:
+    """Render charge provenance without presenting estimates as exact bills."""
+
+    known_cost = _known_cost_value(row)
+    unknown_calls = int(row.get("unknown_cost_calls", row.get("unknown_cost_count", 0)) or 0)
+    estimate_calls = int(row.get("catalog_estimated_cost_calls") or 0)
+    subscription_calls = int(row.get("subscription_calls") or 0)
+    included_calls = int(row.get("included_calls") or 0)
+    local_calls = int(row.get("local_calls") or 0)
+
+    if known_cost is not None:
+        value = format_usd(known_cost, style="table")
+        if estimate_calls > 0:
+            value = f"~{value}"
+        suffixes: list[str] = []
+        if unknown_calls > 0:
+            suffixes.append(f"{unknown_calls} cost unknown")
+        if subscription_calls > 0:
+            suffixes.append("subscription")
+        if included_calls > 0:
+            suffixes.append("included")
+        if local_calls > 0:
+            suffixes.append("local")
+        if suffixes:
+            joiner = "+" if compact else ", "
+            value = f"{value} {joiner.join(suffixes)}"
+        return value
+
+    labels = [
+        label
+        for count, label in (
+            (subscription_calls, "subscription"),
+            (included_calls, "included"),
+            (local_calls, "local"),
+        )
+        if count > 0
+    ]
     if unknown_calls > 0:
-        return f"{known} ({unknown_calls} unmetered)"
-    return known
+        labels.append("cost n/a" if compact else f"unknown ({unknown_calls} cost unknown)")
+    if labels:
+        return ("+" if compact else ", ").join(labels)
+    return "$0.0000"
+
+
+def _format_reported_token_total(
+    row: dict[str, Any],
+    *,
+    token_key: str,
+    reported_calls_key: str,
+    derived_calls_key: str | None = None,
+) -> str:
+    """Keep provider omission, a provider-reported zero, and a derived figure apart.
+
+    A derived figure is arithmetic over counts the provider did send, so it is
+    worth showing — but it is not itself reported, and labelling it as such
+    would overstate what the provider actually told us.
+    """
+
+    total_calls = int(row.get("api_usage_calls") or 0) + int(row.get("estimate_usage_calls") or 0)
+    reported_calls = int(row.get(reported_calls_key) or 0)
+    derived_calls = int(row.get(derived_calls_key) or 0) if derived_calls_key else 0
+    known_calls = reported_calls + derived_calls
+    if total_calls <= 0 or known_calls <= 0:
+        return "not reported"
+    value = _format_exact_token_count(row.get(token_key))
+    if reported_calls <= 0:
+        suffix = " (derived)"
+    elif derived_calls > 0:
+        suffix = " (partly derived)"
+    else:
+        suffix = ""
+    if known_calls < total_calls:
+        return f"{value} (partial {known_calls}/{total_calls}){suffix}"
+    return f"{value}{suffix}"
 
 
 def _format_usage_source_for_display(row: dict[str, Any]) -> str:

@@ -6,6 +6,7 @@ import re
 import subprocess
 import tarfile
 import tempfile
+import threading
 import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -25,6 +26,7 @@ from .assets.usage_logger import AssetUsageLogger
 from .assets.worker_mirror import TaskAssetMirror, mirror_task_assets
 from .assets.worker_section import render_relevant_assets_section
 from .assets.worker_tools import build_worker_asset_mcp_manager, compose_worker_asset_mcp_manager
+from .cancellation import CooperativeCancellationError, EventCancellationToken
 from .config import AppConfig, clone_cfg
 from .error_text import (
     redact_sensitive_error_text,
@@ -90,6 +92,7 @@ from .swarm_trace import (
     SwarmWorkerTraceSurface,
     build_swarm_trace_event,
 )
+from .swarm_write_guard import SwarmWriteScopeGuard
 from .task_readiness import TASK_KIND_ANALYSIS_ONLY, classify_task_lifecycle
 from .task_scope import (
     SCRATCH_ARTIFACT_ENV,
@@ -130,6 +133,7 @@ _VERIFY_ACTIONABLE_FAILURE_RE = re.compile(
     r"SyntaxError|NameError|AttributeError)(.+)?$",
     re.MULTILINE,
 )
+_KNOWLEDGE_INDEX_REBUILD_LOCK = threading.Lock()
 _BASELINE_FAILURE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}")
 _BASELINE_FAILURE_STOPWORDS = {
     "assert",
@@ -180,6 +184,9 @@ class TaskWorkerResult:
     verify_failed: bool
     verify_summary: str | None
     verify_artifact_path: str | None
+    # True when the task succeeded but nothing authoritative could check it. A
+    # completion, not a failure -- the orchestrator keeps the work and merges nothing.
+    verification_unavailable: bool = False
     knowledge_capture_artifact_dir: str | None = None
     task_attempt_entry_id: str | None = None
     task_attempt_knowledge_file_path: str | None = None
@@ -198,6 +205,7 @@ class TaskWorkerResult:
     noop_reason: str | None = None
     task_kind: str | None = None
     task_lifecycle_reason: str | None = None
+    interrupted: bool = False
 
     @property
     def effective_result_kind(self) -> str:
@@ -233,6 +241,7 @@ class TaskWorkerResult:
             "warnings": self.warnings,
             "changed_files": self.changed_files,
             "verify_failed": self.verify_failed,
+            "verification_unavailable": self.verification_unavailable,
             "verify_summary": self.verify_summary,
             "verify_artifact_path": self.verify_artifact_path,
             "knowledge_capture_artifact_dir": self.knowledge_capture_artifact_dir,
@@ -256,6 +265,7 @@ class TaskWorkerResult:
             "noop_reason": self.noop_reason,
             "task_kind": self.task_kind,
             "task_lifecycle_reason": self.task_lifecycle_reason,
+            "interrupted": self.interrupted,
         }
 
 
@@ -818,6 +828,7 @@ def run_task_worker(
     verify_command_selection: ResolvedVerifyCommands | None = None,
     trace_sink: SwarmTraceSink | None = None,
     trace_level: str = "off",
+    cancellation_event: threading.Event | None = None,
 ) -> TaskWorkerResult:
     ensure_execution_dirs(run_paths)
     (run_paths.execution_dir / "worker_results").mkdir(parents=True, exist_ok=True)
@@ -873,6 +884,7 @@ def run_task_worker(
             )
         )
     recording_surface = RecordingSurface(worker_surface)
+    agent_surface: Any = recording_surface
     worker_console = console or make_console(
         file=io.StringIO(), force_terminal=False, no_color=True
     )
@@ -919,6 +931,20 @@ def run_task_worker(
     scratch_artifact_dir = run_paths.execution_dir / "scratch" / safe_task
     scratch_artifact_dir.mkdir(parents=True, exist_ok=True)
     scratch_artifact_section = _scratch_artifact_section(scratch_artifact_dir)
+
+    def _cancel_requested() -> bool:
+        return cancellation_event is not None and cancellation_event.is_set()
+
+    cancellation_token = (
+        EventCancellationToken(cancellation_event) if cancellation_event is not None else None
+    )
+    write_guard: SwarmWriteScopeGuard | None = None
+    if scope_mode == "strict":
+        write_guard = SwarmWriteScopeGuard(
+            worktree_root=worktree_repo_path,
+            allowed_patterns=allowed_scope,
+            extra_allowed_roots=(scratch_artifact_dir,),
+        )
     asset_setup_warnings: list[str] = []
     asset_setup_error: str | None = None
     asset_usage_logger = AssetUsageLogger(run_paths=run_paths, task_id=task_id)
@@ -980,7 +1006,7 @@ def run_task_worker(
     )
     asset_allocation: TaskAssetAllocation | None = None
     relevant_assets_section = ""
-    if asset_surface is not None and task_asset_mirror.primary:
+    if asset_surface is not None and task_asset_mirror.primary and not _cancel_requested():
         asset_allocation = allocate_task_assets(
             task=task,
             plan=plan,
@@ -1089,6 +1115,7 @@ def run_task_worker(
     run_err: str | None = asset_setup_error
     agent_run_exception = False
     agent_exception_summary: str | None = None
+    interrupted = False
     failure_category: FailureCategory | str | None = None
     worktree_git_marker = worktree_repo_path / ".git"
     if worktree_git_marker.exists():
@@ -1097,7 +1124,11 @@ def run_task_worker(
         except GitOpsError as e:
             run_err = f"worker setup failed: {e}"
     try:
-        if run_err is None:
+        if run_err is None and _cancel_requested():
+            interrupted = True
+            run_code = 130
+            run_err = "interrupted before the agent turn started"
+        elif run_err is None:
             if asset_surface is not None:
                 task_asset_mcp_manager = compose_worker_asset_mcp_manager(
                     base_manager=create_mcp_manager(
@@ -1125,7 +1156,7 @@ def run_task_worker(
                 no_log=no_log,
                 api_key_override=api_key_override,
                 console=worker_console,
-                surface=recording_surface,
+                surface=agent_surface,
                 image_paths=task_image_paths,
                 deny_write_prefixes=[".sylliptor"],
                 session_log_dir_override=run_paths.execution_sessions_dir,
@@ -1146,7 +1177,13 @@ def run_task_worker(
                 subagents_enabled=False,
                 enforce_explicit_subagent_requests=False,
                 mcp_manager=task_asset_mcp_manager,
+                cancellation_token=cancellation_token,
+                tool_dispatch_guard=write_guard,
             )
+    except CooperativeCancellationError as e:
+        interrupted = True
+        run_code = 130
+        run_err = f"interrupted at cooperative checkpoint: {e.reason}"
     except Exception as e:  # noqa: BLE001
         run_code = 1
         agent_run_exception = True
@@ -1221,6 +1258,7 @@ def run_task_worker(
 
     commit_hash: str | None = None
     verify_failed = False
+    verification_unavailable = False
     verify_summary: str | None = None
     verify_payload: dict[str, Any] | None = None
     failure_reason: str | None = None
@@ -1250,7 +1288,10 @@ def run_task_worker(
         nonlocal run_err
         run_err = (run_err + "; " if run_err else "") + message
 
-    if nonzero_agent_exit:
+    if interrupted:
+        failure_reason = failure_reason or "interrupted"
+        failure_category = failure_category or "interrupted"
+    elif nonzero_agent_exit:
         failure_reason = failure_reason or "agent_nonzero_exit"
         failure_category = failure_category or FailureCategory.IMPLEMENTATION_FAILED
         _append_run_error(
@@ -1575,6 +1616,39 @@ def run_task_worker(
             else:
                 warnings.append(scope_msg)
 
+    guard_violations = write_guard.violations if write_guard is not None else []
+    if guard_violations:
+        strict_scope_blocked = True
+        if not interrupted:
+            failure_reason = "write_scope_guard_violation"
+        failure_category = failure_category or FailureCategory.IMPLEMENTATION_FAILED
+        scope_violation_files = _merge_changed_files(
+            scope_violation_files,
+            [item.resolved_relpath or item.raw_path for item in guard_violations],
+        )
+        scope_diagnostics.extend(item.to_payload() for item in guard_violations)
+        violation_preview = "; ".join(
+            f"{item.tool_name}: {item.raw_path} ({item.reason})" for item in guard_violations[:5]
+        )
+        if len(guard_violations) > 5:
+            violation_preview += "; ..."
+        _append_run_error(
+            f"swarm write-scope guard blocked {len(guard_violations)} write(s) "
+            f"outside the task write scope: {violation_preview}"
+        )
+        for item in guard_violations:
+            worker_trace_sink.emit(
+                build_swarm_trace_event(
+                    run_id=run_paths.run_id,
+                    task_id=task_id,
+                    phase="scope.violation",
+                    message=(
+                        f"Write blocked by swarm write-scope guard ({item.reason}): "
+                        f"{item.tool_name} -> {item.raw_path}"
+                    ),
+                )
+            )
+
     can_attempt_commit_verify = (
         not runtime_artifacts_changed
         and material_changes_detected
@@ -1663,13 +1737,21 @@ def run_task_worker(
                     allow_baseline_improved_failure=True,
                 )
             elif verify_mode == "strict":
-                success = False
-                failure_reason = failure_reason or "verification_unavailable"
-                failure_category = failure_category or FailureCategory.IMPLEMENTATION_FAILED
-                _append_run_error(
-                    "strict verification requires authoritative commands, but none were available"
+                # The commit exists and no authoritative command exists to check it --
+                # a property of the workspace, not a defect in the work. Failing here
+                # discarded finished tasks over missing tooling, so the worker now
+                # reports an unverified completion: the commit and its worktree are
+                # kept, and the orchestrator merges nothing.
+                verification_unavailable = True
+                verify_summary = (
+                    "verification skipped: no authoritative commands available; "
+                    "task kept as completed_unverified"
                 )
-                verify_summary = "verification skipped: no authoritative commands available"
+                warnings.append(
+                    "Strict verification found no authoritative command for this task. "
+                    "The work was committed but nothing checked it -- review the task "
+                    "branch before merging, or provide an explicit verify command."
+                )
             elif verify_mode != "off":
                 verify_summary = "verification skipped: no authoritative commands available"
             else:
@@ -1753,8 +1835,15 @@ def run_task_worker(
         # site=swarm_worker generic failure result, see failure_category.py
         failure_category = FailureCategory.IMPLEMENTATION_FAILED
 
-    if runtime_artifacts_changed:
+    if interrupted:
+        summary = (
+            "Worker interrupted by cooperative cancellation at a checkpoint; "
+            "the task worktree is preserved for harvest."
+        )
+    elif runtime_artifacts_changed:
         summary = "Worker failed: attempted protected .sylliptor modifications."
+    elif failure_reason == "write_scope_guard_violation":
+        summary = "Worker blocked by the swarm write-scope guard."
     elif failure_reason == "scope_violation":
         summary = "Worker blocked due to strict scope isolation."
     elif success and result_kind == "success_noop" and noop_reason == "diagnostic_analysis_only":
@@ -1764,6 +1853,11 @@ def run_task_worker(
     elif success and result_kind == "success_noop":
         summary = (
             "Worker completed successfully with no repository changes; task was already satisfied."
+        )
+    elif success and verification_unavailable:
+        summary = (
+            "Worker completed and produced a task commit, but nothing verified it: "
+            "no authoritative verification command exists for this workspace."
         )
     elif success:
         summary = "Worker completed successfully and produced a task commit."
@@ -1884,6 +1978,7 @@ def run_task_worker(
         warnings=warnings,
         changed_files=changed_files,
         verify_failed=verify_failed,
+        verification_unavailable=verification_unavailable,
         verify_summary=verify_summary,
         verify_artifact_path=(
             _repo_rel(run_paths.root, verify_path) if verify_path.exists() else None
@@ -1910,6 +2005,7 @@ def run_task_worker(
         noop_reason=noop_reason,
         task_kind=task_lifecycle.kind,
         task_lifecycle_reason=task_lifecycle.reason_code,
+        interrupted=interrupted,
     )
     issue_paths = changed_files or list(allowed_scope)
     if runtime_artifacts_changed:
@@ -1991,5 +2087,8 @@ def run_task_worker(
                 else ["execution_failure"]
             ),
         )
-    rebuild_knowledge_index(run_paths)
+    # Workers finish concurrently.  Serializing the shared workspace index
+    # avoids Windows replace/share violations while preserving atomic writes.
+    with _KNOWLEDGE_INDEX_REBUILD_LOCK:
+        rebuild_knowledge_index(run_paths)
     return result

@@ -4127,6 +4127,136 @@ def test_exec_pr_merge_conflict_writes_conflict_artifacts_and_sets_status(
     assert (conflict_dir / "merge_cleanup.log").exists()
 
 
+def test_exec_pr_merge_conflict_does_not_auto_resolve_without_opt_in(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A conflict stops the sequential path instead of starting a resolver agent.
+
+    Auto-resolution runs a second agent inside its own worktree; that is swarm
+    machinery, so it only happens when the caller asks for it.
+    """
+    runner = CliRunner()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plan_path, plan = _prepare_run_with_tasks(runner, repo, tmp_path)
+    task_id = plan["tasks"][0]["id"]
+
+    monkeypatch.setattr(cli_mod, "run_agent", _run_agent_with_material_change())
+    monkeypatch.setattr(cli_mod, "ensure_git_available", lambda: None)
+    monkeypatch.setattr(cli_mod, "ensure_git_repo", lambda _root: None)
+    monkeypatch.setattr(cli_mod, "ensure_clean_for_pr", lambda _root: None)
+    monkeypatch.setattr(cli_mod, "current_branch", lambda _root: "main")
+    monkeypatch.setattr(
+        cli_mod,
+        "checkout_branch",
+        lambda _root, _branch, *, base_branch: None,
+    )
+    monkeypatch.setattr(cli_mod, "stage_all", lambda _root: None)
+    monkeypatch.setattr(cli_mod, "unstage_staged_prefixes", lambda *_a, **_k: [])
+    monkeypatch.setattr(cli_mod, "ensure_not_staged_prefixes", lambda _root, _prefixes: None)
+    monkeypatch.setattr(cli_mod, "commit_all", lambda _root, *, message: "deadbeef")
+    monkeypatch.setattr(
+        cli_mod,
+        "format_patch_stdout",
+        lambda _root, *, base_branch: "From deadbeef\n new file mode 100644\n",
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "changed_files_between",
+        lambda _root, *, revspec: ["src/x.py"],
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "merge_no_ff",
+        lambda *_a, **_k: (_ for _ in ()).throw(GitOpsError("merge conflict")),
+    )
+    monkeypatch.setattr(cli_mod, "list_unmerged_files", lambda _root: ["src/x.py"])
+    monkeypatch.setattr(
+        cli_mod,
+        "capture_merge_conflict_context",
+        lambda _root, *, base_branch, task_branch, merge_error: {
+            "base_branch": base_branch,
+            "task_branch": task_branch,
+            "merge_error": merge_error,
+            "git_status_porcelain": "UU src/x.py",
+            "unmerged_files": ["src/x.py"],
+            "files": [],
+        },
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "review_merge_conflict",
+        lambda **_kwargs: ConflictReviewOutcome(
+            review_json={
+                "task_id": task_id,
+                "confidence": "medium",
+                "summary": "merge conflict",
+                "root_cause": "same hunk changed",
+                "recommended_strategy": "manual_merge",
+                "per_file": [],
+                "next_steps": ["resolve manually"],
+            },
+            review_markdown="# Merge conflict review\n",
+            skipped_reason=None,
+        ),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "try_abort_merge",
+        lambda _root, *, base_branch: (True, "aborted\n"),
+    )
+    monkeypatch.setattr(
+        cli_mod,
+        "load_conflict_auto_resolve_settings",
+        lambda **_kwargs: ConflictAutoResolveSettings(
+            enabled=True,
+            verify_mode="off",
+            max_attempts=1,
+        ),
+    )
+
+    def _explode(**_kwargs):
+        raise AssertionError("conflict auto-resolve must not run without --auto-resolve-conflicts")
+
+    monkeypatch.setattr(cli_mod, "attempt_auto_resolve_conflict", _explode)
+
+    result = runner.invoke(
+        sylliptor_app,
+        [
+            "forge",
+            "exec",
+            task_id,
+            "--path",
+            os.fspath(repo),
+            "--model",
+            "test-model",
+            "--api-key",
+            "k",
+            "--no-log",
+            "--pr",
+            "--verify",
+            "off",
+        ],
+        env=_env(tmp_path),
+    )
+
+    assert result.exit_code == 1
+    final_plan = _load_json(plan_path)
+    task_record = final_plan["tasks"][0]
+    assert task_record["status"] == "merge_conflict"
+    # The settings allow an attempt; the flag is what withholds it, so the
+    # attempt counter must stay untouched.
+    assert int(task_record.get("conflict_attempts", 0)) == 0
+
+    pointer = _load_json(repo / ".sylliptor" / "current_run.json")
+    report_text = (
+        repo / pointer["run_path"] / "execution" / "reports" / f"{task_id}.md"
+    ).read_text(encoding="utf-8")
+    assert "started no resolver agent" in report_text
+    assert "merge --no-ff" in report_text
+    assert "--auto-resolve-conflicts" in report_text
+
+
 def test_exec_pr_merge_conflict_auto_resolve_success_sets_done(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     repo = tmp_path / "repo"
@@ -4245,6 +4375,7 @@ def test_exec_pr_merge_conflict_auto_resolve_success_sets_done(tmp_path: Path, m
             "--pr",
             "--verify",
             "off",
+            "--auto-resolve-conflicts",
         ],
         env=_env(tmp_path),
     )
@@ -4375,6 +4506,7 @@ def test_exec_pr_merge_conflict_auto_resolve_failure_keeps_merge_conflict_status
             "--pr",
             "--verify",
             "off",
+            "--auto-resolve-conflicts",
         ],
         env=_env(tmp_path),
     )

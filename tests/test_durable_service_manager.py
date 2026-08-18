@@ -7,6 +7,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -18,6 +19,8 @@ from sylliptor_agent_cli.durable_service_manager import (
     SERVICE_METADATA,
     SERVICE_PREVIEW_TOKEN,
     DurableServiceManager,
+    _pid_exists,
+    _terminate_windows_process_tree,
 )
 from sylliptor_agent_cli.sandbox_settings import ShellSandboxSettings
 
@@ -63,7 +66,7 @@ def test_durable_http_service_survives_manager_recreation_and_fresh_stop(
     root = tmp_path / "workspace"
     state_dir = tmp_path / "sessions" / "durable_services"
     root.mkdir()
-    (root / "index.html").write_text("ok\n", encoding="utf-8")
+    (root / "index.html").write_bytes(b"ok\n")
     port = _free_tcp_port()
     manager = _manager(root, state_dir)
     service_id = ""
@@ -136,6 +139,61 @@ def test_tcp_readiness_failure_stops_process_without_leak(tmp_path: Path) -> Non
         manager.stop(started.service_id)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows process-tree regression")
+def test_windows_status_is_non_mutating_and_stop_reaps_shell_child(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    state_dir = tmp_path / "sessions" / "durable_services"
+    child_pid_path = tmp_path / "child.pid"
+    root.mkdir()
+    manager = _manager(root, state_dir)
+    service_id = ""
+    child_pid = 0
+
+    try:
+        started = manager.start(
+            cmd=_python_cmd(
+                "from pathlib import Path; import os, time; "
+                f"Path({str(child_pid_path)!r}).write_text(str(os.getpid()), "
+                "encoding='ascii'); time.sleep(30)"
+            ),
+            cwd=root,
+            readiness={"type": "process_alive", "timeout_s": 2},
+        )
+        service_id = started.service_id
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                child_pid = int(child_pid_path.read_text(encoding="ascii"))
+            except (FileNotFoundError, ValueError):
+                time.sleep(0.02)
+                continue
+            break
+        assert child_pid > 0
+
+        # Repeated status calls exercise the Windows liveness probe. They must
+        # not signal either the shell launcher or its Python child.
+        for _ in range(25):
+            status = manager.status(service_id)
+            assert status["status"] == "running"
+            assert status["alive"] is True
+            assert _pid_exists(child_pid)
+
+        stopped = manager.stop(service_id)
+        assert stopped["stopped"] is True
+        deadline = time.monotonic() + 5
+        while _pid_exists(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _pid_exists(child_pid)
+    finally:
+        if service_id:
+            manager.stop(service_id)
+        if child_pid and _pid_exists(child_pid):
+            _terminate_windows_process_tree(pid=child_pid, timeout_s=1)
+
+
 def test_failed_service_returns_sanitized_startup_error(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     state_dir = tmp_path / "sessions" / "durable_services"
@@ -162,7 +220,7 @@ def test_workspace_preview_serves_loopback_without_docker(tmp_path: Path) -> Non
     root = tmp_path / "workspace"
     state_dir = tmp_path / "sessions" / "durable_services"
     root.mkdir()
-    (root / "index.html").write_text("preview-ok\n", encoding="utf-8")
+    (root / "index.html").write_bytes(b"preview-ok\n")
     manager = DurableServiceManager(
         root=root,
         state_dir=state_dir,
@@ -195,8 +253,13 @@ def test_workspace_preview_rejects_symlink_escape_and_directory_listing(tmp_path
     state_dir = tmp_path / "sessions" / "durable_services"
     root.mkdir()
     outside = tmp_path / "secret.txt"
-    outside.write_text("do-not-serve\n", encoding="utf-8")
-    (root / "escape.txt").symlink_to(outside)
+    outside.write_bytes(b"do-not-serve\n")
+    try:
+        (root / "escape.txt").symlink_to(outside)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege unavailable")
+        raise
     (root / ".env").write_text("secret=value\n", encoding="utf-8")
     (root / "nested").mkdir()
     (root / "escaped-index").mkdir()
@@ -232,7 +295,7 @@ def test_lan_preview_is_dynamically_addressed_and_temporarily_authenticated(
     root = tmp_path / "workspace"
     state_dir = tmp_path / "sessions" / "durable_services"
     root.mkdir()
-    (root / "index.html").write_text("lan-preview-ok\n", encoding="utf-8")
+    (root / "index.html").write_bytes(b"lan-preview-ok\n")
     manager = _manager(root, state_dir)
     service_id = ""
     try:

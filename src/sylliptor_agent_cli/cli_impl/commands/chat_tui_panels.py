@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..tui.forge_status import forge_status_bucket, forge_status_glyph
+
 # Canonical, self-contained helpers (defined directly in these modules — not
 # injected at runtime), so the imports resolve at import time and in tests.
 from .startup import (
@@ -29,7 +31,8 @@ from .startup import (
     _chat_usage_hud_enabled,
     _format_chat_context_percent,
     _format_exact_token_count,
-    _format_usage_cost_for_display,
+    _format_reported_token_total,
+    _format_usage_billing_for_display,
     _format_usage_source_for_display,
     _known_cost_value,
     _refresh_chat_hud_context_cache,
@@ -87,19 +90,26 @@ def _chat_usage_panel_spec(*, session: Any) -> PanelSpec:
     # value column instead.
     model_rows: list[tuple[str, str, str]] = []
     for idx, row in enumerate(rows, start=1):
-        unknown = int(row.get("unknown_cost_count") or 0)
-        cost = _format_usage_cost_for_display(
-            known_cost=_known_cost_value(row), unknown_calls=unknown
-        )
+        cost = _format_usage_billing_for_display(row, compact=True)
         source = _format_usage_source_for_display(row)
-        cache_bits = ""
-        cache_read = int(row.get("cache_read_input_tokens") or 0)
-        cache_write = int(row.get("cache_creation_input_tokens") or 0)
-        if cache_read or cache_write:
-            cache_bits = (
-                f"  cache r:{_format_exact_token_count(cache_read)}"
-                f" w:{_format_exact_token_count(cache_write)}"
-            )
+        cache_read = _format_reported_token_total(
+            row,
+            token_key="cache_read_input_tokens",
+            reported_calls_key="cache_read_reported_calls",
+        )
+        cache_write = _format_reported_token_total(
+            row,
+            token_key="cache_creation_input_tokens",
+            reported_calls_key="cache_creation_reported_calls",
+        )
+        # A provider that reports no cache figures at all says nothing useful by
+        # repeating "not reported" twice on every row; the /usage table still
+        # spells the state out per column.
+        cache_bits = (
+            ""
+            if cache_read == "not reported" and cache_write == "not reported"
+            else f"  cache r:{cache_read} w:{cache_write}"
+        )
         value = (
             f"{row.get('model') or '-'}   "
             f"↓ {_format_exact_token_count(row.get('prompt_tokens'))}  "
@@ -111,31 +121,61 @@ def _chat_usage_panel_spec(*, session: Any) -> PanelSpec:
 
     totals = summary.totals()
     unknown_total = int(totals.get("unknown_cost_calls") or 0)
-    total_cost = _format_usage_cost_for_display(
-        known_cost=_known_cost_value(totals),
-        unknown_calls=unknown_total,
-    )
+    total_cost = _format_usage_billing_for_display(totals)
     # Only paint the cost green when it is fully known; an unknown/partial total
     # stays neutral (never reads as healthy) — matching the classic "[yellow]Total
     # cost is partial" warning.
     cost_tone = (
-        "accent" if (_known_cost_value(totals) is not None and unknown_total == 0) else "plain"
+        "accent"
+        if (
+            _known_cost_value(totals) is not None
+            and unknown_total == 0
+            and int(totals.get("catalog_estimated_cost_calls") or 0) == 0
+        )
+        else "plain"
     )
     total_rows: list[tuple[str, str, str]] = [
-        ("tokens", _format_exact_token_count(totals.get("total_tokens")), "accent"),
-        ("input", _format_exact_token_count(totals.get("prompt_tokens")), "plain"),
-        ("cache read", _format_exact_token_count(totals.get("cache_read_input_tokens")), "plain"),
+        ("processed", _format_exact_token_count(totals.get("total_tokens")), "accent"),
+        ("input total", _format_exact_token_count(totals.get("prompt_tokens")), "plain"),
+        (
+            "input uncached",
+            _format_reported_token_total(
+                totals,
+                token_key="input_tokens_uncached",
+                reported_calls_key="input_tokens_uncached_reported_calls",
+                derived_calls_key="input_tokens_uncached_derived_calls",
+            ),
+            "plain",
+        ),
+        (
+            "cache read",
+            _format_reported_token_total(
+                totals,
+                token_key="cache_read_input_tokens",
+                reported_calls_key="cache_read_reported_calls",
+            ),
+            "plain",
+        ),
         (
             "cache write",
-            _format_exact_token_count(totals.get("cache_creation_input_tokens")),
+            _format_reported_token_total(
+                totals,
+                token_key="cache_creation_input_tokens",
+                reported_calls_key="cache_creation_reported_calls",
+            ),
             "plain",
         ),
         ("output", _format_exact_token_count(totals.get("completion_tokens")), "plain"),
-        ("cost", total_cost, cost_tone),
+        ("billing", total_cost, cost_tone),
+        (
+            "meaning",
+            "processed is cumulative across calls, not current context",
+            "dim",
+        ),
     ]
     if unknown_total > 0:
         total_rows.append(
-            ("note", f"{unknown_total} call(s) unmetered (missing pricing metadata)", "warn")
+            ("note", f"{unknown_total} call(s) have unknown cost (missing pricing)", "warn")
         )
     cache_cost_unknown = int(totals.get("cache_cost_pricing_missing_calls") or 0)
     if cache_cost_unknown > 0:
@@ -174,9 +214,9 @@ def _chat_usage_panel_spec(*, session: Any) -> PanelSpec:
     }
 
 
-# --------------------------------------------------------------- /ctx /context
+# --------------------------------------------------------------- /context (/ctx alias)
 def _chat_context_panel_spec(*, session: Any) -> PanelSpec:
-    """Context-window usage as a panel (mirrors the primary ``/ctx`` table)."""
+    """Context-window usage as a panel (mirrors the primary ``/context`` table)."""
     if not callable(getattr(session, "context_left", None)):
         return {
             "title": "Context Window",
@@ -656,31 +696,21 @@ def _chat_subagent_result_body(*, subagent_name: str, result: dict[str, Any]) ->
 
 
 # --------------------------------------------------------------------- Forge
-# Task-status buckets — kept EXACTLY in sync with cli_common._forge_task_status_counts
-# (the authority for the done/failed/remaining summary) so a row's tone never
-# contradicts the count: done = completed/satisfied states, failure = terminal blocked states, obsolete = 2.
-_FORGE_DONE_STATES = {"done", "already_satisfied"}
-_FORGE_FAILURE_STATES = {
-    "failed",
-    "verify_failed",
-    "candidate_rejected",
-    "changes_requested",
-    "merge_conflict",
-    "blocked_integration",
-    "blocked",
-    "interrupted",
-    "cancelled",
-}
-_FORGE_OBSOLETE_STATES = {"superseded", "invalidated"}
-
-
+# The status→bucket authority lives in ``...tui.forge_status`` so the live swarm
+# table, the ``/show`` plan panel here, and the end-of-run summary can never
+# disagree about whether a task is done, failed, or still running.
 def _forge_status_tone(canonical: str) -> str:
-    """Map a canonical task status to a panel value tone (accent/err/dim/plain)."""
-    if canonical in _FORGE_DONE_STATES:
+    """Map a canonical task status to a panel value tone (accent/err/dim/plain).
+
+    done → accent (green), failed → err (red), obsolete → dim, everything else
+    (running/planned) → plain — the SAME semantic colours the live swarm table
+    uses, so a task reads identically in ``/show`` and while it runs."""
+    bucket = forge_status_bucket(canonical)
+    if bucket == "done":
         return "accent"
-    if canonical in _FORGE_FAILURE_STATES:
+    if bucket == "failed":
         return "err"
-    if canonical in _FORGE_OBSOLETE_STATES:
+    if bucket == "obsolete":
         return "dim"
     return "plain"
 
@@ -728,6 +758,7 @@ def _chat_forge_intro_panel_spec() -> PanelSpec:
         "body": _FORGE_INTRO_BODY,
         "hint": "↵ Enter to begin  ·  Esc to cancel",
         "confirm": "/forge",
+        "accent": "forge",
     }
 
 
@@ -791,9 +822,13 @@ def _chat_forge_plan_panel_spec(*, paths: Any, plan: dict[str, Any]) -> PanelSpe
                 continue
             tid = str(task.get("id") or "-")
             raw_status = str(task.get("status") or "planned")
-            tone = _forge_status_tone(canonical_task_status(raw_status))
+            canonical = canonical_task_status(raw_status)
+            tone = _forge_status_tone(canonical)
+            # Prefix the SAME glyph the live swarm table uses (✓/✗/○/·) so a task
+            # looks identical here and while it executes.
+            glyph = forge_status_glyph(canonical)
             title = str(task.get("title") or "-")
-            value = f"{raw_status}  ·  {title}"
+            value = f"{glyph} {raw_status}  ·  {title}"
             extra: list[str] = []
             deps = task.get("dependencies") or []
             if isinstance(deps, list) and deps:
@@ -815,6 +850,7 @@ def _chat_forge_plan_panel_spec(*, paths: Any, plan: dict[str, Any]) -> PanelSpe
         "title": f"Forge Plan · {getattr(paths, 'run_id', '')}".rstrip(" ·"),
         "sections": sections,
         "hint": "/execute plan to run · /plan markdown for PLAN.md · Esc close",
+        "accent": "forge",
     }
 
 
@@ -847,6 +883,7 @@ def _chat_forge_markdown_panel_spec(*, paths: Any, plan: dict[str, Any]) -> Pane
         "title": f"PLAN.md · {getattr(paths, 'run_id', '')}".rstrip(" ·"),
         "body": body,
         "hint": "↑↓/PgUp/PgDn scroll · Esc close",
+        "accent": "forge",
     }
 
 
@@ -970,7 +1007,12 @@ def _chat_asset_detail_panel_spec(*, cfg: Any, paths: Any, asset_id: str) -> Pan
                     [(str(i + 1), str(fact), "plain") for i, fact in enumerate(facts[:8])],
                 )
             )
-    return {"title": f"Asset · {rec.id}", "sections": sections, "hint": "Esc close"}
+    return {
+        "title": f"Asset · {rec.id}",
+        "sections": sections,
+        "hint": "Esc close",
+        "accent": "forge",
+    }
 
 
 __all__ = [

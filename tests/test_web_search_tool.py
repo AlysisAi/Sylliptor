@@ -343,6 +343,7 @@ def test_web_search_auto_status_supports_qwen37_responses_search(
     ("base_url", "model", "expected_provider"),
     [
         ("https://api.moonshot.cn/v1", "kimi-k2.6", "moonshot_kimi"),
+        ("https://api.moonshot.ai/v1", "kimi-k3", "moonshot_kimi"),
         ("https://open.bigmodel.cn/api/paas/v4/", "glm-4.6", "zhipu_web_search"),
         (
             "https://ark.cn-beijing.volces.com/api/v3",
@@ -391,50 +392,41 @@ def test_web_search_auto_status_uses_cohere_hosted_connector(
     assert runtime.provider == "cohere_web_search"
 
 
-def test_is_openrouter_base_url_recognizes_sylliptor_trial_proxy() -> None:
-    # The hosted Sylliptor MiMo (Xiaomi) trial proxy forwards to OpenRouter, so it
-    # must be treated as an OpenRouter base_url for web search — mirroring the
-    # transport-layer special-case in openai_compat/provider_limits.
+def test_is_openrouter_base_url_no_longer_matches_sylliptor_proxy() -> None:
+    # The Sylliptor hosted proxy forwarded to OpenRouter only during the retired
+    # MiMo (Xiaomi) trial; it now forwards to DeepSeek, which has no native web
+    # search — so the proxy must NOT classify as an OpenRouter base_url anymore.
     assert (
         _is_openrouter_base_url("https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1")
-        is True
+        is False
     )
-    assert _is_openrouter_base_url(DEFAULT_PROXY_BASE_URL) is True
+    assert _is_openrouter_base_url(DEFAULT_PROXY_BASE_URL) is False
     assert _is_openrouter_base_url("https://openrouter.ai/api/v1") is True
-    # A bare *.supabase.co host without the /functions/v1/llm path marker must NOT
-    # match, so unrelated Supabase apps are never misclassified as OpenRouter.
     assert _is_openrouter_base_url("https://example.supabase.co/rest/v1") is False
     assert _is_openrouter_base_url("https://example.supabase.co/") is False
     assert _is_openrouter_base_url("https://api.openai.com/v1") is False
     assert _is_openrouter_base_url(None) is False
 
 
-def test_web_search_status_ready_for_sylliptor_mimo_trial_proxy(
+def test_web_search_no_longer_treats_sylliptor_proxy_as_openrouter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Mirrors the hosted MiMo trial profile: the Supabase proxy base_url, the
-    # friendly "mimo" model, and the openrouter_web adapter pinned by the preset.
+    # The hosted proxy now forwards to DeepSeek (no native web search), so the
+    # MiMo-era OpenRouter routing must not activate for the proxy base_url.
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_ADAPTER", raising=False)
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_BASE_URL", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_API_KEY", raising=False)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
 
     cfg = AppConfig(
-        model="mimo",
+        model="deepseek-v4-flash",
         base_url=DEFAULT_PROXY_BASE_URL,
         web_search_mode="auto",
-        web_search_adapter="openrouter_web",
     )
-    status = resolve_web_search_runtime_status(cfg=cfg, api_key="trial-access-key")
-    runtime = resolve_web_search_runtime(cfg=cfg, api_key="trial-access-key", strict=True)
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="slk_test-key")
 
-    assert status.registration_ready is True
-    assert status.provider == "openrouter_web"
-    assert "explicit adapter selected openrouter_web" in status.notes
-    assert runtime is not None
-    assert runtime.provider == "openrouter_web"
-    assert runtime.base_url == DEFAULT_PROXY_BASE_URL
-    assert runtime.model == "mimo"
+    assert status.provider != "openrouter_web"
 
 
 def test_web_search_openrouter_floors_short_timeout(
@@ -450,13 +442,13 @@ def test_web_search_openrouter_floors_short_timeout(
 
     floored = resolve_web_search_runtime(
         cfg=AppConfig(
-            model="mimo",
-            base_url=DEFAULT_PROXY_BASE_URL,
+            model="qwen-max",
+            base_url="https://openrouter.ai/api/v1",
             web_search_mode="auto",
             web_search_adapter="openrouter_web",
             web_search_timeout_s=20.0,
         ),
-        api_key="trial-access-key",
+        api_key="or-key",
         strict=True,
     )
     assert floored is not None
@@ -465,37 +457,37 @@ def test_web_search_openrouter_floors_short_timeout(
 
     generous = resolve_web_search_runtime(
         cfg=AppConfig(
-            model="mimo",
-            base_url=DEFAULT_PROXY_BASE_URL,
+            model="qwen-max",
+            base_url="https://openrouter.ai/api/v1",
             web_search_mode="auto",
             web_search_adapter="openrouter_web",
             web_search_timeout_s=120.0,
         ),
-        api_key="trial-access-key",
+        api_key="or-key",
         strict=True,
     )
     assert generous is not None
     assert generous.timeout_s == 120.0
 
 
-def test_web_search_auto_status_selects_openrouter_for_mimo_trial_proxy(
+def test_web_search_auto_status_never_selects_openrouter_for_sylliptor_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Even with no explicit adapter, auto mode must pick the OpenRouter web backend
-    # for the trial proxy (no other provider predicate matches the supabase host).
+    # Auto mode used to pick the OpenRouter backend for the proxy during the
+    # MiMo trial. The proxy now forwards to DeepSeek, so no OpenRouter routing.
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
     monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_ADAPTER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_API_KEY", raising=False)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
 
     cfg = AppConfig(
-        model="mimo",
+        model="deepseek-v4-flash",
         base_url=DEFAULT_PROXY_BASE_URL,
         web_search_mode="auto",
     )
-    status = resolve_web_search_runtime_status(cfg=cfg, api_key="trial-access-key")
+    status = resolve_web_search_runtime_status(cfg=cfg, api_key="slk_test-key")
 
-    assert status.registration_ready is True
-    assert status.provider == "openrouter_web"
+    assert status.provider != "openrouter_web"
 
 
 def test_web_search_explicit_openai_override_uses_only_openai(
@@ -2171,3 +2163,317 @@ def test_resolve_web_search_runtime_strict_mode_rejects_missing_requirements(
 
     with pytest.raises(WebSearchError, match=message):
         resolve_web_search_runtime(cfg=cfg, api_key=api_key, strict=True)
+
+
+def _fake_ddgs_result(query: str) -> dict[str, object]:
+    return {
+        "query": query,
+        "answer": "",
+        "citations": [],
+        "sources": [{"url": "https://docs.example.com/keyless", "title": "Keyless result"}],
+        "queries": [query],
+        "model": None,
+        "backend": "ddgs",
+        "allowed_domains": [],
+        "external_web_access": True,
+        "response_id": None,
+        "sources_truncated": False,
+    }
+
+
+def test_web_search_auto_prefers_working_fallback_for_rest_of_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After the native backend hard-fails once, later calls in the same session
+    go straight to the external backend that served the result instead of paying
+    a doomed native round-trip on every call."""
+
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    web_search_module._reset_web_search_session_state_for_tests()
+
+    native_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        native_calls.append(str(request.url.host))
+        return httpx.Response(
+            400,
+            json={"error": {"message": "native web search backend is unavailable"}},
+        )
+
+    ddgs_calls: list[str] = []
+
+    def _fake_ddgs_search(**kwargs: object) -> dict[str, object]:
+        query = str(kwargs["query"])
+        ddgs_calls.append(query)
+        return _fake_ddgs_result(query)
+
+    monkeypatch.setattr(web_search_module, "ddgs_search", _fake_ddgs_search)
+
+    first = web_search(
+        query="first query",
+        cfg=_configured_cfg(),
+        api_key="main-key",
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+        session_id="session-sticky-fallback",
+    )
+    assert first["backend"] == "ddgs"
+    native_calls_after_first = len(native_calls)
+    assert native_calls_after_first >= 1
+
+    from sylliptor_agent_cli.provider_telemetry import last_web_search_summary
+
+    summary = last_web_search_summary()
+    assert summary is not None
+    assert summary["fallback_occurred"] is True
+
+    second = web_search(
+        query="second query",
+        cfg=_configured_cfg(),
+        api_key="main-key",
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+        session_id="session-sticky-fallback",
+    )
+    assert second["backend"] == "ddgs"
+    assert len(native_calls) == native_calls_after_first  # no new native attempt
+    assert ddgs_calls == ["first query", "second query"]
+
+    summary = last_web_search_summary()
+    assert summary is not None
+    assert summary["fallback_occurred"] is True
+
+    web_search_module._reset_web_search_session_state_for_tests()
+
+
+def test_web_search_auto_fallback_preference_is_scoped_to_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    web_search_module._reset_web_search_session_state_for_tests()
+
+    native_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        native_calls.append(str(request.url.host))
+        return httpx.Response(400, json={"error": {"message": "native backend down"}})
+
+    monkeypatch.setattr(
+        web_search_module,
+        "ddgs_search",
+        lambda **kwargs: _fake_ddgs_result(str(kwargs["query"])),
+    )
+
+    web_search(
+        query="first query",
+        cfg=_configured_cfg(),
+        api_key="main-key",
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+        session_id="session-a",
+    )
+    assert len(native_calls) == 1
+
+    # A different session still gives the configured native backend a chance.
+    web_search(
+        query="other session query",
+        cfg=_configured_cfg(),
+        api_key="main-key",
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+        session_id="session-b",
+    )
+    assert len(native_calls) == 2
+
+    web_search_module._reset_web_search_session_state_for_tests()
+
+
+def test_web_search_auto_retries_native_after_preferred_fallback_stops_working(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    web_search_module._reset_web_search_session_state_for_tests()
+
+    native_calls: list[str] = []
+    native_healthy = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        native_calls.append(str(request.url.host))
+        if not native_healthy:
+            return httpx.Response(400, json={"error": {"message": "native backend down"}})
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_native_recovered",
+                "model": "main-model",
+                "output_text": "Native answer.",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "action": {
+                            "sources": [{"url": "https://docs.example.com/native", "title": "N"}]
+                        },
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Native answer."}],
+                    },
+                ],
+            },
+        )
+
+    ddgs_healthy = True
+
+    def _fake_ddgs_search(**kwargs: object) -> dict[str, object]:
+        if not ddgs_healthy:
+            raise DdgsSearchError("keyless (ddgs) search failed: rate limited")
+        return _fake_ddgs_result(str(kwargs["query"]))
+
+    monkeypatch.setattr(web_search_module, "ddgs_search", _fake_ddgs_search)
+
+    first = web_search(
+        query="first query",
+        cfg=_configured_cfg(),
+        api_key="main-key",
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+        session_id="session-recovering",
+    )
+    assert first["backend"] == "ddgs"
+    assert len(native_calls) == 1
+
+    # The remembered fallback breaks while the native backend has recovered:
+    # the preference is dropped and the native backend serves the call again.
+    ddgs_healthy = False
+    native_healthy = True
+    second = web_search(
+        query="second query",
+        cfg=_configured_cfg(),
+        api_key="main-key",
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+        session_id="session-recovering",
+    )
+    assert second["backend"] == "openai_responses"
+    assert len(native_calls) == 2
+
+    web_search_module._reset_web_search_session_state_for_tests()
+
+
+def test_web_search_auto_fallback_preference_is_dropped_when_config_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fixing the web-search configuration mid-session must take effect: the
+    remembered fallback shadows only the exact native runtime that failed."""
+
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_KEYLESS", raising=False)
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    web_search_module._reset_web_search_session_state_for_tests()
+
+    native_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        native_calls.append(str(request.url.path))
+        if request.url.path.startswith("/v1"):
+            return httpx.Response(400, json={"error": {"message": "native backend down"}})
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_fixed_endpoint",
+                "model": "better-model",
+                "output_text": "Native answer from the fixed endpoint.",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "action": {
+                            "sources": [{"url": "https://docs.example.com/fixed", "title": "F"}]
+                        },
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Native answer from the fixed endpoint.",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+
+    monkeypatch.setattr(
+        web_search_module,
+        "ddgs_search",
+        lambda **kwargs: _fake_ddgs_result(str(kwargs["query"])),
+    )
+
+    first = web_search(
+        query="first query",
+        cfg=_configured_cfg(),
+        api_key="main-key",
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+        session_id="session-config-fix",
+    )
+    assert first["backend"] == "ddgs"
+    assert native_calls == ["/v1/responses"]
+
+    # The user reconfigures the endpoint in the same session: the remembered
+    # fallback no longer applies, so the fixed native backend serves the call.
+    fixed_cfg = AppConfig(
+        model="better-model",
+        base_url="https://api.openai.com/v2",
+        web_search_mode="auto",
+        web_search_base_url="https://api.openai.com/v2",
+    )
+    second = web_search(
+        query="second query",
+        cfg=fixed_cfg,
+        api_key="main-key",
+        transport=httpx.MockTransport(handler),
+        resolver=_public_resolver,
+        session_id="session-config-fix",
+    )
+    assert second["backend"] == "openai_responses"
+    assert len(native_calls) == 2
+
+    web_search_module._reset_web_search_session_state_for_tests()
+
+
+def test_web_search_native_mode_failure_names_the_config_remedy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SYLLIPTOR_WEB_SEARCH_PROVIDER", raising=False)
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily-key")
+    seen_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(str(request.url.host))
+        if request.url.host != "api.openai.com":
+            raise AssertionError("native mode must not call external backends")
+        return httpx.Response(400, json={"error": {"message": "gateway rejected the request"}})
+
+    with pytest.raises(WebSearchError) as excinfo:
+        web_search(
+            query="failing docs",
+            cfg=_configured_cfg(mode="native"),
+            api_key="main-key",
+            transport=httpx.MockTransport(handler),
+            resolver=_public_resolver,
+        )
+
+    assert seen_hosts == ["api.openai.com"]
+    message = str(excinfo.value)
+    assert "web_search_mode" in message
+    assert "'auto' or 'external'" in message
+    assert "gateway rejected the request" in message

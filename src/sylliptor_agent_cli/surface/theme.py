@@ -7,7 +7,6 @@ import json
 import os
 import re
 import select
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -380,26 +379,6 @@ def _theme_from_windows_terminal_settings() -> TerminalTheme | None:
     return None
 
 
-def _theme_from_apple_terminal_appearance() -> TerminalTheme | None:
-    if os.environ.get("TERM_PROGRAM") != "Apple_Terminal":
-        return None
-    try:
-        result = subprocess.run(
-            ["defaults", "read", "-g", "AppleInterfaceStyle"],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=0.5,
-        )
-    except Exception:
-        return None
-    if result.returncode == 0 and result.stdout.strip().lower() == "dark":
-        _theme_debug("Apple_Terminal appearance -> dark")
-        return "dark"
-    _theme_debug("Apple_Terminal appearance -> light")
-    return "light"
-
-
 def detect_terminal_theme_if_available(stream: Any | None = None) -> TerminalTheme | None:
     """Detect the terminal background without guessing when detection fails."""
     for env_name in ("SYLLIPTOR_THEME", "OWL_THEME"):
@@ -428,7 +407,14 @@ def detect_terminal_theme_if_available(stream: Any | None = None) -> TerminalThe
     if detected:
         return detected
 
-    return _theme_from_apple_terminal_appearance()
+    # macOS's global light/dark appearance does not describe a Terminal.app
+    # window's active profile. A light desktop can host a dark terminal (and
+    # vice versa), so using AppleInterfaceStyle here can select the exact
+    # opposite foreground palette. Unknown is safer: callers then inherit the
+    # terminal's own foreground and background colours.
+    if os.environ.get("TERM_PROGRAM") == "Apple_Terminal":
+        _theme_debug("Apple_Terminal profile background unavailable -> none")
+    return None
 
 
 def detect_terminal_theme(stream: Any | None = None) -> TerminalTheme:
@@ -458,7 +444,6 @@ __all__ = [
     "_load_jsonc_file",
     "_strip_json_comments",
     "_is_wsl",
-    "_theme_from_apple_terminal_appearance",
     "_theme_from_colorfgbg",
     "_theme_from_hex_background",
     "_theme_from_osc11",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
@@ -21,6 +22,7 @@ from .conflict_auto_resolver import (
 )
 from .error_text import sanitize_optional_error_summary
 from .execution_shared import safe_task_file_component
+from .failed_task_evidence import preserve_failed_task_evidence
 from .failure_category import FailureCategory, failure_category_value
 from .forge import (
     ForgeError,
@@ -33,6 +35,7 @@ from .forge import (
     save_plan,
     set_task_status,
 )
+from .forge_events import emit_task_status
 from .git_ops import (
     GitOpsError,
     branch_exists,
@@ -114,6 +117,7 @@ from .swarm_worker import (
     run_task_worker,
 )
 from .verification_command_analysis import is_benign_non_execution_reason
+from .verification_repair import TASK_STATUS_COMPLETED_UNVERIFIED
 from .verify_gate import ResolvedVerifyCommands, resolve_verify_command_selection
 from .workspace_binding import WorkspaceBinding
 
@@ -267,7 +271,13 @@ def _candidate_branch_name(*, run_id: str, batch_label: str) -> str:
     # Keep candidate refs short and flat so snapshot-backed candidate repos can
     # create refs/heads/<branch>.lock reliably on Windows temp/worktree paths.
     safe_run_id = safe_task_file_component(run_id)
-    run_token = safe_run_id.rsplit("_", 1)[-1][-8:] or safe_run_id[-8:]
+    if len(safe_run_id) <= 16:
+        # Counter-based run ids (e.g. "017-wayland") are already short, and the
+        # counter is the unique part — keep the whole id so tokens never collide
+        # between runs that share a word.
+        run_token = safe_run_id.strip("-_") or safe_run_id
+    else:
+        run_token = safe_run_id.rsplit("_", 1)[-1][-8:] or safe_run_id[-8:]
     safe_batch_label = safe_task_file_component(batch_label)
     batch_token = safe_batch_label.replace("batch_", "b").replace("_", "")
     return f"syc-{run_token}-{batch_token}"
@@ -759,6 +769,9 @@ def _compute_swarm_run_outcome(
     only: str | None,
     max_tasks: int | None,
     dry_run: bool,
+    interrupted: bool = False,
+    interrupted_task_ids: tuple[str, ...] = (),
+    review_merge_strategy: bool = False,
 ) -> SwarmRunOutcome:
     counts = _task_status_counts(plan)
     statuses = list(counts)
@@ -787,8 +800,11 @@ def _compute_swarm_run_outcome(
         status = "failed"
         reason_codes.append("task_failed_or_blocked")
 
+    acceptable_end_statuses = set(_NON_EXECUTABLE_SUCCESS_STATUSES)
+    if review_merge_strategy:
+        acceptable_end_statuses.add("ready_for_merge")
     is_full_run = only is None and max_tasks is None and not dry_run
-    if is_full_run and any(item not in _NON_EXECUTABLE_SUCCESS_STATUSES for item in statuses):
+    if is_full_run and any(item not in acceptable_end_statuses for item in statuses):
         exit_code = 1
         status = "incomplete"
         reason_codes.append("tasks_remaining")
@@ -830,6 +846,17 @@ def _compute_swarm_run_outcome(
     elif worker_verification_warnings and verification_status == "not_run":
         verification_status = "failed_tolerated_by_warn_policy"
         reason_codes.append("worker_verification_failed_warn_mode")
+
+    if review_merge_strategy and counts.get("ready_for_merge") and status == "clean":
+        status = "review_pending"
+        reason_codes.append("merge_review_pending")
+
+    if interrupted:
+        status = "interrupted"
+        exit_code = 130
+        reason_codes.append("cancelled_cooperatively")
+        if interrupted_task_ids:
+            reason_codes.append("tasks_interrupted")
 
     clean = status == "clean" and exit_code == 0 and verification_status in {"passed", "not_run"}
     return SwarmRunOutcome(
@@ -1087,6 +1114,9 @@ def _parse_only(only: str | None) -> set[str] | None:
 def _mark_status(paths: RunPaths, plan: dict[str, Any], task_id: str, status: str) -> None:
     set_task_status(plan, task_id, status)
     save_plan(paths, plan)
+    # Every swarm task transition goes through here, so this is the one place that has
+    # to report task lifecycle events. No-op unless a --machine command is running.
+    emit_task_status(task_id, status, {"run_id": paths.run_id, "source": "swarm"})
 
 
 def _bump_attempt(paths: RunPaths, plan: dict[str, Any], task_id: str) -> None:
@@ -1118,6 +1148,7 @@ def _mark_remaining_tasks_blocked_by_integration(
     blocked: list[str] = []
     terminal_statuses = {
         "done",
+        TASK_STATUS_COMPLETED_UNVERIFIED,
         "failed",
         "verify_failed",
         "candidate_rejected",
@@ -1244,7 +1275,7 @@ def _reject_ready_batch_items(
     reason: str,
     merge_outcomes: list[MergeOutcome],
     execution_skipped: dict[str, str],
-    cleanup_nonmerged_workspace: Callable[[str, PreparedTaskWorkspace | None], None],
+    cleanup_nonmerged_workspace: Callable[..., None],
 ) -> bool:
     task_attempt_resolutions = False
     changed = False
@@ -1284,7 +1315,12 @@ def _reject_ready_batch_items(
                 report_path_raw=item.report_path_raw,
                 record=item.remote_record,
             )
-        cleanup_nonmerged_workspace(item.task_id, item.prepared_workspace)
+        cleanup_nonmerged_workspace(
+            item.task_id,
+            item.prepared_workspace,
+            reason=reason,
+            result=item.result,
+        )
         outcome = MergeOutcome(
             task_id=item.task_id,
             branch=item.branch,
@@ -1445,7 +1481,7 @@ def _merge_ready_batch_items_into_base(
     ready_items: list[ReadyBatchItem],
     merge_outcomes: list[MergeOutcome],
     trace: Callable[..., None],
-    cleanup_nonmerged_workspace: Callable[[str, PreparedTaskWorkspace | None], None],
+    cleanup_nonmerged_workspace: Callable[..., None],
 ) -> tuple[list[str], list[str], list[str], bool, bool]:
     merged_task_ids: list[str] = []
     remote_task_ids: list[str] = []
@@ -1534,7 +1570,12 @@ def _merge_ready_batch_items_into_base(
             reason="worker result was not accepted because merge/apply failed",
         )
         if canonical_task_status(str(item.task.get("status") or "")) == "failed":
-            cleanup_nonmerged_workspace(item.task_id, item.prepared_workspace)
+            cleanup_nonmerged_workspace(
+                item.task_id,
+                item.prepared_workspace,
+                reason=f"merge/apply failed: {outcome.error or 'unknown error'}",
+                result=item.result,
+            )
         trace(
             "merge.error",
             f"Merge failed: {outcome.error or 'unknown error'}",
@@ -1862,6 +1903,8 @@ def run_swarm(
     branch_exists_fn: Callable[[Path, str], bool] = branch_exists,
     current_branch_fn: Callable[[Path], str] = current_branch,
     run_mutation_guard: RunMutationGuard | _CompositeMutationGuard | None = None,
+    cancellation_event: threading.Event | None = None,
+    merge_strategy: str = "auto",
 ) -> int:
     owns_run_mutation_guard = run_mutation_guard is None
     if run_mutation_guard is None:
@@ -1963,6 +2006,16 @@ def run_swarm(
             msg = "swarm requires --mode auto (non-interactive)"
             _trace("swarm.error", msg)
             raise ForgeError(msg)
+        if merge_strategy not in {"auto", "review"}:
+            msg = f"swarm merge_strategy must be auto or review, not {merge_strategy!r}"
+            _trace("swarm.error", msg)
+            raise ForgeError(msg)
+        if merge_strategy == "review":
+            _trace(
+                "merge.lifecycle",
+                "Review merge strategy: completed tasks stay ready_for_merge with "
+                "preserved worktrees; nothing merges into the base branch.",
+            )
 
         selected_base = (
             base_branch.strip() if base_branch else backend.default_base_branch(paths.root)
@@ -2008,6 +2061,11 @@ def run_swarm(
             str(item).strip() for item in (plan.get("requirements") or []) if str(item).strip()
         ]
         executed: list[str] = []
+        interrupted_tasks: set[str] = set()
+
+        def _cancellation_requested() -> bool:
+            return cancellation_event is not None and cancellation_event.is_set()
+
         merge_outcomes: list[MergeOutcome] = []
         integration_results: list[IntegrationGateResult] = []
         replanning_results: list[ReplanAttemptResult] = []
@@ -2147,12 +2205,85 @@ def run_swarm(
             _raise_for_replanned_execution_ready(recorded)
             return recorded
 
+        def _preserve_task_evidence(
+            *,
+            task_id: str,
+            prepared_workspace: PreparedTaskWorkspace,
+            reason: str,
+            result: Any | None = None,
+        ) -> None:
+            """Copy the task's diff and verification log into the run's artifacts.
+
+            Best effort by contract: a capture problem is traced as a warning and never
+            stops the cleanup it precedes.
+            """
+            verify_artifact = getattr(result, "verify_artifact_path", None) if result else None
+            verify_path = Path(verify_artifact) if verify_artifact else None
+            if verify_path is not None and not verify_path.is_absolute():
+                verify_path = paths.root / verify_path
+            if verify_path is None or not verify_path.exists():
+                verify_path = (
+                    paths.execution_verify_dir / f"{safe_task_file_component(task_id)}.txt"
+                )
+            try:
+                evidence = preserve_failed_task_evidence(
+                    execution_dir=paths.execution_dir,
+                    task_id=task_id,
+                    worktree_path=prepared_workspace.worktree_path,
+                    base_branch=prepared_workspace.base_branch,
+                    branch=prepared_workspace.branch,
+                    reason=reason,
+                    verification_log_path=verify_path if verify_path.exists() else None,
+                    verification_summary=(
+                        str(getattr(result, "verify_summary", "") or "") if result else None
+                    ),
+                    extra={
+                        "keep_worktrees": bool(keep_worktrees),
+                        "failure_reason": (
+                            str(getattr(result, "failure_reason", "") or "") if result else ""
+                        ),
+                    },
+                )
+            except Exception as e:  # noqa: BLE001
+                _trace(
+                    "worktree.error",
+                    f"Could not preserve task evidence before cleanup: {e}",
+                    task_id=task_id,
+                )
+                return
+            if evidence.errors:
+                _trace(
+                    "worktree.error",
+                    "Task evidence capture was incomplete: " + "; ".join(evidence.errors),
+                    task_id=task_id,
+                )
+            if evidence.directory is not None:
+                _trace(
+                    "worktree.lifecycle",
+                    f"Preserved task evidence in {_repo_rel(paths.root, evidence.directory)} "
+                    "before workspace cleanup.",
+                    task_id=task_id,
+                    verbosity="full",
+                )
+
         def _cleanup_nonmerged_workspace(
             task_id: str,
             prepared_workspace: PreparedTaskWorkspace | None,
+            *,
+            reason: str = "",
+            result: Any | None = None,
         ) -> None:
             if prepared_workspace is None:
                 return
+            # Evidence FIRST, unconditionally, and before anything can remove the
+            # worktree: an uncommitted edit or an uncommitted new file exists nowhere
+            # else, so cleanup would otherwise be the only record that it ever did.
+            _preserve_task_evidence(
+                task_id=task_id,
+                prepared_workspace=prepared_workspace,
+                reason=reason or "failed task workspace cleanup",
+                result=result,
+            )
             cleanup_errors = backend.cleanup_failed_task_workspace(
                 root=paths.root,
                 prepared_workspace=prepared_workspace,
@@ -2187,7 +2318,7 @@ def run_swarm(
         pending_promoted_knowledge = False
         pending_task_attempt_resolutions = False
         pending_ready_items: list[ReadyBatchItem] = []
-        if not dry_run:
+        if not dry_run and not _cancellation_requested() and merge_strategy == "auto":
             pending_ready: list[dict[str, Any]] = []
             for task in plan.get("tasks") or []:
                 status = canonical_task_status(str(task.get("status") or ""))
@@ -2328,6 +2459,7 @@ def run_swarm(
                         _cleanup_nonmerged_workspace(
                             task_id=task_id,
                             prepared_workspace=prepared_workspace,
+                            reason="strict remote sync blocked acceptance",
                         )
                         _trace(
                             "remote.error",
@@ -2375,6 +2507,7 @@ def run_swarm(
                         _cleanup_nonmerged_workspace(
                             task_id=task_id,
                             prepared_workspace=prepared_workspace,
+                            reason=f"review failed: {e}",
                         )
                         _trace("review.error", f"Review failed: {e}", task_id=task_id)
                         continue
@@ -2400,6 +2533,7 @@ def run_swarm(
                         _cleanup_nonmerged_workspace(
                             task_id=task_id,
                             prepared_workspace=prepared_workspace,
+                            reason="changes requested by review gate",
                         )
                         _trace("review.error", "Changes requested by review gate.", task_id=task_id)
                         continue
@@ -2427,6 +2561,7 @@ def run_swarm(
                     _cleanup_nonmerged_workspace(
                         task_id=task_id,
                         prepared_workspace=prepared_workspace,
+                        reason="task branch does not exist",
                     )
                     outcome = MergeOutcome(
                         task_id=task_id,
@@ -2865,6 +3000,11 @@ def run_swarm(
                             ].selection,
                             trace_sink=sink,
                             trace_level=trace_level_normalized,
+                            **(
+                                {"cancellation_event": cancellation_event}
+                                if cancellation_event is not None
+                                else {}
+                            ),
                         ): str(task.get("id") or "")
                         for task in batch_tasks
                     }
@@ -2944,6 +3084,8 @@ def run_swarm(
                                 _cleanup_nonmerged_workspace(
                                     task_id=result.task_id,
                                     prepared_workspace=prepared_workspaces.get(result.task_id),
+                                    reason=execution_skipped.get(result.task_id, ""),
+                                    result=result,
                                 )
                                 _trace("verify.error", reason, task_id=result.task_id)
                                 continue
@@ -2977,6 +3119,8 @@ def run_swarm(
                                 _cleanup_nonmerged_workspace(
                                     task_id=result.task_id,
                                     prepared_workspace=prepared_workspaces.get(result.task_id),
+                                    reason=execution_skipped.get(result.task_id, ""),
+                                    result=result,
                                 )
                                 _trace(
                                     "worker.error",
@@ -3049,6 +3193,8 @@ def run_swarm(
                                 _cleanup_nonmerged_workspace(
                                     task_id=result.task_id,
                                     prepared_workspace=prepared_workspaces.get(result.task_id),
+                                    reason=execution_skipped.get(result.task_id, ""),
+                                    result=result,
                                 )
                                 _trace(
                                     "review.error",
@@ -3089,6 +3235,8 @@ def run_swarm(
                                 _cleanup_nonmerged_workspace(
                                     task_id=result.task_id,
                                     prepared_workspace=prepared_workspaces.get(result.task_id),
+                                    reason=execution_skipped.get(result.task_id, ""),
+                                    result=result,
                                 )
                                 _trace(
                                     "review.error", f"Review failed: {e}", task_id=result.task_id
@@ -3117,6 +3265,8 @@ def run_swarm(
                                 _cleanup_nonmerged_workspace(
                                     task_id=result.task_id,
                                     prepared_workspace=prepared_workspaces.get(result.task_id),
+                                    reason=execution_skipped.get(result.task_id, ""),
+                                    result=result,
                                 )
                                 _trace(
                                     "review.error",
@@ -3130,8 +3280,62 @@ def run_swarm(
                                 task_id=result.task_id,
                                 verbosity="full",
                             )
+                        if result.verification_unavailable:
+                            # Nothing merges without a check behind it, and nothing is
+                            # cleaned up either: the commit, its branch and its worktree
+                            # stay exactly where they are for a human to review.
+                            _mark_status(
+                                paths,
+                                plan,
+                                result.task_id,
+                                TASK_STATUS_COMPLETED_UNVERIFIED,
+                            )
+                            batch_task_attempt_resolutions = (
+                                _resolve_worker_task_attempt_acceptance(
+                                    paths,
+                                    plan=plan,
+                                    task_id=result.task_id,
+                                    acceptance_state="accepted",
+                                    summary=(
+                                        "Worker result was kept as an unverified completion: "
+                                        "no authoritative verification command exists for this "
+                                        "workspace, so nothing was merged."
+                                    ),
+                                    result=result,
+                                )
+                                or batch_task_attempt_resolutions
+                            )
+                            _mark_worker_knowledge_capture_skipped(
+                                paths,
+                                task_id=result.task_id,
+                                result=result,
+                                reason=(
+                                    "worker result completed without any authoritative verification"
+                                ),
+                            )
+                            _trace(
+                                "verify.warning",
+                                (
+                                    "No authoritative verification command exists; task kept "
+                                    "as completed_unverified and left unmerged for review."
+                                ),
+                                task_id=result.task_id,
+                            )
+                            continue
                         _mark_status(paths, plan, result.task_id, "ready_for_merge")
                     else:
+                        if result.interrupted:
+                            interrupted_tasks.add(result.task_id)
+                            _mark_status(paths, plan, result.task_id, "interrupted")
+                            execution_skipped[result.task_id] = (
+                                result.error or "interrupted by cooperative cancellation"
+                            )
+                            _trace(
+                                "worker.lifecycle",
+                                "Worker interrupted; preserving task workspace for review.",
+                                task_id=result.task_id,
+                            )
+                            continue
                         noop_verification_failed = (
                             result.failure_reason == "noop_verification_failed"
                         )
@@ -3188,6 +3392,8 @@ def run_swarm(
                         _cleanup_nonmerged_workspace(
                             task_id=result.task_id,
                             prepared_workspace=prepared_workspaces.get(result.task_id),
+                            reason=execution_skipped.get(result.task_id, ""),
+                            result=result,
                         )
                         if (
                             result.verify_failed
@@ -3343,6 +3549,8 @@ def run_swarm(
                             _cleanup_nonmerged_workspace(
                                 task_id=result.task_id,
                                 prepared_workspace=prepared_workspaces.get(result.task_id),
+                                reason=execution_skipped.get(result.task_id, ""),
+                                result=result,
                             )
                             _trace(
                                 "remote.error",
@@ -3366,6 +3574,18 @@ def run_swarm(
                             remote_record=remote_record,
                         )
                     )
+
+                if merge_strategy == "review":
+                    reviewable = [item.task_id for item in ready_items]
+                    if reviewable:
+                        _trace(
+                            "merge.lifecycle",
+                            "Review merge strategy: leaving task(s) ready_for_merge "
+                            f"for host review: {', '.join(reviewable)}.",
+                        )
+                    if _cancellation_requested():
+                        interrupted_tasks.update(reviewable)
+                    continue
 
                 deferred_current_items = [
                     item
@@ -3690,6 +3910,8 @@ def run_swarm(
         if (
             tolerated_integration_failures
             and not integration_blocked
+            and not _cancellation_requested()
+            and merge_strategy == "auto"
             and effective_integration_mode != "off"
             and final_gate_task_ids
         ):
@@ -3739,6 +3961,9 @@ def run_swarm(
             only=only,
             max_tasks=max_tasks,
             dry_run=False,
+            interrupted=_cancellation_requested() or bool(interrupted_tasks),
+            interrupted_task_ids=tuple(sorted(interrupted_tasks)),
+            review_merge_strategy=merge_strategy == "review",
         )
         _write_swarm_summary_json(
             paths=paths,

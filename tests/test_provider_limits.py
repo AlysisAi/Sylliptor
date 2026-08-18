@@ -7,6 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 import pytest
 
+import sylliptor_agent_cli.llm.openai_compat as openai_compat_mod
+import sylliptor_agent_cli.llm.provider_limits as provider_limits_mod
+import sylliptor_agent_cli.model_registry as model_registry_mod
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.llm.openai_compat import LLMError, OpenAICompatClient
 from sylliptor_agent_cli.llm.provider_limits import (
@@ -80,6 +83,12 @@ def test_qwen_aliases_fold_to_single_canonical_key() -> None:
         ("https://openrouter.ai/api/v1", "openai/gpt-5", "openrouter"),
         ("https://api.openai.com/v1", "gpt-5", "openai"),
         ("https://api.deepseek.com/v1", "deepseek-chat", "deepseek"),
+        ("https://api.z.ai/api/coding/paas/v4", "glm-5.3", "zai_coding_plan"),
+        (
+            "https://integrate.api.nvidia.com/v1",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "nvidia",
+        ),
         (
             "https://generativelanguage.googleapis.com/v1beta/openai",
             "gemini-3.1-pro-preview",
@@ -87,11 +96,12 @@ def test_qwen_aliases_fold_to_single_canonical_key() -> None:
         ),
         ("https://api.mistral.ai/v1", "mistral-large-latest", "mistral"),
         ("https://api.x.ai/v1", "grok-4", "xai"),
-        # Hosted Sylliptor MiMo trial proxy forwards to OpenRouter/Xiaomi.
+        ("https://api.kimi.com/coding/v1", "k3", "kimi-code"),
+        # The Sylliptor hosted proxy (llm Edge Function) forwards to DeepSeek.
         (
             "https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1",
-            "mimo-v2.5-pro",
-            "openrouter",
+            "deepseek-v4-flash",
+            "deepseek",
         ),
     ],
 )
@@ -116,6 +126,52 @@ def test_resolve_model_provider_key_keeps_openrouter_transport_provider() -> Non
     )
 
     assert provider_key == "openrouter"
+
+
+def test_zai_general_api_is_not_misclassified_as_coding_plan() -> None:
+    assert (
+        best_effort_provider_key(
+            base_url="https://api.z.ai/api/paas/v4",
+            model="glm-5.3",
+        )
+        != "zai_coding_plan"
+    )
+    assert (
+        best_effort_provider_key(
+            base_url="https://api.z.ai/api/coding/paas/v40",
+            model="glm-5.3",
+        )
+        != "zai_coding_plan"
+    )
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        ("https://integrate.api.nvidia.com/v1", "nvidia"),
+        ("https://api.z.ai/api/coding/paas/v4", "zai_coding_plan"),
+        (
+            "https://api.z.ai/api/coding/paas/v4/chat/completions",
+            "zai_coding_plan",
+        ),
+        ("https://api.z.ai/api/paas/v4", None),
+        ("https://api.z.ai/", None),
+    ],
+)
+def test_provider_url_classification_agrees_across_all_call_sites(
+    base_url: str,
+    expected: str | None,
+) -> None:
+    results = (
+        openai_compat_mod._provider_key_from_base_url(base_url),
+        provider_limits_mod._provider_key_from_base_url(base_url),
+        model_registry_mod._provider_key_from_base_url(base_url),
+    )
+
+    if expected is None:
+        assert all(result != "zai_coding_plan" for result in results)
+    else:
+        assert results == (expected, expected, expected)
 
 
 def test_concurrency_cap_respected_for_parallel_requests() -> None:

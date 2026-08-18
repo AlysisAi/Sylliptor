@@ -14,12 +14,38 @@ from rich.markup import escape as escape_rich_markup
 from ...compaction.conversation_compactor import CompactionState
 from ...error_text import sanitize_error_text_for_output
 from ...failure_category import exit_code_for_failure
+from ...personas import (
+    DEFAULT_PERSONA,
+    get_persona,
+    is_persona_name,
+    next_persona,
+    normalize_persona,
+    persona_modes_enabled,
+    persona_overlay_messages,
+    persona_overlay_user_messages,
+    resolve_persona_exec_mode,
+)
 from ...run_outcome import INFRASTRUCTURE_FAILURE_EXIT_CODE
 from ...runtime_kind import RuntimeKind
 from ...surface.console import safe_plain_error
 from .state import _ChatExecutionRequest, _ChatPlanModeState, _ForgeChatState
 
 _PROTECTED_GLOBAL_NAMES: set[str] = set()
+_PATCHABLE_DEPENDENCY_GLOBAL_NAMES: set[str] = {
+    "create_session",
+    "load_config",
+    "_chat_trace_level",
+    "_current_branch_label",
+    "_guarded_workspace_prompt_text",
+    "_is_git_dirty",
+    "_is_narrow_terminal",
+    "_is_non_interactive_terminal",
+    "_maybe_make_chat_prompt_session",
+    "_run_inline_option_selector",
+    "_select_guarded_workspace_action_interactive",
+    "paste_clipboard_image",
+    "typer",
+}
 
 
 def _sync_cli_globals(cli_mod: Any) -> None:
@@ -29,7 +55,15 @@ def _sync_cli_globals(cli_mod: Any) -> None:
             if callable(local_value):
                 _PROTECTED_GLOBAL_NAMES.add(local_name)
     for name, value in cli_mod.__dict__.items():
-        if name.startswith("__") or name in _PROTECTED_GLOBAL_NAMES:
+        if name.startswith("__"):
+            continue
+        if name in _PROTECTED_GLOBAL_NAMES and name not in _PATCHABLE_DEPENDENCY_GLOBAL_NAMES:
+            continue
+        if (
+            name in _PROTECTED_GLOBAL_NAMES
+            and module_globals.get(name) is value
+            and name in _PATCHABLE_DEPENDENCY_GLOBAL_NAMES
+        ):
             continue
         module_globals[name] = value
 
@@ -59,7 +93,8 @@ def _raw_benchmark_profile_requested(*, benchmark: bool) -> bool:
     if benchmark:
         return True
     profile = os.environ.get("SYLLIPTOR_RUN_PROFILE", "")
-    return profile.strip().lower() in _RAW_BENCHMARK_PROFILE_NAMES
+    normalized = profile.strip().lower()
+    return normalized in _RAW_BENCHMARK_PROFILE_NAMES
 
 
 def _apply_raw_benchmark_profile(cfg: Any) -> None:
@@ -75,9 +110,25 @@ def _apply_raw_benchmark_profile(cfg: Any) -> None:
 
 _SUBAGENT_DEFAULT_TASKS: dict[str, str] = {
     "explorer": "Summarize the repo structure, key entry points, and what to inspect next.",
-    "reviewer": "Review current git diff/status and report risks, regressions, and missing tests.",
+    "implementer": (
+        "Implement the current clearly scoped request, then report changed files and verification."
+    ),
+    "frontend-engineer": (
+        "Implement the current user-facing web request with responsive, accessible states and "
+        "report verification and visual-QA evidence."
+    ),
+    "debugger": (
+        "Reproduce the reported failure, isolate its root cause, and identify a regression check."
+    ),
+    "code-reviewer": (
+        "Review current git diff/status and report risks, regressions, and missing tests."
+    ),
     "test-strategist": (
         "Propose the smallest high-value test plan for the current changes and edge cases."
+    ),
+    "visual-designer": (
+        "Create the raster asset required by the current request and report its path, metadata, "
+        "technical validation, and visual-QA status."
     ),
 }
 
@@ -104,13 +155,15 @@ _STRICT_SHELL_SANDBOX_UNAVAILABLE_PREFIX = (
 
 
 def _strip_rich_markup(text: Any) -> str:
-    """Best-effort strip of Rich console markup for plain transcript display."""
+    """Best-effort strip of Rich console markup (``[red]…[/red]``) for plain
+    transcript display. The resume status strings carry colour tags meant for the
+    classic Rich console; in the TUI they render literally, so flatten them."""
     raw = str(text or "")
     try:
         from rich.text import Text
 
         return Text.from_markup(raw).plain
-    except Exception:
+    except Exception:  # noqa: BLE001 - malformed markup → fall back to a regex
         return re.sub(r"\[/?[a-zA-Z][^\]]*\]", "", raw)
 
 
@@ -127,6 +180,17 @@ def _sync_tui_session_state(
 ) -> None:
     if include_exec_mode:
         tui_state.exec_mode = str(getattr(session, "mode", "") or "").strip()
+        # A persona model swap changes the live client, not cfg.model — the
+        # footer should show what will actually answer.
+        live_model = str(getattr(getattr(session, "client", None), "model", "") or "")
+        if live_model:
+            tui_state.model_name = live_model
+    # Empty when the feature is off so the footer renders no persona half.
+    tui_state.persona = (
+        normalize_persona(getattr(session, "persona", "code"), _session_persona_registry(session))
+        if persona_modes_enabled(getattr(session, "cfg", None))
+        else ""
+    )
     try:
         usage_enabled = globals().get("_chat_usage_hud_enabled")
         if callable(usage_enabled):
@@ -179,8 +243,9 @@ def _is_deferrable_subagent_command(text: str) -> bool:
     """True for an explicit ``/subagent <name> <task>`` that spawns a real run.
 
     False for the bare form (the TUI picker intercepts it), for the instant
-    ``on|off|status`` toggles, and for ``/subagent <name>`` with no task (which
-    only prints usage) — none of those block, so they stay on the fast path.
+    ``on|off|status`` toggles, and for ``/subagent <name>`` with no task
+    (answered inline — a one-line hint in the TUI, the usage panel in the
+    classic CLI) — none of those block, so they stay on the fast path.
     """
     parts = str(text or "").strip().split()
     if len(parts) < 3 or parts[0].lower() != "/subagent":
@@ -331,33 +396,6 @@ _PLAN_MODE_EXECUTE_NOW_RE = re.compile(
 )
 _PLAN_MODE_NUMBERED_STEP_RE = re.compile(r"^\s{0,3}\d+[.)]\s+\S")
 _PLAN_MODE_TASK_PREVIEW_CHARS = 96
-
-
-def _apply_interactive_chat_step_budget_floor(
-    effective: Any,
-    *,
-    max_steps_provided: bool,
-) -> None:
-    if max_steps_provided:
-        return
-    policy = str(getattr(effective, "step_budget_policy", "adaptive") or "adaptive").strip().lower()
-    if policy != "adaptive":
-        return
-    default_chat_max_steps = int(globals().get("DEFAULT_CHAT_MAX_STEPS", 50) or 50)
-    try:
-        current_max_steps = int(getattr(effective, "max_steps", 0) or 0)
-    except (TypeError, ValueError):
-        current_max_steps = 0
-    if current_max_steps < default_chat_max_steps:
-        effective.max_steps = default_chat_max_steps
-
-
-def _parameter_value_was_provided(value: Any, source: Any) -> bool:
-    if value is None:
-        return False
-    if source is None:
-        return True
-    return source is not ParameterSource.DEFAULT
 
 
 def _chat_plan_mode_latest_task(plan_mode_state: Any) -> str | None:
@@ -980,6 +1018,357 @@ def _apply_chat_effective_mode(
         emit_mode_changed(next_mode)
 
 
+def _apply_chat_persona(
+    *,
+    session: Any,
+    persona: str,
+    source: str = "user",
+) -> str:
+    """Apply a persona to the live session; returns the effective exec mode.
+
+    The persona is a convention: it selects a default execution mode through
+    the clamp rule (lower freely, never raise above the user's chosen mode)
+    and everything enforcement-related still flows through
+    ``_apply_chat_effective_mode`` -> ``build_tools`` guards. Personas whose
+    default keeps the user's mode (code/debug) restore any mode narrowed by a
+    previous persona (architect/ask).
+    """
+    from ...agent.prompt_context import refresh_session_environment_context_message
+
+    definition = get_persona(persona, _session_persona_registry(session))
+    current_mode = str(getattr(session, "mode", "review") or "review").strip().lower()
+    restore = getattr(session, "persona_restore_mode", None)
+    restore_active = restore is not None
+    base_mode = str(restore or current_mode).strip().lower()
+    base_globs = (
+        getattr(session, "persona_restore_write_globs", None)
+        if restore_active
+        else getattr(session, "allow_write_globs", None)
+    )
+    target_mode = resolve_persona_exec_mode(definition, base_mode)
+    target_persona_globs = (
+        list(definition.allow_write_globs) if definition.allow_write_globs else None
+    )
+    swap = _resolve_persona_model_swap(session, definition)
+    prepared_client: Any | None = None
+    prepared_client_key: tuple[str, float] | None = None
+    if swap is not None:
+        swap_role, swap_model, swap_temperature = swap
+        try:
+            prepared_client, prepared_client_key = _prepare_session_client_for_persona(
+                session=session,
+                role=swap_role,
+                model=swap_model,
+                temperature=swap_temperature,
+            )
+        except Exception as exc:
+            store_obj = getattr(session, "store", None)
+            append_fail = getattr(store_obj, "append", None)
+            if callable(append_fail):
+                append_fail(
+                    "persona_model_swap_failed",
+                    {
+                        "persona": definition.name,
+                        "model": swap_model,
+                        "error": sanitize_error_text_for_output(exc),
+                    },
+                )
+            # A configured persona model is part of the switch contract. Do
+            # not silently land the persona on a different client, and do not
+            # mutate any persona state after strict-policy rejection.
+            raise
+    narrows = bool(definition.default_exec_mode) or bool(definition.allow_write_globs)
+    session.persona = definition.name
+    if narrows:
+        session.persona_restore_mode = base_mode
+        session.persona_restore_write_globs = list(base_globs) if base_globs is not None else None
+    else:
+        session.persona_restore_mode = None
+        session.persona_restore_write_globs = None
+    current_persona_globs = getattr(session, "persona_allow_write_globs", None)
+    scope_changed = (current_persona_globs or None) != (target_persona_globs or None)
+    # Preserve the user's base scope and give the gate both constraints. It
+    # evaluates them conjunctively instead of trying to synthesize glob
+    # intersections (which is incomplete for general glob languages).
+    session.allow_write_globs = list(base_globs) if base_globs is not None else None
+    session.persona_allow_write_globs = target_persona_globs
+    if prepared_client is not None and prepared_client_key is not None:
+        session.client = prepared_client
+        session.persona_client_key = prepared_client_key
+    if target_mode != current_mode or scope_changed:
+        # The rebuild inside _apply_chat_effective_mode re-reads the session's
+        # allow_write_globs, so a scope-only change still needs it.
+        _apply_chat_effective_mode(
+            session=session,
+            next_mode=target_mode,
+            persist_default_mode=False,
+        )
+    else:
+        refresh_session_environment_context_message(session)
+    surface = getattr(session, "surface", None)
+    emit_persona_changed = getattr(surface, "emit_persona_changed", None)
+    if callable(emit_persona_changed):
+        emit_persona_changed(definition.name, target_mode, source)
+    store = getattr(session, "store", None)
+    append = getattr(store, "append", None)
+    if callable(append):
+        append(
+            "persona_switch_applied",
+            {
+                "persona": definition.name,
+                "effective_mode": target_mode,
+                "source": source,
+                "model": str(getattr(getattr(session, "client", None), "model", "") or ""),
+            },
+        )
+    return target_mode
+
+
+def _apply_startup_persona(*, session: Any, console: Any = None) -> None:
+    """Apply a non-default ``default_persona`` once at chat startup.
+
+    Session creation records ``session.persona`` from config but deliberately
+    leaves the execution mode alone (agent core stays persona-agnostic); the
+    chat loop owns applying the persona's default mode, exactly as it owns
+    every later transition.
+    """
+    cfg = getattr(session, "cfg", None)
+    if not persona_modes_enabled(cfg):
+        return
+    for warning in getattr(session, "persona_registry_warnings", ()) or ():
+        if console is not None:
+            console.print(f"[yellow]Custom persona:[/yellow] {warning}")
+    registry = _session_persona_registry(session)
+    configured = str(getattr(cfg, "default_persona", "code") or "code").strip().lower()
+    persona = normalize_persona(getattr(session, "persona", "code"), registry)
+    if (
+        console is not None
+        and configured != DEFAULT_PERSONA
+        and normalize_persona(configured, registry) == DEFAULT_PERSONA
+    ):
+        console.print(f"[yellow]Unknown persona {configured!r}; starting as code.[/yellow]")
+    if persona == "code" or getattr(session, "persona_restore_mode", None) is not None:
+        return
+    try:
+        _apply_chat_persona(session=session, persona=persona, source="config")
+    except Exception as exc:  # noqa: BLE001
+        if console is not None:
+            console.print(f"[red]Failed to apply default persona {persona}:[/red] {exc}")
+        return
+    if console is not None:
+        console.print(f"[dim]Persona: {persona}[/dim]")
+
+
+def _session_persona_registry(session: Any) -> Any:
+    return getattr(session, "persona_registry", None)
+
+
+def _resolve_persona_model_swap(session: Any, definition: Any) -> tuple[str, str, float] | None:
+    """Resolved ``(role, model, temperature)`` when the client must change.
+
+    Resolution is entirely the existing chain (persona_models -> role ->
+    resolve_model_for_role precedence). With no role/persona model config the
+    chain lands on ``cfg.model`` for every persona, so default installs never
+    swap — sticky persona models activate only when the user configured them.
+    """
+    cfg = getattr(session, "cfg", None)
+    client_obj = getattr(session, "client", None)
+    if client_obj is None:
+        # No live client (bare test/session shims): nothing to swap.
+        return None
+    from ...config import resolve_role_temperature
+    from ...model_router import resolve_model_for_role
+    from ...personas import resolve_persona_model_role
+
+    role = resolve_persona_model_role(cfg, definition.name, _session_persona_registry(session))
+    target = str(resolve_model_for_role(cfg=cfg, role=role, plan=None) or "").strip()
+    temperature = float(resolve_role_temperature(cfg, role=role))
+    if not target:
+        return None
+    target_key = (target, temperature)
+    current_key = getattr(session, "persona_client_key", None)
+    if current_key is None:
+        current_model = str(getattr(client_obj, "model", "") or "").strip()
+        current_temperature = getattr(client_obj, "temperature", None)
+        try:
+            current_key = (current_model, float(current_temperature))
+        except (TypeError, ValueError):
+            # Bare test/session shims may not expose temperature. Preserve the
+            # historical no-op when the model itself is unchanged; real
+            # sessions always record persona_client_key.
+            if target == current_model:
+                return None
+    if target_key == current_key:
+        return None
+    return role, target, temperature
+
+
+def _prepare_session_client_for_persona(
+    *, session: Any, role: str, model: str, temperature: float
+) -> tuple[Any, tuple[str, float]]:
+    """Validate and construct a persona client without changing live state.
+
+    Strict metadata policy applies to every model that can become active, not
+    only the model present at session creation. Clients are cached by the
+    resolved inputs that affect their behavior, so roles sharing a model but
+    using different temperatures cannot contaminate one another.
+    """
+    from ...agent.session import _make_session_llm_client
+    from ...config import (
+        resolve_llm_enable_thinking,
+        resolve_llm_reasoning_effort,
+        resolve_llm_timeout_s,
+        resolve_prompt_cache_key,
+        resolve_prompt_cache_retention,
+    )
+    from ...model_metadata_policy import (
+        ActiveModelRef,
+        evaluate_active_model_metadata_policy,
+    )
+    from ...model_registry import ModelRegistry
+
+    cfg = getattr(session, "cfg", None)
+    registry = getattr(session, "model_registry", None)
+    if registry is None:
+        registry = ModelRegistry(
+            cfg=cfg,
+            api_key=str(getattr(session, "api_key", "") or ""),
+        )
+    policy_result = evaluate_active_model_metadata_policy(
+        cfg=cfg,
+        registry=registry,
+        active_models=[ActiveModelRef(role=role, model_name=model)],
+    )
+    surface = getattr(session, "surface", None)
+    emit_warning = getattr(surface, "on_warning", None)
+    for warning_message in policy_result.warning_messages:
+        if callable(emit_warning):
+            emit_warning(warning_message)
+
+    cache = getattr(session, "persona_client_cache", None)
+    if cache is None:
+        cache = {}
+        session.persona_client_cache = cache
+    current_key = getattr(session, "persona_client_key", None)
+    current_client = getattr(session, "client", None)
+    if current_key is not None and current_client is not None:
+        cache.setdefault(current_key, current_client)
+    target_key = (model, temperature)
+    client = cache.get(target_key)
+    if client is None:
+        client = _make_session_llm_client(
+            cfg=cfg,
+            api_key=str(getattr(session, "api_key", "") or ""),
+            model=model,
+            timeout_s=resolve_llm_timeout_s(cfg),
+            temperature=temperature,
+            prompt_cache_key=resolve_prompt_cache_key(cfg),
+            prompt_cache_retention=resolve_prompt_cache_retention(cfg),
+            prompt_cache_namespace=None,
+            enable_thinking=resolve_llm_enable_thinking(cfg),
+            reasoning_effort=resolve_llm_reasoning_effort(cfg),
+            session_id=None,
+        )
+        cache[target_key] = client
+    return client, target_key
+
+
+def _load_resumed_persona(session: Any) -> str | None:
+    """Last applied persona from the resumed session's log, or None.
+
+    Resume restores the *base* execution mode from ``session_start`` and
+    leaves the persona at the config default; the ``persona_switch_applied``
+    events (user switches, Tab cycles, approved switch_mode proposals, and
+    the startup application) carry the rest. Last-wins scan, same pattern as
+    the chat-resume runtime-settings loaders.
+    """
+    from ...session_store import read_session_events
+    from ..commands.chat_resume_helpers import _resolve_session_log_path
+
+    if not persona_modes_enabled(getattr(session, "cfg", None)):
+        return None
+    try:
+        log_path = _resolve_session_log_path(session)
+    except Exception:  # noqa: BLE001 - resume must not fail on persona lookup
+        return None
+    if log_path is None:
+        return None
+    persona: str | None = None
+    try:
+        for event in read_session_events(log_path):
+            if str(event.get("type") or "") != "persona_switch_applied":
+                continue
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                candidate = str(payload.get("persona") or "").strip().lower()
+                if candidate:
+                    persona = candidate
+    except Exception:  # noqa: BLE001
+        return None
+    return persona
+
+
+def _reapply_resumed_persona(*, session: Any, console: Any = None) -> None:
+    """Re-apply the resumed session's last persona after the state swap.
+
+    ``session_start`` restores the user's base mode; re-applying the persona
+    on top reproduces the narrowed mode, write scope, restore point, and
+    model role exactly as the clamp would have left them. The no-op Code
+    persona needs no application — the restored base state already is the
+    correct state.
+    """
+    persona = _load_resumed_persona(session)
+    if not persona:
+        return
+    normalized = normalize_persona(persona, _session_persona_registry(session))
+    if (
+        normalized == DEFAULT_PERSONA
+        and normalize_persona(getattr(session, "persona", DEFAULT_PERSONA)) == DEFAULT_PERSONA
+    ):
+        return
+    try:
+        _apply_chat_persona(session=session, persona=normalized, source="resume")
+    except Exception as exc:  # noqa: BLE001
+        if console is not None:
+            console.print(f"[yellow]Could not restore persona {normalized}:[/yellow] {exc}")
+        return
+    if console is not None and normalized != DEFAULT_PERSONA:
+        console.print(f"[dim]Persona restored: {normalized}[/dim]")
+
+
+def _clear_persona_restore(session: Any) -> None:
+    """An explicit user /mode <exec> redefines the base: restore any
+    persona-narrowed write scope first, then drop the restore point."""
+    if getattr(session, "persona_restore_mode", None) is not None:
+        session.allow_write_globs = getattr(session, "persona_restore_write_globs", None)
+    session.persona_allow_write_globs = None
+    session.persona_restore_mode = None
+    session.persona_restore_write_globs = None
+
+
+def _apply_pending_persona_switch(*, session: Any, console: Any = None) -> None:
+    """Apply a user-approved switch_mode proposal after the turn ends.
+
+    The tool only parks the approved target in the session's
+    ``PersonaSwitchState``; applying it here keeps the tool surface stable for
+    the whole turn and reuses the exact primitive user switches go through.
+    """
+    state = getattr(session, "persona_switch_state", None)
+    pending = getattr(state, "pending", None)
+    if not pending:
+        return
+    state.pending = None
+    persona, _reason = pending
+    try:
+        _apply_chat_persona(session=session, persona=persona, source="model")
+    except Exception as exc:  # noqa: BLE001
+        if console is not None:
+            console.print(f"[red]Failed to apply approved persona switch:[/red] {exc}")
+        return
+    if console is not None:
+        console.print(f"[dim]Persona → {persona}[/dim]")
+
+
 class _ConfigReloadRequiresRestart(RuntimeError):
     """Raised when a saved config cannot be applied to the current session topology."""
 
@@ -1083,7 +1472,6 @@ def _reload_snapshot_value(value: Any) -> Any:
 def _reload_clients(session: Any) -> list[Any]:
     candidates = [
         getattr(session, "client", None),
-        getattr(session, "router_client", None),
         getattr(
             getattr(session, "conversation_compactor", None),
             "compactor_client",
@@ -1158,9 +1546,7 @@ def _apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> No
 
 
 def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConfig) -> None:
-    from ...agent.routing import _resolve_routing_mode
     from ...config import (
-        AppConfig,
         ConfigError,
         clone_cfg,
         resolve_api_key,
@@ -1190,31 +1576,15 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
     from ...model_router import (
         ROLE_CODING,
         ROLE_COMPACTOR,
-        ROLE_ROUTER,
         resolve_model_for_role,
     )
     from ...profile_presets import find_preset_for_profile
     from ...profiles import get_active_profile, resolve_effective_base_url
     from ...provider_auth import create_provider_auth
 
-    next_routing_mode = _resolve_routing_mode(cfg)
-    current_routing_mode = str(getattr(session, "routing_mode", "") or "").strip().lower()
-    if current_routing_mode not in {"auto", "code_only"}:
-        current_cfg = getattr(session, "cfg", None)
-        current_routing_mode = (
-            _resolve_routing_mode(current_cfg)
-            if isinstance(current_cfg, AppConfig)
-            else next_routing_mode
-        )
-    if current_routing_mode != next_routing_mode:
-        raise _ConfigReloadRequiresRestart(
-            "Routing mode changed from "
-            f"{current_routing_mode!r} to {next_routing_mode!r}; restart chat to rebuild "
-            "the router client safely."
-        )
-
     session.cfg = clone_cfg(cfg)
-    session.routing_mode = next_routing_mode
+    # Deprecated no-op field: kept in step with config for observability only.
+    session.routing_mode = str(getattr(cfg, "routing_mode", "auto") or "auto")
     fixed_step_override = getattr(session, "chat_turn_fixed_override", None)
     session.max_steps = int(
         fixed_step_override if fixed_step_override is not None else session.cfg.max_steps
@@ -1433,21 +1803,6 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
             temperature=coding_temperature,
         )
 
-    router_client = getattr(session, "router_client", None)
-    if next_routing_mode == "auto" and router_client is not None:
-        router_model = resolve_model_for_role(
-            cfg=session.cfg,
-            role=ROLE_ROUTER,
-            plan=None,
-        )
-        _apply_client_config(
-            router_client,
-            model=router_model,
-            role=ROLE_ROUTER,
-            temperature=0.0,
-            disable_reasoning=True,
-        )
-
     compactor = getattr(session, "conversation_compactor", None)
     compactor_client = getattr(compactor, "compactor_client", None)
     if compactor_client is not None:
@@ -1563,6 +1918,59 @@ def _handle_forge_chat_command(*args: Any, **kwargs: Any) -> Any:
 
     _commands._sync_command_globals(globals())
     return _commands._handle_forge_chat_command(*args, **kwargs)
+
+
+def _finalize_deferred_forge_execution(
+    *,
+    surface: Any,
+    token: Any,
+    paths: Any,
+    forge_state: Any,
+    captured: str,
+    completed: bool,
+) -> None:
+    """Close out a TUI ``/execute plan`` worker run honestly.
+
+    A cancelled token does NOT mean the run died: ``run_swarm`` never receives
+    the token, so a soft-interrupt at any point still lets the swarm run to its
+    natural end and the handler return normally (``completed``). The old logic
+    keyed everything on the token alone, which silently discarded a finished
+    run's entire completion output and froze the view as "Interrupted." — the
+    user never learned the run had actually completed.
+    """
+    if surface is None:
+        return
+    cancelled = bool(getattr(token, "is_cancelled", False))
+    run_attempted = bool(getattr(forge_state, "swarm_run_attempted", False))
+    out = str(captured or "").rstrip("\n")
+    if out and (completed or not cancelled):
+        try:
+            surface.append_system(out)
+        except Exception:
+            pass
+    try:
+        if cancelled and not completed:
+            interrupt_forge = getattr(surface, "interrupt_forge", None)
+            if callable(interrupt_forge):
+                interrupt_forge()
+        elif completed and not run_attempted:
+            # The handler rejected the execute before run_swarm (empty plan, no
+            # execution-ready tasks, guard failure): say so instead of freezing
+            # a "Finished · 0 done · N remaining" table for a run that never
+            # started (the rejection reason is in the note above).
+            surface.end_forge(
+                summary="Execution did not start — see the note above.",
+                paths=paths,
+            )
+        elif cancelled:
+            # The Esc-time UI handler already froze the view as "Interrupted."
+            # and cleared the surface's run paths; re-arm them so the frozen
+            # table reflects the statuses the finished swarm actually wrote.
+            surface.end_forge(paths=paths)
+        else:
+            surface.end_forge()
+    except Exception:
+        pass
 
 
 def _planner_workspace_context_for_session(*, session: Any) -> dict[str, Any] | None:
@@ -1792,6 +2200,14 @@ def chat(
         help="Queue image path(s) for the next message. Repeat --image for multiple files.",
     ),
     mode: Mode | None = typer.Option(None, "--mode", help="Mode override."),
+    persona: str | None = typer.Option(
+        None,
+        "--persona",
+        help=(
+            "Persona for this run: code, architect, ask, debug, or a custom "
+            "persona from .sylliptor_personas."
+        ),
+    ),
     model: str | None = typer.Option(None, "--model", help="Model override."),
     base_url: str | None = typer.Option(None, "--base-url", help="Base URL override."),
     temperature: float | None = typer.Option(None, "--temperature", help="Sampling temperature."),
@@ -1854,6 +2270,7 @@ def chat(
     requested_path = path
     cfg = load_config()
     effective = clone_cfg(cfg)
+    current_ctx = get_current_context(silent=True)
     if base_url is not None:
         effective.base_url = base_url
     if model is not None:
@@ -1871,7 +2288,11 @@ def chat(
     max_steps_provided = max_steps is not None
     if current_ctx is not None:
         stream_provided = stream_source is not None and stream_source is not ParameterSource.DEFAULT
-        max_steps_provided = _parameter_value_was_provided(max_steps, max_steps_source)
+        max_steps_provided = (
+            max_steps is not None
+            and max_steps_source is not None
+            and max_steps_source is not ParameterSource.DEFAULT
+        )
     if stream_provided and stream is not None:
         effective.stream = stream
     else:
@@ -1885,9 +2306,9 @@ def chat(
     effective_mode = (mode.value if mode else effective.default_mode) or "review"
     delegated_execution = effective.execution.backend == "delegated"
 
-    # Keep the interactive shell available while a selected subscription is
-    # disconnected, so the user can authenticate without falling back to the
-    # classic prompt.
+    # The interactive shell is useful even before a selected subscription can
+    # serve model calls. Resolve that state separately from model configuration so
+    # a disconnected account does not send users back to the classic CLI.
     tui_enabled_now = False
     if not non_interactive:
         try:
@@ -2020,6 +2441,16 @@ def chat(
                 console=console,
             )
             return
+        if persona is not None:
+            # --persona for this invocation: becomes the session's starting
+            # persona; the startup machinery applies clamp, scope, overlay,
+            # and sticky model exactly like an interactive switch. Unknown
+            # names (builtin or custom-from-workspace) are rejected after
+            # session creation, where the custom registry is loaded.
+            if not persona_modes_enabled(effective):
+                console.print("[red]Persona modes are disabled.[/red]")
+                raise typer.Exit(code=2)
+            effective.default_persona = str(persona).strip().lower()
         # Full-screen TUI is the default interactive chat surface. Users can
         # set SYLLIPTOR_TUI=0 to fall back to the classic prompt loop below.
         if not non_interactive:
@@ -2057,9 +2488,9 @@ def chat(
                     workspace=_workspace,
                     branch=_branch,
                     exec_mode=str(effective_mode or "").strip(),
-                    # Approval gate must default OFF (= classic behaviour): otherwise
-                    # TuiSurface.request_approval auto-approves everything and the
-                    # execution mode (safe/review prompts) is silently bypassed.
+                    # Approval prompts must default to "ask" (= classic behaviour):
+                    # otherwise TuiSurface.request_approval auto-allows everything
+                    # and the execution mode (safe/review prompts) is silently bypassed.
                     # --yes opts into approve-everything; Shift+Tab toggles it live.
                     auto_approve=bool(yes),
                 )
@@ -2091,7 +2522,8 @@ def chat(
                     )
                     built._sylliptor_tui_interactive = True
                     _set_chat_usage_hud_enabled(built, _resolve_usage_hud_default(effective))
-                    _sync_tui_session_state(_tui_state, built)
+                    _apply_startup_persona(session=built, console=None)
+                    _sync_tui_session_state(_tui_state, built, include_exec_mode=True)
                     _refresh_chat_hud_context_cache(built)
                     _tui_box["session"] = built
                     return built
@@ -2100,13 +2532,26 @@ def chat(
                     built = _tui_box.get("session")
                     if built is None:
                         return
+                    # An approved switch_mode proposal applies at turn end; the
+                    # classic loop does this in its turn-finally, and this hook
+                    # is the TUI's turn-end equivalent. Silent on success (the
+                    # badge flip is the feedback, matching Tab cycling); the
+                    # badge sync below picks up the new persona + mode.
+                    try:
+                        _apply_pending_persona_switch(session=built, console=None)
+                    except Exception:  # noqa: BLE001 - HUD refresh must still run
+                        pass
+                    _sync_tui_session_state(_tui_state, built, include_exec_mode=True)
                     from ..commands.startup import (
                         _chat_context_percent_value,
+                        _format_usage_billing_for_display,
                         _known_cost_value,
                     )
 
                     try:
                         _refresh_chat_hud_context_cache(built)
+                        # The footer reports provider-usable input capacity so
+                        # its "context" label agrees with /context and /status.
                         pct = _chat_context_percent_value(built)
                         if pct is not None:
                             _tui_state.context_pct = float(pct)
@@ -2129,8 +2574,12 @@ def chat(
                                 # Nothing metered and nothing unmetered yet → $0.0000.
                                 _tui_state.cost_usd = 0.0
                             _tui_state.cost_unknown_calls = unknown_calls
+                            _tui_state.cost_display = _format_usage_billing_for_display(
+                                totals, compact=True
+                            )
                     except Exception:
                         pass
+                    _sync_tui_session_state(_tui_state, built)
 
                 def _tui_config_flow_factory() -> Any:
                     # Built fresh each time bare /config opens, so it always reflects
@@ -2259,6 +2708,30 @@ def chat(
                                 surface.begin_forge(paths, token)
                             except Exception:
                                 pass
+
+                        def _report_sink(report_md: Any) -> None:
+                            # Render the run's completion answer as a real assistant
+                            # markdown block. Deliberately NOT gated on the token: a
+                            # soft-interrupt cannot stop run_swarm, so by the time the
+                            # handler emits this report the swarm ran to its natural
+                            # end — dropping the answer would hide a finished run. The
+                            # interrupt is acknowledged with a preface instead.
+                            if surface is None:
+                                return
+                            text = str(report_md or "").strip()
+                            if not text:
+                                return
+                            if bool(getattr(token, "is_cancelled", False)):
+                                text = (
+                                    "_The interrupt could not stop the running swarm; "
+                                    "it ran to completion._\n\n" + text
+                                )
+                            try:
+                                surface.append_note(text, role="assistant")
+                            except Exception:
+                                pass
+
+                        completed = False
                         try:
                             _handle_chat_command(
                                 input_text=command_text,
@@ -2269,7 +2742,9 @@ def chat(
                                 forge_state=_tui_forge_state,
                                 plan_mode_state=_tui_plan_state,
                                 plan_mode_escape_supported=False,
+                                forge_execution_report_sink=_report_sink,
                             )
+                            completed = True
                         except Exception as _exec_exc:  # noqa: BLE001
                             if surface is not None:
                                 try:
@@ -2277,23 +2752,14 @@ def chat(
                                 except Exception:
                                     pass
                         finally:
-                            cancelled = bool(getattr(token, "is_cancelled", False))
-                            if surface is not None:
-                                out = buf.getvalue().rstrip("\n")
-                                if out and not cancelled:
-                                    try:
-                                        surface.append_system(out)
-                                    except Exception:
-                                        pass
-                                try:
-                                    if cancelled:
-                                        interrupt_forge = getattr(surface, "interrupt_forge", None)
-                                        if callable(interrupt_forge):
-                                            interrupt_forge()
-                                    else:
-                                        surface.end_forge()
-                                except Exception:
-                                    pass
+                            _finalize_deferred_forge_execution(
+                                surface=surface,
+                                token=token,
+                                paths=paths,
+                                forge_state=_tui_forge_state,
+                                captured=buf.getvalue(),
+                                completed=completed,
+                            )
 
                     return _run
 
@@ -2310,13 +2776,44 @@ def chat(
                             return
                         surface = getattr(built, "surface", None)
                         buf = _io.StringIO()
+                        # Capture UNWRAPPED: the planmeta renderer reconstructs
+                        # logical notes from the captured "│ …" bar lines and
+                        # re-wraps them at the live panel width, so wrapping here
+                        # would only mangle notes into bar-less continuation
+                        # fragments (soft_wrap also stops Rich character-folding
+                        # a single giant token, e.g. a provider error blob).
                         cap = _RichConsole(
                             file=buf,
                             force_terminal=False,
                             no_color=True,
                             highlight=False,
-                            width=max(20, min(int(width or 100), 120)),
+                            soft_wrap=True,
+                            width=4096,
                         )
+
+                        def _planner_reply_sink(message: Any, questions: Any) -> None:
+                            # Render the planner reply as a real assistant markdown
+                            # block (styled like any chat turn) instead of dumping the
+                            # captured, flat "Planner: …" console text as a system line.
+                            if surface is None or getattr(token, "is_cancelled", False):
+                                return
+                            text = str(message or "").strip()
+                            asks = [str(q).strip() for q in (questions or []) if str(q).strip()]
+                            parts: list[str] = []
+                            if text:
+                                parts.append(text)
+                            if asks:
+                                if parts:
+                                    parts.append("")
+                                parts.append("**A few questions to sharpen the plan:**")
+                                parts.extend(f"- {q}" for q in asks)
+                            body = "\n".join(parts).strip()
+                            if body:
+                                try:
+                                    surface.append_note(body, role="assistant")
+                                except Exception:
+                                    pass
+
                         try:
                             _handle_chat_command(
                                 input_text=command_text,
@@ -2327,6 +2824,7 @@ def chat(
                                 forge_state=_tui_forge_state,
                                 plan_mode_state=_tui_plan_state,
                                 plan_mode_escape_supported=False,
+                                forge_planner_reply_sink=_planner_reply_sink,
                             )
                         except Exception as _planner_exc:  # noqa: BLE001
                             if surface is not None and not getattr(token, "is_cancelled", False):
@@ -2341,7 +2839,10 @@ def chat(
                         output = buf.getvalue().rstrip("\n")
                         if output:
                             try:
-                                surface.append_system(output)
+                                # Captured planner meta / plan-reconciliation notes go
+                                # into a collapsible dim aside (one line by default,
+                                # Ctrl+O to expand) so they never bury the reply.
+                                surface.append_note(output, role="planmeta")
                             except Exception:
                                 pass
 
@@ -2492,6 +2993,11 @@ def chat(
                     # "/execute plan" inside Forge runs the swarm — defer it to the
                     # worker thread (not the synchronous runner, which would freeze
                     # the UI) with a live forge view instead of a flat captured dump.
+                    # The bare form is normally intercepted by the launch-gate panel
+                    # provider; only its "Launch now" action (a one-shot re-submit of
+                    # "/execute plan") reaches here. We normalize to a plain
+                    # "/execute plan" (the command handler rejects any other arg); the
+                    # chosen knobs travel out-of-band on the forge state.
                     _exec_parts = text.strip().lower().split()
                     if (
                         _tui_forge_state.ui_mode == "forge"
@@ -2502,8 +3008,8 @@ def chat(
                         return (
                             "run",
                             "",
-                            text.strip(),
-                            {"_deferred_execute": _tui_make_forge_execute(text.strip())},
+                            "/execute plan",
+                            {"_deferred_execute": _tui_make_forge_execute("/execute plan")},
                         )
                     # Typed "/resume <index|id>" applies natively (resolve → swap →
                     # reload transcript) instead of the capture path (whose history
@@ -2608,7 +3114,7 @@ def chat(
                         _sys.stdin = saved_stdin
                     output = buf.getvalue().rstrip("\n")
                     # Keep footer badges in sync after local commands such as
-                    # /mode and /usage HUD.
+                    # /mode and /usage hud.
                     _sync_tui_session_state(_tui_state, sess, include_exec_mode=True)
                     # The forge state machine flips ui_mode inside _enter_forge_mode
                     # (and back to "chat" on /back / /done); this single sync drives
@@ -2655,7 +3161,6 @@ def chat(
                     _chat_terminals_panel_spec,
                     _chat_toolbar_panel_spec,
                     _chat_usage_panel_spec,
-                    _short_subagent_desc,
                 )
 
                 def _tui_status_panel(arg: str = "") -> dict[str, Any] | None:
@@ -3006,6 +3511,189 @@ def chat(
                         "on_select": _tui_login_select,
                     }
 
+                # --- Forge launch gate: /execute plan opens a confirm + knob picker ---
+                # One-shot flag: "Launch now" sets it, then re-submits a clean
+                # "/execute plan"; the gate provider consumes it and falls through to
+                # the runner, so the swarm launches without echoing any internal
+                # sentinel into the visible transcript.
+                _tui_forge_launch = {"confirmed": False}
+                _FORGE_KNOB_DEFAULTS: dict[str, Any] = {
+                    "parallel": 2,
+                    "scope_mode": "strict",
+                    "verify_mode": "warn",
+                    "review": False,
+                }
+
+                def _tui_forge_knobs() -> dict[str, Any]:
+                    knobs = dict(_FORGE_KNOB_DEFAULTS)
+                    stored = _tui_forge_state.swarm_knobs
+                    if isinstance(stored, dict):
+                        knobs.update(stored)
+                    return knobs
+
+                def _tui_forge_cycle_knob(key: str) -> None:
+                    knobs = _tui_forge_knobs()
+                    if key == "parallel":
+                        current = int(knobs.get("parallel", 2) or 2)
+                        knobs["parallel"] = current + 1 if current < 4 else 1
+                    elif key == "scope_mode":
+                        knobs["scope_mode"] = (
+                            "warn" if knobs.get("scope_mode") == "strict" else "strict"
+                        )
+                    elif key == "verify_mode":
+                        order = ["warn", "strict", "off"]
+                        try:
+                            idx = order.index(str(knobs.get("verify_mode")))
+                        except ValueError:
+                            idx = 0
+                        knobs["verify_mode"] = order[(idx + 1) % len(order)]
+                    elif key == "review":
+                        knobs["review"] = not bool(knobs.get("review"))
+                    _tui_forge_state.swarm_knobs = knobs
+
+                def _tui_forge_knob_blurb(key: str, knobs: dict[str, Any]) -> str:
+                    # One terse line describing only the *currently selected* value —
+                    # cycling a knob swaps the line, so each alternative explains
+                    # itself the moment it is picked (never an all-values glossary).
+                    if key == "parallel":
+                        n = int(knobs.get("parallel", 2) or 2)
+                        if n <= 1:
+                            return "Tasks build one at a time."
+                        return f"Up to {n} tasks build at once."
+                    if key == "scope_mode":
+                        if knobs.get("scope_mode") == "strict":
+                            return "A worker edits only its task's files."
+                        return "Cross-task edits allowed, just flagged in the report."
+                    if key == "verify_mode":
+                        # NB: warn still fails a task on NEW check failures — it only
+                        # downgrades pre-existing/baseline failures and infra problems
+                        # (see swarm_worker._run_authoritative_verification).
+                        mode = str(knobs.get("verify_mode"))
+                        if mode == "strict":
+                            return "Any check failure fails the task."
+                        if mode == "off":
+                            return "Skip verification checks."
+                        return "New failures fail the task; pre-existing just warn."
+                    if key == "review":
+                        if knobs.get("review"):
+                            return "A reviewer checks each task before it merges."
+                        return "Merge without a reviewer pass."
+                    return ""
+
+                def _tui_forge_launch_gate_picker(
+                    plan: Any, paths: Any, focus: str | None = None
+                ) -> dict[str, Any]:
+                    knobs = _tui_forge_knobs()
+                    tasks = plan.get("tasks") if isinstance(plan, dict) else None
+                    n_tasks = len(tasks) if isinstance(tasks, list) else 0
+                    run_id = str(getattr(paths, "run_id", "") or "")
+                    all_default = all(
+                        knobs.get(key) == value for key, value in _FORGE_KNOB_DEFAULTS.items()
+                    )
+
+                    def _default_tag(key: str) -> str:
+                        if knobs.get(key) == _FORGE_KNOB_DEFAULTS.get(key):
+                            return "(default)"
+                        return ""
+
+                    rows = [
+                        {
+                            "value": "__launch__",
+                            "label": "Launch now",
+                            "description": (
+                                f"Build {n_tasks} task(s) — recommended defaults."
+                                if all_default
+                                else f"Build {n_tasks} task(s) with the settings below."
+                            ),
+                            "current": focus in (None, "__launch__"),
+                            "tag": "",
+                        },
+                        {
+                            "value": "parallel",
+                            "label": f"Workers: {knobs['parallel']}",
+                            "description": _tui_forge_knob_blurb("parallel", knobs),
+                            "current": focus == "parallel",
+                            "tag": _default_tag("parallel"),
+                        },
+                        {
+                            "value": "scope_mode",
+                            "label": f"File scope: {knobs['scope_mode']}",
+                            "description": _tui_forge_knob_blurb("scope_mode", knobs),
+                            "current": focus == "scope_mode",
+                            "tag": _default_tag("scope_mode"),
+                        },
+                        {
+                            "value": "verify_mode",
+                            "label": f"Verify: {knobs['verify_mode']}",
+                            "description": _tui_forge_knob_blurb("verify_mode", knobs),
+                            "current": focus == "verify_mode",
+                            "tag": _default_tag("verify_mode"),
+                        },
+                        {
+                            "value": "review",
+                            "label": f"Review: {'on' if knobs['review'] else 'off'}",
+                            "description": _tui_forge_knob_blurb("review", knobs),
+                            "current": focus == "review",
+                            "tag": _default_tag("review"),
+                        },
+                    ]
+
+                    def _on_select(value: Any) -> dict[str, Any] | None:
+                        selected = str(value)
+                        if selected == "__launch__":
+                            # Confirm-launch: flag a one-shot bypass, then re-submit a
+                            # clean "/execute plan" (no sentinel echoed to the
+                            # transcript). The gate provider consumes the flag and the
+                            # runner defers the real swarm execution on the worker.
+                            _tui_forge_launch["confirmed"] = True
+                            return {"submit": "/execute plan"}
+                        _tui_forge_cycle_knob(selected)
+                        pair = _tui_forge_plan_and_paths()
+                        if pair is None:
+                            return None
+                        # Re-present the gate with the cycled value, keeping focus.
+                        return {
+                            "picker": _tui_forge_launch_gate_picker(
+                                pair[0], pair[1], focus=selected
+                            )
+                        }
+
+                    title = (f"Launch Forge · {run_id}".rstrip(" ·")) or "Launch Forge"
+                    return {
+                        "title": title,
+                        "hint": "↑↓ move · Enter/1 launch · 2-5 cycle setting · Esc cancel",
+                        "rows": rows,
+                        "on_select": _on_select,
+                    }
+
+                def _tui_forge_execute_gate(arg: str = "") -> dict[str, Any] | None:
+                    # /execute plan → open the launch gate instead of firing the swarm
+                    # blind. Only the bare "plan" form opens it; any other arg returns
+                    # None to fall through to the runner.
+                    if _tui_forge_state.ui_mode != "forge":
+                        return None
+                    if arg.strip().lower() != "plan":
+                        return None
+                    if _tui_forge_launch.get("confirmed"):
+                        # The gate's own "Launch now" re-submitting "/execute plan":
+                        # consume the one-shot flag and fall through so the runner
+                        # defers the real execution (no second gate, no loop).
+                        _tui_forge_launch["confirmed"] = False
+                        return None
+                    pair = _tui_forge_plan_and_paths()
+                    if pair is None:
+                        return None
+                    plan, paths = pair
+                    # No usable plan yet → let the runner surface the "add tasks first"
+                    # guidance rather than offering a launch that will be rejected.
+                    tasks = plan.get("tasks") if isinstance(plan, dict) else None
+                    reqs = plan.get("requirements") if isinstance(plan, dict) else None
+                    if not (isinstance(tasks, list) and tasks) and not (
+                        isinstance(reqs, list) and reqs
+                    ):
+                        return None
+                    return {"picker": _tui_forge_launch_gate_picker(plan, paths)}
+
                 _tui_panel_providers = {
                     "/status": _tui_status_panel,
                     "/usage": _tui_usage_panel,
@@ -3020,6 +3708,7 @@ def chat(
                     "/show": _tui_forge_show_panel,
                     "/plan": _tui_forge_plan_panel,
                     "/assets": _tui_assets_panel,
+                    "/execute": _tui_forge_execute_gate,
                 }
 
                 # Slash-command dropdown: same completer the classic prompt uses, so
@@ -3045,6 +3734,7 @@ def chat(
                 from ..commands.chat_terminal import (
                     _chat_mode_display,
                     _chat_mode_rows,
+                    _chat_persona_rows,
                     _chat_trace_rows,
                 )
                 from ..commands.startup import (
@@ -3078,6 +3768,7 @@ def chat(
                             msgs.append(("warn", _FULLACCESS_WARNING))
                         return msgs
                     try:
+                        _clear_persona_restore(built)
                         _apply_chat_effective_mode(
                             session=built, next_mode=value, persist_default_mode=True
                         )
@@ -3088,6 +3779,84 @@ def chat(
                     if value == "fullaccess":
                         msgs.append(("warn", _FULLACCESS_WARNING))
                     return msgs
+
+                def _tui_persona_select(value: str) -> list[tuple[str, str]] | None:
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    if not persona_modes_enabled(getattr(built, "cfg", None)):
+                        return [("warn", "Persona modes are disabled.")]
+                    if _chat_plan_mode_enabled(_tui_plan_state):
+                        return [
+                            (
+                                "warn",
+                                "Cannot change persona while Plan Mode is on. Use /plan off first.",
+                            )
+                        ]
+                    registry = _session_persona_registry(built)
+                    persona_name = normalize_persona(value, registry)
+                    current_persona = normalize_persona(getattr(built, "persona", "code"), registry)
+                    if persona_name == current_persona:
+                        return [("system", f"Persona already set: {persona_name}")]
+                    try:
+                        _apply_chat_persona(session=built, persona=persona_name, source="user")
+                    except Exception as exc:  # noqa: BLE001
+                        return [("error", f"Failed to change persona: {exc}")]
+                    _tui_state.persona = persona_name
+                    _tui_state.exec_mode = str(getattr(built, "mode", "") or "").strip()
+                    return [("system", f"Persona → {persona_name}")]
+
+                def _tui_persona_picker() -> dict[str, Any] | None:
+                    built = _tui_box.get("session")
+                    registry = _session_persona_registry(built)
+                    current_persona = normalize_persona(getattr(built, "persona", "code"), registry)
+                    rows: list[dict[str, Any]] = []
+                    for value, label, desc in _chat_persona_rows(custom=registry):
+                        clean = label.split(") ", 1)[-1] if ") " in label else label
+                        rows.append(
+                            {
+                                "label": clean,
+                                "description": desc,
+                                "value": value,
+                                "current": value == current_persona,
+                            }
+                        )
+                    return {
+                        "title": "Persona",
+                        "rows": rows,
+                        "on_select": _tui_persona_select,
+                    }
+
+                def _tui_persona_cycle() -> list[tuple[str, str]] | None:
+                    # Kilo/OpenCode-style shortcut: Tab on an empty input cycles
+                    # code -> architect -> ask -> debug -> code. Same primitive,
+                    # clamp, and events as /mode <persona>. Success is SILENT:
+                    # the footer badge flipping is the feedback — the transcript
+                    # only ever sees warnings and errors.
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    if not persona_modes_enabled(getattr(built, "cfg", None)):
+                        return None
+                    if _chat_plan_mode_enabled(_tui_plan_state):
+                        return [
+                            (
+                                "warn",
+                                "Cannot change persona while Plan Mode is on. Use /plan off first.",
+                            )
+                        ]
+                    target = next_persona(
+                        getattr(built, "persona", "code"), _session_persona_registry(built)
+                    )
+                    try:
+                        effective = _apply_chat_persona(
+                            session=built, persona=target, source="user"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        return [("error", f"Failed to change persona: {exc}")]
+                    _tui_state.persona = target
+                    _tui_state.exec_mode = effective
+                    return None
 
                 def _tui_mode_picker() -> dict[str, Any] | None:
                     built = _tui_box.get("session")
@@ -3196,18 +3965,7 @@ def chat(
                     registry = registry_obj if isinstance(registry_obj, dict) else {}
                     if not registry:
                         return None  # nothing to pick → runner prints guidance
-                    rows: list[dict[str, Any]] = []
-                    for value, _label, desc in _chat_subagent_rows(registry=registry):
-                        rows.append(
-                            {
-                                "label": str(value),
-                                # Full first-clause summary — the picker wraps it to
-                                # a couple of lines rather than clipping on the right.
-                                "description": _short_subagent_desc(desc, limit=120),
-                                "value": str(value),
-                                "current": False,
-                            }
-                        )
+                    rows = _subagent_picker_row_specs(registry=registry)
                     enabled = bool(getattr(built, "subagents_enabled", False))
                     # Enter PREFILLS "/subagent <name> " — it does not spawn (the task
                     # still has to be typed). Say that, rather than promising a spawn
@@ -3374,11 +4132,17 @@ def chat(
                             loader(history)
                         except Exception:  # noqa: BLE001 - reload is best-effort
                             pass
+                    # Restore the resumed session's persona (mode narrowing,
+                    # write scope, model role) before the badge sync reads it.
+                    try:
+                        _reapply_resumed_persona(session=built, console=None)
+                    except Exception:  # noqa: BLE001 - resume must still land
+                        pass
                     try:
                         _tui_on_turn_complete()  # refresh tokens/cost/context
                     except Exception:
                         pass
-                    _tui_state.exec_mode = str(getattr(built, "mode", "") or "").strip()
+                    _sync_tui_session_state(_tui_state, built, include_exec_mode=True)
                     new_model = str(getattr(getattr(built, "cfg", None), "model", "") or "")
                     if new_model:
                         _tui_state.model_name = new_model
@@ -3422,6 +4186,7 @@ def chat(
                 _tui_picker_providers = {
                     "/login": _tui_login_picker,
                     "/mode": _tui_mode_picker,
+                    "/persona": _tui_persona_picker,
                     "/stream": _tui_stream_picker,
                     "/trace": _tui_trace_picker,
                     "/subagent": _tui_subagent_picker,
@@ -3442,6 +4207,7 @@ def chat(
                         command_runner=_tui_command_runner,
                         panel_providers=_tui_panel_providers,
                         picker_providers=_tui_picker_providers,
+                        persona_cycle=_tui_persona_cycle,
                         completer=_tui_completer,
                         config_flow_factory=_tui_config_flow_factory,
                         on_config_saved=_tui_on_config_saved,
@@ -3596,6 +4362,7 @@ def chat(
         pending_images = [os.fspath(p) for p in (image or [])]
         forge_state = _ForgeChatState()
         plan_mode_state = _ChatPlanModeState()
+        _apply_startup_persona(session=session, console=console)
         prompt_session = _maybe_make_chat_prompt_session(
             console=console,
             root=focus_path,
@@ -3718,6 +4485,11 @@ def chat(
                 if isinstance(command_result, _ChatExecutionRequest)
                 else None
             )
+            chat_only_turn = (
+                bool(command_result.chat_only)
+                if isinstance(command_result, _ChatExecutionRequest)
+                else False
+            )
 
             images_for_turn = pending_images.copy()
             interrupted = False
@@ -3743,10 +4515,24 @@ def chat(
                     run_turn_kwargs: dict[str, Any] = {"image_paths": images_for_turn or None}
                     if routing_mode_override is not None:
                         run_turn_kwargs["routing_mode_override"] = routing_mode_override
-                    if ephemeral_system_messages:
-                        run_turn_kwargs["ephemeral_system_messages"] = ephemeral_system_messages
-                    if ephemeral_user_messages:
-                        run_turn_kwargs["ephemeral_user_messages"] = ephemeral_user_messages
+                    combined_ephemeral_system = list(ephemeral_system_messages or [])
+                    combined_ephemeral_system += persona_overlay_messages(
+                        cfg=getattr(session, "cfg", None),
+                        persona=getattr(session, "persona", "code"),
+                        registry=_session_persona_registry(session),
+                    )
+                    if combined_ephemeral_system:
+                        run_turn_kwargs["ephemeral_system_messages"] = combined_ephemeral_system
+                    combined_ephemeral_user = persona_overlay_user_messages(
+                        cfg=getattr(session, "cfg", None),
+                        persona=getattr(session, "persona", "code"),
+                        registry=_session_persona_registry(session),
+                    )
+                    combined_ephemeral_user += list(ephemeral_user_messages or [])
+                    if combined_ephemeral_user:
+                        run_turn_kwargs["ephemeral_user_messages"] = combined_ephemeral_user
+                    if chat_only_turn:
+                        run_turn_kwargs["chat_only"] = True
                     session.run_turn(execution_instruction, **run_turn_kwargs)
             except KeyboardInterrupt:
                 interrupted = True
@@ -3771,6 +4557,10 @@ def chat(
                         console.print(
                             f"[red]Failed to restore Plan Mode after execution:[/red] {e}"
                         )
+                # An approved switch_mode proposal applies after mode-override
+                # restoration so the persona's clamp works from the user's
+                # real base mode, never a temporary /ask override.
+                _apply_pending_persona_switch(session=session, console=console)
 
             if llm_failed:
                 # Keep queued images so the user can retry without re-attaching.
@@ -3827,6 +4617,14 @@ def run(
         help="Attach image path(s). Repeat --image for multiple files.",
     ),
     mode: Mode | None = typer.Option(None, "--mode", help="Mode override."),
+    persona: str | None = typer.Option(
+        None,
+        "--persona",
+        help=(
+            "Persona for this one-shot run: code, architect, ask, debug, or a "
+            "custom persona from .sylliptor_personas."
+        ),
+    ),
     model: str | None = typer.Option(None, "--model", help="Model override."),
     base_url: str | None = typer.Option(None, "--base-url", help="Base URL override."),
     temperature: float | None = typer.Option(None, "--temperature", help="Sampling temperature."),
@@ -3887,7 +4685,15 @@ def run(
     deadline_seconds: float | None = typer.Option(
         None,
         "--deadline-seconds",
-        help="Stop this one-shot run after the given invocation-wide wall-clock seconds.",
+        help=(
+            "Stop this one-shot run after the given invocation-wide wall-clock seconds. "
+            "Defaults to 3600 (60 min); use --no-deadline to run unbounded."
+        ),
+    ),
+    no_deadline: bool = typer.Option(
+        False,
+        "--no-deadline",
+        help="Run without any wall-clock budget, overriding the default one-shot deadline.",
     ),
     require_deadline: bool = typer.Option(
         False,
@@ -3914,7 +4720,11 @@ def run(
     )
     max_steps_provided = max_steps is not None
     if current_ctx is not None:
-        max_steps_provided = _parameter_value_was_provided(max_steps, max_steps_source)
+        max_steps_provided = (
+            max_steps is not None
+            and max_steps_source is not None
+            and max_steps_source is not ParameterSource.DEFAULT
+        )
 
     effective = clone_cfg(cfg)
     raw_benchmark_profile = _raw_benchmark_profile_requested(benchmark=benchmark)
@@ -3990,12 +4800,91 @@ def run(
             source=binding_source,
             action=WorkspaceAction.CHAT,
         )
+        run_persona_overlays: list[str] | None = None
+        run_persona_user_overlays: list[str] | None = None
+        run_persona_globs: list[str] | None = None
+        if persona is not None:
+            from ...config import resolve_role_temperature
+            from ...model_router import resolve_model_for_role
+            from ...personas import (
+                load_custom_personas,
+            )
+            from ...personas import (
+                persona_overlay_messages as _persona_overlays_fn,
+            )
+            from ...personas import (
+                persona_overlay_user_messages as _persona_user_overlays_fn,
+            )
+            from ...personas import (
+                resolve_persona_model_role as _resolve_persona_role,
+            )
+
+            normalized_run_persona = str(persona).strip().lower()
+            if delegated_execution:
+                console.print("[red]--persona is not supported with delegated execution.[/red]")
+                raise typer.Exit(code=2)
+            if not persona_modes_enabled(effective):
+                console.print("[red]Persona modes are disabled.[/red]")
+                raise typer.Exit(code=2)
+            run_registry, run_persona_warnings = load_custom_personas(
+                workspace_binding.workspace_context.workspace_root
+            )
+            for warning in run_persona_warnings:
+                console.print(f"[yellow]Custom persona:[/yellow] {warning}")
+            if not is_persona_name(normalized_run_persona, run_registry):
+                console.print(f"[red]Unknown persona:[/red] {normalized_run_persona}")
+                raise typer.Exit(code=2)
+            run_definition = get_persona(normalized_run_persona, run_registry)
+            # Same clamp as interactive switching: the persona may lower the
+            # requested mode, never raise it.
+            effective_mode = resolve_persona_exec_mode(run_definition, effective_mode)
+            if run_definition.allow_write_globs:
+                run_persona_globs = list(run_definition.allow_write_globs)
+            run_persona_overlays = (
+                _persona_overlays_fn(
+                    cfg=effective, persona=normalized_run_persona, registry=run_registry
+                )
+                or None
+            )
+            run_persona_user_overlays = (
+                _persona_user_overlays_fn(
+                    cfg=effective, persona=normalized_run_persona, registry=run_registry
+                )
+                or None
+            )
+            if model is None:
+                persona_role = _resolve_persona_role(
+                    effective, normalized_run_persona, run_registry
+                )
+                resolved_persona_model = str(
+                    resolve_model_for_role(cfg=effective, role=persona_role, plan=None) or ""
+                ).strip()
+                if resolved_persona_model and resolved_persona_model != effective.model:
+                    effective.model = resolved_persona_model
+            else:
+                persona_role = _resolve_persona_role(
+                    effective, normalized_run_persona, run_registry
+                )
+            # create_session constructs the one-shot main client through the
+            # coding slot. Carry the selected persona role's temperature into
+            # that slot so explicit zero values and per-role tuning survive.
+            effective.coding_temperature = resolve_role_temperature(
+                effective,
+                role=persona_role,
+            )
+            effective.default_persona = normalized_run_persona
         if delegated_execution:
             from ...config import resolve_run_deadline
+            from ...execution_deadline import DEFAULT_RUN_DEADLINE_SECONDS
 
+            delegated_default_deadline = (
+                None if (require_deadline or no_deadline) else DEFAULT_RUN_DEADLINE_SECONDS
+            )
             resolved_deadline = resolve_run_deadline(
                 effective,
                 cli_deadline_seconds=deadline_seconds,
+                cli_no_deadline=no_deadline,
+                default_seconds=delegated_default_deadline,
             )
             delegated_deadline = resolved_deadline.seconds
             if require_deadline and delegated_deadline is None:
@@ -4013,7 +4902,7 @@ def run(
                 cwd=workspace_binding.workspace_context.workspace_root,
                 instruction=instruction,
                 mode=effective_mode,
-                image_paths=tuple(image_path.resolve() for image_path in (image or ())),
+                image_paths=tuple(path.resolve() for path in (image or ())),
                 no_log=no_log,
                 console=console,
             )
@@ -4024,6 +4913,9 @@ def run(
                 instruction=instruction,
                 image_paths=[os.fspath(p) for p in (image or [])],
                 mode=effective_mode,
+                persona_allow_write_globs=run_persona_globs,
+                ephemeral_system_messages=run_persona_overlays,
+                ephemeral_user_messages=run_persona_user_overlays,
                 runtime_kind=RuntimeKind.ONE_SHOT,
                 yes=effective_yes,
                 max_steps=effective.max_steps,
@@ -4042,6 +4934,7 @@ def run(
                 verify_cmd=verify_cmd,
                 workspace_binding=workspace_binding,
                 run_deadline_seconds=deadline_seconds,
+                no_run_deadline=no_deadline,
                 require_run_deadline=require_deadline,
                 crash_diagnostic_log_path=diagnostic_log,
             )

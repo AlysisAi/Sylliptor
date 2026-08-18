@@ -29,6 +29,7 @@ class SubagentDefinition:
     required_capabilities: tuple[str, ...] = ()
     model_role: str | None = None
     model: str | None = None
+    allow_workspace_writes: bool = True
 
 
 @dataclass(frozen=True)
@@ -75,7 +76,7 @@ _LIST_FIELDS = {
     "disallowedTools",
 }
 _STRING_FIELDS = {"name", "description", "mode", "model", "model_role"}
-_BOOL_FIELDS = {"enabled"}
+_BOOL_FIELDS = {"enabled", "allow_workspace_writes"}
 _KNOWN_FIELDS = _LIST_FIELDS | _STRING_FIELDS | _BOOL_FIELDS
 
 
@@ -144,6 +145,7 @@ def built_in_subagents(
             prompt_trust="trusted",
             mode="readonly",
             allow_tools=readonly_tools,
+            allow_workspace_writes=False,
         ),
         "implementer": SubagentDefinition(
             name="implementer",
@@ -331,6 +333,7 @@ def built_in_subagents(
             prompt_trust="trusted",
             mode="auto",
             allow_tools=diagnostic_tools,
+            allow_workspace_writes=False,
         ),
         "code-reviewer": SubagentDefinition(
             name="code-reviewer",
@@ -389,6 +392,7 @@ def built_in_subagents(
             mode="readonly",
             allow_tools=readonly_tools,
             model_role="review",
+            allow_workspace_writes=False,
         ),
         "test-strategist": SubagentDefinition(
             name="test-strategist",
@@ -446,6 +450,7 @@ def built_in_subagents(
             prompt_trust="trusted",
             mode="readonly",
             allow_tools=readonly_tools,
+            allow_workspace_writes=False,
         ),
         "visual-designer": SubagentDefinition(
             name="visual-designer",
@@ -807,4 +812,5 @@ def _parse_subagent_markdown(path: Path) -> SubagentDefinition | None:
         deny_tools=deny_tools,
         model_role=model_role,
         model=model,
+        allow_workspace_writes=bool(meta.get("allow_workspace_writes", True)),
     )

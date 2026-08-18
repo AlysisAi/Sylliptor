@@ -7,9 +7,8 @@ from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
+from ...text_normalization import normalize_for_matching
 from ...tools.registry import get_builtin_tool_metadata
-from ...turn_intent import contains_any_normalized_marker as _contains_any_normalized_marker
-from ...turn_intent import normalize_turn_intent_text as _normalize_marker_text
 from ...verification_command_analysis import (
     VerificationCommandEvidentiaryCapability,
     analyze_verification_command,
@@ -22,90 +21,6 @@ from ..prompt_context import (
 from ..verification import _runtime_message
 
 MAX_RECENT_EXPLORATION_PATHS = 12
-_ONE_SHOT_NON_FINAL_PROGRESS_MARKERS = (
-    "i will",
-    "i'll",
-    "ill",
-    "then i will",
-    "let me",
-    "plan:",
-    "next steps:",
-    "i will proceed",
-    "θα προχωρησω",
-    "θα υλοποιησω",
-    "θα ενημερωσω",
-    "θα προσθεσω",
-    "στη συνεχεια θα",
-    "επομενο βημα",
-    "σχεδιο:",
-    "πρωτα θα",
-    "μετα θα",
-)
-_ONE_SHOT_COMPLETION_MARKERS = (
-    "implemented",
-    "updated",
-    "ran tests",
-    "tests pass",
-    "changed files",
-    "i added",
-    "i updated",
-    "i ran",
-    "completed",
-    "finished",
-    "υλοποιησα",
-    "προσθεσα",
-    "ενημερωσα",
-    "διορθωσα",
-    "ετρεξα τα tests",
-    "ετρεξα tests",
-    "ολοκληρωθηκε",
-    "ολοκληρωσα",
-    "τελειωσα",
-)
-_ONE_SHOT_BLOCKER_MARKERS = (
-    "blocked",
-    "cannot proceed",
-    "can't proceed",
-    "need approval",
-    "missing info",
-    "missing information",
-    "need more info",
-    "need more information",
-    "permission denied",
-    "requires approval",
-    "δεν μπορω να προχωρησω",
-    "δεν μπορω να συνεχισω",
-    "χρειαζομαι εγκριση",
-    "απαιτειται εγκριση",
-    "λειπουν πληροφοριες",
-    "δεν εχω αρκετες πληροφοριες",
-    "δεν εχω αρκετη πληροφορια",
-    "εχω μπλοκαρει",
-    "ειμαι μπλοκαρισμενος",
-    "ειμαι μπλοκαρισμενη",
-    "δεν εχω προσβαση",
-)
-_STRUCTURED_BLOCKER_MARKER_RE = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:\[?\s*)?"
-    r"(?:blocked|blocker|needs[_\s-]?user|needs[_\s-]?input|need[_\s-]?user[_\s-]?input)"
-    r"(?:\s*\]?)?\s*:",
-    re.IGNORECASE,
-)
-_STRUCTURED_BLOCKER_CATEGORY_RE = re.compile(
-    r"\b(?:category|type|reason)\s*:\s*"
-    r"(?:approval|ambiguous(?:_requirement)?|credentials?|docker|environment|"
-    r"missing(?:_information|_dependency|_toolchain)?|network|permission|policy|"
-    r"sandbox|toolchain|unavailable)\b",
-    re.IGNORECASE,
-)
-_BLOCKER_OBSTACLE_RE = re.compile(
-    r"\b(?:approval|permission|permissions|sandbox|docker|network|offline|toolchain|"
-    r"missing|unavailable|not\s+available|not\s+installed|command\s+not\s+found|"
-    r"no\s+such\s+file|ambiguous|clarif(?:y|ication)|user\s+input|"
-    r"cannot\s+resolve|can't\s+resolve|environment|host|credential|credentials|"
-    r"secret|secrets|api\s+key|access|policy|blocked)\b",
-    re.IGNORECASE,
-)
 _EXPLORATION_FALLBACK_TOOL_NAMES = {
     "fs_read",
     "fs_read_lines",
@@ -127,7 +42,6 @@ _ACTION_PROGRESS_FALLBACK_TOOL_NAMES = {
     "fs_write",
     "git_apply_patch",
     "verify_run",
-    "subagent_run",
 }
 _ACTION_PROGRESS_TOOL_CATEGORIES = {"write", "verify", "subagent"}
 _EXPLORATION_TOOL_CATEGORIES = {"read", "search", "history"}
@@ -153,48 +67,6 @@ _UNEXECUTED_TOOL_CALL_MARKUP_MARKERS = (
 )
 
 
-def _assistant_text_contains_progress_intent(text: str) -> bool:
-    normalized = _normalize_marker_text(text)
-    return _contains_any_normalized_marker(normalized, _ONE_SHOT_NON_FINAL_PROGRESS_MARKERS)
-
-
-def _assistant_text_has_completion_marker(text: str) -> bool:
-    normalized = _normalize_marker_text(text)
-    return _contains_any_normalized_marker(normalized, _ONE_SHOT_COMPLETION_MARKERS)
-
-
-def _assistant_text_has_blocker_marker(text: str) -> bool:
-    normalized = _normalize_marker_text(text)
-    return _contains_any_normalized_marker(normalized, _ONE_SHOT_BLOCKER_MARKERS)
-
-
-def _assistant_text_has_structured_blocker_marker(text: str) -> bool:
-    return _STRUCTURED_BLOCKER_MARKER_RE.search(str(text or "")) is not None
-
-
-def _structured_blocker_has_concrete_detail(text: str) -> bool:
-    match = _STRUCTURED_BLOCKER_MARKER_RE.search(str(text or ""))
-    if match is None:
-        return False
-    detail = str(text or "")[match.end() :].strip()
-    if len(detail.split()) < 3:
-        return False
-    if _STRUCTURED_BLOCKER_CATEGORY_RE.search(detail):
-        return True
-    return _BLOCKER_OBSTACLE_RE.search(detail) is not None
-
-
-def _assistant_text_has_well_formed_blocker(text: str) -> bool:
-    raw_text = str(text or "").strip()
-    if not raw_text:
-        return False
-    if _assistant_text_has_structured_blocker_marker(raw_text):
-        return _structured_blocker_has_concrete_detail(raw_text)
-    if not _assistant_text_has_blocker_marker(raw_text):
-        return False
-    return _BLOCKER_OBSTACLE_RE.search(raw_text) is not None
-
-
 def _exploration_attempt_outcome(success_count: int, failed_count: int) -> str:
     if success_count > 0 and failed_count > 0:
         return "mixed"
@@ -206,8 +78,26 @@ def _exploration_attempt_outcome(success_count: int, failed_count: int) -> str:
 
 
 def _one_shot_progress_fingerprint(text: str) -> str:
-    normalized = _normalize_marker_text(text)
+    normalized = normalize_for_matching(text)
     return re.sub(r"[^\w ]+", "", normalized, flags=re.UNICODE)
+
+
+def _stagnation_detection_event_should_emit(detection_count: int, *, nudge_sent: bool) -> bool:
+    """Whether the Nth stagnation detection of an episode should be recorded.
+
+    Once stagnation locks in, the detector fires on every subsequent step, so a
+    long stagnating turn used to log one near-identical event per step (50+ per
+    session). Detections that actually send a nudge are always recorded;
+    otherwise emission is spaced at power-of-two counts (1, 2, 4, 8, ...), so a
+    stagnating turn logs O(log n) events with unchanged prompt behavior — the
+    suppressed occurrences are summarized on the next emitted event.
+    """
+
+    if nudge_sent:
+        return True
+    if detection_count <= 0:
+        return False
+    return detection_count & (detection_count - 1) == 0
 
 
 def _tool_call_retry_key(name: str, arguments: dict[str, Any]) -> str:
@@ -584,6 +474,17 @@ def _is_action_progress_tool(
     focused: bool = False,
 ) -> bool:
     normalized = _normal_tool_name(tool_name)
+    if normalized == "subagent_run":
+        effect_names: set[str] = set()
+        if isinstance(result, dict):
+            raw_effects = result.get("effects")
+            if isinstance(raw_effects, (list, tuple, set)):
+                effect_names = {
+                    str(effect or "").strip().lower() for effect in raw_effects if str(effect or "")
+                }
+        return bool(effect_names & {"write_workspace", "run_commands", "external_write"}) or bool(
+            _shell_touched_paths(result=result, touched_paths=touched_paths)
+        )
     if normalized in _SHELL_TOOL_NAMES:
         return _is_shell_action_progress_tool(
             normalized,
@@ -607,6 +508,14 @@ def _is_exploration_only_tool(
     focused: bool = False,
 ) -> bool:
     normalized = _normal_tool_name(tool_name)
+    if normalized == "subagent_run":
+        return not _is_action_progress_tool(
+            normalized,
+            arguments=arguments,
+            result=result,
+            touched_paths=touched_paths,
+            focused=focused,
+        )
     if normalized in _SHELL_TOOL_NAMES:
         return not _is_shell_action_progress_tool(
             normalized,

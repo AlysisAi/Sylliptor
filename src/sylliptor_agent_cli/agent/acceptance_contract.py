@@ -8,7 +8,7 @@ import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from ..config import normalize_verify_command_list
@@ -334,8 +334,9 @@ class AcceptanceContract:
 _BACKTICK_COMMAND_RE = re.compile(r"`([^`\n]+)`")
 _PATH_RE = re.compile(
     r"(?<![\w.-])("
-    r"(?:/|\./|\.\./)?(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+(?:\.[A-Za-z0-9_.-]+)?|"
-    r"(?:\./|\.\./)?[A-Za-z0-9_.-]+\."
+    r"(?:[A-Za-z]:[\\/]|[\\/]{1,2}|\.{1,2}[\\/])?"
+    r"(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+(?:\.[A-Za-z0-9_.-]+)?|"
+    r"(?:\.{1,2}[\\/])?[A-Za-z0-9_.-]+\."
     r"(?:py|js|ts|tsx|jsx|json|toml|yaml|yml|txt|md|html|css|csv|xml|sql|sh|go|rs|java|rb|php|out|expected|actual|bin)"
     r")(?=$|[\s,;:!?\]\)}]|[.](?:\s|$))"
 )
@@ -1077,18 +1078,16 @@ def _resolve_acceptance_path(
             role=role,
             clause=clause,
         )
-    if cleaned.startswith("/"):
-        root_abs = Path(root).expanduser().resolve(strict=False)
-        candidate = Path(cleaned).expanduser().resolve(strict=False)
-        try:
-            rel = candidate.relative_to(root_abs).as_posix()
-        except ValueError:
+    absolute = _classify_absolute_acceptance_path(cleaned=cleaned, root=root)
+    if absolute is not None:
+        rel, absolute_path = absolute
+        if rel is None:
             return AcceptancePathRef(
                 raw_text=raw_text,
                 display_path=cleaned,
                 path_kind=AcceptancePathKind.ABSOLUTE_EXTERNAL,
                 role=role,
-                absolute_path=candidate.as_posix(),
+                absolute_path=absolute_path,
                 clause=clause,
             )
         return AcceptancePathRef(
@@ -1097,7 +1096,7 @@ def _resolve_acceptance_path(
             path_kind=AcceptancePathKind.ABSOLUTE_WITHIN_WORKSPACE,
             role=role,
             workspace_relative_path=rel,
-            absolute_path=candidate.as_posix(),
+            absolute_path=absolute_path,
             clause=clause,
         )
     normalized = _normalize_rel_path(cleaned)
@@ -1113,6 +1112,47 @@ def _resolve_acceptance_path(
         absolute_path=candidate.as_posix(),
         clause=clause,
     )
+
+
+def _classify_absolute_acceptance_path(
+    *,
+    cleaned: str,
+    root: Path,
+) -> tuple[str | None, str] | None:
+    """Classify absolute paths without applying host-OS semantics to user text.
+
+    ``Path('/usr/local/bin/tool').resolve()`` on Windows silently prefixes the
+    current drive, while ``Path('C:/workspace/file')`` is not absolute on POSIX.
+    Acceptance paths can describe either style regardless of the host, so compare
+    them with their matching pure-path model and preserve external spelling.
+    """
+
+    root_text = _clean_path_token(str(root))
+    windows_candidate = PureWindowsPath(cleaned)
+    if windows_candidate.is_absolute() and windows_candidate.drive:
+        absolute_path = windows_candidate.as_posix()
+        windows_root = PureWindowsPath(root_text)
+        if windows_root.is_absolute() and windows_root.drive:
+            try:
+                rel = windows_candidate.relative_to(windows_root).as_posix()
+            except ValueError:
+                rel = None
+            return rel, absolute_path
+        return None, absolute_path
+
+    if not cleaned.startswith("/"):
+        return None
+
+    posix_candidate = PurePosixPath(cleaned)
+    posix_root = PurePosixPath(root_text)
+    absolute_path = posix_candidate.as_posix()
+    if posix_root.is_absolute():
+        try:
+            rel = posix_candidate.relative_to(posix_root).as_posix()
+        except ValueError:
+            rel = None
+        return rel, absolute_path
+    return None, absolute_path
 
 
 def _legacy_paths_from_refs(path_refs: tuple[AcceptancePathRef, ...]) -> tuple[str, ...]:

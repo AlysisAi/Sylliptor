@@ -1380,7 +1380,7 @@ def test_subagent_tool_result_fires_subagent_stop_event(
 
 def _env_probe_command() -> str:
     return (
-        f'{shlex.quote(sys.executable)} -c "import os,json,sys; '
+        f'{_shell_quote(sys.executable)} -c "import os,json,sys; '
         "print(json.dumps({'has_openai': 'OPENAI_API_KEY' in os.environ, "
         "'my_flag': os.environ.get('MY_FLAG'), "
         "'has_path': 'PATH' in os.environ, "
@@ -1644,7 +1644,7 @@ def test_env_sandbox_all_mode_unchanged(
 
 def _payload_inspect_command() -> str:
     return (
-        f'{shlex.quote(sys.executable)} -c "import json,sys; '
+        f'{_shell_quote(sys.executable)} -c "import json,sys; '
         "d=json.load(sys.stdin); "
         "ti=d.get('tool_input',{}); "
         "c=ti.get('content'); "
@@ -1657,6 +1657,12 @@ def _payload_inspect_command() -> str:
         "'marker_sha256': c.get('sha256') if isinstance(c,dict) else None"
         '}))"'
     )
+
+
+def _shell_quote(value: str) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline([value])
+    return shlex.quote(value)
 
 
 def test_payload_truncation_oversized_content(

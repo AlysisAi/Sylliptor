@@ -102,6 +102,14 @@ CODE_SCAN_SKIP_DIR_NAMES = frozenset(
         "target",
         "vendor",
         "venv",
+        # Vendored-dependency trees under other conventional names. Editing
+        # (or symbol-scanning) these is practically never the intended change:
+        # sklearn uses ``externals``, pip uses ``_vendor``, Chromium-style
+        # projects use ``third_party``/``thirdparty``.
+        "_vendor",
+        "externals",
+        "third_party",
+        "thirdparty",
     }
 ) | frozenset(RUNTIME_ARTIFACT_DIR_NAMES)
 GENERATED_DIR_NAMES = frozenset({"gen", "generated", "out"})
@@ -234,6 +242,60 @@ def is_generated_or_vendor_path(path: str) -> bool:
     if not parts:
         return False
     return bool(set(parts) & (CODE_SCAN_SKIP_DIR_NAMES | GENERATED_DIR_NAMES))
+
+
+DERIVED_ARTIFACT_FILENAMES = frozenset(
+    {
+        "bun.lockb",
+        "cargo.lock",
+        "composer.lock",
+        "flake.lock",
+        "gemfile.lock",
+        "go.sum",
+        "gradle.lockfile",
+        "mix.lock",
+        "npm-shrinkwrap.json",
+        "package-lock.json",
+        "packages.lock.json",
+        "pipfile.lock",
+        "pnpm-lock.yaml",
+        "podfile.lock",
+        "poetry.lock",
+        "pubspec.lock",
+        "uv.lock",
+        "yarn.lock",
+    }
+)
+_MINIFIED_BUNDLE_NAME_SUFFIXES = (".min.js", ".min.mjs", ".min.cjs", ".min.css")
+_SOURCE_MAP_NAME_SUFFIXES = (".js.map", ".mjs.map", ".cjs.map", ".css.map")
+
+
+def derived_artifact_reason(path: str) -> str | None:
+    """Classify machine-generated, low-information-density artifacts.
+
+    These files are legitimate to read when they are the subject of the task,
+    but reading them wholesale by default mostly burns context: lockfiles,
+    minified bundles, source maps, and files under generated/vendored trees.
+    Classification is by file class (name shape and location) only — never by
+    task wording — so callers can offer an explicit opt-in instead of a block.
+    Returns a short human-readable reason, or None for ordinary files.
+    """
+
+    normalized = normalize_classification_path(path)
+    if not normalized:
+        return None
+    name = PurePosixPath(normalized).name.casefold()
+    if name in DERIVED_ARTIFACT_FILENAMES:
+        return "dependency lockfile"
+    if name.endswith(_MINIFIED_BUNDLE_NAME_SUFFIXES):
+        return "minified bundle"
+    if name.endswith(_SOURCE_MAP_NAME_SUFFIXES):
+        return "source map"
+    if name.endswith(".lock"):
+        return "lockfile"
+    if is_generated_or_vendor_path(normalized):
+        return "generated or vendored path"
+    return None
 
 
 def is_fixture_path(path: str) -> bool:

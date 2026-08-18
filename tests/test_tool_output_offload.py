@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import pytest
+
+import sylliptor_agent_cli.compaction.tool_output_offload as offload_module
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.compaction.settings import resolve_compaction_settings
 from sylliptor_agent_cli.compaction.tool_output_offload import ToolOutputOffloader
@@ -104,7 +108,9 @@ def test_offloader_offloads_large_output_and_writes_artifact_in_session_root(
 
     assert result.offloaded is True
     assert result.transcript_shaped is True
-    assert result.artifact_locator == ".sylliptor/tool_outputs/step3_shell_run_call_abc.json"
+    assert result.artifact_locator == (
+        ".sylliptor/sessions/session_one/tool_outputs/step3_shell_run_call_abc.json"
+    )
     assert result.artifact_fs_path is not None
     assert not str(result.artifact_locator).startswith("/")
     assert result.artifact_readable_via_fs is True
@@ -118,7 +124,9 @@ def test_offloader_offloads_large_output_and_writes_artifact_in_session_root(
     assert saved["tool_name"] == "shell/run"
     assert saved["tool_call_id"] == "call:abc"
     assert saved["step"] == 3
-    assert saved["result"]["stdout"] == large_text
+    assert "result" not in saved
+    assert json.loads(saved["content_json"])["stdout"] == large_text
+    assert artifact_path.read_text(encoding="utf-8").count(large_text) == 1
 
     stub = json.loads(result.content_for_message)
     assert stub["offloaded"] is True
@@ -132,7 +140,7 @@ def test_offloader_offloads_large_output_and_writes_artifact_in_session_root(
         f"Truncated to 40 of {result.original_chars} chars. Full output saved to "
         f"workspace_root at {result.artifact_locator} - use fs_read on that path to view all of it."
     )
-    assert stub["raw_saved_in_session_log"] is True
+    assert stub["raw_saved_in_session_log"] is False
     assert "summary" in stub
     assert "preview" in stub
     assert len(stub["preview"]) <= 40 + len("...(truncated)")
@@ -153,7 +161,7 @@ def test_offloader_write_failure_returns_json_stub(tmp_path: Path, monkeypatch) 
     def _raise_write_error(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
         raise OSError("disk full")
 
-    monkeypatch.setattr(Path, "write_text", _raise_write_error)
+    monkeypatch.setattr(offload_module, "_atomic_private_write_text", _raise_write_error)
     payload = {"stdout": "x" * 500}
     content_json = json.dumps(payload, ensure_ascii=True)
 
@@ -182,6 +190,108 @@ def test_offloader_write_failure_returns_json_stub(tmp_path: Path, monkeypatch) 
     assert "error" in stub
     assert "the rest is not readable via fs" in stub["full_output"]
     assert "Re-run the command narrowed" in stub["full_output"]
+
+
+def test_offloader_atomic_publish_preserves_old_artifact_after_replace_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    session_artifact_root = tmp_path / "session-store" / "atomic-session"
+    workspace_root.mkdir()
+    offloader = ToolOutputOffloader(
+        artifact_layout=SessionArtifactLayout(filesystem_root=session_artifact_root),
+        workspace_root=workspace_root,
+        threshold_chars=50,
+        preview_chars=40,
+    )
+    first_json = json.dumps({"stdout": "first-committed-" + "a" * 500})
+    first = offloader.maybe_offload(
+        tool_name="shell_run",
+        tool_call_id="same-call",
+        step=7,
+        result={},
+        content_json=first_json,
+    )
+    assert first.offloaded is True
+    artifact_path = Path(str(first.artifact_fs_path))
+    committed = artifact_path.read_bytes()
+
+    def _crash_before_replace(_source: Path, _target: Path) -> None:
+        raise OSError("simulated crash before rename")
+
+    monkeypatch.setattr(offload_module.os, "replace", _crash_before_replace)
+    second = offloader.maybe_offload(
+        tool_name="shell_run",
+        tool_call_id="same-call",
+        step=7,
+        result={},
+        content_json=json.dumps({"stdout": "second-uncommitted-" + "b" * 500}),
+    )
+
+    assert second.offloaded is False
+    assert artifact_path.read_bytes() == committed
+    assert not list(artifact_path.parent.glob(f".{artifact_path.name}.*.tmp"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows ACLs are not POSIX mode bits")
+def test_offloader_artifact_is_private_on_posix(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    offloader = ToolOutputOffloader(
+        artifact_layout=SessionArtifactLayout(
+            filesystem_root=tmp_path / "sessions" / "private-session"
+        ),
+        workspace_root=workspace_root,
+        threshold_chars=10,
+        preview_chars=5,
+    )
+
+    result = offloader.maybe_offload(
+        tool_name="shell_run",
+        tool_call_id="private",
+        step=1,
+        result={},
+        content_json=json.dumps({"stdout": "private" * 100}),
+    )
+
+    artifact_path = Path(str(result.artifact_fs_path))
+    assert artifact_path.stat().st_mode & 0o777 == 0o600
+    assert artifact_path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_offloader_rejects_workspace_symlink_escape_and_falls_back_to_session_store(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    outside = tmp_path / "workspace-controlled-target"
+    session_artifact_root = tmp_path / "trusted-session-store" / "escape-session"
+    workspace_root.mkdir()
+    outside.mkdir()
+    try:
+        (workspace_root / ".sylliptor").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("Directory symlinks are unavailable on this host")
+    offloader = ToolOutputOffloader(
+        artifact_layout=SessionArtifactLayout(filesystem_root=session_artifact_root),
+        workspace_root=workspace_root,
+        threshold_chars=20,
+        preview_chars=10,
+    )
+
+    result = offloader.maybe_offload(
+        tool_name="shell_run",
+        tool_call_id="escape-call",
+        step=1,
+        result={},
+        content_json=json.dumps({"stdout": "contained" + "x" * 500}),
+    )
+
+    assert result.offloaded is True
+    assert offloader.artifact_root == session_artifact_root.resolve()
+    assert Path(str(result.artifact_fs_path)).is_relative_to(session_artifact_root.resolve())
+    assert result.artifact_readable_via_fs is False
+    assert list(outside.rglob("*")) == []
 
 
 def test_offloader_non_fs_readable_stub_guides_to_narrow_rerun(tmp_path: Path) -> None:

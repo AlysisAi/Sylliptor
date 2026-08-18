@@ -3,8 +3,9 @@
 A fast (<2 min total), Windows + Linux, default-runnable regression net that drives a
 real tiny build -- create a file via the agent, applied to the working tree -- through
 the actual CLI (as a subprocess) against the local mock provider. It is the trustworthy
-"did I break a real build" signal an autonomous fix-loop needs: the three modes (simple
-``run``, ``forge exec``, and ``forge swarm``) must each finish with a
+"did I break a real build" signal an autonomous fix-loop needs: the four public paths
+(simple ``run``, classic chat with a subagent, ``forge exec``, and ``forge swarm``) must
+each finish with a
 coherent terminal status and the deliverable on disk, with no raw error leaking.
 
 The mock provider (scripts/qa/mock_llm.py) is pattern-driven: an instruction containing
@@ -326,9 +327,12 @@ def test_smoke_classic_chat_subagent_reads_readme_end_to_end(tmp_path: Path) -> 
     ]
     assert len(task_requests) >= 2, "the child did not complete its fs_read tool round trip"
 
+    tool_task_requests = [request for request in task_requests if request.get("tools")]
+    assert tool_task_requests, "the child did not receive its readonly tool surface"
+
     exposed_tool_names = {
         str(function.get("name") or "")
-        for tool in task_requests[0].get("tools") or ()
+        for tool in tool_task_requests[0].get("tools") or ()
         if isinstance(tool, dict)
         for function in [tool.get("function")]
         if isinstance(function, dict)

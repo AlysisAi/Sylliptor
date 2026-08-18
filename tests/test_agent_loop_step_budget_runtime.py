@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 from sylliptor_agent_cli import agent_loop as agent_loop_mod
@@ -117,16 +116,6 @@ class _CompletesAfterToolCallsClient:
         )
 
 
-def _route_decision(route: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        route=route,
-        confidence=0.99,
-        language="",
-        script="",
-        explicit_language_override=False,
-    )
-
-
 def _event_payloads(path: Path, event_type: str) -> list[dict[str, Any]]:
     return [
         dict(event.get("payload") or {})
@@ -136,9 +125,8 @@ def _event_payloads(path: Path, event_type: str) -> list[dict[str, Any]]:
 
 
 def test_autonomous_repo_turn_runs_past_legacy_cap_until_model_completes(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(agent_loop_mod, "_route_turn", lambda **_kwargs: _route_decision("repo"))
     cfg = AppConfig(model="test-model", routing_mode="auto", step_budget_policy="adaptive")
     session = create_session(
         cfg=cfg,
@@ -181,8 +169,7 @@ def test_autonomous_repo_turn_runs_past_legacy_cap_until_model_completes(
     assert _event_payloads(log_path, "forced_final_summary_requested") == []
 
 
-def test_simple_agent_fixed_override_uses_fixed_turn_ceiling(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(agent_loop_mod, "_route_turn", lambda **_kwargs: _route_decision("repo"))
+def test_simple_agent_fixed_override_uses_fixed_turn_ceiling(tmp_path: Path) -> None:
     cfg = AppConfig(model="test-model", routing_mode="auto", step_budget_policy="adaptive")
     session = create_session(
         cfg=cfg,
@@ -219,9 +206,8 @@ def test_simple_agent_fixed_override_uses_fixed_turn_ceiling(tmp_path: Path, mon
 
 
 def test_low_level_session_can_still_use_an_explicit_finite_loop(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(agent_loop_mod, "_route_turn", lambda **_kwargs: _route_decision("repo"))
     cfg = AppConfig(model="test-model", routing_mode="auto", step_budget_policy="adaptive")
     session = create_session(
         cfg=cfg,
@@ -295,20 +281,12 @@ def test_deadline_exhausted_before_first_llm_skips_model_and_not_step_budget(
     assert all(event.get("max_steps") is None for event in error_events)
 
 
-def test_non_repo_fast_path_clears_active_turn_budget_without_new_resolution_event(
-    tmp_path: Path, monkeypatch
+def test_chat_only_turn_adds_no_step_budget_resolution(
+    tmp_path: Path,
 ) -> None:
-    def fake_route_turn(*, instruction: str, **_kwargs: Any) -> SimpleNamespace:
-        if "repo" in instruction:
-            return _route_decision("repo")
-        return _route_decision("chat")
-
-    monkeypatch.setattr(agent_loop_mod, "_route_turn", fake_route_turn)
-    monkeypatch.setattr(
-        agent_loop_mod,
-        "_respond_non_repo_turn",
-        lambda **_kwargs: "I am doing well.",
-    )
+    # Router-free path: there is no non-repo fast path. The bounded /chat turn
+    # is the one surface that answers without entering the repo loop, and it
+    # must not resolve (or leak) a per-turn step budget.
     cfg = AppConfig(model="test-model", routing_mode="auto", step_budget_policy="adaptive")
     session = create_session(
         cfg=cfg,
@@ -333,7 +311,7 @@ def test_non_repo_fast_path_clears_active_turn_budget_without_new_resolution_eve
             == session.step_budget_runtime.last_resolution.resolved_max_steps
         )
         assert session.step_budget_runtime.active_turn_budget is None
-        second_exit_code = session.run_turn("How are you?")
+        second_exit_code = session.run_turn("How are you?", chat_only=True)
         active_turn_budget = session.step_budget_runtime.active_turn_budget
         log_path = session.store.path
     finally:
@@ -341,7 +319,7 @@ def test_non_repo_fast_path_clears_active_turn_budget_without_new_resolution_eve
 
     assert first_exit_code == 0
     assert second_exit_code == 0
-    assert client.calls == 1
+    assert client.calls == 2
     assert active_turn_budget is None
     assert len(_event_payloads(log_path, "turn_step_budget_resolved")) == 1
 

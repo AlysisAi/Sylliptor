@@ -13,6 +13,13 @@ ROLE_PLANNER = "planner"
 ROLE_COMPREHENSION = "comprehension"
 ROLE_COMPACTOR = "compactor"
 ROLE_ROUTER = "router"
+ROLE_POWER_CONTRACT_SENTINEL = "power_contract_sentinel"
+ROLE_POWER_AGREEMENT_SENTINEL = "power_agreement_sentinel"
+ROLE_POWER_BLIND_JUDGE = "power_blind_judge"
+ROLE_POWER_DEBATER = "power_debater"
+ROLE_POWER_ADJUDICATOR = "power_adjudicator"
+ROLE_POWER_PROBE_GENERATOR = "power_probe_generator"
+ROLE_POWER_PROBE_VALIDATOR = "power_probe_validator"
 PREFER_CONTEXT_FORGE = "forge"
 
 ROLE_ENV_VARS: dict[str, str] = {
@@ -24,6 +31,13 @@ ROLE_ENV_VARS: dict[str, str] = {
     ROLE_COMPREHENSION: "SYLLIPTOR_COMPREHENSION_MODEL",
     ROLE_COMPACTOR: "SYLLIPTOR_MODEL_COMPACTOR",
     ROLE_ROUTER: "SYLLIPTOR_MODEL_ROUTER",
+    ROLE_POWER_CONTRACT_SENTINEL: "SYLLIPTOR_MODEL_POWER_CONTRACT_SENTINEL",
+    ROLE_POWER_AGREEMENT_SENTINEL: "SYLLIPTOR_MODEL_POWER_AGREEMENT_SENTINEL",
+    ROLE_POWER_BLIND_JUDGE: "SYLLIPTOR_MODEL_POWER_BLIND_JUDGE",
+    ROLE_POWER_DEBATER: "SYLLIPTOR_MODEL_POWER_DEBATER",
+    ROLE_POWER_ADJUDICATOR: "SYLLIPTOR_MODEL_POWER_ADJUDICATOR",
+    ROLE_POWER_PROBE_GENERATOR: "SYLLIPTOR_MODEL_POWER_PROBE_GENERATOR",
+    ROLE_POWER_PROBE_VALIDATOR: "SYLLIPTOR_MODEL_POWER_PROBE_VALIDATOR",
 }
 
 
@@ -131,6 +145,15 @@ def resolve_model_for_role(
         return resolve_model_for_role(
             cfg=cfg,
             role=ROLE_CODING,
+            plan=plan,
+            fallback_to_default=fallback_to_default,
+            prefer_context=prefer_context,
+        )
+
+    if role_key.startswith("power_"):
+        return resolve_model_for_role(
+            cfg=cfg,
+            role=ROLE_REVIEW,
             plan=plan,
             fallback_to_default=fallback_to_default,
             prefer_context=prefer_context,

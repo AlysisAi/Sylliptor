@@ -21,6 +21,17 @@ from sylliptor_agent_cli.knowledge_base import write_task_attempt_entry
 from sylliptor_agent_cli.runtime_kind import RuntimeKind
 from sylliptor_agent_cli.verify_gate import ResolvedVerifyCommands
 
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
+
+
+def _delegate_non_git_subprocess_calls(fake_run: Any) -> Any:
+    def wrapped(cmd: Any, **kwargs: Any) -> Any:
+        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "git":
+            return fake_run(cmd, **kwargs)
+        return _ORIGINAL_SUBPROCESS_RUN(cmd, **kwargs)
+
+    return wrapped
+
 
 def test_load_conflict_auto_resolve_settings_defaults_to_enabled() -> None:
     settings = load_conflict_auto_resolve_settings(
@@ -299,6 +310,7 @@ def test_attempt_auto_resolve_conflict_success_writes_artifacts(
         lambda **_kwargs: _VerifyPass(),
     )
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -483,6 +495,7 @@ def test_attempt_auto_resolve_conflict_preserves_warning_visibility_for_recordin
         lambda **_kwargs: _VerifyPass(),
     )
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -618,6 +631,7 @@ def test_attempt_auto_resolve_conflict_rejects_nonzero_exit_with_material_change
         "sylliptor_agent_cli.conflict_auto_resolver.run_task_verification", fail_verify
     )
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -757,6 +771,7 @@ def test_attempt_auto_resolve_conflict_rejects_nonzero_exit_before_strict_verify
         ),
     )
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -888,6 +903,7 @@ def test_attempt_auto_resolve_conflict_refines_generic_fallback_to_node_test(
         "sylliptor_agent_cli.conflict_auto_resolver.run_task_verification", fake_verify
     )
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -1020,6 +1036,7 @@ def test_attempt_auto_resolve_conflict_uses_structured_node_text_refinement(
         "sylliptor_agent_cli.conflict_auto_resolver.run_task_verification", fake_verify
     )
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -1113,7 +1130,11 @@ def test_conflict_instruction_bundle_preserves_scope_and_unmerged_files_under_ti
         "model_metadata_overrides": {
             "models": {
                 "resolver-model": {
-                    "context_window_tokens": 8192,
+                    # Sized to stay one notch above the minimal truncation tier so
+                    # omission notes are still emitted; rebased (+256) after the
+                    # tool-necessity/artifact-reporting norms grew the fixed prompt
+                    # overhead. The scenario stays budget-tight by construction.
+                    "context_window_tokens": 8448,
                     "max_output_tokens": 2048,
                     "supports_vision": False,
                 }
@@ -1234,6 +1255,7 @@ def test_attempt_auto_resolve_conflict_invalid_attempt_count_falls_back_to_one(
         "sylliptor_agent_cli.conflict_auto_resolver.run_task_verification", fail_verify
     )
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -1357,6 +1379,7 @@ def test_attempt_auto_resolve_conflict_verify_off_disables_tool_exposure_and_out
         "sylliptor_agent_cli.conflict_auto_resolver.run_task_verification", fail_verify
     )
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -1465,6 +1488,7 @@ def test_attempt_auto_resolve_conflict_nonzero_exit_without_material_changes_fai
 
     monkeypatch.setattr("sylliptor_agent_cli.conflict_auto_resolver.stage_all", fail_stage_all)
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -1560,6 +1584,7 @@ def test_attempt_auto_resolve_conflict_runtime_artifact_drift_blocks_nonzero_sal
 
     monkeypatch.setattr("sylliptor_agent_cli.conflict_auto_resolver.stage_all", fail_stage_all)
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -1661,6 +1686,7 @@ def test_attempt_auto_resolve_conflict_nonzero_exit_with_unresolved_markers_stay
 
     monkeypatch.setattr("sylliptor_agent_cli.conflict_auto_resolver.stage_all", fail_stage_all)
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -1772,6 +1798,7 @@ def test_attempt_auto_resolve_conflict_stages_resolved_unmerged_paths_before_che
         lambda *_a, **_k: "From deadbeef\n",
     )
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -1875,6 +1902,7 @@ def test_attempt_auto_resolve_conflict_run_agent_exception_is_not_salvaged(
 
     monkeypatch.setattr("sylliptor_agent_cli.conflict_auto_resolver.stage_all", fail_stage_all)
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -1983,6 +2011,7 @@ def test_attempt_auto_resolve_conflict_strict_verify_failure_keeps_worktree(
         lambda **_kwargs: _VerifyFail(),
     )
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [
@@ -2112,6 +2141,7 @@ def test_attempt_auto_resolve_conflict_warn_verify_failure_is_warning(
         lambda **_kwargs: _VerifyFail(),
     )
 
+    @_delegate_non_git_subprocess_calls
     def fake_subprocess_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
         cwd, args = _git_args(cmd)
         if cwd == str(worktree_repo) and args == [

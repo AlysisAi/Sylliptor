@@ -11,6 +11,7 @@ build/
 .venv/
 venv/
 .tmp_ci*/
+.pytest-*/
 
 # Tooling
 .dev/
@@ -19,7 +20,7 @@ venv/
 .mypy_cache/
 .coverage
 htmlcov/
-uv.lock
+node_modules/
 .sylliptor/
 .sylliptor_data_demo/
 .sylliptor_data_demo_verify/
@@ -27,6 +28,13 @@ uv.lock
 sylliptor-feedback/
 reports/
 qa_reports/
+.qa-results/
+.workflow-release-dist/
+benchmark_results/
+benchmarks/terminal_bench/artifacts/
+*_context_review.zip
+owner-scoping.patch
+sylliptor_ecs.tar.gz
 
 # Claude Code local config
 .claude/

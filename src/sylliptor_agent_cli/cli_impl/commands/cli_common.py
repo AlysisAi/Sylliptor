@@ -160,7 +160,6 @@ from ...extensions.state import (
 )
 from ...extensions.workspace_trust import is_workspace_trusted
 from ...surface.styles import (
-    STYLE_ACCENT,
     STYLE_CHROME,
     STYLE_CONTENT,
     STYLE_DESELECTED_DESC,
@@ -211,7 +210,6 @@ from ...forge import (
     add_requirement,
     add_task,
     append_planner_chat,
-    append_planner_router_event,
     append_planner_summary,
     append_transcript_note,
     attach_asset,
@@ -306,6 +304,15 @@ from ...merge_conflict_reviewer import (
 )
 from ...model_metadata_utils import parse_non_negative_float, parse_positive_int
 from ...model_router import ROLE_CODING, resolve_model_for_role
+from ...plan_repair import (
+    PlannerRepairReport,
+    apply_plan_status,
+    clarification_goal_key,
+    plan_repair_event_payload,
+    plan_status,
+    record_plan_repair,
+    resolve_plan_repair_policy,
+)
 from ...plan_validation import validate_plan, validate_plan_against_assets
 from ...remote_sync import (
     RemoteSyncError,
@@ -385,6 +392,7 @@ from ...tools.registry import (
 )
 from ...tools.web_search import resolve_web_search_runtime_status
 from ...usage_tracker import aggregate_usage_from_session_logs, format_context_percent, format_usd
+from ...verification_repair import TASK_STATUS_COMPLETED_UNVERIFIED
 from ...verify_gate import (
     VerifyError,
     normalize_verify_mode,
@@ -448,6 +456,7 @@ from .forge import (
     forge_exec,
     forge_plan,
     forge_review,
+    forge_run,
     forge_show,
     forge_status,
     forge_swarm,
@@ -655,81 +664,6 @@ def _print_forge_error(*, console: Console, message: str) -> None:
     )
 
 
-def _forge_supports_unicode_glyphs(console: Console) -> bool:
-    """Whether the console encoding can render the status/box glyphs we add."""
-    encoding = str(getattr(console, "encoding", "") or "")
-    if not encoding:
-        return True
-    try:
-        "●○─→✓✗".encode(encoding)
-    except (LookupError, UnicodeError):
-        return False
-    return True
-
-
-def _forge_phase_rule(*, console: Console, label: str, style: str = STYLE_EMPHASIS) -> Any:
-    """A quiet ``│ -- LABEL --...`` separator sized to the terminal width."""
-    from rich.text import Text
-
-    clean_label = str(label or "").strip()
-    dash = "─" if _forge_supports_unicode_glyphs(console) else "-"
-    try:
-        width = int(getattr(console, "width", 0) or 0)
-    except (TypeError, ValueError):
-        width = 0
-    width = max(width, _MIN_TERMINAL_COLUMNS)
-    lead = dash * 2
-    if not clean_label:
-        body = max(3, width - 2)
-        return Text.assemble(("│ ", STYLE_CHROME), (dash * body, STYLE_CHROME))
-    used = 2 + len(lead) + 1 + len(clean_label) + 1
-    tail = max(3, width - used)
-    return Text.assemble(
-        ("│ ", STYLE_CHROME),
-        (f"{lead} ", STYLE_CHROME),
-        (clean_label, style),
-        (" ", STYLE_CHROME),
-        (dash * tail, STYLE_CHROME),
-    )
-
-
-def _print_forge_suggestion(*, console: Console, message: str) -> None:
-    """Print a dim ``│ -> ...`` next-step nudge under a Forge command result."""
-    from rich.text import Text
-
-    arrow = "→" if _forge_supports_unicode_glyphs(console) else "->"
-    console.print(
-        Text.assemble(
-            ("│ ", STYLE_CHROME),
-            (f"{arrow} ", STYLE_ACCENT),
-            (str(message or ""), STYLE_DIM),
-        ),
-        highlight=False,
-    )
-
-
-def _forge_plan_has_requirement(plan: dict[str, Any]) -> bool:
-    requirements = plan.get("requirements") if isinstance(plan, dict) else None
-    if not isinstance(requirements, list):
-        return False
-    return any(bool(str(requirement_text(req)).strip()) for req in requirements)
-
-
-def _forge_plan_state(plan: dict[str, Any]) -> str:
-    """Classify a Forge plan into empty/planning/ready/done for UI guidance."""
-    if not isinstance(plan, dict):
-        return "empty"
-    tasks = plan.get("tasks") or []
-    has_tasks = isinstance(tasks, list) and len(tasks) > 0
-    if not has_tasks:
-        return "planning" if _forge_plan_has_requirement(plan) else "empty"
-    done, failed, remaining = _forge_task_status_counts(plan)
-    total = done + failed + remaining
-    if total > 0 and failed == 0 and remaining == 0:
-        return "done"
-    return "ready"
-
-
 def _forge_task_status_counts(plan: dict[str, Any]) -> tuple[int, int, int]:
     from ...swarm_scheduler import canonical_task_status
 
@@ -740,7 +674,7 @@ def _forge_task_status_counts(plan: dict[str, Any]) -> tuple[int, int, int]:
     done = 0
     failed = 0
     remaining = 0
-    done_states = {"done", "already_satisfied"}
+    done_states = {"done", "already_satisfied", TASK_STATUS_COMPLETED_UNVERIFIED}
     failure_states = {
         "failed",
         "verify_failed",
@@ -777,6 +711,10 @@ def _forge_task_status_markup(status: str) -> str:
     display = raw or canonical or "planned"
     if canonical in {"done", "completed", "already_satisfied"}:
         return f"[bold]{display}[/bold]"
+    if canonical == TASK_STATUS_COMPLETED_UNVERIFIED:
+        # Completed, but nothing authoritative checked it — bold like the other
+        # completions, dimmed so the table still shows it is a weaker result.
+        return f"[bold bright_black]{display}[/bold bright_black]"
     if canonical in {
         "failed",
         "verify_failed",
@@ -1108,16 +1046,18 @@ def _ordered_unique_strings(values: list[str]) -> list[str]:
     return ordered
 
 
-_CHAT_RETIRED_COMMANDS = {"/keys", "/tour", "/examples"}
+_CHAT_RETIRED_COMMANDS = {"/keys", "/tour", "/examples", "/chat"}
 _CHAT_GLOBAL_VISIBLE_COMMANDS = [
     "/help",
     "/login",
     "/mode",
+    "/persona",
+    "/ask",
     "/status",
     "/terminals",
     "/pwd",
     "/usage",
-    "/ctx",
+    "/context",
     "/compact",
     "/clear",
     "/resume",
@@ -1160,7 +1100,7 @@ _FORGE_SHARED_CHAT_COMMANDS = [
     "/terminals",
     "/pwd",
     "/usage",
-    "/ctx",
+    "/context",
     "/compact",
     "/resume",
     "/stream",
@@ -1211,7 +1151,7 @@ _CHAT_COMMANDS = _ordered_unique_strings(
         "/",
         "/cd",
         "/forge",
-        "/context",
+        "/ctx",
         "/terminals list",
         "/terminals show",
         "/terminals kill",
@@ -1229,6 +1169,9 @@ _CHAT_COMMANDS = _ordered_unique_strings(
         "/subagent on",
         "/subagent off",
         "/subagent status",
+        "/stream on",
+        "/stream off",
+        "/stream status",
         "/usage hud",
         "/usage hud on",
         "/usage hud off",

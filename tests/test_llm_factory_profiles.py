@@ -32,6 +32,7 @@ from sylliptor_agent_cli.llm.protocols import (
     OPENAI_RESPONSES_PROTOCOL,
     UnsupportedProtocolError,
 )
+from sylliptor_agent_cli.llm.types import BillingMode
 from sylliptor_agent_cli.profiles import ProfileSpec, add_profile, set_active_profile
 from sylliptor_agent_cli.provider_auth import ProviderAuthError
 from sylliptor_agent_cli.surface.noop_surface import NoopSurface
@@ -219,6 +220,83 @@ def test_make_llm_client_rejects_unconfirmed_subscription_selection(
         make_llm_client(cfg=cfg, api_key="", model="gpt-test")
 
 
+def test_factory_marks_subscription_and_local_billing_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = SimpleNamespace(
+        protocol=OPENAI_RESPONSES_PROTOCOL,
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+    monkeypatch.setattr(
+        "sylliptor_agent_cli.llm.factory.create_provider_auth",
+        lambda provider_id, *, transport=None: adapter,
+    )
+    subscription_profile = ProfileSpec(
+        name="chatgpt-codex",
+        protocol=OPENAI_RESPONSES_PROTOCOL,
+        base_url=adapter.base_url,
+        auth_provider="openai-codex",
+        default_model="gpt-test",
+        reasoning_effort="medium",
+    )
+    subscription_cfg = _cfg_with_profile(subscription_profile)
+
+    subscription_client = make_llm_client(
+        cfg=subscription_cfg,
+        api_key="",
+        model="gpt-test",
+    )
+
+    # A known local runtime stays LOCAL even when it is given a placeholder key
+    # (Ollama and LM Studio accept any string), because the preset key decides.
+    preset_local_client = make_llm_client(
+        cfg=_cfg_with_profile(
+            ProfileSpec(
+                name="ollama",
+                protocol=OPENAI_COMPAT_PROTOCOL,
+                base_url="http://localhost:11434/v1",
+                default_model="local-model",
+            )
+        ),
+        api_key="ollama",
+        model="local-model",
+    )
+
+    # An unrecognised loopback endpoint with no credential is still local.
+    unkeyed_local_client = make_llm_client(
+        cfg=_cfg_with_profile(
+            ProfileSpec(
+                name="custom-local",
+                protocol=OPENAI_COMPAT_PROTOCOL,
+                base_url="http://127.0.0.1:8080/v1",
+                default_model="local-model",
+            )
+        ),
+        api_key="",
+        model="local-model",
+    )
+
+    # But a keyed gateway on loopback (LiteLLM and friends) fronts a paid
+    # upstream API — calling that free would under-report real spend.
+    proxied_client = make_llm_client(
+        cfg=_cfg_with_profile(
+            ProfileSpec(
+                name="litellm-proxy",
+                protocol=OPENAI_COMPAT_PROTOCOL,
+                base_url="http://localhost:4000/v1",
+                default_model="gpt-4o",
+            )
+        ),
+        api_key="sk-proxy-key",
+        model="gpt-4o",
+    )
+
+    assert subscription_client.usage_contract.billing_mode == BillingMode.SUBSCRIPTION
+    assert preset_local_client.usage_contract.billing_mode == BillingMode.LOCAL
+    assert unkeyed_local_client.usage_contract.billing_mode == BillingMode.LOCAL
+    assert proxied_client.usage_contract.billing_mode == BillingMode.METERED_API
+
+
 def test_make_llm_client_routes_openai_compat_to_existing_client() -> None:
     cfg = _cfg_with_profile(
         ProfileSpec(
@@ -235,6 +313,50 @@ def test_make_llm_client_routes_openai_compat_to_existing_client() -> None:
     assert isinstance(client, OpenAICompatClient)
     assert client.base_url == "https://api.openai.com/v1"
     assert client.extra_headers == {"x-test": "yes"}
+
+
+def test_make_llm_client_resolves_nvidia_nim_provider_contract() -> None:
+    model = "nvidia/nemotron-3-super-120b-a12b"
+    cfg = _cfg_with_profile(
+        ProfileSpec(
+            name="nvidia",
+            protocol=OPENAI_COMPAT_PROTOCOL,
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key_env="NVIDIA_API_KEY",
+            default_model=model,
+        )
+    )
+
+    client = make_llm_client(cfg=cfg, api_key="nvapi-test", model=model)
+
+    assert isinstance(client, OpenAICompatClient)
+    assert client.provider_key == "nvidia"
+    assert client.reasoning_trace_capability.adapter == "nvidia_reasoning"
+    assert client.reasoning_trace_capability.continuation_state == "sensitive"
+    assert client.usage_contract.billing_mode == BillingMode.METERED_API
+    assert client.usage_contract.response_usage_confidence.value == "reported"
+
+
+def test_make_llm_client_resolves_zai_coding_plan_subscription_contract() -> None:
+    model = "glm-5.3"
+    cfg = _cfg_with_profile(
+        ProfileSpec(
+            name="zai-coding-plan",
+            protocol=OPENAI_COMPAT_PROTOCOL,
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            api_key_env="ZAI_API_KEY",
+            default_model=model,
+        )
+    )
+
+    client = make_llm_client(cfg=cfg, api_key="zai-test", model=model)
+
+    assert isinstance(client, OpenAICompatClient)
+    assert client.provider_key == "zai_coding_plan"
+    assert client.reasoning_trace_capability.adapter == "openai_compat_passive"
+    assert client.reasoning_trace_capability.has_safe_summary is False
+    assert client.usage_contract.billing_mode == BillingMode.SUBSCRIPTION
+    assert client.usage_contract.response_usage_confidence.value == "reported"
 
 
 def test_make_llm_client_passes_prompt_cache_fields_only_to_declared_openai_support() -> None:

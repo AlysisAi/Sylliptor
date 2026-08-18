@@ -10,12 +10,16 @@ from typer.testing import CliRunner
 from sylliptor_agent_cli.cli import app as sylliptor_app
 from sylliptor_agent_cli.cli_impl.commands import root as root_mod
 from sylliptor_agent_cli.config import AppConfig, save_config
-from sylliptor_agent_cli.llm.types import LLMResponse
+from sylliptor_agent_cli.llm.types import LLMResponse, LLMUsage
 from sylliptor_agent_cli.profiles import ProfileSpec, add_profile, set_active_profile
 from sylliptor_agent_cli.provider_diagnostics import (
     ProviderLiveValidation,
+    ReasoningSuppressionReport,
+    WebSearchLiveValidation,
     build_provider_diagnostics,
+    probe_reasoning_suppression_live,
     validate_active_provider_live,
+    validate_web_search_live,
 )
 
 
@@ -589,7 +593,7 @@ def test_provider_diagnostics_reports_stale_model_alias() -> None:
             protocol="gemini_generate_content",
             base_url="https://generativelanguage.googleapis.com/v1beta",
             api_key_env="GEMINI_API_KEY",
-            default_model="gemini-2.5-flash",
+            default_model="gemini-2.0-flash",
             web_search_adapter="gemini_grounding",
         )
     )
@@ -597,7 +601,7 @@ def test_provider_diagnostics_reports_stale_model_alias() -> None:
     diagnostics = build_provider_diagnostics(cfg)
 
     assert any("known renamed/deprecated alias" in issue for issue in diagnostics.issues)
-    assert any("gemini-3.5-flash" in issue for issue in diagnostics.issues)
+    assert any("gemini-3.6-flash" in issue for issue in diagnostics.issues)
 
 
 def test_provider_diagnostics_reports_native_feature_model_risk() -> None:
@@ -850,7 +854,31 @@ def test_doctor_providers_live_yes_uses_redacted_validation(
             message="Minimal text request completed successfully.",
         )
 
+    def fake_search_validate(*_args, **_kwargs):
+        return WebSearchLiveValidation(
+            mode="auto",
+            configured_adapter="openai_responses",
+            resolved_adapter="openai_responses",
+            backend_used="ddgs",
+            fallback_used=True,
+            status="passed",
+            message="openai_responses failed (Responses error 400); fallback ddgs served the probe.",
+        )
+
+    def fake_reasoning_probe(*_args, **_kwargs):
+        return ReasoningSuppressionReport(
+            profile_name="openai-responses",
+            provider_key="openai",
+            protocol="openai_responses",
+            model="gpt-5.4-mini",
+            outcome="suppressed",
+            reasoning_tokens=0,
+            message="Provider honored enable_thinking=false (0 reasoning tokens).",
+        )
+
     monkeypatch.setattr(root_mod, "validate_active_provider_live", fake_validate)
+    monkeypatch.setattr(root_mod, "validate_web_search_live", fake_search_validate)
+    monkeypatch.setattr(root_mod, "probe_reasoning_suppression_live", fake_reasoning_probe)
 
     result = CliRunner().invoke(
         sylliptor_app,
@@ -863,3 +891,349 @@ def test_doctor_providers_live_yes_uses_redacted_validation(
     assert "gpt-5.4-mini" in result.output
     assert "passed" in result.output
     assert "sk-openai-secret-value" not in result.output
+    # The live path also exercises the enabled optional tools end-to-end and
+    # reports whether reasoning-off requests are honored.
+    assert "web_search live check" in result.output
+    assert "fallback_used" in result.output
+    assert "reasoning-off live check" in result.output
+    assert "reasoning_off_outcome" in result.output
+
+
+class _CapturingSearchProbe:
+    """search_fn stub recording every probe call it receives."""
+
+    def __init__(self, outcomes: list[dict | Exception]) -> None:
+        self._outcomes = list(outcomes)
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _web_search_ready_cfg(*, mode: str = "auto") -> AppConfig:
+    return _cfg_with_profile(
+        ProfileSpec(
+            name="openai-responses",
+            protocol="openai_responses",
+            base_url="https://api.openai.com/v1",
+            api_key_env="OPENAI_API_KEY",
+            default_model="gpt-5.4-mini",
+            web_search_adapter="auto",
+        ),
+        web_search_mode=mode,
+    )
+
+
+def test_web_search_live_probe_passes_through_resolved_adapter(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
+    cfg = _web_search_ready_cfg()
+    probe = _CapturingSearchProbe(
+        [
+            {
+                "backend_adapter": "openai_responses",
+                "source_count": 1,
+                "sources": [{"url": "https://example.com", "title": "Example"}],
+            }
+        ]
+    )
+
+    validation = validate_web_search_live(cfg, timeout_s=7.0, search_fn=probe)
+
+    assert validation.status == "passed"
+    assert validation.ok is True
+    assert validation.resolved_adapter == "openai_responses"
+    assert validation.backend_used == "openai_responses"
+    assert validation.fallback_used is False
+    assert len(probe.calls) == 1
+    call = probe.calls[0]
+    assert call["max_sources"] == 1
+    probe_cfg = call["cfg"]
+    # The first attempt pins the resolved adapter so its own failure would be
+    # reported instead of silently masked by an in-call fallback, and the probe
+    # runs on a short timeout so doctor stays cheap.
+    assert probe_cfg.web_search_adapter == "openai_responses"
+    assert probe_cfg.web_search_timeout_s == 7.0
+    assert "sk-openai-secret-value" not in validation.message
+
+
+def test_web_search_live_probe_reports_native_failure_and_fallback_success(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """A gateway that statically looks ready but rejects real search calls must
+    show up as a native failure served by a fallback, not as plain "ready"."""
+
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
+    cfg = _web_search_ready_cfg()
+    # Static readiness still says the native adapter is fine.
+    assert build_provider_diagnostics(cfg).web_search_registration_ready is True
+
+    from sylliptor_agent_cli.tools.web_search import WebSearchError
+
+    probe = _CapturingSearchProbe(
+        [
+            WebSearchError(
+                "Responses error 400: include value 'web_search_call.action.sources' "
+                "cannot be produced by this gateway"
+            ),
+            {
+                "backend_adapter": "ddgs",
+                "source_count": 1,
+                "sources": [{"url": "https://example.com", "title": "Example"}],
+            },
+        ]
+    )
+
+    validation = validate_web_search_live(cfg, search_fn=probe)
+
+    assert validation.status == "passed"
+    assert validation.resolved_adapter == "openai_responses"
+    assert validation.backend_used == "ddgs"
+    assert validation.fallback_used is True
+    assert "openai_responses failed" in validation.message
+    assert "cannot be produced by this gateway" in validation.message
+    assert "fallback ddgs served the probe" in validation.message
+    assert len(probe.calls) == 2
+    assert probe.calls[0]["cfg"].web_search_adapter == "openai_responses"
+    assert probe.calls[1]["cfg"].web_search_adapter == "auto"
+
+
+def test_web_search_live_probe_reports_failure_when_all_backends_fail(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
+    cfg = _web_search_ready_cfg()
+
+    from sylliptor_agent_cli.tools.web_search import WebSearchError
+
+    probe = _CapturingSearchProbe(
+        [
+            WebSearchError("Responses error 400: gateway broken"),
+            WebSearchError("web_search failed across auto backends: everything down"),
+        ]
+    )
+
+    validation = validate_web_search_live(cfg, search_fn=probe)
+
+    assert validation.status == "failed"
+    assert validation.ok is False
+    assert "gateway broken" in validation.message
+    assert "everything down" in validation.message
+
+
+def test_web_search_live_probe_native_mode_reports_the_native_error(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
+    cfg = _web_search_ready_cfg(mode="native")
+
+    from sylliptor_agent_cli.tools.web_search import WebSearchError
+
+    probe = _CapturingSearchProbe(
+        [WebSearchError("native web search via openai_responses failed: gateway broken")]
+    )
+
+    validation = validate_web_search_live(cfg, search_fn=probe)
+
+    assert validation.status == "failed"
+    assert "gateway broken" in validation.message
+    # Native mode never tries external backends, so the probe must not either.
+    assert len(probe.calls) == 1
+
+
+def test_web_search_live_probe_env_override_pins_the_backend(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """An explicit env adapter override pins the backend exactly like the real
+    web_search call path, so a failed probe must not try fallback backends."""
+
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
+    monkeypatch.setenv("SYLLIPTOR_WEB_SEARCH_ADAPTER", "openai_responses")
+    cfg = _web_search_ready_cfg()
+
+    from sylliptor_agent_cli.tools.web_search import WebSearchError
+
+    probe = _CapturingSearchProbe([WebSearchError("Responses error 400: gateway broken")])
+
+    validation = validate_web_search_live(cfg, search_fn=probe)
+
+    assert validation.status == "failed"
+    assert "gateway broken" in validation.message
+    assert len(probe.calls) == 1
+
+
+def test_web_search_live_probe_detects_in_call_fallback_on_first_attempt(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """If the pinned attempt is served by a different backend (e.g. an env
+    override defeated the pin and an in-call fallback engaged), the report says
+    so instead of pretending the resolved adapter worked."""
+
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
+    cfg = _web_search_ready_cfg()
+    probe = _CapturingSearchProbe(
+        [
+            {
+                "backend_adapter": "ddgs",
+                "source_count": 1,
+                "sources": [{"url": "https://example.com", "title": "Example"}],
+            }
+        ]
+    )
+
+    validation = validate_web_search_live(cfg, search_fn=probe)
+
+    assert validation.status == "passed"
+    assert validation.resolved_adapter == "openai_responses"
+    assert validation.backend_used == "ddgs"
+    assert validation.fallback_used is True
+    assert "did not serve the probe" in validation.message
+
+
+def test_web_search_live_probe_skips_when_web_search_is_disabled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
+    cfg = _web_search_ready_cfg(mode="off")
+
+    def _never_called(**_kwargs):
+        raise AssertionError("disabled web_search must not be probed")
+
+    validation = validate_web_search_live(cfg, search_fn=_never_called)
+
+    assert validation.status == "skipped"
+    assert validation.backend_used == ""
+
+
+def test_reasoning_suppression_probe_reports_ignored_flag(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
+    cfg = _web_search_ready_cfg()
+    captured: dict[str, object] = {}
+    response = LLMResponse(
+        content="ok",
+        tool_calls=[],
+        raw={},
+        usage=LLMUsage(
+            prompt_tokens=10,
+            completion_tokens=1290,
+            total_tokens=1300,
+            reasoning_tokens=1280,
+        ),
+    )
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return _CapturingClient(response)
+
+    report = probe_reasoning_suppression_live(cfg, client_factory=factory)
+
+    # The probe is built the same way latency-sensitive internal clients are.
+    assert captured["enable_thinking"] is False
+    assert captured["reasoning_effort"] == ""
+    assert report.outcome == "ignored"
+    assert report.reasoning_tokens == 1280
+    assert "despite enable_thinking=false" in report.message
+    assert "sk-openai-secret-value" not in report.message
+
+
+def test_reasoning_suppression_probe_reports_suppressed(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
+    cfg = _web_search_ready_cfg()
+    response = LLMResponse(
+        content="ok",
+        tool_calls=[],
+        raw={},
+        usage=LLMUsage(
+            prompt_tokens=10,
+            completion_tokens=2,
+            total_tokens=12,
+            reasoning_tokens=0,
+        ),
+    )
+
+    report = probe_reasoning_suppression_live(
+        cfg,
+        client_factory=lambda **_kwargs: _CapturingClient(response),
+    )
+
+    assert report.outcome == "suppressed"
+    assert report.reasoning_tokens == 0
+
+
+def test_reasoning_suppression_probe_reports_not_reported(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
+    cfg = _web_search_ready_cfg()
+    response = LLMResponse(
+        content="ok",
+        tool_calls=[],
+        raw={},
+        usage=LLMUsage(prompt_tokens=10, completion_tokens=2, total_tokens=12),
+    )
+
+    report = probe_reasoning_suppression_live(
+        cfg,
+        client_factory=lambda **_kwargs: _CapturingClient(response),
+    )
+
+    assert report.outcome == "not_reported"
+    assert report.reasoning_tokens is None
+    assert "cannot be verified" in report.message
+
+
+def test_reasoning_suppression_probe_uses_profile_default_model(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """The probe targets the active profile's default model; the legacy
+    SYLLIPTOR_MODEL_ROUTER override no longer influences it."""
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret-value")
+    monkeypatch.setenv("SYLLIPTOR_MODEL_ROUTER", "legacy-router-model")
+    cfg = _web_search_ready_cfg()
+    captured: dict[str, object] = {}
+    response = LLMResponse(
+        content="ok",
+        tool_calls=[],
+        raw={},
+        usage=LLMUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2, reasoning_tokens=0),
+    )
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return _CapturingClient(response)
+
+    report = probe_reasoning_suppression_live(cfg, client_factory=factory)
+
+    assert captured["model"] == "gpt-5.4-mini"
+    assert report.model == "gpt-5.4-mini"

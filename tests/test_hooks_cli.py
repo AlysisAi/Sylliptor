@@ -814,5 +814,6 @@ def test_hooks_trace_latest_default_explains_hidden_foreign_sessions(tmp_path: P
     )
 
     assert result.exit_code == 0
-    assert "No sessions owned by this account" in result.output
-    assert "different account" in result.output
+    normalized_output = " ".join(result.output.split())
+    assert "No sessions owned by this account" in normalized_output
+    assert "different account" in normalized_output

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import typer
@@ -12,6 +13,7 @@ from ...agent_runtimes.service import (
     logout_runtime,
     runtime_connection_snapshot,
 )
+from ...auth_diagnostics import credential_backend_fields
 from ...config import AppConfig, ConfigError, load_config, save_config
 from ...profiles import (
     SUBSCRIPTION_SELECTION_REQUIRED_KEY,
@@ -36,6 +38,68 @@ auth_app = typer.Typer(
 )
 
 SYLLIPTOR_LOGIN_CONNECTION_ID = "sylliptor"
+
+JSON_OPTION_HELP = (
+    "Emit one machine-readable JSON object on stdout and nothing else. "
+    "Exit code 0 means the command ran; the payload carries the auth state."
+)
+
+
+def _status_payload(
+    *,
+    connection: str,
+    authenticated: bool,
+    account_label: str | None = None,
+    method: str | None = None,
+    detail: str | None = None,
+    transport: str | None = None,
+    error: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build the auth status contract a supervising app can read.
+
+    ``authenticated`` is data, not an outcome: a false value is still a
+    successful probe, so the caller never has to disambiguate it from a failure
+    of the command itself. The keyring fields explain why a spawned process can
+    see different auth state than the terminal the user logged in from.
+    """
+
+    payload: dict[str, Any] = {
+        "connection": connection,
+        "authenticated": bool(authenticated),
+        "account_label": account_label,
+        "method": method,
+        "detail": detail,
+        "transport": transport,
+        "error": error,
+    }
+    payload.update(credential_backend_fields())
+    payload.update(extra)
+    return payload
+
+
+def _emit_json(payload: dict[str, Any]) -> None:
+    """Write exactly one JSON object to stdout."""
+
+    typer.echo(json.dumps(payload, sort_keys=True))
+
+
+def _print_credential_backend_note(console: Any) -> None:
+    """Say so when credentials are not protected by the OS keyring.
+
+    Silent degradation is what makes auth state look inconsistent between a
+    terminal and a spawned process, so an interactive user gets told too.
+    """
+
+    fields = credential_backend_fields()
+    if fields["keyring_available"]:
+        return
+    console.print(
+        f"[yellow]OS keyring unavailable[/yellow] "
+        f"(backend: {fields['keyring_backend'] or 'unresolved'}) — credentials use the "
+        f"{fields['credential_fallback']} key store instead. "
+        "Run `sylliptor doctor auth` for details."
+    )
 
 
 def login_connection_rows() -> list[tuple[str, str, str]]:
@@ -98,10 +162,15 @@ def login_connection_interactively(
 
 
 @auth_app.command("list")
-def auth_list() -> None:
+def auth_list(
+    json_output: bool = typer.Option(False, "--json", help=JSON_OPTION_HELP),
+) -> None:
     """List supported subscription connections and account state."""
 
     cfg = _patchable("load_config", load_config)()
+    if json_output is True:
+        _emit_json(_auth_list_payload(cfg))
+        return
     table = Table(title="AI subscription connections")
     table.add_column("connection")
     table.add_column("availability")
@@ -134,7 +203,83 @@ def auth_list() -> None:
             else ""
         )
         table.add_row(option.label, installation, account, active)
-    _console().print(table)
+    console = _console()
+    console.print(table)
+    _print_credential_backend_note(console)
+
+
+def _auth_list_payload(cfg: AppConfig) -> dict[str, Any]:
+    """Describe every offered connection without printing human output."""
+
+    connections: list[dict[str, Any]] = []
+    for option in provider_auth_setup_options():
+        if _is_direct_provider(option.id):
+            active = _active_auth_provider(cfg) == option.id
+            try:
+                adapter = create_provider_auth(option.id)
+                status = adapter.account_status()
+            except ProviderAuthError as exc:
+                connections.append(
+                    _status_payload(
+                        connection=option.id,
+                        authenticated=False,
+                        error=str(exc),
+                        display_name=option.label,
+                        availability="built in",
+                        active=active,
+                    )
+                )
+                continue
+            connections.append(
+                _status_payload(
+                    connection=option.id,
+                    authenticated=status.connected,
+                    account_label=status.account_label,
+                    detail=status.detail,
+                    transport=f"native Sylliptor client ({adapter.protocol})",
+                    display_name=option.label,
+                    availability="built in",
+                    verified=bool(status.verified),
+                    active=active,
+                )
+            )
+            continue
+        active = (
+            cfg.execution.backend == "delegated" and str(cfg.execution.runtime or "") == option.id
+        )
+        try:
+            snapshot = runtime_connection_snapshot(cfg, option.id)
+        except RuntimeConnectionError as exc:
+            connections.append(
+                _status_payload(
+                    connection=option.id,
+                    authenticated=False,
+                    error=str(exc),
+                    display_name=option.label,
+                    availability="unavailable",
+                    active=active,
+                )
+            )
+            continue
+        connections.append(
+            _status_payload(
+                connection=option.id,
+                authenticated=snapshot.account.authenticated,
+                account_label=snapshot.account.account_label,
+                method=snapshot.account.auth_method_id,
+                detail=snapshot.account.detail,
+                transport=f"delegated runtime ({snapshot.option.adapter})",
+                display_name=option.label,
+                availability=snapshot.probe.version
+                or ("available" if snapshot.probe.available else "missing"),
+                installed=bool(snapshot.probe.available),
+                verified=bool(snapshot.account.verified),
+                active=active,
+            )
+        )
+    payload: dict[str, Any] = {"connections": connections, "error": None}
+    payload.update(credential_backend_fields())
+    return payload
 
 
 @auth_app.command("status")
@@ -143,9 +288,11 @@ def auth_status(
         None,
         help="Connection id. Defaults to the selected connection (or the only adapter).",
     ),
+    json_output: bool = typer.Option(False, "--json", help=JSON_OPTION_HELP),
 ) -> None:
     """Show availability and provider-owned account status."""
 
+    emit_json = json_output is True
     cfg = _patchable("load_config", load_config)()
     resolved = _cli_runtime_id(cfg, runtime_id)
     if _use_direct_provider(cfg, resolved, requested=runtime_id):
@@ -153,8 +300,32 @@ def auth_status(
             adapter = create_provider_auth(resolved)
             status = adapter.account_status()
         except ProviderAuthError as exc:
+            if emit_json:
+                # The probe answered: the connection is not usable, and the
+                # reason is data rather than a failure of this command.
+                _emit_json(
+                    _status_payload(
+                        connection=resolved,
+                        authenticated=False,
+                        error=str(exc),
+                    )
+                )
+                return
             _console().print(f"[red]Authentication error:[/red] {exc}")
             raise typer.Exit(code=2) from exc
+        if emit_json:
+            _emit_json(
+                _status_payload(
+                    connection=resolved,
+                    authenticated=status.connected,
+                    account_label=status.account_label,
+                    detail=status.detail,
+                    transport=f"native Sylliptor client ({adapter.protocol})",
+                    display_name=adapter.display_name,
+                    verified=bool(status.verified),
+                )
+            )
+            return
         console = _console()
         console.print(f"Connection: {adapter.display_name} ({resolved})")
         console.print(f"Transport: native Sylliptor client ({adapter.protocol})")
@@ -163,14 +334,42 @@ def auth_status(
             console.print(f"Account: {status.account_label}")
         if status.detail:
             console.print(f"Status: {status.detail}")
+        _print_credential_backend_note(console)
         if not status.connected:
+            console.print(f"[dim]Run `sylliptor auth login {resolved}` to reconnect.[/dim]")
             raise typer.Exit(code=1)
         return
     try:
         snapshot = runtime_connection_snapshot(cfg, resolved)
     except RuntimeConnectionError as exc:
+        if emit_json:
+            _emit_json(
+                _status_payload(
+                    connection=resolved,
+                    authenticated=False,
+                    error=str(exc),
+                )
+            )
+            return
         _console().print(f"[red]Runtime error:[/red] {exc}")
         raise typer.Exit(code=2) from exc
+    if emit_json:
+        _emit_json(
+            _status_payload(
+                connection=resolved,
+                authenticated=snapshot.account.authenticated,
+                account_label=snapshot.account.account_label,
+                method=snapshot.account.auth_method_id,
+                detail=snapshot.account.detail,
+                transport=f"delegated runtime ({snapshot.option.adapter})",
+                display_name=snapshot.option.label,
+                executable=snapshot.probe.executable or snapshot.settings.executable,
+                installed=bool(snapshot.probe.available),
+                version=snapshot.probe.version,
+                verified=bool(snapshot.account.verified),
+            )
+        )
+        return
     console = _console()
     console.print(f"Runtime: {snapshot.option.label} ({snapshot.option.id})")
     console.print(f"Executable: {snapshot.probe.executable or snapshot.settings.executable}")
@@ -184,6 +383,7 @@ def auth_status(
         console.print(f"Account: {snapshot.account.account_label}")
     if snapshot.account.detail:
         console.print(f"Status: {snapshot.account.detail}")
+    _print_credential_backend_note(console)
     if not snapshot.probe.available or not snapshot.account.authenticated:
         raise typer.Exit(code=1)
 

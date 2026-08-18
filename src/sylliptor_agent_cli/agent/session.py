@@ -88,7 +88,13 @@ from ..mcp.config import load_resolved_mcp_config
 from ..mcp.manager import ForgeTaskScopedMcpManager, McpManager, create_mcp_manager
 from ..model_metadata_policy import ActiveModelRef, evaluate_active_model_metadata_policy
 from ..model_registry import ModelRegistry, resolve_model_provider_key
-from ..model_router import ROLE_CODING, ROLE_COMPACTOR, ROLE_ROUTER, resolve_model_for_role
+from ..model_router import ROLE_CODING, ROLE_COMPACTOR, resolve_model_for_role
+from ..personas import (
+    PersonaSwitchState,
+    load_custom_personas,
+    normalize_persona,
+    persona_modes_enabled,
+)
 from ..process_reaping import (
     ProcessGroupRegistry,
     ReapAction,
@@ -151,7 +157,9 @@ from ..workspace_provisioning import (
     provisioning_already_attempted,
     resolve_provisioning_decision,
 )
+from .empty_response_stall import EmptyResponseStallTracker
 from .errors import SessionWorkdirError
+from .llm_calls import _main_agent_chat, _rewrite_final_summary_for_language
 from .prompt_context import (
     _build_plugin_activation_index,
     _component_plugin_allowed,
@@ -171,15 +179,9 @@ from .prompt_context import (
     resolve_workdir_relpath_within_workspace,
     set_session_active_workdir,
 )
-from .routing import (
-    _ROUTING_MODE_AUTO,
-    _emit_assistant_message_events,
-    _main_agent_chat,
-    _resolve_routing_mode,
-    _rewrite_final_summary_for_language,
-)
 from .tools_assembly import (
     ToolDef,
+    ToolDispatchGuard,
     _custom_tools_write_scope_restricted,
     _filter_custom_tool_session_state_for_plugins,
     _filter_mcp_config_for_plugins,
@@ -190,6 +192,10 @@ from .turn import (
     _looks_like_unexecuted_tool_call_markup,
 )
 from .turn import run_turn as _run_turn
+from .turn.events import (
+    _emit_assistant_message_events,
+    _legacy_message_tool_events_required,
+)
 
 OpenAICompatClient = _OpenAICompatClient
 _DEFAULT_CREATE_MCP_MANAGER = create_mcp_manager
@@ -472,12 +478,42 @@ class AgentSession:
     terminal_manager: TerminalManager | None = None
     durable_service_manager: DurableServiceManager | None = None
     router_client: Any | None = None
+    _semantic_router_bound_client: Any | None = None
+    _provisioned_router_client: Any | None = None
     api_key: str = ""
     api_key_source: str = "missing"
     shell_runner: Any | None = None
     no_log: bool = False
     non_interactive: bool = False
     one_shot_execution: bool = False
+    # Persona mode (code|architect|ask|debug). A convention layered on the
+    # execution-mode gate, never an enforcement layer; "code" is the no-op
+    # persona. See docs/persona_modes_design.md.
+    persona: str = "code"
+    # The user's chosen execution mode remembered while a narrowing persona
+    # (architect/ask) is active, so switching back to code/debug restores it.
+    # None when the active persona narrows nothing. An explicit /mode <exec>
+    # always wins and clears the restore point (and restores the write scope).
+    persona_restore_mode: str | None = None
+    # The user's base allow_write_globs snapshotted alongside
+    # persona_restore_mode (may legitimately be None = unrestricted; the
+    # restore-active signal is persona_restore_mode itself).
+    persona_restore_write_globs: list[str] | None = None
+    # Active persona scope, enforced independently from the user's base
+    # allow_write_globs. A path must satisfy both scopes when both exist.
+    persona_allow_write_globs: list[str] | None = None
+    # Coordination cell for the switch_mode tool (interactive chat only; None
+    # everywhere else, which also keeps the tool unregistered).
+    persona_switch_state: PersonaSwitchState | None = None
+    # Persona clients are keyed by the resolved client configuration that can
+    # vary by role. Model-only caching would reuse the wrong temperature when
+    # two roles intentionally share a model.
+    persona_client_cache: dict[tuple[str, float], Any] | None = None
+    persona_client_key: tuple[str, float] | None = None
+    # Custom personas loaded from .sylliptor_personas / <user-config>/personas
+    # (interactive chat only; builtins always win on name collisions).
+    persona_registry: dict[str, Any] | None = None
+    persona_registry_warnings: tuple[str, ...] = ()
     enable_chat_turn_step_budget: bool = False
     chat_turn_fixed_override: int | None = None
     verification_enabled: bool = True
@@ -487,6 +523,7 @@ class AgentSession:
     verification_selection_reason: str = ""
     verification_contract_type: str = ""
     verification_authoritative: bool = False
+    verification_best_effort: bool = False
     deny_write_prefixes: list[str] | None = None
     allow_write_globs: list[str] | None = None
     session_log_dir_override: Path | None = None
@@ -525,6 +562,10 @@ class AgentSession:
     crash_diagnostic_log_path: str | None = None
     agentbox_telemetry: AgentBoxTelemetry | None = None
     process_group_registry: ProcessGroupRegistry | None = None
+    # Empty-response handling is budgeted per session, not per turn: two failed
+    # recovery cycles mean the endpoint is not answering, and re-spending the
+    # budget every turn would reintroduce the unbounded retrying this bounds.
+    empty_response_stall_tracker: EmptyResponseStallTracker | None = None
 
     def _reap_tracked_process_groups(self, *, event: ReapEvent) -> None:
         """Terminate or report the process groups this session's runner started.
@@ -841,7 +882,8 @@ class AgentSession:
             text,
             streamed_text_emitted=streamed_text_emitted,
         )
-        self.surface.on_assistant_message_done(text)
+        if _legacy_message_tool_events_required(self.surface):
+            self.surface.on_assistant_message_done(text)
         return normalized_text
 
     def _record_llm_usage(
@@ -1266,6 +1308,7 @@ class AgentSession:
         explicit_language_override: bool = False,
         latest_assistant_text: str = "",
         allow_llm_summary: bool = True,
+        local_summary_override: str = "",
         final_event_payload: dict[str, Any] | None = None,
     ) -> str:
         normalized_termination_kind = _normalize_forced_summary_termination_kind(
@@ -1341,13 +1384,18 @@ class AgentSession:
                     fallback_reason = "tool_call_markup_response"
 
         if fallback_reason is not None:
-            final_text = self._forced_final_summary_fallback_text(
-                termination_cause=termination_cause,
-                termination_kind=normalized_termination_kind,
-                max_steps=max_steps,
-                fallback_reason=fallback_reason,
-                latest_assistant_text=latest_assistant_text,
-            )
+            # A caller that already built a factual account of what it salvaged
+            # supplies it here, so the local summary reports real state instead
+            # of the generic termination notice.
+            final_text = str(local_summary_override or "").strip()
+            if not final_text:
+                final_text = self._forced_final_summary_fallback_text(
+                    termination_cause=termination_cause,
+                    termination_kind=normalized_termination_kind,
+                    max_steps=max_steps,
+                    fallback_reason=fallback_reason,
+                    latest_assistant_text=latest_assistant_text,
+                )
             fallback_payload: dict[str, Any] = {
                 "reason": reason,
                 "termination_cause": termination_cause,
@@ -1395,6 +1443,7 @@ class AgentSession:
         ephemeral_system_messages: list[str] | tuple[str, ...] | None = None,
         ephemeral_user_messages: list[str] | tuple[str, ...] | None = None,
         cancellation_token: Any | None = None,
+        chat_only: bool = False,
     ) -> int:
         try:
             if self.agentbox_telemetry is None:
@@ -1406,6 +1455,7 @@ class AgentSession:
                     ephemeral_system_messages=ephemeral_system_messages,
                     ephemeral_user_messages=ephemeral_user_messages,
                     cancellation_token=cancellation_token,
+                    chat_only=chat_only,
                 )
             self.agentbox_telemetry.task(instruction)
             with self.agentbox_telemetry.turn():
@@ -1417,6 +1467,7 @@ class AgentSession:
                     ephemeral_system_messages=ephemeral_system_messages,
                     ephemeral_user_messages=ephemeral_user_messages,
                     cancellation_token=cancellation_token,
+                    chat_only=chat_only,
                 )
         except Exception as exc:
             # Single authoritative terminal-failure boundary: every caller (one-shot
@@ -1569,6 +1620,7 @@ def create_session(
     console: Any | None = None,
     deny_write_prefixes: list[str] | None = None,
     allow_write_globs: list[str] | None = None,
+    persona_allow_write_globs: list[str] | None = None,
     non_interactive: bool = False,
     one_shot_execution: bool = False,
     enable_chat_turn_step_budget: bool = False,
@@ -1600,6 +1652,7 @@ def create_session(
     execution_deadline: ExecutionDeadline | None = None,
     crash_diagnostic_log_path: str | Path | None = None,
     crash_diagnostic_logger: CrashDiagnosticLogger | None = None,
+    tool_dispatch_guard: ToolDispatchGuard | None = None,
 ) -> AgentSession:
     surface = surface or NoopSurface()
     resolved_runtime_kind = resolve_session_runtime_kind(
@@ -1618,6 +1671,7 @@ def create_session(
         yes=yes,
         deny_write_prefixes=deny_write_prefixes,
         allow_write_globs=allow_write_globs,
+        persona_allow_write_globs=persona_allow_write_globs,
         non_interactive=non_interactive,
         one_shot_execution=one_shot_execution,
         verification_enabled=verification_enabled,
@@ -1716,7 +1770,9 @@ def create_session(
         )
 
     registry = ModelRegistry(cfg=session_cfg, api_key=api_key)
-    routing_mode = _resolve_routing_mode(session_cfg)
+    # Deprecated no-op: recorded for observability and the (ignored)
+    # AgentSession.routing_mode field; nothing consults it.
+    routing_mode = str(getattr(session_cfg, "routing_mode", "auto") or "auto")
     resolved_subagents_enabled = prompt_context.resolved_subagents_enabled
     resolved_skills_enabled = prompt_context.resolved_skills_enabled
     skills_auto_invoke = prompt_context.skills_auto_invoke
@@ -1776,16 +1832,7 @@ def create_session(
             role=ROLE_COMPACTOR,
             plan=None,
         )
-    router_model_name: str | None = None
-    if routing_mode == _ROUTING_MODE_AUTO:
-        router_model_name = resolve_model_for_role(
-            cfg=session_cfg,
-            role=ROLE_ROUTER,
-            plan=None,
-        )
     active_model_refs = [ActiveModelRef(role=ROLE_CODING, model_name=session_cfg.model)]
-    if router_model_name:
-        active_model_refs.append(ActiveModelRef(role=ROLE_ROUTER, model_name=router_model_name))
     if compactor_model_name:
         active_model_refs.append(
             ActiveModelRef(role=ROLE_COMPACTOR, model_name=compactor_model_name)
@@ -1808,31 +1855,6 @@ def create_session(
         reasoning_effort=llm_reasoning_effort,
         session_id=session_id,
     )
-    router_client: Any | None = None
-    if routing_mode == _ROUTING_MODE_AUTO:
-        assert router_model_name is not None
-        # The router client performs strict-JSON turn routing plus the short
-        # chat/general/tool responses. Model "thinking" adds no value to these
-        # dispatch/classification calls, but on slow reasoning models (e.g. Xiaomi
-        # MiMo via the hosted trial proxy) it triples latency and completion
-        # tokens — enough to exceed the request timeout or truncate the JSON,
-        # which silently degrades the turn to the generic clarification fallback
-        # ("Could you clarify..."). Force reasoning off here (both flags, so a
-        # configured reasoning_effort cannot re-enable it via the OpenRouter
-        # reasoning payload); deep reasoning stays enabled on the coding client.
-        router_client = _make_session_llm_client(
-            cfg=session_cfg,
-            api_key=api_key,
-            model=router_model_name,
-            timeout_s=llm_timeout_s,
-            temperature=0.0,
-            prompt_cache_key=resolve_prompt_cache_key(session_cfg),
-            prompt_cache_retention=resolve_prompt_cache_retention(session_cfg),
-            prompt_cache_namespace=_prompt_cache_namespace(ROLE_ROUTER),
-            enable_thinking=False,
-            reasoning_effort="",
-            session_id=session_id,
-        )
     sessions_dir = (
         session_log_dir_override
         if session_log_dir_override is not None
@@ -1927,6 +1949,7 @@ def create_session(
             mode=mode,
             deny_write_prefixes=deny_write_prefixes,
             allow_write_globs=allow_write_globs,
+            persona_allow_write_globs=persona_allow_write_globs,
         ),
     )
     (
@@ -1963,6 +1986,20 @@ def create_session(
         else:
             warnings.warn(native_streaming_warning_message, stacklevel=2)
 
+    for verification_warning_message in prompt_context.verification_selection_warnings:
+        store.append(
+            "warning",
+            {
+                "warning": "verification_selection_degraded",
+                "message": verification_warning_message,
+                **verification_selection_metadata,
+            },
+        )
+        if callable(surface_on_warning):
+            surface_on_warning(verification_warning_message)
+        else:
+            warnings.warn(verification_warning_message, stacklevel=2)
+
     store.append(
         "session_start",
         {
@@ -1975,7 +2012,7 @@ def create_session(
             "task_max_steps": session_cfg.task_max_steps,
             "subagent_max_steps": session_cfg.subagent_max_steps,
             "model": session_cfg.model,
-            "router_model": router_model_name,
+            "router_model": "",
             "base_url_descriptor": endpoint_descriptor(session_cfg.base_url),
             "profile_name": active_profile.name,
             "protocol": active_profile.protocol,
@@ -2260,10 +2297,40 @@ def create_session(
                 return _session_verify_command_selection(session_obj)
             return prompt_context.effective_verification_selection
 
+        persona_switch_state = (
+            PersonaSwitchState()
+            if (
+                resolved_runtime_kind == RuntimeKind.INTERACTIVE_CHAT
+                and not non_interactive
+                and persona_modes_enabled(session_cfg)
+            )
+            else None
+        )
+        persona_registry: dict[str, Any] | None = None
+        persona_registry_warnings: tuple[str, ...] = ()
+        if persona_switch_state is not None:
+            try:
+                loaded_personas, persona_registry_warnings = load_custom_personas(root)
+                persona_registry = loaded_personas or None
+            except Exception:  # noqa: BLE001 - custom personas must not break startup
+                persona_registry = None
+                persona_registry_warnings = ()
+        completion_gate_tools_enabled = bool(
+            subagent_depth == 0
+            and str(mode or "").strip().lower() != "readonly"
+            and (
+                effective_one_shot_execution
+                or (
+                    resolved_runtime_kind == RuntimeKind.INTERACTIVE_CHAT
+                    and enable_chat_turn_step_budget
+                )
+            )
+        )
         tools = build_tools(
             root=root,
             console=console,
             surface=surface,
+            persona_switch_state=persona_switch_state,
             store=store,
             process_group_registry=process_group_registry,
             mode=mode,
@@ -2277,6 +2344,7 @@ def create_session(
             model_registry=registry,
             deny_write_prefixes=deny_write_prefixes,
             allow_write_globs=allow_write_globs,
+            persona_allow_write_globs=persona_allow_write_globs,
             non_interactive=non_interactive,
             shell_runner=runner,
             terminal_manager=terminal_manager,
@@ -2287,6 +2355,7 @@ def create_session(
             verify_command_selection=prompt_context.effective_verification_selection,
             get_verify_command_selection=_get_verify_command_selection,
             one_shot_execution=effective_one_shot_execution,
+            completion_gate_tools_enabled=completion_gate_tools_enabled,
             skills_enabled=resolved_skills_enabled,
             skill_registry=discovered_skills.skills,
             subagents_enabled=resolved_subagents_enabled,
@@ -2304,6 +2373,7 @@ def create_session(
             execution_deadline=execution_deadline,
             crash_diagnostic_log_path=resolved_crash_diagnostic_log_path,
             crash_diagnostics=crash_diagnostics,
+            tool_dispatch_guard=tool_dispatch_guard,
         )
         if mcp_manager is not None and mcp_manager.resolved_config.has_any_config:
             store.append("mcp_catalog_snapshot", mcp_manager.catalog_snapshot_metadata())
@@ -2562,6 +2632,14 @@ def create_session(
             cfg=session_cfg,
             root=root,
             mode=mode,
+            persona=(
+                normalize_persona(getattr(session_cfg, "default_persona", "code"), persona_registry)
+                if persona_modes_enabled(session_cfg)
+                else "code"
+            ),
+            persona_switch_state=persona_switch_state,
+            persona_registry=persona_registry,
+            persona_registry_warnings=persona_registry_warnings,
             yes=yes,
             stream=session_cfg.stream,
             routing_mode=routing_mode,
@@ -2592,10 +2670,16 @@ def create_session(
             verification_authoritative=bool(
                 verification_selection_metadata.get("verification_authoritative", False)
             ),
+            verification_best_effort=bool(
+                verification_selection_metadata.get("verification_best_effort", False)
+            ),
             deny_write_prefixes=(
                 list(deny_write_prefixes) if deny_write_prefixes is not None else None
             ),
             allow_write_globs=(list(allow_write_globs) if allow_write_globs is not None else None),
+            persona_allow_write_globs=(
+                list(persona_allow_write_globs) if persona_allow_write_globs is not None else None
+            ),
             session_log_dir_override=session_log_dir_override,
             skills_enabled=resolved_skills_enabled,
             skills_auto_invoke=skills_auto_invoke,
@@ -2608,6 +2692,8 @@ def create_session(
             surface=surface,
             store=store,
             client=client,
+            persona_client_cache={(session_cfg.model, coding_temperature): client},
+            persona_client_key=(session_cfg.model, coding_temperature),
             model_registry=registry,
             usage_summary=usage_summary,
             usage_role=usage_role,
@@ -2644,7 +2730,6 @@ def create_session(
             session_source_metadata=copy.deepcopy(normalized_session_source_metadata),
             pinned_prefix_len=pinned_prefix_len,
             startup_context_baseline_tokens=startup_context_baseline_tokens,
-            router_client=router_client,
             custom_tool_session_state=custom_tool_session_state,
             hook_dispatcher=hook_dispatcher,
             execution_deadline=execution_deadline,

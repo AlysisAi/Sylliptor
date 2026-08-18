@@ -64,63 +64,8 @@ def _forge_help_panel() -> Panel:
     return _chat_commands_panel(ui_mode="forge")
 
 
-def _forge_plan_readiness_line(*, console: Console, plan: dict[str, Any]) -> Any:
-    """A one-line go/no-go readiness chip derived from the current plan state."""
-    from rich.text import Text
-
-    use_unicode = _forge_supports_unicode_glyphs(console)
-    filled = "●" if use_unicode else "*"
-    hollow = "○" if use_unicode else "o"
-    tasks = plan.get("tasks") or []
-    has_tasks = isinstance(tasks, list) and len(tasks) > 0
-    if not has_tasks:
-        if _forge_plan_has_requirement(plan):
-            req_count = sum(
-                1 for req in (plan.get("requirements") or []) if str(requirement_text(req)).strip()
-            )
-            req_word = "requirement" if req_count == 1 else "requirements"
-            text = f"{req_count} {req_word}, 0 tasks — describe the work or /task to add tasks"
-        else:
-            text = "no tasks yet · add /goal then /task to start planning"
-        return Text.assemble(("│ ", STYLE_CHROME), (f"{hollow} ", STYLE_DIM), (text, STYLE_DIM))
-    done, failed, remaining = _forge_task_status_counts(plan)
-    total = done + failed + remaining
-    if failed > 0:
-        task_word = "task" if failed == 1 else "tasks"
-        text = f"needs attention · {failed} {task_word} blocked — see status column"
-        glyph_style = STYLE_WARN
-    elif remaining == 0 and total > 0:
-        task_word = "task" if total == 1 else "tasks"
-        text = f"all tasks done · {done} of {total} {task_word} finished"
-        glyph_style = STYLE_SUCCESS
-    else:
-        task_word = "task" if total == 1 else "tasks"
-        text = f"ready to execute · {total} {task_word} · 0 blocked"
-        glyph_style = STYLE_SUCCESS
-    return Text.assemble(("│ ", STYLE_CHROME), (f"{filled} ", glyph_style), (text, STYLE_DIM))
-
-
-def _forge_next_step_line(*, console: Console, plan: dict[str, Any]) -> Any:
-    """A state-aware ``Next`` hint naming the single best next command."""
-    from rich.text import Text
-
-    _ = console
-    hint = {
-        "empty": "paste your goal, or /goal then /task to start planning",
-        "planning": "/show to review, then /execute plan when ready",
-        "ready": "/execute plan to start the run",
-        "done": "run complete · /done to save, or /back to chat",
-    }.get(_forge_plan_state(plan), "/help for commands")
-    return Text.assemble(
-        ("│ ", STYLE_CHROME),
-        ("Next · ", STYLE_ACCENT),
-        (hint, STYLE_DIM),
-    )
-
-
 def _forge_enter_panel(
     *,
-    console: Console,
     paths: RunPaths,
     plan: dict[str, Any],
     entry_kind: str,
@@ -148,19 +93,17 @@ def _forge_enter_panel(
         context_bits.append(f"mode {str(mode).strip()}")
     if context_bits:
         lines.append(_forge_bar_text(text=" · ".join(context_bits), style="dim"))
-    lines.extend(
-        [
-            _forge_bar_text(
-                text=_forge_entry_status_text(entry_kind=entry_kind),
-                style="dim",
-            ),
-            _forge_bar_text(
-                text="/show for summary · /execute plan when ready · /help for commands",
-                style="dim",
-            ),
-            _forge_plan_readiness_line(console=console, plan=plan),
-            _forge_next_step_line(console=console, plan=plan),
-        ]
+    lines.append(
+        _forge_bar_text(
+            text=_forge_entry_status_text(entry_kind=entry_kind),
+            style="dim",
+        )
+    )
+    lines.append(
+        _forge_bar_text(
+            text="/show for summary · /execute plan when ready · /help for commands",
+            style="dim",
+        )
     )
     return Group(*lines)
 
@@ -341,7 +284,6 @@ def _show_forge_plan_summary(*, console: Console, paths: RunPaths, plan: dict[st
         message=f"Run {paths.run_id} · {task_count} tasks · {asset_count} assets",
         style=STYLE_EMPHASIS,
     )
-    console.print(_forge_plan_readiness_line(console=console, plan=plan), highlight=False)
     _print_forge_meta(console=console, message=f"Goal · {goal}", style=STYLE_CONTENT)
     _print_forge_meta(console=console, message=f"Summary · {summary}", style=STYLE_CONTENT)
     requirements = plan.get("requirements") or []
@@ -361,18 +303,6 @@ def _show_forge_plan_summary(*, console: Console, paths: RunPaths, plan: dict[st
                 message=f"... ({req_count - 8} more requirements)",
                 style="dim",
             )
-
-    if not _forge_has_usable_plan_input(plan):
-        if asset_count:
-            _print_forge_meta(console=console, message=f"Assets · {asset_count}", style="dim")
-        _print_forge_meta(console=console, message="This plan is empty.", style=STYLE_EMPHASIS)
-        _print_forge_meta(
-            console=console,
-            message="Add work two ways: paste a goal/spec, or use /goal then /task.",
-            style=STYLE_CONTENT,
-        )
-        console.print(_forge_next_step_line(console=console, plan=plan), highlight=False)
-        return
 
     table = _forge_task_table()
     table.add_column("id", style="dim", no_wrap=True, ratio=1)
@@ -395,7 +325,6 @@ def _show_forge_plan_summary(*, console: Console, paths: RunPaths, plan: dict[st
         table.add_row("-", "-", "(no tasks yet)", "-", "off")
     console.print(table)
     _print_forge_meta(console=console, message=f"Assets · {asset_count}", style="dim")
-    console.print(_forge_next_step_line(console=console, plan=plan), highlight=False)
 
 
 def _show_forge_plan_markdown(
@@ -481,14 +410,27 @@ def _sync_forge_planner_follow_up_state_from_result(
     *,
     planner_state: _ForgePlannerSessionState,
     planner_result: Any,
+    goal_key: str | None = None,
 ) -> None:
     questions = getattr(planner_result, "questions", None)
     plan_update = getattr(planner_result, "plan_update", None)
     error = str(getattr(planner_result, "error", "") or "").strip()
+    awaiting = bool(not error and not plan_update)
     _set_forge_planner_follow_up_state(
         planner_state=planner_state,
         questions=questions if isinstance(questions, list) else list(questions or []),
-        awaiting_clarification=bool(not error and not plan_update),
+        awaiting_clarification=awaiting,
+    )
+    if goal_key is None:
+        return
+    tracker = getattr(planner_state, "clarification_loop", None)
+    if tracker is None:
+        return
+    # A turn that produced a plan update resets the streak; only a genuine
+    # question-and-nothing-else turn counts toward the cap.
+    tracker.record(
+        goal_key=goal_key,
+        awaiting_clarification=awaiting and bool(planner_state.awaiting_clarification),
     )
 
 
@@ -717,6 +659,15 @@ def _run_forge_planner_turn_controller(
         selection_label=selection_label,
     )
     planner_workspace_root = resolve_knowledge_workspace_root(paths)
+    clarification_tracker = getattr(planner_state, "clarification_loop", None)
+    goal_key = clarification_goal_key(plan=plan, user_text=user_text)
+    if clarification_tracker is not None:
+        clarification_tracker.max_rounds = resolve_plan_repair_policy(
+            planner_state.cfg
+        ).max_clarification_rounds
+        clarification_rounds = clarification_tracker.rounds_for(goal_key)
+    else:
+        clarification_rounds = 0
     planner_result = _patchable("run_planner_turn", run_planner_turn)(
         cfg=planner_state.cfg,
         api_key_override=api_key_override,
@@ -732,6 +683,7 @@ def _run_forge_planner_turn_controller(
         prefer_context="forge",
         awaiting_clarification=planner_state.awaiting_clarification,
         pending_questions=planner_state.pending_questions,
+        clarification_rounds=clarification_rounds,
         run_paths=paths,
     )
     usage_events = list(getattr(planner_result, "usage_events", []) or [])
@@ -740,9 +692,6 @@ def _run_forge_planner_turn_controller(
             on_usage_events(usage_events)
         except Exception:
             pass
-    planner_router_event = getattr(planner_result, "planner_router_event", None)
-    if isinstance(planner_router_event, dict):
-        append_planner_router_event(paths, planner_router_event)
     render_reply(
         str(getattr(planner_result, "assistant_message", "") or ""),
         list(getattr(planner_result, "questions", []) or []),
@@ -754,16 +703,10 @@ def _run_forge_planner_turn_controller(
 
     request_retry_count = int(getattr(planner_result, "request_retry_count", 0) or 0)
     planner_error = str(getattr(planner_result, "error", "") or "").strip()
-    planner_intent_route = str(getattr(planner_result, "intent_route", "") or "").strip()
-    planner_intent_reason = str(getattr(planner_result, "intent_reason", "") or "").strip()
-    if planner_intent_route and planner_intent_route not in {"planning", "clarification_answer"}:
-        route_note = f"Planner router classified turn as {planner_intent_route}"
-        if planner_intent_reason:
-            route_note += f" ({planner_intent_reason})"
-        append_transcript_note(paths, role="system", message=route_note)
     _sync_forge_planner_follow_up_state_from_result(
         planner_state=planner_state,
         planner_result=planner_result,
+        goal_key=goal_key,
     )
 
     if planner_error:
@@ -870,6 +813,11 @@ def _run_forge_planner_turn_controller(
             reconciliation_result, planner_state.workspace_context = _reconcile_plan_for_paths(
                 **reconciliation_kwargs
             )
+        # Record what the repair loop had to salvage, and stamp the plan with an
+        # explicit draft/execution_ready status, before it is written. Downstream
+        # surfaces read the status instead of rediscovering it at exec time.
+        record_plan_repair(plan, getattr(planner_result, "repair", None) or PlannerRepairReport())
+        apply_plan_status(plan, validation_warnings=validate_plan(plan))
         save_plan(paths, plan)
         if apply_result.changed:
             if trace_callback is not None:
@@ -1157,7 +1105,6 @@ def _enter_forge_mode(
     )
     console.print(
         _forge_enter_panel(
-            console=console,
             paths=paths,
             plan=plan,
             entry_kind=entry_selection.entry_kind,

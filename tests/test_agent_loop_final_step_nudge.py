@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
-import sylliptor_agent_cli.agent_loop as agent_loop_mod
 from sylliptor_agent_cli.agent_loop import (
     _FINAL_TOOL_ENABLED_STEP_SYSTEM_PROMPT,
     _LOW_STEP_BUDGET_SYSTEM_PROMPT_TEMPLATE,
@@ -418,25 +416,9 @@ def test_final_step_nudge_preserves_stable_request_prefix_and_only_adds_suffix()
     assert final_request[2] == {"role": "system", "content": turn_wrapper}
 
 
-def test_non_repo_fast_path_stays_unchanged(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(
-        agent_loop_mod,
-        "_route_turn",
-        lambda **_kwargs: SimpleNamespace(
-            route="chat",
-            confidence=0.99,
-            reply="",
-            language="",
-            script="",
-            explicit_language_override=False,
-            language_source="default",
-        ),
-    )
-    monkeypatch.setattr(
-        agent_loop_mod,
-        "_respond_non_repo_turn",
-        lambda **_kwargs: "Normal non-repo reply.",
-    )
+def test_chat_only_turn_never_requests_forced_final_summary(tmp_path: Path) -> None:
+    # Router-free path: the bounded /chat turn answers in one model call and
+    # never trips the step-budget or forced-final-summary machinery.
     session = create_session(
         cfg=AppConfig(model=SMOKE_MODEL, routing_mode="auto"),
         root=tmp_path,
@@ -448,15 +430,20 @@ def test_non_repo_fast_path_stays_unchanged(tmp_path: Path, monkeypatch) -> None
         session_log_dir_override=tmp_path / "sessions",
         enable_chat_turn_step_budget=True,
     )
-    client = _UnexpectedChatClient()
+    # /chat turns request no tool schemas, which this file's scripted client
+    # models as its tool-free "finalization" call shape.
+    client = _ScriptedClient(
+        [],
+        finalization_response=LLMResponse(content="I am doing well.", tool_calls=[], raw={}),
+    )
     session.client = client  # type: ignore[assignment]
 
     try:
-        exit_code = session.run_turn("How are you?")
+        exit_code = session.run_turn("How are you?", chat_only=True)
         log_path = session.store.path
     finally:
         session.close()
 
     assert exit_code == 0
-    assert client.calls == 0
+    assert len(client.calls) == 1
     assert _event_payloads(log_path, "forced_final_summary_requested") == []

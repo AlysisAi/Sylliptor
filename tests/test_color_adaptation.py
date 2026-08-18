@@ -290,7 +290,7 @@ def test_detect_terminal_theme_ignores_wsl_settings_scan_errors(monkeypatch) -> 
     assert detect_terminal_theme(stream=_Pipe()) == "neutral"
 
 
-def test_apple_terminal_falls_back_to_system_appearance(monkeypatch) -> None:
+def test_apple_terminal_does_not_infer_profile_from_system_appearance(monkeypatch) -> None:
     for env_name in (
         "SYLLIPTOR_THEME",
         "OWL_THEME",
@@ -301,14 +301,10 @@ def test_apple_terminal_falls_back_to_system_appearance(monkeypatch) -> None:
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
     monkeypatch.setattr(theme_mod, "_theme_from_osc11", lambda _stream: None)
+    monkeypatch.setattr(theme_mod, "_windows_terminal_settings_paths", lambda: [])
 
-    class _Result:
-        returncode = 0
-        stdout = "Dark\n"
-
-    monkeypatch.setattr(theme_mod.subprocess, "run", lambda *_args, **_kwargs: _Result())
-
-    assert detect_terminal_theme_if_available(stream=_Pipe()) == "dark"
+    assert detect_terminal_theme_if_available(stream=_Pipe()) is None
+    assert detect_terminal_theme(stream=_Pipe()) == "neutral"
 
 
 def test_theme_debug_emits_detection_steps(monkeypatch, capsys) -> None:

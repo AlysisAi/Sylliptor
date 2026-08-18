@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 import httpx
 
@@ -11,7 +13,7 @@ from ..config import (
     resolve_web_search_mode,
 )
 from ..model_registry import ModelRegistry, resolve_model_provider_key
-from ..profile_presets import find_preset_for_profile
+from ..profile_presets import LOCAL_PROFILE_PRESET_KEYS, find_preset_for_profile
 from ..profiles import (
     ProfileSpec,
     active_subscription_selection_ready,
@@ -42,6 +44,7 @@ from .protocols import (
     resolve_reasoning_trace_capability,
 )
 from .provider_limits import resolve_provider_retry_settings
+from .types import BillingMode
 
 if TYPE_CHECKING:
     from ..config import AppConfig
@@ -122,6 +125,31 @@ def make_llm_client(
         if capabilities is not None
         else default_usage_contract_for_protocol(protocol)
     )
+    # A loopback base URL only implies a free local runtime when no credential is
+    # configured. Keyed gateways (LiteLLM, corporate proxies) front paid upstream
+    # APIs over localhost too, and suppressing their cost would under-report spend.
+    loopback_host = (urlparse(base_url).hostname or "").strip().lower() in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
+    unkeyed_loopback = loopback_host and not str(api_key or "").strip()
+    if resolved_profile.auth_provider:
+        billing_mode = BillingMode.SUBSCRIPTION
+    elif (
+        capabilities is not None
+        and capabilities.usage_contract.billing_mode == BillingMode.SUBSCRIPTION
+    ):
+        billing_mode = BillingMode.SUBSCRIPTION
+    elif provider_key in LOCAL_PROFILE_PRESET_KEYS or unkeyed_loopback:
+        billing_mode = BillingMode.LOCAL
+    elif provider_key == "sylliptor":
+        billing_mode = BillingMode.INCLUDED
+    elif provider_key:
+        billing_mode = BillingMode.METERED_API
+    else:
+        billing_mode = BillingMode.UNKNOWN
+    usage_contract = replace(usage_contract, billing_mode=billing_mode)
     model_meta = ModelRegistry(cfg=cfg, api_key=api_key).get(
         model,
         include_provider_auth=False,

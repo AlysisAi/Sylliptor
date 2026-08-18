@@ -64,9 +64,9 @@ def discover_skills(
     for ancestor_distance, ancestor_path in project_ancestors:
         for source_kind, parts, source_family in _PROJECT_SKILL_ROOT_SPECS:
             root = ancestor_path.joinpath(*parts)
-            if not root.exists() or not root.is_dir():
-                continue
             try:
+                if not root.exists() or not root.is_dir():
+                    continue
                 bundle_paths = sorted(child for child in root.iterdir() if child.is_dir())
             except OSError as exc:
                 issues.append(
@@ -103,9 +103,9 @@ def discover_skills(
     for source_kind, parts, source_family in _USER_SKILL_ROOT_SPECS:
         base_root = canonical_user_root if source_kind == "native" else resolved_home_dir
         root = base_root.joinpath(*parts)
-        if not root.exists() or not root.is_dir():
-            continue
         try:
+            if not root.exists() or not root.is_dir():
+                continue
             bundle_paths = sorted(child for child in root.iterdir() if child.is_dir())
         except OSError as exc:
             issues.append(

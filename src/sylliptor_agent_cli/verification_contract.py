@@ -85,6 +85,24 @@ class VerificationCommandSpec:
         }
 
 
+# Rejection reasons that mean "Sylliptor could not classify this command",
+# as opposed to "Sylliptor recognized this command and refused it". Only the
+# former is survivable: an unclassifiable command costs the session a
+# verification contract, while a refused one (a vacuous verifier, a masked
+# failure, an unsafe pipeline) would actively manufacture false evidence, so
+# accepting it is worse than stopping.
+UNCLASSIFIABLE_VERIFY_REJECTION_REASONS = frozenset(
+    {
+        "unknown_verification_capability",
+        "unrecognized_command",
+    }
+)
+
+
+def rejection_reason_is_unclassifiable(reason: str) -> bool:
+    return str(reason or "").strip() in UNCLASSIFIABLE_VERIFY_REJECTION_REASONS
+
+
 _TRUSTED_SHELL_PROVENANCE = {
     VerificationCommandProvenance.HOST_AUTHORITATIVE,
     VerificationCommandProvenance.EXPLICIT_USER_COMMAND,

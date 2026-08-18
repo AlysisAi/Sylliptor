@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import site
 import subprocess
 import sys
 import textwrap
+import tomllib
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
@@ -114,6 +116,8 @@ def _run_subprocess(
         input=input_text,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
 
@@ -126,9 +130,49 @@ def _assert_completed_ok(proc: subprocess.CompletedProcess[str], *, label: str) 
     )
 
 
+def _uv_executable() -> str:
+    executable = shutil.which("uv")
+    if executable is None:
+        pytest.skip("release-smoke packaging tests require uv")
+    return executable
+
+
+def test_editable_build_helper_is_exactly_pinned_and_locked() -> None:
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert "editables==0.5" in project["build-system"]["requires"]
+    assert "editables==0.5" in project["project"]["optional-dependencies"]["dev"]
+
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    locked_versions = {
+        str(package.get("version") or "")
+        for package in lock.get("package", [])
+        if package.get("name") == "editables"
+    }
+    assert locked_versions == {"0.5"}
+
+
+def test_release_version_sources_are_aligned() -> None:
+    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+
+    project_version = str(project["project"]["version"])
+    locked_projects = [
+        package
+        for package in lock["package"]
+        if package["name"] == "sylliptor-agent-cli"
+        and package.get("source", {}).get("editable") == "."
+    ]
+
+    assert len(locked_projects) == 1
+    assert __version__ == project_version
+    assert str(locked_projects[0]["version"]) == project_version
+    assert f"## [{project_version}]" in (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+
 def _install_cli(tmp_root: Path, *, install_mode: str) -> _InstalledCli:
     build_env = _build_backend_env()
     install_env = _subprocess_env()
+    uv = _uv_executable()
     venv_dir = tmp_root / f"venv-{install_mode}"
     create_proc = _run_subprocess(
         [sys.executable, "-m", "venv", "--system-site-packages", os.fspath(venv_dir)],
@@ -145,13 +189,13 @@ def _install_cli(tmp_root: Path, *, install_mode: str) -> _InstalledCli:
         wheelhouse.mkdir(parents=True, exist_ok=True)
         wheel_proc = _run_subprocess(
             [
-                sys.executable,
-                "-m",
-                "pip",
-                "wheel",
-                "--no-deps",
+                uv,
+                "build",
+                "--wheel",
                 "--no-build-isolation",
-                "--wheel-dir",
+                "--no-sources",
+                "--no-create-gitignore",
+                "--out-dir",
                 os.fspath(wheelhouse),
                 os.fspath(REPO_ROOT),
             ],
@@ -162,29 +206,16 @@ def _install_cli(tmp_root: Path, *, install_mode: str) -> _InstalledCli:
         [wheel_path] = sorted(wheelhouse.glob("sylliptor_agent_cli-*.whl"))
         install_target = [os.fspath(wheel_path)]
     elif install_mode == "editable":
-        editables_proc = _run_subprocess(
-            [
-                os.fspath(python),
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "editables",
-            ],
-            cwd=REPO_ROOT,
-            env=install_env,
-        )
-        _assert_completed_ok(editables_proc, label="install editable build helper")
         install_target = ["-e", os.fspath(REPO_ROOT)]
     else:
         raise AssertionError(f"Unexpected install mode: {install_mode}")
 
     install_cmd = [
-        os.fspath(python),
-        "-m",
+        uv,
         "pip",
         "install",
-        "--disable-pip-version-check",
+        "--python",
+        os.fspath(python),
     ]
     if install_mode == "wheel":
         install_cmd.append("--no-deps")

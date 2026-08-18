@@ -12,6 +12,7 @@ from .task_scope import (
     normalize_claimed_scope_patterns,
     normalize_repo_path_list,
 )
+from .verification_repair import TASK_STATUS_COMPLETED_UNVERIFIED
 
 _EXPECTED_RED_REGRESSION_TEXT_RE = re.compile(
     r"\b(?:red|known[- ]?failing|expected\s+to\s+fail|fail(?:s|ing)?\s+before\s+fix|"
@@ -39,7 +40,12 @@ _SUPPORT_SCOPE_DIRS = frozenset(
         "tests",
     }
 )
-SUCCESSFUL_TERMINAL_STATUSES = frozenset({"done", "already_satisfied"})
+# ``completed_unverified`` belongs here: the task's work landed and was kept, only
+# the authoritative check for it was missing. Treating it as unfinished would block
+# every dependent task for a reason that has nothing to do with the work itself.
+SUCCESSFUL_TERMINAL_STATUSES = frozenset(
+    {"done", "already_satisfied", TASK_STATUS_COMPLETED_UNVERIFIED}
+)
 
 
 def canonical_task_status(status: str) -> str:

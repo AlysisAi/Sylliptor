@@ -47,7 +47,12 @@ from prompt_toolkit.layout.processors import (
 )
 from prompt_toolkit.widgets import Frame, TextArea
 
-from .app import _SPINNER_FRAMES, _render_picker_rows, _wrap_line
+from .app import (
+    _SPINNER_FRAMES,
+    _render_picker_rows,
+    _transcript_content_width_for,
+    _wrap_line,
+)
 from .setup_app import _TONE_STYLE, _row_to_dict
 
 # Opaque dark background so the full-screen float fully covers the chat behind it.
@@ -97,8 +102,16 @@ class ConfigOverlay:
             height=1,
             style=_BG,
         )
+        # Mask the input whenever the active input screen asks for it (its
+        # ``input_password`` flag) — generic across flows, so both ConfigFlow's
+        # api_key stage and PowerConfigFlow's paste-key stage hide the secret.
         _is_password = Condition(
-            lambda: self.flow is not None and getattr(self.flow, "stage", "") == "api_key"
+            lambda: (
+                self._open["on"]
+                and self.flow is not None
+                and self.flow.current_mode() == "input"
+                and bool(getattr(self.flow.screen(), "input_password", False))
+            )
         )
         self._input = TextArea(
             height=1,
@@ -164,13 +177,16 @@ class ConfigOverlay:
             pass
 
     def _width(self) -> int:
-        info = self._body_window.render_info
-        if info is not None and info.window_width:
-            return int(info.window_width)
+        # Derived from the terminal, not read back from render_info: the overlay
+        # body is a full-screen float (no frame) carrying one scrollbar margin, so
+        # it is exactly one column narrower than the screen. render_info is a frame
+        # BEHIND — after a resize it still reports the old, wider size, and the
+        # rows built from it overflow and hard-wrap into the new, narrower window.
         try:
-            return max(20, get_app().output.get_size().columns - 2)
+            cols = get_app().output.get_size().columns
         except Exception:
             return 80
+        return max(20, _transcript_content_width_for(cols))
 
     # ------------------------------------------------------------- rendering
 
@@ -309,15 +325,18 @@ class ConfigOverlay:
 
     # ------------------------------------------------------------- lifecycle
 
-    def open(self) -> None:
+    def open(self, flow_factory: Callable[[], Any] | None = None) -> None:
+        # ``flow_factory`` overrides the default for this open only, so the same
+        # overlay chrome (masked input, rendering, key handling) can host a
+        # different step machine for this invocation.
         if self._open["on"]:
             return
         try:
-            self.flow = self._flow_factory()
+            self.flow = (flow_factory or self._flow_factory)()
         except Exception as exc:  # noqa: BLE001 - surface, don't crash the chat UI
             if self._on_error is not None:
                 try:
-                    self._on_error(f"/config could not open: {exc}")
+                    self._on_error(f"configuration could not open: {exc}")
                 except Exception:
                     pass
             self.flow = None

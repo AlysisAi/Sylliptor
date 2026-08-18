@@ -53,6 +53,16 @@ from ..profiles import (
     update_profile,
 )
 from ..provider_diagnostics import provider_diagnostic_warning_lines
+from ..provider_model_catalog import (
+    ProviderModelCatalogError,
+    ProviderModelOption,
+    discover_provider_models,
+)
+from ..reasoning_contracts import (
+    UNKNOWN_CONTRACT,
+    reasoning_contract_for,
+    reasoning_labels_allowed_by_contract,
+)
 from ..sandbox_doctor import (
     BubblewrapInstallPlan,
     SandboxDiagnostic,
@@ -74,8 +84,20 @@ _DEFAULT_WORKSPACE_KEY = "default_workspace_path"
 # configured" heuristic.
 _ONBOARDED_KEY = "onboarded"
 _CUSTOM_MODEL_VALUE = "__custom_model__"
-_INHERIT_DEFAULT_MODEL_VALUE = "__inherit_default_model__"
 _CUSTOM_PROVIDER_KEY = "custom"
+_NVIDIA_PRESET_KEY = "nvidia"
+_MODEL_REASONING_SETUP_PRESET_KEYS = frozenset({_NVIDIA_PRESET_KEY, "zai-coding-plan"})
+_SETUP_REASONING_LABELS: tuple[str, ...] = (
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+    "auto",
+)
 _MAX_API_KEY_VALIDATION_ATTEMPTS = 3
 _FALLBACK_VALIDATION_MODEL = "gpt-5.4-mini"
 _VALIDATION_TIMEOUT_S = 8.0
@@ -136,13 +158,7 @@ class _ApiKeyStepResult:
 class _ModelStepResult:
     model: str
     custom: bool = False
-
-
-@dataclass(frozen=True)
-class _RouterModelStepResult:
-    model: str = ""
-    custom: bool = False
-    inherited: bool = True
+    reasoning_label: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -189,7 +205,6 @@ def run_setup_wizard() -> bool:
     profile_result: _ProfileStepResult | None = None
     api_key_result: _ApiKeyStepResult | None = None
     model_result: _ModelStepResult | None = None
-    router_model_result: _RouterModelStepResult | None = None
     workspace_result: _WorkspaceStepResult | None = None
     step_idx = 0
 
@@ -213,14 +228,12 @@ def run_setup_wizard() -> bool:
                         profile_result = None
                         api_key_result = None
                         model_result = None
-                        router_model_result = None
                 elif step_name == "profile":
                     previous_profile = profile_result
                     new_profile = _prompt_profile(console, previous=previous_profile)
                     if previous_profile is not None and new_profile != previous_profile:
                         api_key_result = None
                         model_result = None
-                        router_model_result = None
                     profile_result = new_profile
                 elif step_name == "api_key":
                     if profile_result is None:
@@ -238,16 +251,6 @@ def run_setup_wizard() -> bool:
                         profile_result,
                         api_key_result=api_key_result,
                         previous=model_result,
-                    )
-                elif step_name == "router_model":
-                    if profile_result is None or api_key_result is None or model_result is None:
-                        raise ConfigError("Provider profile, API key, or model step was skipped.")
-                    router_model_result, api_key_result = _prompt_router_model(
-                        console,
-                        profile_result,
-                        api_key_result=api_key_result,
-                        default_model_result=model_result,
-                        previous=router_model_result,
                     )
                 elif step_name == "workspace":
                     workspace_result = _prompt_workspace(console, previous=workspace_result)
@@ -290,19 +293,13 @@ def run_setup_wizard() -> bool:
             )
             return True
 
-        if (
-            profile_result is None
-            or api_key_result is None
-            or model_result is None
-            or router_model_result is None
-        ):
+        if profile_result is None or api_key_result is None or model_result is None:
             raise ConfigError("Setup did not collect all required native-provider inputs.")
 
         cfg = _commit_setup(
             profile_result=profile_result,
             api_key_result=api_key_result,
             model_result=model_result,
-            router_model_result=router_model_result,
             workspace_result=workspace_result,
             console=console,
         )
@@ -313,7 +310,6 @@ def run_setup_wizard() -> bool:
             profile_result=profile_result,
             api_key_result=api_key_result,
             model_result=model_result,
-            router_model_result=router_model_result,
             workspace_result=workspace_result,
             sandbox_result=sandbox_result,
         )
@@ -337,7 +333,7 @@ def run_setup_wizard() -> bool:
 def _maybe_offer_sylliptor_login(
     console: Console, *, profile_result: _ProfileStepResult, cfg: AppConfig
 ) -> None:
-    """If the user chose the hosted MiMo (login-based) preset, offer to connect now.
+    """If the user chose the Sylliptor account preset, offer to connect now.
 
     That preset authenticates via `sylliptor login` instead of an API key.
     Running the handshake here saves a separate step; declining is harmless (the
@@ -440,34 +436,29 @@ def _subscription_picker_rows() -> list[tuple[str, str, str]]:
     return rows
 
 
-_SYLLIPTOR_HOSTED_PRESET_KEY = "sylliptor"
-
-
 def _connect_provider_picker_rows() -> list[tuple[str, str, str]]:
     """One merged "Connect a provider" list.
 
     Subscription sign-ins and API-key providers appear side by side, so the
     auth method is a property of the row rather than an upfront branch.
-    Subscription rows lead, then the hosted providers in preset order; the
-    Sylliptor-hosted MiMo preset sits last among providers (the free trial is
-    over, so it is not promoted), and the advanced sub-list (local endpoints,
-    custom URLs, legacy presets) stays behind the final row. Values are either
-    a preset key, a ``runtime:<id>`` subscription value, or
+    The Sylliptor account and subscription rows lead, followed by hosted
+    providers in preset order. The advanced sub-list keeps local endpoints,
+    custom URLs, and legacy presets behind the final row. Values are
+    either a preset key, a ``runtime:<id>`` subscription value, or
     :data:`_ADVANCED_PROVIDER_PRESETS_VALUE`.
     """
     rows: list[tuple[str, str, str]] = []
+    rows.append(
+        (
+            "sylliptor",
+            "Sylliptor Pro",
+            "Browser sign-in — no API key needed.",
+        )
+    )
     for value, label, description in _subscription_picker_rows():
         rows.append((value, label, description or "Browser sign-in with your subscription."))
-    presets = _setup_presets()
     rows.extend(
-        (preset.key, preset_selection_label(preset), "API key")
-        for preset in presets
-        if preset.key != _SYLLIPTOR_HOSTED_PRESET_KEY
-    )
-    rows.extend(
-        (preset.key, preset_selection_label(preset), "Sylliptor account sign-in — no API key")
-        for preset in presets
-        if preset.key == _SYLLIPTOR_HOSTED_PRESET_KEY
+        (preset.key, preset_selection_label(preset), "API key") for preset in _setup_presets()
     )
     rows.append(
         (
@@ -573,7 +564,6 @@ def _setup_step_names(
         "profile",
         "api_key",
         "model",
-        "router_model",
         "workspace",
     )
 
@@ -944,6 +934,10 @@ def _validation_timeout_s(profile: ProfileSpec) -> float:
 def _validation_reasoning_effort(profile: ProfileSpec) -> str | None:
     if _is_gemini_profile(profile):
         return _GEMINI_VALIDATION_REASONING_EFFORT
+    if _is_zai_coding_plan_profile(profile):
+        # The plan defaults to max. A low-effort one-token validation proves
+        # model access while consuming the smallest documented reasoning tier.
+        return "low"
     return None
 
 
@@ -951,6 +945,12 @@ def _is_gemini_profile(profile: ProfileSpec) -> bool:
     name = str(profile.name or "").strip().casefold()
     base_url = str(profile.base_url or "").strip().casefold()
     return name == "gemini" or "generativelanguage.googleapis.com" in base_url
+
+
+def _is_zai_coding_plan_profile(profile: ProfileSpec) -> bool:
+    name = str(profile.name or "").strip().casefold()
+    base_url = str(profile.base_url or "").strip().rstrip("/").casefold()
+    return name == "zai-coding-plan" or base_url == "https://api.z.ai/api/coding/paas/v4"
 
 
 def _validation_result_from_error(
@@ -1054,11 +1054,18 @@ def _prompt_model(
     previous: _ModelStepResult | None = None,
 ) -> tuple[_ModelStepResult, _ApiKeyStepResult]:
     current_previous = previous
+    discovered_models, catalog_warning = _discover_setup_provider_models(
+        profile_result,
+        api_key=api_key_result.api_key,
+    )
+    if catalog_warning:
+        console.print(f"[yellow]{catalog_warning}[/yellow]")
     while True:
         model_result = _prompt_model_choice(
             console,
             profile_result,
             previous=current_previous,
+            discovered_models=discovered_models,
         )
         updated_api_key_result = _validate_selected_model(
             console=console,
@@ -1082,7 +1089,13 @@ def _prompt_model(
                     validation_message=warning,
                 )
             continue
-        return model_result, updated_api_key_result
+        reasoning_label = _prompt_setup_reasoning_label(
+            console,
+            profile_result=profile_result,
+            model=model_result.model,
+            current=model_result.reasoning_label,
+        )
+        return replace(model_result, reasoning_label=reasoning_label), updated_api_key_result
 
 
 def _prompt_model_choice(
@@ -1090,8 +1103,9 @@ def _prompt_model_choice(
     profile_result: _ProfileStepResult,
     *,
     previous: _ModelStepResult | None = None,
+    discovered_models: tuple[ProviderModelOption, ...] = (),
 ) -> _ModelStepResult:
-    rows = _model_picker_rows(profile_result)
+    rows = _model_picker_rows(profile_result, discovered_models=discovered_models)
     row_values = {value for value, _label, _description in rows}
     current_value = rows[0][0]
     if previous is not None:
@@ -1121,104 +1135,6 @@ def _prompt_model_choice(
         raise ConfigError("Default model is required.")
     console.print(f"[green]Default model:[/green] {model}")
     return _ModelStepResult(model=model.strip(), custom=is_custom)
-
-
-def _prompt_router_model(
-    console: Console,
-    profile_result: _ProfileStepResult,
-    *,
-    api_key_result: _ApiKeyStepResult,
-    default_model_result: _ModelStepResult,
-    previous: _RouterModelStepResult | None = None,
-) -> tuple[_RouterModelStepResult, _ApiKeyStepResult]:
-    current_previous = previous
-    while True:
-        router_model_result = _prompt_router_model_choice(
-            console,
-            profile_result,
-            default_model_result=default_model_result,
-            previous=current_previous,
-        )
-        if router_model_result.inherited:
-            return router_model_result, api_key_result
-
-        updated_api_key_result = _validate_selected_model(
-            console=console,
-            profile_result=profile_result,
-            api_key_result=api_key_result,
-            model_result=_ModelStepResult(
-                model=router_model_result.model,
-                custom=router_model_result.custom,
-            ),
-        )
-        if updated_api_key_result.validation_status == "model_not_found":
-            current_previous = router_model_result
-            if router_model_result.custom and _prompt_yes_no(
-                f"Use custom router model '{router_model_result.model}' anyway? [y/N]",
-                default=False,
-            ):
-                warning = (
-                    f"Router model '{router_model_result.model}' was not confirmed; "
-                    "provider reported it was missing and you chose to use it anyway."
-                )
-                return router_model_result, replace(
-                    updated_api_key_result,
-                    validation_status="inconclusive",
-                    validation_message=warning,
-                )
-            continue
-        return router_model_result, updated_api_key_result
-
-
-def _prompt_router_model_choice(
-    console: Console,
-    profile_result: _ProfileStepResult,
-    *,
-    default_model_result: _ModelStepResult,
-    previous: _RouterModelStepResult | None = None,
-) -> _RouterModelStepResult:
-    rows = _router_model_picker_rows(
-        profile_result,
-        default_model_result=default_model_result,
-        previous=previous,
-    )
-    row_values = {value for value, _label, _description in rows}
-    current_value = _INHERIT_DEFAULT_MODEL_VALUE
-    if previous is not None:
-        if previous.inherited:
-            current_value = _INHERIT_DEFAULT_MODEL_VALUE
-        else:
-            current_value = previous.model if previous.model in row_values else _CUSTOM_MODEL_VALUE
-    selected = _run_wizard_picker(
-        console=console,
-        title="Router Model",
-        subtitle="Pick a cheap model for routing, or inherit the default model.",
-        rows=rows,
-        current_value=current_value,
-        cancel_hint="back",
-    )
-    if selected is None:
-        raise _GoBack()
-    if selected == _INHERIT_DEFAULT_MODEL_VALUE:
-        console.print("[green]Router model:[/green] inherit default")
-        return _RouterModelStepResult()
-    if selected == _CUSTOM_MODEL_VALUE:
-        default_model = (
-            previous.model
-            if previous is not None and not previous.inherited and previous.model not in row_values
-            else ""
-        )
-        model = _prompt_custom_model_name(previous=default_model or None)
-        is_custom = True
-    else:
-        model = selected
-        is_custom = False
-    if profile_result.preset is not None:
-        model = canonical_model_alias_for_preset(profile_result.preset, model)
-    if not model.strip():
-        raise ConfigError("Router model is required when not inheriting the default model.")
-    console.print(f"[green]Router model:[/green] {model}")
-    return _RouterModelStepResult(model=model.strip(), custom=is_custom, inherited=False)
 
 
 def _validate_selected_model(
@@ -1258,50 +1174,34 @@ def _validate_selected_model(
     )
 
 
-def _router_model_picker_rows(
+def _discover_setup_provider_models(
     profile_result: _ProfileStepResult,
     *,
-    default_model_result: _ModelStepResult,
-    previous: _RouterModelStepResult | None = None,
-) -> list[tuple[str, str, str]]:
-    rows: list[tuple[str, str, str]] = [
-        (
-            _INHERIT_DEFAULT_MODEL_VALUE,
-            "Same as default model (recommended)",
-            f"Use {default_model_result.model} now and follow future default-model changes",
-        )
-    ]
-    seen: set[str] = {_INHERIT_DEFAULT_MODEL_VALUE}
+    api_key: str,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[tuple[ProviderModelOption, ...], str]:
     preset = profile_result.preset
-    if preset is not None:
-        for value, label, description in model_options_for_preset(preset):
-            if value in seen:
-                continue
-            seen.add(value)
-            rows.append((value, label, description))
-
-    default_model = str(default_model_result.model or "").strip()
-    if default_model and default_model not in seen:
-        seen.add(default_model)
-        rows.append((default_model, default_model, "selected default model"))
-
-    if previous is not None and not previous.inherited and previous.model:
-        previous_model = str(previous.model).strip()
-        if previous_model and previous_model not in seen:
-            seen.add(previous_model)
-            rows.append((previous_model, previous_model, "previous router model"))
-
-    rows.append(
-        (
-            _CUSTOM_MODEL_VALUE,
-            "Type a custom model name",
-            "Use any model supported by this provider",
+    if preset is None or preset.key != _NVIDIA_PRESET_KEY:
+        return (), ""
+    try:
+        options = discover_provider_models(
+            profile=profile_result.profile,
+            api_key=api_key,
+            transport=transport,
         )
-    )
-    return rows
+    except ProviderModelCatalogError:
+        return (), (
+            "NVIDIA's live model catalog is unavailable. Recommended models and "
+            "custom model entry are still available."
+        )
+    return tuple(sorted(options, key=lambda option: option.id.casefold())), ""
 
 
-def _model_picker_rows(profile_result: _ProfileStepResult) -> list[tuple[str, str, str]]:
+def _model_picker_rows(
+    profile_result: _ProfileStepResult,
+    *,
+    discovered_models: tuple[ProviderModelOption, ...] = (),
+) -> list[tuple[str, str, str]]:
     rows: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     preset = profile_result.preset
@@ -1318,14 +1218,110 @@ def _model_picker_rows(profile_result: _ProfileStepResult) -> list[tuple[str, st
         if normalized and normalized not in seen:
             seen.add(normalized)
             rows.append((normalized, normalized, "current profile default"))
-    rows.append(
-        (
-            _CUSTOM_MODEL_VALUE,
-            "Type a custom model name",
-            "Use any model supported by this provider",
-        )
+    custom_row = (
+        _CUSTOM_MODEL_VALUE,
+        "Type a custom model name",
+        "Use any model supported by this provider",
     )
+    if preset is not None and preset.key == _NVIDIA_PRESET_KEY:
+        # Keep manual entry reachable without scrolling through NVIDIA's large
+        # live catalog. Curated recommendations remain above it; live inventory
+        # follows below.
+        rows.append(custom_row)
+    for option in discovered_models:
+        model_id = str(option.id or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        description = str(option.description or "").strip()
+        if not description:
+            owner = model_id.partition("/")[0]
+            description = (
+                f"live NVIDIA catalog · hosted model from {owner}"
+                if owner and owner != model_id
+                else "live NVIDIA catalog"
+            )
+        label = option.label or model_id
+        if option.chat_compatibility == "unknown":
+            label = f"{label} (chat compatibility unverified)"
+            description = (
+                f"{description} · provider catalog does not declare endpoint compatibility; "
+                "selection is validated before setup completes"
+            )
+        rows.append((model_id, label, description))
+    if custom_row not in rows:
+        rows.append(custom_row)
     return rows
+
+
+def _setup_reasoning_labels(
+    profile_result: _ProfileStepResult,
+    *,
+    model: str,
+    current: str = "auto",
+) -> tuple[str, ...]:
+    preset = profile_result.preset
+    if preset is None or preset.key not in _MODEL_REASONING_SETUP_PRESET_KEYS:
+        return ("auto",)
+    contract = reasoning_contract_for(
+        preset.provider_key,
+        model,
+        preset_key=preset.key,
+    )
+    if contract is UNKNOWN_CONTRACT:
+        return ("auto",)
+    labels = reasoning_labels_allowed_by_contract(
+        contract,
+        _SETUP_REASONING_LABELS,
+        current=current if current in _SETUP_REASONING_LABELS else "auto",
+    )
+    return tuple(labels) or ("auto",)
+
+
+def _prompt_setup_reasoning_label(
+    console: Console,
+    *,
+    profile_result: _ProfileStepResult,
+    model: str,
+    current: str = "auto",
+) -> str:
+    preset = profile_result.preset
+    if preset is None or preset.key not in _MODEL_REASONING_SETUP_PRESET_KEYS:
+        return current
+    labels = _setup_reasoning_labels(
+        profile_result,
+        model=model,
+        current=current,
+    )
+    if labels == ("auto",) and preset.key == _NVIDIA_PRESET_KEY:
+        console.print(
+            "[dim]Reasoning controls for this NVIDIA-hosted model are not verified; "
+            "using the provider default without sending a guessed parameter.[/dim]"
+        )
+        return "auto"
+    descriptions = {
+        "off": "disable reasoning using this model's documented provider control",
+        "low": "lower reasoning effort",
+        "medium": "balanced reasoning effort",
+        "high": "full reasoning effort",
+        "max": "maximum reasoning effort",
+        "auto": "use the provider's documented default",
+    }
+    rows = [
+        (label, label, descriptions.get(label, "provider-documented reasoning effort"))
+        for label in labels
+    ]
+    selected = _run_wizard_picker(
+        console=console,
+        title="Reasoning Effort",
+        subtitle=f"Choose a verified reasoning mode for {model} on {preset.label}.",
+        rows=rows,
+        current_value=current if current in labels else "auto",
+        cancel_hint="models",
+    )
+    if selected is None:
+        raise _GoBack()
+    return selected
 
 
 def _prompt_custom_model_name(*, previous: str | None = None) -> str:
@@ -1394,7 +1390,6 @@ def _commit_setup(
     profile_result: _ProfileStepResult,
     api_key_result: _ApiKeyStepResult,
     model_result: _ModelStepResult,
-    router_model_result: _RouterModelStepResult,
     workspace_result: _WorkspaceStepResult,
     console: Console,
 ) -> AppConfig:
@@ -1406,13 +1401,25 @@ def _commit_setup(
         add_profile(cfg, profile_result.profile)
         set_active_profile(cfg, profile_result.profile.name)
         set_config_value(cfg, "model", model_result.model)
-        set_config_value(
-            cfg,
-            "role_models.router",
-            "" if router_model_result.inherited else router_model_result.model,
+        reasoning_label = str(model_result.reasoning_label or "auto").strip().casefold()
+        reasoning_effort = (
+            None
+            if reasoning_label == "auto"
+            else ("none" if reasoning_label == "off" else reasoning_label)
         )
-        update_profile(cfg, profile_result.profile.name, default_model=model_result.model)
+        cfg.llm_reasoning_effort = reasoning_effort
+        cfg.llm_enable_thinking = None if reasoning_label == "auto" else reasoning_label != "off"
+        update_profile(
+            cfg,
+            profile_result.profile.name,
+            default_model=model_result.model,
+            reasoning_effort=reasoning_effort,
+        )
         extra_fields = dict(cfg.extra_fields or {})
+        if reasoning_label not in {"auto", "off"}:
+            extra_fields["llm_thinking_label"] = reasoning_label
+        else:
+            extra_fields.pop("llm_thinking_label", None)
         extra_fields[_DEFAULT_WORKSPACE_KEY] = workspace_result.workspace
         extra_fields[_ONBOARDED_KEY] = True
         extra_fields.pop("subscription_reconnect_required", None)
@@ -1870,22 +1877,22 @@ def _print_setup_complete(
     profile_result: _ProfileStepResult,
     api_key_result: _ApiKeyStepResult,
     model_result: _ModelStepResult,
-    router_model_result: _RouterModelStepResult,
     workspace_result: _WorkspaceStepResult,
     sandbox_result: _SandboxStepResult,
 ) -> None:
     api_key_label = _api_key_summary_label(api_key_result)
     sandbox_label = _sandbox_summary_label(sandbox_result)
-    router_model_label = (
-        "inherits default" if router_model_result.inherited else router_model_result.model
-    )
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("label", no_wrap=True, style="bold")
     table.add_column("value")
     table.add_row("Profile:", f"{profile_result.label} (active)")
     table.add_row("API key:", api_key_label)
     table.add_row("Model:", model_result.model)
-    table.add_row("Router model:", router_model_label)
+    if (
+        profile_result.preset is not None
+        and profile_result.preset.key in _MODEL_REASONING_SETUP_PRESET_KEYS
+    ):
+        table.add_row("Reasoning:", model_result.reasoning_label)
     table.add_row("Workspace:", workspace_result.workspace)
     table.add_row("Sandbox:", sandbox_label)
     console.print()

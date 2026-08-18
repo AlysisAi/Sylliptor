@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import json
 import threading
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -14,39 +12,70 @@ from sylliptor_agent_cli.config import (
     load_config,
     load_persisted_profile_keys,
     resolve_api_key,
-    save_persisted_profile_key,
 )
 from sylliptor_agent_cli.profile_presets import get_preset, make_profile_from_preset
 
-_ACCESS_KEY = "11111111-2222-3333-4444-555555555555"
+_GATEWAY_KEY = "slk_test-1111-2222-3333-4444"
+_USER_CODE = "ABCD-EFGH"
+_DEVICE_CODE = "device-code-secret-hex"
 
 
-class _StubExchangeServer:
-    """Stands in for the `cli-auth` edge function: code -> {access_key, email}."""
+class _StubDeviceFlowServer:
+    """Stands in for the `device-code` + `device-token` edge functions.
 
-    def __init__(self, *, access_key: str, email: str | None) -> None:
-        self.received: list[dict] = []
-        access = access_key
-        mail = email
-        received = self.received
+    Behaviour is driven by ``approve_after``: the Nth poll returns approved
+    with the key; earlier polls return pending. ``terminal`` overrides every
+    poll with a fixed terminal status (e.g. "denied", "expired").
+    """
+
+    def __init__(self, *, approve_after: int = 1, terminal: str | None = None) -> None:
+        self.polls = 0
+        self.code_requests: list[dict] = []
+        outer = self
 
         class _Handler(BaseHTTPRequestHandler):
             def log_message(self, *args: object) -> None:  # noqa: A002
                 return
 
-            def do_POST(self) -> None:  # noqa: N802
-                if not self.path.endswith("/cli-auth/exchange"):
-                    self.send_error(404)
-                    return
-                length = int(self.headers.get("Content-Length", "0") or 0)
-                body = json.loads(self.rfile.read(length) or b"{}")
-                received.append(body)
-                payload = json.dumps({"access_key": access, "email": mail}).encode()
+            def _reply(self, payload: dict) -> None:
+                body = json.dumps(payload).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(payload)
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if self.path.endswith("/device-code"):
+                    outer.code_requests.append(body)
+                    self._reply(
+                        {
+                            "device_code": _DEVICE_CODE,
+                            "user_code": _USER_CODE,
+                            "verification_url": "https://example.test/activate",
+                            "verification_url_complete": (
+                                f"https://example.test/activate?code={_USER_CODE}"
+                            ),
+                            # interval 0 keeps the tests fast.
+                            "interval": 0,
+                            "expires_in": 900,
+                        }
+                    )
+                    return
+                if self.path.endswith("/device-token"):
+                    assert body.get("device_code") == _DEVICE_CODE
+                    outer.polls += 1
+                    if terminal is not None:
+                        self._reply({"status": terminal})
+                        return
+                    if outer.polls >= approve_after:
+                        self._reply({"status": "approved", "key": _GATEWAY_KEY})
+                    else:
+                        self._reply({"status": "pending"})
+                    return
+                self.send_error(404)
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -70,34 +99,28 @@ def _config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
 
-def _callback_browser(code: str, state_override: str | None = None):
-    """A fake browser that drives the CLI's localhost callback with a code."""
-
+def _noop_browser(opened: list[str]):
     def _open(url: str) -> bool:
-        query = parse_qs(urlsplit(url).query)
-        port = query["port"][0]
-        state = state_override if state_override is not None else query["state"][0]
-        target = f"http://127.0.0.1:{port}/callback?code={code}&state={state}"
-        urllib.request.urlopen(target, timeout=5).read()
+        opened.append(url)
         return True
 
     return _open
 
 
-def test_sylliptor_preset_offers_mimo_models() -> None:
+def test_sylliptor_preset_offers_pro_models() -> None:
     preset = get_preset("sylliptor")
     assert preset is not None
     assert preset.api_key_env is None
-    # Flagship is the default; flash + omni are the other two trial models.
-    assert preset.suggested_models[0] == "mimo-v2.5-pro"
-    assert set(preset.suggested_models) == {"mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2.5"}
+    assert preset.suggested_models[0] == "deepseek-v4-flash"
+    assert set(preset.suggested_models) == {"deepseek-v4-flash", "deepseek-v4-pro"}
     profile = make_profile_from_preset(preset, name="sylliptor")
-    assert profile.default_model == "mimo-v2.5-pro"
-    # The legacy bare "mimo" id canonicalizes to the flagship via the preset alias,
-    # so old sessions stop showing a "current model" that no model matches.
+    assert profile.default_model == "deepseek-v4-flash"
+    # Retired MiMo-trial ids canonicalize to the Pro default via preset aliases,
+    # so old sessions stop pointing at models we no longer serve.
     from sylliptor_agent_cli.profile_presets import canonical_model_alias_for_preset
 
-    assert canonical_model_alias_for_preset(preset, "mimo") == "mimo-v2.5-pro"
+    assert canonical_model_alias_for_preset(preset, "mimo") == "deepseek-v4-flash"
+    assert canonical_model_alias_for_preset(preset, "mimo-v2.5-pro") == "deepseek-v4-flash"
 
 
 def test_login_status_defaults_to_logged_out(tmp_path: Path, monkeypatch) -> None:
@@ -114,67 +137,78 @@ def test_logout_when_not_logged_in_returns_false(tmp_path: Path, monkeypatch) ->
     assert account_login.logout(cfg) is False
 
 
-def test_login_full_flow_wires_access_key_as_bearer(tmp_path: Path, monkeypatch) -> None:
+def test_login_full_flow_wires_gateway_key_as_bearer(tmp_path: Path, monkeypatch) -> None:
     _config_env(tmp_path, monkeypatch)
-    stub = _StubExchangeServer(access_key=_ACCESS_KEY, email="u@example.com")
+    stub = _StubDeviceFlowServer(approve_after=3)  # a couple of pending polls first
     monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
+    opened: list[str] = []
     try:
         cfg = load_config()
-        result = account_login.login(
-            cfg, browser_opener=_callback_browser("THE-ONE-TIME-CODE"), timeout_s=10
-        )
+        result = account_login.login(cfg, browser_opener=_noop_browser(opened), timeout_s=30)
 
-        # The handshake delivered the right code to the exchange endpoint.
-        assert stub.received and stub.received[0]["code"] == "THE-ONE-TIME-CODE"
+        # The browser was pointed at the approval page with the code prefilled.
+        assert opened and _USER_CODE in opened[0]
+        # The CLI kept polling until approval.
+        assert stub.polls == 3
 
-        # Result reflects an active sylliptor profile with NO model auto-selected
-        # (the free MiMo default was removed); the user picks one after login.
-        assert result.email == "u@example.com"
+        # Result reflects an active sylliptor profile with the Pro default model.
         assert result.profile_name == "sylliptor"
-        assert result.model == ""
+        assert result.model == "deepseek-v4-flash"
+        assert result.base_url.rstrip("/").endswith("/v1")
 
-        # The access_key is persisted as the sylliptor profile key.
-        assert load_persisted_profile_keys()["sylliptor"] == _ACCESS_KEY
+        # The gateway key is persisted as the sylliptor profile key.
+        assert load_persisted_profile_keys()["sylliptor"] == _GATEWAY_KEY
 
-        # Reloaded config has sylliptor active with no default model preselected.
+        # Reloaded config has sylliptor active with the default model.
         reloaded = load_config()
         assert reloaded.extra_fields["active_profile"] == "sylliptor"
-        assert reloaded.model == ""
+        assert reloaded.model == "deepseek-v4-flash"
 
-        # The crucial wiring: resolve_api_key returns the access_key as the
-        # Bearer for the sylliptor profile (so requests hit the proxy authed).
+        # The crucial wiring: resolve_api_key returns the gateway key as the
+        # Bearer for the sylliptor profile (so requests hit the gateway authed).
         resolution = resolve_api_key(reloaded, profile_name="sylliptor")
-        assert resolution.key == _ACCESS_KEY
+        assert resolution.key == _GATEWAY_KEY
 
         status = account_login.login_status(reloaded)
         assert status.logged_in is True
         assert status.active is True
-        assert status.base_url.endswith("/functions/v1/llm/v1")
+        assert status.key_preview is not None and status.key_preview.startswith("slk_")
     finally:
         stub.close()
 
 
-def test_login_rejects_state_mismatch(tmp_path: Path, monkeypatch) -> None:
+def test_login_denied_persists_nothing(tmp_path: Path, monkeypatch) -> None:
     _config_env(tmp_path, monkeypatch)
-    cfg = load_config()
-    with pytest.raises(account_login.SylliptorLoginError):
-        account_login.login(
-            cfg,
-            browser_opener=_callback_browser("code", state_override="WRONG-STATE"),
-            timeout_s=10,
-        )
-    # Nothing was persisted on a failed login.
-    assert "sylliptor" not in load_persisted_profile_keys()
+    stub = _StubDeviceFlowServer(terminal="denied")
+    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
+    try:
+        with pytest.raises(account_login.SylliptorLoginError, match="rejected"):
+            account_login.login(load_config(), browser_opener=_noop_browser([]), timeout_s=10)
+        assert "sylliptor" not in load_persisted_profile_keys()
+    finally:
+        stub.close()
+
+
+def test_login_expired_code_raises(tmp_path: Path, monkeypatch) -> None:
+    _config_env(tmp_path, monkeypatch)
+    stub = _StubDeviceFlowServer(terminal="expired")
+    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
+    try:
+        with pytest.raises(account_login.SylliptorLoginError, match="expired"):
+            account_login.login(load_config(), browser_opener=_noop_browser([]), timeout_s=10)
+        assert "sylliptor" not in load_persisted_profile_keys()
+    finally:
+        stub.close()
 
 
 def test_login_then_logout_clears_key(tmp_path: Path, monkeypatch) -> None:
     _config_env(tmp_path, monkeypatch)
-    stub = _StubExchangeServer(access_key=_ACCESS_KEY, email=None)
+    stub = _StubDeviceFlowServer()
     monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
     try:
         cfg = load_config()
-        account_login.login(cfg, browser_opener=_callback_browser("code"), timeout_s=10)
-        assert load_persisted_profile_keys().get("sylliptor") == _ACCESS_KEY
+        account_login.login(cfg, browser_opener=_noop_browser([]), timeout_s=10)
+        assert load_persisted_profile_keys().get("sylliptor") == _GATEWAY_KEY
 
         reloaded = load_config()
         assert account_login.logout(reloaded) is True
@@ -183,84 +217,62 @@ def test_login_then_logout_clears_key(tmp_path: Path, monkeypatch) -> None:
         stub.close()
 
 
-class _StubStatusServer:
-    """Stands in for the proxy's read-only GET .../llm/v1/status route."""
+def test_login_preserves_user_chosen_model_across_relogin(tmp_path: Path, monkeypatch) -> None:
+    from dataclasses import replace
 
-    def __init__(self, payload: dict, *, status_code: int = 200) -> None:
-        body = json.dumps(payload).encode()
+    from sylliptor_agent_cli.config import save_config
+    from sylliptor_agent_cli.profiles import add_profile, get_profile
 
-        class _Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args: object) -> None:  # noqa: A002
-                return
-
-            def do_GET(self) -> None:  # noqa: N802
-                if not self.path.endswith("/llm/v1/status"):
-                    self.send_error(404)
-                    return
-                self.send_response(status_code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
-
-    @property
-    def base_url(self) -> str:
-        host, port = self._server.server_address
-        return f"http://{host}:{port}"
-
-    def close(self) -> None:
-        self._server.shutdown()
-        self._server.server_close()
-        self._thread.join(timeout=5)
-
-
-def test_fetch_trial_status_returns_none_when_logged_out(tmp_path: Path, monkeypatch) -> None:
     _config_env(tmp_path, monkeypatch)
-    cfg = load_config()
-    assert account_login.fetch_trial_status(cfg) is None
-
-
-def test_fetch_trial_status_parses_proxy_response(tmp_path: Path, monkeypatch) -> None:
-    _config_env(tmp_path, monkeypatch)
-    save_persisted_profile_key("sylliptor", _ACCESS_KEY)
-    stub = _StubStatusServer(
-        {
-            "email": "u@example.com",
-            "plan": "trial",
-            "trial_ends_at": "2099-01-01T00:00:00+00:00",
-            "tokens_total": 1_000_000,
-            "tokens_used": 275,
-            "tokens_remaining": 999_725,
-        }
-    )
+    stub = _StubDeviceFlowServer()
     monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
     try:
-        status = account_login.fetch_trial_status(load_config())
-        assert status is not None
-        assert status.plan == "trial"
-        assert status.tokens_used == 275
-        assert status.tokens_total == 1_000_000
-        line = account_login.format_trial_status_line(status)
-        assert line is not None
-        assert "275 / 1,000,000 tokens used" in line
-        assert "ends 2099-01-01" in line
+        # Fresh connect defaults to the Pro flagship-for-volume model.
+        first = account_login.login(load_config(), browser_opener=_noop_browser([]), timeout_s=10)
+        assert first.model == "deepseek-v4-flash"
+
+        # Simulate the user picking another model in `/config`.
+        cfg = load_config()
+        add_profile(cfg, replace(get_profile(cfg, "sylliptor"), default_model="deepseek-v4-pro"))
+        save_config(cfg)
+
+        # Re-login must keep that choice instead of clobbering it back.
+        second = account_login.login(load_config(), browser_opener=_noop_browser([]), timeout_s=10)
+        assert second.model == "deepseek-v4-pro"
+        assert load_config().model == "deepseek-v4-pro"
     finally:
         stub.close()
 
 
-def test_fetch_trial_status_swallows_server_error(tmp_path: Path, monkeypatch) -> None:
+def test_login_migrates_legacy_mimo_selection(tmp_path: Path, monkeypatch) -> None:
+    # A user coming from the retired Xiaomi MiMo trial has a profile pinned to a
+    # MiMo id. The preset aliases canonicalize it to the Pro default at config
+    # load, so re-login lands them on a model the gateway actually serves.
+    from dataclasses import replace
+
+    from sylliptor_agent_cli.config import save_config
+    from sylliptor_agent_cli.profiles import add_profile, get_profile
+
     _config_env(tmp_path, monkeypatch)
-    save_persisted_profile_key("sylliptor", _ACCESS_KEY)
-    stub = _StubStatusServer({"error": {"code": "status_failed"}}, status_code=500)
+    stub = _StubDeviceFlowServer()
     monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
     try:
-        assert account_login.fetch_trial_status(load_config()) is None  # graceful on HTTP 500
+        account_login.login(load_config(), browser_opener=_noop_browser([]), timeout_s=10)
+        cfg = load_config()
+        add_profile(cfg, replace(get_profile(cfg, "sylliptor"), default_model="mimo"))
+        save_config(cfg)
+
+        again = account_login.login(load_config(), browser_opener=_noop_browser([]), timeout_s=10)
+        assert again.model == "deepseek-v4-flash"
     finally:
         stub.close()
+
+
+def test_fetch_trial_status_returns_none(tmp_path: Path, monkeypatch) -> None:
+    # No CLI status endpoint yet: plan/credits live on the account page. The
+    # None path is the documented contract callers degrade on.
+    _config_env(tmp_path, monkeypatch)
+    assert account_login.fetch_trial_status(load_config()) is None
 
 
 def test_format_trial_status_line_expired() -> None:
@@ -284,7 +296,7 @@ def test_format_trial_status_line_empty_returns_none() -> None:
 
 
 class _StubModelsServer:
-    """Stands in for the proxy's GET .../llm/v1/models discovery route."""
+    """Stands in for the gateway's GET /v1/models discovery route."""
 
     def __init__(self, model_ids: list[str], *, status_code: int = 200) -> None:
         body = json.dumps(
@@ -296,7 +308,7 @@ class _StubModelsServer:
                 return
 
             def do_GET(self) -> None:  # noqa: N802
-                if not self.path.endswith("/llm/v1/models"):
+                if not self.path.endswith("/models"):
                     self.send_error(404)
                     return
                 self.send_response(status_code)
@@ -320,105 +332,21 @@ class _StubModelsServer:
         self._thread.join(timeout=5)
 
 
-def test_list_trial_models_parses_proxy_allowlist(tmp_path: Path, monkeypatch) -> None:
+def test_list_trial_models_parses_gateway_allowlist(tmp_path: Path, monkeypatch) -> None:
     _config_env(tmp_path, monkeypatch)
-    stub = _StubModelsServer(["mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2.5"])
-    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
+    stub = _StubModelsServer(["deepseek-v4-flash", "deepseek-v4-pro"])
+    monkeypatch.setenv("SYLLIPTOR_GATEWAY_URL", f"{stub.base_url}/v1")
     try:
         models = account_login.list_trial_models(load_config())
-        assert models == ["mimo-v2.5-pro", "mimo-v2-flash", "mimo-v2.5"]
+        assert models == ["deepseek-v4-flash", "deepseek-v4-pro"]
     finally:
         stub.close()
 
 
 def test_list_trial_models_empty_when_unreachable(tmp_path: Path, monkeypatch) -> None:
     _config_env(tmp_path, monkeypatch)
-    stub = _StubModelsServer(["mimo"])
+    stub = _StubModelsServer(["deepseek-v4-flash"])
     base_url = stub.base_url
     stub.close()  # nothing is listening now -> connection refused
-    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", base_url)
+    monkeypatch.setenv("SYLLIPTOR_GATEWAY_URL", f"{base_url}/v1")
     assert account_login.list_trial_models(load_config()) == []
-
-
-def test_login_preserves_user_chosen_model_across_relogin(tmp_path: Path, monkeypatch) -> None:
-    from dataclasses import replace
-
-    from sylliptor_agent_cli.config import save_config
-    from sylliptor_agent_cli.profiles import add_profile, get_profile
-
-    _config_env(tmp_path, monkeypatch)
-    stub = _StubExchangeServer(access_key=_ACCESS_KEY, email=None)
-    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
-    try:
-        # First connect: no profile yet, and we no longer auto-select MiMo, so the
-        # default model is empty until the user picks one.
-        first = account_login.login(
-            load_config(), browser_opener=_callback_browser("code"), timeout_s=10
-        )
-        assert first.model == ""
-
-        # Simulate the user picking another model in `/config`.
-        cfg = load_config()
-        add_profile(cfg, replace(get_profile(cfg, "sylliptor"), default_model="mimo-pro"))
-        save_config(cfg)
-
-        # Re-login must keep that choice instead of clobbering it back to MiMo.
-        second = account_login.login(
-            load_config(), browser_opener=_callback_browser("code"), timeout_s=10
-        )
-        assert second.model == "mimo-pro"
-        assert load_config().model == "mimo-pro"
-    finally:
-        stub.close()
-
-
-def test_login_preserves_existing_mimo_selection_via_preset_alias(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # A user who ALREADY chose the MiMo trial keeps that choice across re-login: the
-    # `sylliptor` preset (kept intact) canonicalizes the legacy bare "mimo" id up to
-    # its real flagship name via model_aliases at config-load — this is preserving a
-    # prior selection, not auto-defaulting a fresh user (see test_login_does_not_
-    # default_to_mimo for the fresh case).
-    from dataclasses import replace
-
-    from sylliptor_agent_cli.config import save_config
-    from sylliptor_agent_cli.profiles import add_profile, get_profile
-
-    _config_env(tmp_path, monkeypatch)
-    stub = _StubExchangeServer(access_key=_ACCESS_KEY, email=None)
-    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
-    try:
-        # Seed a profile that still carries the legacy bare "mimo" placeholder.
-        account_login.login(load_config(), browser_opener=_callback_browser("code"), timeout_s=10)
-        cfg = load_config()
-        add_profile(cfg, replace(get_profile(cfg, "sylliptor"), default_model="mimo"))
-        save_config(cfg)
-
-        # Re-login canonicalizes the placeholder to the named flagship via the preset
-        # alias (NOT via any login-time auto-default, which was removed).
-        again = account_login.login(
-            load_config(), browser_opener=_callback_browser("code"), timeout_s=10
-        )
-        assert again.model == "mimo-v2.5-pro"
-    finally:
-        stub.close()
-
-
-def test_login_does_not_default_to_mimo(tmp_path: Path, monkeypatch) -> None:
-    # Regression: the Xiaomi MiMo partnership ended and the free key is gone, so a
-    # fresh `sylliptor login` must NOT silently select a MiMo model (or any model).
-    # The login path itself stays — only the auto-default is removed.
-    _config_env(tmp_path, monkeypatch)
-    stub = _StubExchangeServer(access_key=_ACCESS_KEY, email=None)
-    monkeypatch.setenv("SYLLIPTOR_SUPABASE_URL", stub.base_url)
-    try:
-        result = account_login.login(
-            load_config(), browser_opener=_callback_browser("code"), timeout_s=10
-        )
-        assert result.profile_name == "sylliptor"  # path is kept
-        assert result.model == ""  # but no model is auto-selected
-        assert "mimo" not in result.model.casefold()
-        assert load_config().model == ""  # persisted profile carries no default
-    finally:
-        stub.close()

@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
+from threading import RLock
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -134,6 +136,80 @@ _WEB_SEARCH_MAX_PROVIDER_RETRIES = 1
 # OpenRouter web adapter's per-attempt budget so an under-configured timeout still has
 # time to return results; an explicitly higher web_search_timeout_s is preserved.
 _OPENROUTER_WEB_MIN_TIMEOUT_S = 60.0
+
+
+# After a native backend hard-fails in ``auto`` mode and an external backend
+# serves the result, remember that per session: re-attempting the broken native
+# backend on every call wastes a full failed round-trip before each fallback.
+# The preference is dropped as soon as the remembered backend stops working or
+# the native runtime it shadowed is reconfigured (fingerprint mismatch), so a
+# recovered or fixed native backend is retried on the next call after that.
+_AUTO_FALLBACK_PREFERENCES_LOCK = RLock()
+_AUTO_FALLBACK_PREFERENCE_BY_SESSION: dict[str, tuple[str, str]] = {}
+
+
+def _web_search_runtime_fingerprint(runtime: WebSearchRuntimeConfig) -> str:
+    key_digest = sha256(str(runtime.api_key or "").encode("utf-8")).hexdigest()[:16]
+    return "\n".join(
+        [
+            str(runtime.provider or ""),
+            str(runtime.base_url or ""),
+            str(runtime.model or ""),
+            key_digest,
+        ]
+    )
+
+
+def _record_session_fallback_preference(
+    session_id: str | None,
+    provider: str,
+    *,
+    failed_runtime_fingerprint: str,
+) -> None:
+    if not session_id:
+        return
+    with _AUTO_FALLBACK_PREFERENCES_LOCK:
+        _AUTO_FALLBACK_PREFERENCE_BY_SESSION[session_id] = (
+            provider,
+            failed_runtime_fingerprint,
+        )
+
+
+def _session_fallback_preference(
+    session_id: str | None,
+    *,
+    current_runtime_fingerprint: str,
+) -> str | None:
+    """Return the remembered fallback backend, or None when it no longer applies.
+
+    A preference recorded against a differently-configured native runtime is
+    discarded: the user changing the web-search configuration mid-session must
+    give the newly configured backend a fresh chance.
+    """
+
+    if not session_id:
+        return None
+    with _AUTO_FALLBACK_PREFERENCES_LOCK:
+        stored = _AUTO_FALLBACK_PREFERENCE_BY_SESSION.get(session_id)
+        if stored is None:
+            return None
+        provider, failed_fingerprint = stored
+        if failed_fingerprint != current_runtime_fingerprint:
+            _AUTO_FALLBACK_PREFERENCE_BY_SESSION.pop(session_id, None)
+            return None
+        return provider
+
+
+def _clear_session_fallback_preference(session_id: str | None) -> None:
+    if not session_id:
+        return
+    with _AUTO_FALLBACK_PREFERENCES_LOCK:
+        _AUTO_FALLBACK_PREFERENCE_BY_SESSION.pop(session_id, None)
+
+
+def _reset_web_search_session_state_for_tests() -> None:
+    with _AUTO_FALLBACK_PREFERENCES_LOCK:
+        _AUTO_FALLBACK_PREFERENCE_BY_SESSION.clear()
 
 
 def _web_search_provider_retry_settings(cfg: AppConfig | None) -> ProviderRetrySettings:
@@ -454,36 +530,12 @@ def _is_xai_base_url(base_url: str | None) -> bool:
     return _is_host_or_subdomain(_base_url_host(base_url), "api.x.ai")
 
 
-_SYLLIPTOR_TRIAL_PROXY_PATH_MARKER = "/functions/v1/llm"
-
-
-def _is_sylliptor_trial_proxy_base_url(base_url: str | None) -> bool:
-    """True for the hosted Sylliptor MiMo trial proxy (a Supabase Edge Function).
-
-    The proxy forwards chat completions to OpenRouter/Xiaomi, so for web search it
-    must be treated as an OpenRouter base_url (otherwise web_search is never
-    registered for MiMo trial users and web_fetch loses its returned_by_web_search
-    URL source). Match the ``/functions/v1/llm`` path so unrelated ``*.supabase.co``
-    apps are never misclassified. Mirrors openai_compat._is_sylliptor_trial_proxy
-    and provider_limits._provider_key_from_base_url.
-    """
-    normalized = str(base_url or "").strip()
-    if not normalized:
-        return False
-    try:
-        path = (urlsplit(normalized).path or "").casefold()
-    except ValueError:
-        return False
-    if _SYLLIPTOR_TRIAL_PROXY_PATH_MARKER not in path:
-        return False
-    host = _base_url_host(base_url)
-    return host == "supabase.co" or host.endswith(".supabase.co")
-
-
 def _is_openrouter_base_url(base_url: str | None) -> bool:
-    if _is_host_or_subdomain(_base_url_host(base_url), "openrouter.ai"):
-        return True
-    return _is_sylliptor_trial_proxy_base_url(base_url)
+    # NOTE: the Sylliptor hosted proxy (`…supabase.co/functions/v1/llm`) used to
+    # be classified as OpenRouter while it forwarded to OpenRouter/Xiaomi during
+    # the retired MiMo trial. It now forwards to DeepSeek (no native web
+    # search), so no special-case applies anymore.
+    return _is_host_or_subdomain(_base_url_host(base_url), "openrouter.ai")
 
 
 def _is_perplexity_base_url(base_url: str | None) -> bool:
@@ -1683,7 +1735,14 @@ def web_search(
     def _fallback_to_external_or_raise(provider: str, error: Exception) -> dict[str, Any]:
         if provider_override is not None:
             raise WebSearchError(str(error)) from error
-        if resolve_web_search_mode(cfg) != "auto" or not validated_external_web_access:
+        mode = resolve_web_search_mode(cfg)
+        if mode == _WEB_SEARCH_MODE_NATIVE:
+            raise WebSearchError(
+                f"native web search via {provider} failed and web_search_mode="
+                "native disables external fallback backends (set web_search_mode "
+                f"to 'auto' or 'external' to allow them): {error}"
+            ) from error
+        if mode != _WEB_SEARCH_MODE_AUTO or not validated_external_web_access:
             raise WebSearchError(str(error)) from error
         failures = [f"{provider}: {error}"]
         last_error: Exception = error
@@ -1691,7 +1750,7 @@ def web_search(
             tavily_runtime = _resolve_tavily_readiness(cfg=cfg).runtime
             if tavily_runtime is not None:
                 try:
-                    return _with_web_search_observability(
+                    result = _with_web_search_observability(
                         result=_run_tavily(tavily_runtime),
                         runtime=tavily_runtime,
                         cfg=cfg,
@@ -1700,11 +1759,18 @@ def web_search(
                 except TavilySearchError as tavily_error:
                     failures.append(f"tavily: {tavily_error}")
                     last_error = tavily_error
+                else:
+                    _record_session_fallback_preference(
+                        session_id,
+                        _TAVILY_PROVIDER,
+                        failed_runtime_fingerprint=_web_search_runtime_fingerprint(runtime),
+                    )
+                    return result
         if provider != _DDGS_PROVIDER:
             ddgs_runtime = _resolve_ddgs_readiness(cfg=cfg).runtime
             if ddgs_runtime is not None:
                 try:
-                    return _with_web_search_observability(
+                    result = _with_web_search_observability(
                         result=_run_ddgs(ddgs_runtime),
                         runtime=ddgs_runtime,
                         cfg=cfg,
@@ -1713,11 +1779,53 @@ def web_search(
                 except DdgsSearchError as ddgs_error:
                     failures.append(f"ddgs: {ddgs_error}")
                     last_error = ddgs_error
+                else:
+                    _record_session_fallback_preference(
+                        session_id,
+                        _DDGS_PROVIDER,
+                        failed_runtime_fingerprint=_web_search_runtime_fingerprint(runtime),
+                    )
+                    return result
         if len(failures) == 1:
             raise WebSearchError(str(error)) from error
         raise WebSearchError(
             "web_search failed across auto backends: " + "; ".join(failures)
         ) from last_error
+
+    preferred_fallback = _session_fallback_preference(
+        session_id,
+        current_runtime_fingerprint=_web_search_runtime_fingerprint(runtime),
+    )
+    if (
+        preferred_fallback in (_TAVILY_PROVIDER, _DDGS_PROVIDER)
+        and preferred_fallback != runtime.provider
+        and provider_override is None
+        and resolve_web_search_mode(cfg) == _WEB_SEARCH_MODE_AUTO
+        and validated_external_web_access
+    ):
+        preferred_runtime = (
+            _resolve_tavily_readiness(cfg=cfg).runtime
+            if preferred_fallback == _TAVILY_PROVIDER
+            else _resolve_ddgs_readiness(cfg=cfg).runtime
+        )
+        if preferred_runtime is None:
+            _clear_session_fallback_preference(session_id)
+        else:
+            try:
+                return _with_web_search_observability(
+                    result=(
+                        _run_tavily(preferred_runtime)
+                        if preferred_fallback == _TAVILY_PROVIDER
+                        else _run_ddgs(preferred_runtime)
+                    ),
+                    runtime=preferred_runtime,
+                    cfg=cfg,
+                    fallback_occurred=True,
+                )
+            except (TavilySearchError, DdgsSearchError):
+                # The remembered fallback stopped working; forget it and give
+                # the configured backend another chance on this call.
+                _clear_session_fallback_preference(session_id)
 
     if runtime.provider == _TAVILY_PROVIDER:
         try:

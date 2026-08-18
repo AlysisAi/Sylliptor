@@ -49,6 +49,7 @@ from .types import (
     UsageConfidence,
     UsageContract,
 )
+from .usage_normalization import parse_compatible_usage
 
 
 class ResponsesError(RuntimeError):
@@ -107,6 +108,42 @@ _TEMPERATURE_UNSUPPORTED_TOKENS = (
 )
 _RESPONSES_OMIT_TEMPERATURE_MODELS: set[str] = set()
 
+# Endpoints (base_url + model) whose gateway rejected the optional ``include``
+# entries (e.g. ``web_search_call.action.sources``). Source metadata is an
+# enhancement, not a requirement, so once a gateway rejects it we stop sending
+# it for the rest of the process instead of failing every request.
+_RESPONSES_OMIT_INCLUDE_ENDPOINTS: set[str] = set()
+
+_INCLUDE_UNSUPPORTED_STATUS_MARKERS = ("error 400", "error 422", "web_search unsupported")
+_INCLUDE_VALUE_CONTEXT_TOKENS = (
+    "web_search_call.action.sources",
+    "include value",
+    "include values",
+    "'include'",
+    '"include"',
+    "include parameter",
+    "include field",
+    "param 'include'",
+    'param "include"',
+    "parameter: include",
+    "parameter 'include'",
+)
+_INCLUDE_UNSUPPORTED_TOKENS = (
+    "invalid",
+    "unsupported",
+    "not support",
+    "not allowed",
+    "not permitted",
+    "unknown",
+    "unrecognized",
+    "unexpected",
+    "cannot be produced",
+    "cannot",
+    "forbidden",
+    "must be omitted",
+    "extra",
+)
+
 _REASONING_SUMMARY_UNSUPPORTED_STATUS_MARKERS = ("error 400", "error 422")
 _REASONING_SUMMARY_UNSUPPORTED_TOKENS = (
     "invalid",
@@ -128,8 +165,28 @@ _REASONING_SUMMARY_UNSUPPORTED_TOKENS = (
 )
 
 
-def _responses_temperature_omit_key(base_url: str, model: str) -> str:
+def _responses_endpoint_model_key(base_url: str, model: str) -> str:
     return f"{str(base_url).strip().rstrip('/')}\n{str(model).strip()}"
+
+
+def _responses_temperature_omit_key(base_url: str, model: str) -> str:
+    return _responses_endpoint_model_key(base_url, model)
+
+
+def _responses_include_unsupported(err: Exception) -> bool:
+    """Return whether a 400/422 clearly rejects the optional ``include`` entries.
+
+    Requires an explicit ``include``-value context token so unrelated 400s that
+    merely contain the word "include" (e.g. "input must include a message") do
+    not permanently drop source metadata for the endpoint.
+    """
+
+    text = str(err).casefold()
+    if not any(marker in text for marker in _INCLUDE_UNSUPPORTED_STATUS_MARKERS):
+        return False
+    if not any(token in text for token in _INCLUDE_VALUE_CONTEXT_TOKENS):
+        return False
+    return any(token in text for token in _INCLUDE_UNSUPPORTED_TOKENS)
 
 
 def _responses_temperature_unsupported(err: Exception) -> bool:
@@ -678,6 +735,16 @@ def _extract_sources_and_queries(data: dict[str, Any]) -> tuple[list[WebSearchSo
     return sources, queries
 
 
+def _has_web_search_call_output(data: dict[str, Any]) -> bool:
+    output = data.get("output")
+    if not isinstance(output, list):
+        return False
+    return any(
+        isinstance(item, dict) and str(item.get("type") or "") == "web_search_call"
+        for item in output
+    )
+
+
 def _merge_citation_sources(
     sources: list[WebSearchSource],
     citations: list[WebSearchCitation],
@@ -927,56 +994,17 @@ def _responses_reasoning(
 
 
 def _parse_usage(raw: Any) -> LLMUsage | None:
-    if not isinstance(raw, dict):
+    usage = parse_compatible_usage(raw, responses_shape=True)
+    if usage is None:
         return None
-
-    def _as_non_negative_int(value: Any) -> int | None:
-        try:
-            parsed = int(value) if value is not None else None
-        except (TypeError, ValueError):
-            return None
-        if parsed is None or parsed >= 0:
-            return parsed
-        return None
-
-    input_tokens = raw.get("input_tokens", raw.get("prompt_tokens"))
-    output_tokens = raw.get("output_tokens", raw.get("completion_tokens"))
-    total_tokens = raw.get("total_tokens")
-    cached_tokens = raw.get("cached_prompt_tokens")
-    input_details = raw.get("input_tokens_details")
-    if cached_tokens is None and isinstance(input_details, dict):
-        cached_tokens = input_details.get("cached_tokens")
-    prompt_details = raw.get("prompt_tokens_details")
-    if cached_tokens is None and isinstance(prompt_details, dict):
-        cached_tokens = prompt_details.get("cached_tokens")
-    output_details = raw.get("output_tokens_details")
-    if not isinstance(output_details, dict):
-        output_details = raw.get("completion_tokens_details")
-    reasoning_tokens = None
-    if isinstance(output_details, dict):
-        reasoning_tokens = output_details.get("reasoning_tokens")
-
-    prompt_tokens = _as_non_negative_int(input_tokens)
-    cached_prompt_tokens = _as_non_negative_int(cached_tokens)
-    input_tokens_uncached = None
-    if prompt_tokens is not None and cached_prompt_tokens is not None:
-        input_tokens_uncached = max(0, prompt_tokens - cached_prompt_tokens)
-    usage = LLMUsage(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=_as_non_negative_int(output_tokens),
-        total_tokens=_as_non_negative_int(total_tokens),
-        cached_prompt_tokens=cached_prompt_tokens,
-        input_tokens_uncached=input_tokens_uncached,
-        cache_read_input_tokens=cached_prompt_tokens,
-        reasoning_tokens=_as_non_negative_int(reasoning_tokens),
-        raw_provider_usage=copy.deepcopy(raw),
-    )
     if (
         usage.prompt_tokens is None
         and usage.completion_tokens is None
         and usage.total_tokens is None
         and usage.cached_prompt_tokens is None
+        and usage.cache_creation_input_tokens is None
         and usage.reasoning_tokens is None
+        and usage.provider_cost_usd is None
     ):
         return None
     return usage
@@ -1941,6 +1969,7 @@ class OpenAIResponsesClient:
         )
         mapped_tools = tool_mapping.tools
         temp_omit_key = _responses_temperature_omit_key(self.base_url, self.model)
+        include_omit_key = _responses_endpoint_model_key(self.base_url, self.model)
         reasoning_summary_support_key = self._reasoning_summary_support_key()
         reasoning = _responses_reasoning(
             enable_thinking=self.enable_thinking,
@@ -2005,7 +2034,10 @@ class OpenAIResponsesClient:
                         removed_sylliptor_web_search=tool_mapping.removed_sylliptor_web_search,
                     )
                 )
-                if tool_mapping.added_builtin_web_search:
+                if (
+                    tool_mapping.added_builtin_web_search
+                    and include_omit_key not in _RESPONSES_OMIT_INCLUDE_ENDPOINTS
+                ):
                     payload["include"] = ["web_search_call.action.sources"]
             elif tool_choice is not None:
                 payload["tool_choice"] = _tool_choice_for_mapped_tools(
@@ -2164,6 +2196,20 @@ class OpenAIResponsesClient:
                 telemetry.set_request_shape(_request_shape_metadata(payload))
                 telemetry.set_token_reconciliation(_token_reconciliation_metadata(payload))
 
+            def _retry_without_include(err: Exception) -> bool:
+                nonlocal payload
+                if "include" not in payload:
+                    return False
+                if not _responses_include_unsupported(err):
+                    return False
+                # Bounded: the retried payload has no ``include`` entries, so
+                # this branch cannot fire twice for the same request.
+                _RESPONSES_OMIT_INCLUDE_ENDPOINTS.add(include_omit_key)
+                payload = dict(payload)
+                payload.pop("include", None)
+                _refresh_request_metadata()
+                return True
+
             def _retry_without_reasoning_summary(err: Exception) -> bool:
                 nonlocal payload, reasoning, reasoning_summary_fallback_used
                 if reasoning_summary_fallback_used:
@@ -2228,6 +2274,8 @@ class OpenAIResponsesClient:
                                         _refresh_request_metadata()
                                         continue
                                     if _retry_without_reasoning_summary(err):
+                                        continue
+                                    if _retry_without_include(err):
                                         continue
                                     if (
                                         "temperature" in payload
@@ -2299,6 +2347,8 @@ class OpenAIResponsesClient:
                         continue
                     if _retry_without_reasoning_summary(err):
                         continue
+                    if _retry_without_include(err):
+                        continue
                     # The model rejected ``temperature``: drop it (and remember
                     # that for this model) and retry once. Bounded — the second
                     # attempt has no ``temperature`` so it can't loop here.
@@ -2368,8 +2418,16 @@ class OpenAIResponsesClient:
                 raise LLMError(f"OpenAI Responses refusal: {refusal}")
             if not _has_responses_reasoning_output(data):
                 status = str(data.get("status") or "").strip()
-                suffix = f" (status={status})" if status else ""
-                raise LLMError(f"OpenAI Responses returned no assistant text or tool calls{suffix}")
+                # A completed response with no output is a valid provider result,
+                # even though it gives the agent nothing to act on. Preserve that
+                # structure as an empty LLMResponse so the shared turn-level
+                # recovery and stall policy can decide what happens next. Other
+                # statuses remain provider failures and must stay explicit.
+                if status.casefold() != "completed":
+                    suffix = f" (status={status})" if status else ""
+                    raise LLMError(
+                        f"OpenAI Responses returned no assistant text or tool calls{suffix}"
+                    )
 
         response_model = data.get("model") if isinstance(data.get("model"), str) else None
         return LLMResponse(
@@ -2400,6 +2458,9 @@ class OpenAIResponsesClient:
         if external_web_access is not None:
             tool_spec["external_web_access"] = bool(external_web_access)
 
+        include_omit_key = _responses_endpoint_model_key(self.base_url, self.model)
+        include_omitted = include_omit_key in _RESPONSES_OMIT_INCLUDE_ENDPOINTS
+
         payload: dict[str, Any] = {
             "model": self.model,
             "input": query,
@@ -2407,7 +2468,7 @@ class OpenAIResponsesClient:
         }
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
-        if include_source_details:
+        if include_source_details and not include_omitted:
             payload["include"] = ["web_search_call.action.sources"]
         if self.provider_auth is not None:
             payload = self.provider_auth.adapt_responses_payload(payload)
@@ -2417,46 +2478,64 @@ class OpenAIResponsesClient:
             model=self.model,
         )
 
-        def _send_request() -> httpx.Response:
-            auth_refresh_used = False
-            try:
-                while True:
-                    with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
-                        response = client.post(
-                            url,
-                            headers=self._headers(url, force_refresh=auth_refresh_used),
-                            json=payload,
-                        )
-                    if (
-                        response.status_code == 401
-                        and self.provider_auth is not None
-                        and not auth_refresh_used
-                    ):
-                        auth_refresh_used = True
-                        continue
-                    break
-            except httpx.DecodingError as e:
-                raise ResponsesError(
-                    f"Responses response decompression failed: {sanitize_error_text_for_output(e)}"
-                ) from e
-            except Exception as e:  # noqa: BLE001
-                raise ResponsesError(
-                    f"Responses request failed: {sanitize_error_text_for_output(e)}"
-                ) from e
-            if response.status_code >= 400:
-                raise self._error_from_response(response)
-            return response
+        def _perform_request(request_payload: dict[str, Any]) -> httpx.Response:
+            def _send_request() -> httpx.Response:
+                auth_refresh_used = False
+                try:
+                    while True:
+                        with httpx.Client(
+                            timeout=self.timeout_s, transport=self._transport
+                        ) as client:
+                            response = client.post(
+                                url,
+                                headers=self._headers(url, force_refresh=auth_refresh_used),
+                                json=request_payload,
+                            )
+                        if (
+                            response.status_code == 401
+                            and self.provider_auth is not None
+                            and not auth_refresh_used
+                        ):
+                            auth_refresh_used = True
+                            continue
+                        break
+                except httpx.DecodingError as e:
+                    raise ResponsesError(
+                        "Responses response decompression failed: "
+                        f"{sanitize_error_text_for_output(e)}"
+                    ) from e
+                except Exception as e:  # noqa: BLE001
+                    raise ResponsesError(
+                        f"Responses request failed: {sanitize_error_text_for_output(e)}"
+                    ) from e
+                if response.status_code >= 400:
+                    raise self._error_from_response(response)
+                return response
 
-        response = run_provider_limited_call(
-            call=_send_request,
-            provider_key=provider_key,
-            provider_concurrency_caps=self.provider_concurrency_caps,
-            retry_settings=self.provider_retry_settings,
-            operation="responses_web_search",
-            sleep_fn=self._provider_sleep_fn,
-            random_fn=self._provider_random_fn,
-            retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
-        )
+            return run_provider_limited_call(
+                call=_send_request,
+                provider_key=provider_key,
+                provider_concurrency_caps=self.provider_concurrency_caps,
+                retry_settings=self.provider_retry_settings,
+                operation="responses_web_search",
+                sleep_fn=self._provider_sleep_fn,
+                random_fn=self._provider_random_fn,
+                retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
+            )
+
+        try:
+            response = _perform_request(payload)
+        except ResponsesError as err:
+            if "include" not in payload or not _responses_include_unsupported(err):
+                raise
+            # The gateway rejected the optional ``include`` entries. Source
+            # metadata is an enhancement, not a requirement: retry once without
+            # it and remember the capability so later calls skip the doomed
+            # variant. Bounded — the retried payload has no ``include``.
+            _RESPONSES_OMIT_INCLUDE_ENDPOINTS.add(include_omit_key)
+            include_omitted = True
+            payload = {key: value for key, value in payload.items() if key != "include"}
+            response = _perform_request(payload)
 
         try:
             data = response.json()
@@ -2480,7 +2559,14 @@ class OpenAIResponsesClient:
         sources, queries = _extract_sources_and_queries(data)
         sources = _merge_citation_sources(sources, citations)
         if not sources:
-            raise ResponsesError("Responses web_search did not return sources")
+            # Absent source metadata is tolerated only when it was not
+            # requested (the gateway rejected the optional include) AND the
+            # response still shows a real search happened. A response with no
+            # web_search_call at all never searched — treat it as a failure so
+            # callers (e.g. auto-mode fallback) can engage a working backend
+            # instead of accepting an unsourced answer.
+            if not (include_omitted and _has_web_search_call_output(data)):
+                raise ResponsesError("Responses web_search did not return sources")
 
         response_id = str(data.get("id") or "").strip() or None
         response_model = str(data.get("model") or "").strip() or None

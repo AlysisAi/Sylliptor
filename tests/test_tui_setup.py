@@ -35,7 +35,13 @@ from sylliptor_agent_cli.provider_auth import ProviderAccountStatus, ProviderMod
 def _config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "config"))
     monkeypatch.setenv("SYLLIPTOR_DATA_DIR", os.fspath(tmp_path / "data"))
-    for var in ("SYLLIPTOR_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"):
+    for var in (
+        "SYLLIPTOR_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "ZAI_API_KEY",
+    ):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -82,12 +88,6 @@ def _start_subscription(flow: SetupFlow, runtime_id: str = "openai-codex") -> No
     flow.advance_message()
     assert flow.stage == "connect_provider"
     flow.choose(f"{flow_mod._wiz._RUNTIME_EXECUTION_PREFIX}{runtime_id}")
-    assert flow.stage == "workspace"
-
-
-def _inherit_router_model(flow: SetupFlow) -> None:
-    assert flow.stage == "router_model"
-    flow.choose(flow_mod._wiz._INHERIT_DEFAULT_MODEL_VALUE)
     assert flow.stage == "workspace"
 
 
@@ -163,10 +163,7 @@ def test_flow_full_happy_path_persists(monkeypatch, tmp_path):
     _drive_busy(flow)  # validate key -> model
     assert flow.stage == "model"
     flow.choose("gpt-5.5")
-    _drive_busy(flow)  # validate default model -> router model
-    assert flow.stage == "router_model"
-    flow.choose("gpt-5.4-nano")
-    _drive_busy(flow)  # validate router model -> workspace
+    _drive_busy(flow)  # validate default model -> workspace
     assert flow.stage == "workspace"
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)  # commit -> diagnose -> complete
@@ -174,7 +171,8 @@ def test_flow_full_happy_path_persists(monkeypatch, tmp_path):
 
     cfg = load_config()
     assert cfg.model == "gpt-5.5"
-    assert cfg.extra_fields["role_models"]["router"] == "gpt-5.4-nano"
+    # No router step remains, so setup never writes role_models.
+    assert "role_models" not in cfg.extra_fields
     assert load_persisted_profile_keys().get("openai") == "sk-test-123"
     # Summary reflects a validated key + ready sandbox.
     summary = " ".join(text for text, _tone in flow._summary_lines())
@@ -185,6 +183,72 @@ def test_flow_full_happy_path_persists(monkeypatch, tmp_path):
     flow.advance_message()
     assert flow.stage == "done"
     assert flow.success is True
+
+
+def test_flow_nvidia_selects_live_deepseek_then_verified_reasoning(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+    _patch_validate(monkeypatch)
+    monkeypatch.setattr(
+        flow_mod._wiz,
+        "_discover_setup_provider_models",
+        lambda *_args, **_kwargs: (
+            (
+                flow_mod._wiz.ProviderModelOption(
+                    id="deepseek-ai/deepseek-v4-pro",
+                    label="deepseek-ai/deepseek-v4-pro",
+                ),
+                flow_mod._wiz.ProviderModelOption(
+                    id="meta/llama-3.3-70b-instruct",
+                    label="meta/llama-3.3-70b-instruct",
+                ),
+            ),
+            "",
+        ),
+    )
+
+    flow = SetupFlow()
+    _start_native(flow)
+    flow.choose("nvidia")
+    flow.submit_input("nvapi-test")
+    _drive_busy(flow)
+
+    assert flow.stage == "model"
+    assert "deepseek-ai/deepseek-v4-pro" in {row.value for row in flow.screen().rows}
+    assert "meta/llama-3.3-70b-instruct" in {row.value for row in flow.screen().rows}
+
+    flow.choose("deepseek-ai/deepseek-v4-pro")
+    _drive_busy(flow)
+    assert flow.stage == "model_thinking"
+    assert [row.value for row in flow.screen().rows] == ["off", "high", "max", "auto"]
+
+    flow.choose("max")
+    assert flow.stage == "workspace"
+    assert flow.model_result is not None
+    assert flow.model_result.reasoning_label == "max"
+
+
+def test_flow_zai_coding_plan_exposes_reasoning_floor(monkeypatch, tmp_path):
+    _config_env(tmp_path, monkeypatch)
+    _patch_validate(monkeypatch)
+
+    flow = SetupFlow()
+    _start_native(flow)
+    flow.choose("zai-coding-plan")
+    flow.submit_input("zai-test")
+    _drive_busy(flow)
+
+    assert flow.stage == "model"
+    assert "glm-5.3" in {row.value for row in flow.screen().rows}
+
+    flow.choose("glm-5.3")
+    _drive_busy(flow)
+    assert flow.stage == "model_thinking"
+    assert [row.value for row in flow.screen().rows] == ["low", "high", "max", "auto"]
+
+    flow.choose("max")
+    assert flow.stage == "workspace"
+    assert flow.model_result is not None
+    assert flow.model_result.reasoning_label == "max"
 
 
 def test_flow_optional_key_provider_skips_validation(monkeypatch, tmp_path):
@@ -236,7 +300,6 @@ def test_flow_subscription_skips_api_key_provider_steps(monkeypatch, tmp_path):
     assert flow.profile_result is None
     assert flow.api_key_result is None
     assert flow.model_result is None
-    assert flow.router_model_result is None
 
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)
@@ -350,25 +413,25 @@ def test_flow_subscription_login_failure_is_non_fatal(monkeypatch, tmp_path):
 
 
 def test_provider_screen_surfaces_hosted_providers_with_advanced_branch():
-    # The merged "Connect a Provider" picker surfaces subscription sign-ins and
-    # every hosted provider (DeepSeek, OpenRouter, …) side by side, so users
-    # aren't limited to the big-three brands. Only local, compatibility, custom,
-    # and legacy presets stay behind the "Advanced" branch. Asserts the
-    # *displayed rows*, not just handler behaviour.
+    # The merged picker puts the Sylliptor account first, followed by other
+    # subscription sign-ins and API-key providers. Local, compatibility,
+    # custom, legacy, and account-gated presets stay behind "Advanced".
+    # Asserts the *displayed rows*, not just handler behaviour.
     flow = SetupFlow()
     _start_native(flow)
 
     rows = flow.screen().rows
     values = [r.value for r in rows]
-    # Subscription sign-ins lead, then the hosted API-key providers.
-    assert values[0].startswith(flow_mod._wiz._RUNTIME_EXECUTION_PREFIX)
-    assert values[1] == "openai-responses"
+    assert values[0] == "sylliptor"
+    assert values[1].startswith(flow_mod._wiz._RUNTIME_EXECUTION_PREFIX)
+    assert values.index("sylliptor") < values.index("openai-responses")
     labels = [r.label for r in rows]
-    # The free trial is over: MiMo is not promoted and no row claims a trial.
+    # No row over-promises a trial or a recommendation.
     assert not any("free trial" in label for label in labels)
     assert sum("recommended" in label.lower() for label in labels) == 0
     assert values[-1] == flow_mod._wiz._ADVANCED_PROVIDER_PRESETS_VALUE
-    assert values[-2] == "sylliptor"  # demoted to the end of the hosted list
+    assert any("sylliptor" in label.casefold() for label in labels)
+    assert "xiaomi-mimo" not in values
     assert "deepseek" in values  # hosted providers sit on the primary screen…
     assert "openrouter" in values
     assert "ollama" not in values  # …local endpoints stay behind the advanced branch
@@ -378,15 +441,16 @@ def test_provider_screen_surfaces_hosted_providers_with_advanced_branch():
     assert by_value["openai-responses"].description == "API key"
     assert "no API key" in by_value["sylliptor"].description
 
-    # The advanced branch holds the local / compatibility / custom / legacy presets.
+    # The advanced branch holds the local / compatibility / custom / legacy
+    # presets plus the account-gated profile entry.
     flow.choose(flow_mod._wiz._ADVANCED_PROVIDER_PRESETS_VALUE)
     assert flow.stage == "provider_advanced"
     advanced_values = [r.value for r in flow.screen().rows]
-    assert "sylliptor" not in advanced_values
+    assert "sylliptor" in advanced_values
     assert "deepseek" not in advanced_values  # promoted to the primary screen
     assert "ollama" in advanced_values
     assert "custom" in advanced_values
-    assert flow.screen().progress.startswith("Step 2 of 7")
+    assert flow.screen().progress.startswith("Step 2 of 6")
     assert "Provider (advanced)" in flow.screen().progress
 
     flow.back()
@@ -458,46 +522,17 @@ def test_flow_custom_model_not_found_confirm(monkeypatch, tmp_path):
     _drive_busy(flow)
     assert flow.stage == "model_not_found_confirm"
     flow.confirm(True)  # use it anyway
-    assert flow.stage == "router_model"
-    assert flow.api_key_result.validation_status == "inconclusive"
-    _inherit_router_model(flow)
-
-
-def test_validated_router_does_not_erase_unconfirmed_default_warning(monkeypatch, tmp_path):
-    _config_env(tmp_path, monkeypatch)
-
-    def _validate(**kwargs: Any):
-        if kwargs.get("model") == "unconfirmed-default":
-            return flow_mod._wiz._ApiKeyValidationResult(
-                status="model_not_found",
-                message="default model was not found",
-            )
-        return flow_mod._wiz._ApiKeyValidationResult(status="validated")
-
-    monkeypatch.setattr(flow_mod._wiz, "_validate_api_key", _validate)
-
-    flow = SetupFlow()
-    _start_native(flow)
-    flow.choose("openai")
-    flow.submit_input("sk-test")
-    _drive_busy(flow)
-    flow.choose(flow_mod._wiz._CUSTOM_MODEL_VALUE)
-    flow.submit_input("unconfirmed-default")
-    _drive_busy(flow)
-    flow.confirm(True)
-
-    assert flow.stage == "router_model"
-    assert flow.api_key_result.validation_status == "inconclusive"
-    flow.choose("gpt-5.4-mini")
-    _drive_busy(flow)
-
     assert flow.stage == "workspace"
     assert flow.api_key_result.validation_status == "inconclusive"
-    assert "unconfirmed-default" in flow.api_key_result.validation_message
-    assert flow.status_tone == "warn"
+    assert "totally-made-up" in flow.api_key_result.validation_message
 
 
-def test_flow_router_model_inherit_clears_override_and_navigates(monkeypatch, tmp_path):
+def test_flow_has_no_router_step_and_profile_switch_drops_legacy_key(monkeypatch, tmp_path):
+    # The router-model step is gone; the flow moves model -> workspace and the
+    # summary renders no Router line. The legacy role_models.router key is
+    # still removed — by the profile-switch hygiene in set_active_profile when
+    # commit swaps the migrated "default" profile for the chosen provider —
+    # while other unexposed role keys survive.
     _config_env(tmp_path, monkeypatch)
     cfg = AppConfig()
     cfg.extra_fields = {"role_models": {"coding": "coding-model", "router": "old-router-model"}}
@@ -515,132 +550,26 @@ def test_flow_router_model_inherit_clears_override_and_navigates(monkeypatch, tm
     flow.choose("llama3.3")
     _drive_busy(flow)
 
-    assert flow.stage == "router_model"
-    screen = flow.screen()
-    assert screen.progress.startswith("Step 5 of 7")
-    assert screen.rows[0].value == flow_mod._wiz._INHERIT_DEFAULT_MODEL_VALUE
-    assert "llama3.3" in screen.rows[0].description
-
+    assert flow.stage == "workspace"
     flow.back()
     assert flow.stage == "model"
     flow.choose("llama3.3")
     _drive_busy(flow)
-    assert flow.stage == "router_model"
+    assert flow.stage == "workspace"
 
     flow.request_cancel()
     assert flow.stage == "cancel_confirm"
     flow.confirm(False)
-    assert flow.stage == "router_model"
+    assert flow.stage == "workspace"
 
-    _inherit_router_model(flow)
-    assert flow.router_model_result == flow_mod._wiz._RouterModelStepResult()
-    flow.back()
-    assert flow.stage == "router_model"
-    _inherit_router_model(flow)
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)
 
     assert flow.stage == "complete"
     role_models = load_config().extra_fields["role_models"]
     assert role_models == {"coding": "coding-model"}
-    assert "Router     inherits default" in " ".join(text for text, _tone in flow._summary_lines())
-
-
-def test_flow_custom_router_model_not_found_can_retry_or_accept(monkeypatch, tmp_path):
-    _config_env(tmp_path, monkeypatch)
-    validated_models: list[str | None] = []
-
-    def _validate(**kwargs: Any):
-        model = kwargs.get("model")
-        validated_models.append(model)
-        if model == "router-missing":
-            return flow_mod._wiz._ApiKeyValidationResult(
-                status="model_not_found",
-                message="no such router model",
-            )
-        return flow_mod._wiz._ApiKeyValidationResult(status="validated")
-
-    monkeypatch.setattr(flow_mod._wiz, "_validate_api_key", _validate)
-
-    flow = SetupFlow()
-    _start_native(flow)
-    flow.choose("openai")
-    flow.submit_input("sk-test")
-    _drive_busy(flow)
-    flow.choose("gpt-5.5")
-    _drive_busy(flow)
-    assert flow.stage == "router_model"
-
-    router_values = [row.value for row in flow.screen().rows]
-    assert router_values[0] == flow_mod._wiz._INHERIT_DEFAULT_MODEL_VALUE
-    assert "gpt-5.4-mini" in router_values
-    assert router_values[-1] == flow_mod._wiz._CUSTOM_MODEL_VALUE
-
-    flow.choose(flow_mod._wiz._CUSTOM_MODEL_VALUE)
-    assert flow.stage == "custom_router_model"
-    flow.submit_input("")
-    assert flow.stage == "custom_router_model"
-    assert flow.status_tone == "err"
-    flow.back()
-    assert flow.stage == "router_model"
-
-    flow.choose(flow_mod._wiz._CUSTOM_MODEL_VALUE)
-    flow.submit_input("router-missing")
-    _drive_busy(flow)
-    assert flow.stage == "router_model_not_found_confirm"
-    assert flow.screen().progress.startswith("Step 5 of 7")
-    flow.confirm(False)
-    assert flow.stage == "router_model"
-
-    flow.choose(flow_mod._wiz._CUSTOM_MODEL_VALUE)
-    assert flow.screen().input_default == "router-missing"
-    flow.submit_input("router-missing")
-    _drive_busy(flow)
-    flow.confirm(True)
-
-    assert flow.stage == "workspace"
-    assert flow.router_model_result == flow_mod._wiz._RouterModelStepResult(
-        model="router-missing",
-        custom=True,
-        inherited=False,
-    )
-    assert flow.api_key_result.validation_status == "inconclusive"
-    assert validated_models == [None, "gpt-5.5", "router-missing", "router-missing"]
-    flow.back()
-    assert flow.stage == "router_model"
-    assert flow.screen().rows[flow.screen().index].value == "router-missing"
-
-
-def test_flow_preset_router_model_not_found_returns_to_picker(monkeypatch, tmp_path):
-    _config_env(tmp_path, monkeypatch)
-
-    def _validate(**kwargs: Any):
-        if kwargs.get("model") == "gpt-5.4-mini":
-            return flow_mod._wiz._ApiKeyValidationResult(
-                status="model_not_found",
-                message="router model unavailable",
-            )
-        return flow_mod._wiz._ApiKeyValidationResult(status="validated")
-
-    monkeypatch.setattr(flow_mod._wiz, "_validate_api_key", _validate)
-
-    flow = SetupFlow()
-    _start_native(flow)
-    flow.choose("openai")
-    flow.submit_input("sk-test")
-    _drive_busy(flow)
-    flow.choose("gpt-5.5")
-    _drive_busy(flow)
-    flow.choose("gpt-5.4-mini")
-    _drive_busy(flow)
-
-    assert flow.stage == "router_model"
-    assert flow.status_tone == "err"
-    # Declining an unavailable router choice preserves the successful default-model
-    # validation; choosing inherit must not leave a stale router error on the key.
-    assert flow.api_key_result.validation_status == "validated"
-    _inherit_router_model(flow)
-    assert flow.api_key_result.validation_status == "validated"
+    summary_lines = [text for text, _tone in flow._summary_lines()]
+    assert not any(text.startswith("Router") for text in summary_lines)
 
 
 def test_flow_workspace_invalid_path_stays(monkeypatch, tmp_path):
@@ -653,7 +582,7 @@ def test_flow_workspace_invalid_path_stays(monkeypatch, tmp_path):
     flow.submit_input("")  # skip key
     flow.choose("llama3.3")
     _drive_busy(flow)
-    _inherit_router_model(flow)
+    assert flow.stage == "workspace"
     target_file = tmp_path / "afile.txt"
     target_file.write_text("x", encoding="utf-8")
     flow.submit_input(os.fspath(target_file))  # not a directory
@@ -672,7 +601,7 @@ def test_flow_workspace_missing_folder_confirms_and_creates(monkeypatch, tmp_pat
 
     assert flow.stage == "workspace_create_confirm"
     screen = flow.screen()
-    assert screen.progress.startswith("Step 6 of 7")
+    assert screen.progress.startswith("Step 5 of 6")
     assert "create_if_missing" not in screen.subtitle
     assert any(os.fspath(missing.resolve()) in text for text, _tone in screen.lines)
 
@@ -686,11 +615,11 @@ def test_flow_workspace_missing_folder_confirms_and_creates(monkeypatch, tmp_pat
 
 def test_flow_progress_counts_sandbox_as_setup_step():
     flow = SetupFlow()
-    assert flow._progress("router_model").startswith("Step 5 of 7")
+    assert flow._progress("model").startswith("Step 4 of 6")
     flow.stage = "workspace"
-    assert flow.screen().progress.startswith("Step 6 of 7")
+    assert flow.screen().progress.startswith("Step 5 of 6")
     flow.stage = "sandbox_choice"
-    assert flow.screen().progress.startswith("Step 7 of 7")
+    assert flow.screen().progress.startswith("Step 6 of 6")
     assert "Sandbox" in flow.screen().progress
 
 
@@ -748,7 +677,7 @@ def _to_sandbox(flow: SetupFlow, tmp_path: Path) -> None:
     flow.submit_input("")
     flow.choose("llama3.3")
     _drive_busy(flow)
-    _inherit_router_model(flow)
+    assert flow.stage == "workspace"
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)  # commit -> diagnose (-> next sandbox screen)
 
@@ -811,11 +740,12 @@ def test_flow_hosted_mimo_offers_login(monkeypatch, tmp_path):
 
     flow = SetupFlow()
     _start_native(flow)
-    flow.choose("sylliptor")  # hosted MiMo trial (no key)
-    flow.submit_input("")  # optional key skipped
-    flow.choose("mimo")
-    _drive_busy(flow)  # validate (skipped) -> router model
-    _inherit_router_model(flow)
+    flow.choose("sylliptor")  # account login skips API-key and model steps
+    assert flow.stage == "workspace"
+    assert flow.api_key_result is not None
+    assert flow.api_key_result.validation_status == "skipped"
+    assert flow.model_result is not None
+    assert flow.model_result.model == "deepseek-v4-flash"
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)  # commit -> diagnose -> login_confirm
     assert flow.stage == "login_confirm"
@@ -886,9 +816,9 @@ def test_headless_full_path_saves(tmp_path, monkeypatch):
         sandbox_doctor, "diagnose_sandbox", lambda _cfg, **_k: _fake_diag(ready=True)
     )
 
-    # welcome -> picker(row 1 openai-responses, key required) -> type key ->
-    # model(idx0) -> router(inherit) -> workspace(default home, Enter) -> complete -> done.
-    keys = "\r" + "\x1b[B" + "\r" + "sk-xyz" + "\r" + "\r" + "\r" + "\r" + "\r"
+    # welcome -> picker(row 2 openai-responses; row 0 is Sylliptor and row 1
+    # is the subscription runtime) -> key -> model -> workspace -> done.
+    keys = "\r" + "\x1b[B" * 2 + "\r" + "sk-xyz" + "\r" + "\r" + "\r" + "\r"
     assert _headless(keys) is True
     cfg = load_config()
     assert cfg.model  # a default model was persisted
@@ -941,7 +871,7 @@ def test_flow_fatal_commit_error(monkeypatch, tmp_path):
     flow.submit_input("")
     flow.choose("llama3.3")
     _drive_busy(flow)
-    _inherit_router_model(flow)
+    assert flow.stage == "workspace"
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)  # committing -> fatal (NOT complete)
     assert flow.stage == "fatal"
@@ -966,10 +896,7 @@ def test_flow_hosted_mimo_login_failure_is_non_fatal(monkeypatch, tmp_path):
     flow = SetupFlow()
     _start_native(flow)
     flow.choose("sylliptor")
-    flow.submit_input("")
-    flow.choose("mimo")
-    _drive_busy(flow)
-    _inherit_router_model(flow)
+    assert flow.stage == "workspace"
     flow.submit_input(os.fspath(tmp_path))
     _drive_busy(flow)  # -> login_confirm
     assert flow.stage == "login_confirm"

@@ -7,6 +7,7 @@ _PUBLIC_FACADE_NAMES = {
     "_PUBLIC_LOOP_COPY_VALUES",
     "_copy_loop_globals_to_public",
     "_apply_chat_effective_mode",
+    "_apply_chat_persona",
     "_handle_chat_command",
     "_handle_chat_command_impl",
     "_handle_forge_chat_command",
@@ -94,6 +95,11 @@ def _run_plan_mode_approval_loop(*args: Any, **kwargs: Any) -> Any:
 def _apply_chat_effective_mode(*args: Any, **kwargs: Any) -> Any:
     _sync_loop_globals_from_public()
     return _loop_module()._apply_chat_effective_mode(*args, **kwargs)
+
+
+def _apply_chat_persona(*args: Any, **kwargs: Any) -> Any:
+    _sync_loop_globals_from_public()
+    return _loop_module()._apply_chat_persona(*args, **kwargs)
 
 
 def _handle_chat_command_impl(cli_mod: Any, *args: Any, **kwargs: Any) -> Any:

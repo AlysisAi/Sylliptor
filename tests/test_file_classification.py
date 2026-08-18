@@ -3,8 +3,10 @@ from __future__ import annotations
 import pytest
 
 from sylliptor_agent_cli.file_classification import (
+    derived_artifact_reason,
     describe_path_kinds,
     is_code_implementation_path,
+    is_generated_or_vendor_path,
     is_symbol_scannable_path,
     is_test_path,
     language_for_path,
@@ -95,3 +97,63 @@ def test_path_kind_descriptions_include_known_and_unknown_kinds() -> None:
     assert describe_path_kinds(["README.md", "settings.json"]) == "docs/config only"
     assert describe_path_kinds(["notes/data.unknownext"]) == "docs only"
     assert describe_path_kinds(["scripts/task.weird"]) == "unknown .weird files only"
+
+
+@pytest.mark.parametrize(
+    ("path", "reason"),
+    [
+        ("package-lock.json", "dependency lockfile"),
+        ("uv.lock", "dependency lockfile"),
+        ("Cargo.lock", "dependency lockfile"),
+        ("go.sum", "dependency lockfile"),
+        ("assets/app.min.js", "minified bundle"),
+        ("assets/styles.min.css", "minified bundle"),
+        ("assets/app.js.map", "source map"),
+        ("state/session.lock", "lockfile"),
+        ("dist/bundle.js", "generated or vendored path"),
+        ("vendor/lib/util.py", "generated or vendored path"),
+    ],
+)
+def test_derived_artifact_reason_classifies_by_file_class(path: str, reason: str) -> None:
+    assert derived_artifact_reason(path) == reason
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/main.py",
+        "README.md",
+        "package.json",
+        "pyproject.toml",
+        "src/locker.py",
+        "docs/locks.md",
+        "",
+    ],
+)
+def test_ordinary_paths_are_not_derived_artifacts(path: str) -> None:
+    assert derived_artifact_reason(path) is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "sklearn/externals/joblib/parallel.py",
+        "pip/_vendor/requests/api.py",
+        "src/third_party/zlib/deflate.c",
+        "lib/thirdparty/mod.js",
+    ],
+)
+def test_vendored_tree_conventions_classify_as_generated_or_vendor(path: str) -> None:
+    assert is_generated_or_vendor_path(path) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "sklearn/external_api.py",
+        "docs/vendors.md",
+        "src/thirdparty_client_names.py",
+    ],
+)
+def test_vendored_lookalike_names_stay_first_party(path: str) -> None:
+    assert is_generated_or_vendor_path(path) is False

@@ -67,7 +67,9 @@ def test_chat_prompt_ctrl_alt_v_pastes_clipboard_image(tmp_path: Path, monkeypat
     assert pending_images == [os.fspath(pasted)]
     output = buffer.getvalue()
     assert "Pasted clipboard image:" in output
-    assert pasted.name in output
+    # Rich may fold a long temporary path in the middle of its filename at the
+    # console boundary. Verify the emitted path independent of visual wrapping.
+    assert pasted.name in "".join(output.splitlines())
 
 
 def test_chat_prompt_session_skips_history_when_data_dir_is_read_only(

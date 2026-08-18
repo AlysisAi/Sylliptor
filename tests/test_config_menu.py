@@ -371,7 +371,7 @@ def test_commit_persists_default_model_section_to_active_profile(
     save_config(cfg)
 
     state = ConfigMenuState.from_cfg(load_config())
-    state.set_field("model", "claude-sonnet-4-6")
+    state.set_field("model", "claude-sonnet-5")
     state.set_field("base_url", "https://anthropic.example/v1")
     cfg_to_save = load_config()
     result = state.commit_to(cfg_to_save)
@@ -572,6 +572,138 @@ def test_default_model_rows_include_active_profile_preset_suggestions() -> None:
     assert "deepseek-coder" not in model_values
 
 
+def test_nvidia_default_model_rows_merge_live_third_party_catalog_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sylliptor_agent_cli.profile_presets import get_preset, make_profile_from_preset
+
+    preset = get_preset("nvidia")
+    assert preset is not None
+    cfg = AppConfig(model="nvidia/nemotron-3-super-120b-a12b")
+    add_profile(cfg, make_profile_from_preset(preset, name="nvidia"))
+    set_active_profile(cfg, "nvidia")
+    state = ConfigMenuState.from_cfg(cfg)
+    state.set_field("new_api_key", "nvapi-test")
+    calls: list[str] = []
+
+    def discover(*, profile: ProfileSpec, api_key: str, **_kwargs: object):
+        calls.append(api_key)
+        assert profile.base_url == "https://integrate.api.nvidia.com/v1"
+        return (
+            config_menu_mod.ProviderModelOption(
+                id="deepseek-ai/deepseek-v4-pro",
+                label="deepseek-ai/deepseek-v4-pro",
+            ),
+            config_menu_mod.ProviderModelOption(
+                id="meta/llama-3.3-70b-instruct",
+                label="meta/llama-3.3-70b-instruct",
+            ),
+        )
+
+    monkeypatch.setattr(config_menu_mod, "discover_provider_models", discover)
+
+    first = config_menu_mod._default_model_rows(state)
+    second = config_menu_mod._default_model_rows(state)
+    model_values = [value for value, _label, _description in first]
+
+    assert calls == ["nvapi-test"]
+    assert first == second
+    assert model_values.count("deepseek-ai/deepseek-v4-pro") == 1
+    assert "meta/llama-3.3-70b-instruct" in model_values
+    live_meta_row = next(row for row in first if row[0] == "meta/llama-3.3-70b-instruct")
+    assert live_meta_row[1].endswith("(chat compatibility unverified)")
+    assert "does not declare endpoint compatibility" in live_meta_row[2]
+    assert model_values.index(config_menu_mod._CUSTOM_MODEL_VALUE) < model_values.index(
+        "meta/llama-3.3-70b-instruct"
+    )
+    assert config_menu_mod._thinking_labels_for_state(
+        state,
+        model="deepseek-ai/deepseek-v4-pro",
+    ) == ("off", "high", "max", "auto")
+    assert config_menu_mod._thinking_labels_for_state(
+        state,
+        model="new-vendor/model-released-today",
+    ) == ("auto",)
+
+
+def test_switching_to_nvidia_resets_effort_inherited_from_another_provider() -> None:
+    from sylliptor_agent_cli.profile_presets import get_preset, make_profile_from_preset
+
+    openai = get_preset("openai")
+    nvidia = get_preset("nvidia")
+    assert openai is not None
+    assert nvidia is not None
+    cfg = AppConfig(
+        model="gpt-5.4",
+        llm_enable_thinking=True,
+        llm_reasoning_effort="xhigh",
+    )
+    cfg.extra_fields["llm_thinking_label"] = "xhigh"
+    add_profile(cfg, make_profile_from_preset(openai, name="openai"))
+    add_profile(cfg, make_profile_from_preset(nvidia, name="nvidia"))
+    set_active_profile(cfg, "openai")
+    state = ConfigMenuState.from_cfg(cfg)
+
+    assert state.thinking_label == "xhigh"
+    state.set_active_profile_name("nvidia")
+
+    assert state.fields["model"] == "nvidia/nemotron-3-super-120b-a12b"
+    assert state.thinking_label == "auto"
+    assert state.thinking_label_explicitly_set is True
+    assert config_menu_mod._thinking_labels_for_state(state) == (
+        "off",
+        "low",
+        "high",
+        "auto",
+    )
+
+
+def test_loading_active_nvidia_profile_normalizes_stale_effort_to_auto() -> None:
+    from sylliptor_agent_cli.profile_presets import get_preset, make_profile_from_preset
+
+    nvidia = get_preset("nvidia")
+    assert nvidia is not None
+    cfg = AppConfig(
+        model="nvidia/nemotron-3-super-120b-a12b",
+        llm_enable_thinking=True,
+        llm_reasoning_effort="xhigh",
+    )
+    cfg.extra_fields["llm_thinking_label"] = "xhigh"
+    add_profile(cfg, make_profile_from_preset(nvidia, name="nvidia"))
+    set_active_profile(cfg, "nvidia")
+
+    state = ConfigMenuState.from_cfg(cfg)
+
+    assert state.thinking_label == "auto"
+    assert state.thinking_label_explicitly_set is True
+
+
+def test_zai_coding_plan_drops_stale_effort_and_never_offers_reasoning_off() -> None:
+    from sylliptor_agent_cli.profile_presets import get_preset, make_profile_from_preset
+
+    zai = get_preset("zai-coding-plan")
+    assert zai is not None
+    cfg = AppConfig(
+        model="glm-5.3",
+        llm_enable_thinking=False,
+        llm_reasoning_effort="none",
+    )
+    cfg.extra_fields["llm_thinking_label"] = "off"
+    add_profile(cfg, make_profile_from_preset(zai, name="zai-coding-plan"))
+    set_active_profile(cfg, "zai-coding-plan")
+
+    state = ConfigMenuState.from_cfg(cfg)
+
+    assert state.thinking_label == "auto"
+    assert state.thinking_label_explicitly_set is True
+    assert config_menu_mod._thinking_labels_for_state(state) == (
+        "low",
+        "high",
+        "max",
+        "auto",
+    )
+
+
 def test_default_model_rows_include_discovered_sylliptor_trial_models(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -579,14 +711,14 @@ def test_default_model_rows_include_discovered_sylliptor_trial_models(
 
     monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path / "config"))
     monkeypatch.setenv("SYLLIPTOR_DATA_DIR", os.fspath(tmp_path / "data"))
-    # Live proxy advertises a provider-prefixed variant of a curated model, plus a
-    # genuinely new one.
+    # Live gateway advertises a provider-prefixed variant of a curated model,
+    # plus a genuinely new one.
     monkeypatch.setattr(
         "sylliptor_agent_cli.account_login.list_trial_models",
-        lambda _cfg: ["xiaomi/mimo-v2.5-pro", "mimo-next"],
+        lambda _cfg: ["deepseek/deepseek-v4-flash", "deepseek-v5-preview"],
     )
 
-    cfg = AppConfig(model="mimo-v2.5-pro")
+    cfg = AppConfig(model="deepseek-v4-flash")
     add_profile(cfg, make_profile_from_preset(get_preset("sylliptor"), name="sylliptor"))
     set_active_profile(cfg, "sylliptor")
     state = ConfigMenuState.from_cfg(cfg)
@@ -595,13 +727,12 @@ def test_default_model_rows_include_discovered_sylliptor_trial_models(
         value for value, _label, _description in config_menu_mod._default_model_rows(state)
     ]
     # Curated clean names present...
-    assert "mimo-v2.5-pro" in model_values
-    assert "mimo-v2-flash" in model_values
-    assert "mimo-v2.5" in model_values
+    assert "deepseek-v4-flash" in model_values
+    assert "deepseek-v4-pro" in model_values
     # ...the provider-prefixed duplicate of a curated model is suppressed...
-    assert "xiaomi/mimo-v2.5-pro" not in model_values
+    assert "deepseek/deepseek-v4-flash" not in model_values
     # ...but a genuinely new discovered model still shows.
-    assert "mimo-next" in model_values
+    assert "deepseek-v5-preview" in model_values
 
 
 def test_default_model_rows_survive_sylliptor_discovery_failure(
@@ -617,7 +748,7 @@ def test_default_model_rows_survive_sylliptor_discovery_failure(
 
     monkeypatch.setattr("sylliptor_agent_cli.account_login.list_trial_models", _boom)
 
-    cfg = AppConfig(model="mimo-v2.5-pro")
+    cfg = AppConfig(model="deepseek-v4-flash")
     add_profile(cfg, make_profile_from_preset(get_preset("sylliptor"), name="sylliptor"))
     set_active_profile(cfg, "sylliptor")
     state = ConfigMenuState.from_cfg(cfg)
@@ -626,7 +757,7 @@ def test_default_model_rows_survive_sylliptor_discovery_failure(
     model_values = [
         value for value, _label, _description in config_menu_mod._default_model_rows(state)
     ]
-    assert "mimo-v2.5-pro" in model_values
+    assert "deepseek-v4-flash" in model_values
 
 
 def test_default_model_rows_fallback_to_base_url_provider() -> None:
@@ -646,7 +777,7 @@ def test_default_model_rows_fallback_to_base_url_provider() -> None:
             name="anthropic",
             base_url="https://api.anthropic.com/v1",
             api_key_env="ANTHROPIC_API_KEY",
-            default_model="claude-sonnet-4-6",
+            default_model="claude-sonnet-5",
         ),
     )
     set_active_profile(cfg, "deepseek")
@@ -802,102 +933,6 @@ def test_config_reload_recomputes_auto_reasoning_trace_capability_for_model_rout
     assert client.reasoning_trace_capability.adapter == "openai_compat_passive"
 
 
-def test_router_model_rows_merge_and_cache_live_gemini_catalog(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from sylliptor_agent_cli.profile_presets import get_preset, make_profile_from_preset
-    from sylliptor_agent_cli.provider_model_catalog import ProviderModelOption
-
-    preset = get_preset("gemini")
-    assert preset is not None
-    profile = make_profile_from_preset(preset, name="gemini")
-    cfg = AppConfig(model="gemini-3.5-flash", base_url=profile.base_url)
-    add_profile(cfg, profile)
-    set_active_profile(cfg, profile.name)
-    state = ConfigMenuState.from_cfg(cfg)
-    state.set_field("new_api_key", "new-gemini-key")
-    calls: list[tuple[ProfileSpec, str | None]] = []
-
-    def _discover(**kwargs: object) -> tuple[ProviderModelOption, ...]:
-        discovered_profile = kwargs["profile"]
-        assert isinstance(discovered_profile, ProfileSpec)
-        api_key = kwargs.get("api_key")
-        assert api_key is None or isinstance(api_key, str)
-        calls.append((discovered_profile, api_key))
-        return (
-            ProviderModelOption(
-                id="gemini-3.5-flash",
-                label="Gemini 3.5 Flash",
-                description="live duplicate of curated model",
-            ),
-            ProviderModelOption(
-                id="gemini-account-private",
-                label="Private Gemini",
-                description="available to this API key",
-            ),
-        )
-
-    monkeypatch.setattr(
-        "sylliptor_agent_cli.provider_model_catalog.discover_provider_models",
-        _discover,
-    )
-
-    first_rows = config_menu_mod._router_model_rows(state)
-    second_rows = config_menu_mod._router_model_rows(state)
-    values = [value for value, _label, _description in first_rows]
-
-    assert calls == [(profile, "new-gemini-key")]
-    assert first_rows == second_rows
-    assert values[0] == config_menu_mod._INHERIT_DEFAULT_MODEL_VALUE
-    assert values.count("gemini-3.5-flash") == 1
-    assert "gemini-account-private" in values
-    assert values[-1] == config_menu_mod._CUSTOM_MODEL_VALUE
-    private_row = next(row for row in first_rows if row[0] == "gemini-account-private")
-    assert private_row[1:] == ("Private Gemini", "available to this API key")
-    assert state.model_catalog_warning is None
-
-
-def test_switching_provider_resets_only_router_overrides() -> None:
-    from sylliptor_agent_cli.profile_presets import get_preset, make_profile_from_preset
-
-    gemini_preset = get_preset("gemini")
-    anthropic_preset = get_preset("anthropic")
-    assert gemini_preset is not None and anthropic_preset is not None
-    gemini = make_profile_from_preset(gemini_preset, name="gemini")
-    anthropic = make_profile_from_preset(anthropic_preset, name="anthropic")
-    cfg = AppConfig(model=gemini.default_model, base_url=gemini.base_url)
-    add_profile(cfg, gemini)
-    add_profile(cfg, anthropic)
-    set_active_profile(cfg, gemini.name)
-    cfg.extra_fields["role_models"] = {
-        "router": "gemini-router",
-        "coding": "shared-coder",
-    }
-    cfg.extra_fields["forge_role_models"] = {
-        "router": "gemini-forge-router",
-        "review": "shared-reviewer",
-    }
-    state = ConfigMenuState.from_cfg(cfg)
-
-    router_reset = state.set_active_profile_name(anthropic.name)
-
-    assert router_reset is True
-    assert state.role_models["router"] == ""
-    assert state.forge_role_models["router"] == ""
-    assert state.role_models["coding"] == "shared-coder"
-    assert state.forge_role_models["review"] == "shared-reviewer"
-    assert state.fields["model"] == anthropic.default_model
-
-    restored_reset = state.set_active_profile_name(gemini.name)
-
-    assert restored_reset is False
-    assert state.role_models["router"] == "gemini-router"
-    assert state.forge_role_models["router"] == "gemini-forge-router"
-    subtitle = config_menu_mod._router_model_picker_subtitle(state)
-    assert "currently uses gemini-router" in subtitle
-    assert "currently follows" not in subtitle
-
-
 def test_staged_api_key_stays_bound_to_its_profile_across_switch_and_save(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -918,29 +953,13 @@ def test_staged_api_key_stays_bound_to_its_profile_across_switch_and_save(
     state = ConfigMenuState.from_cfg(cfg)
     state.set_field("new_api_key", "gemini-secret")
     state.set_active_profile_name(anthropic.name)
-    calls: list[tuple[str, str | None]] = []
 
-    def _discover(**kwargs: object) -> tuple[object, ...]:
-        profile = kwargs["profile"]
-        assert isinstance(profile, ProfileSpec)
-        api_key = kwargs.get("api_key")
-        assert api_key is None or isinstance(api_key, str)
-        calls.append((profile.name, api_key))
-        return ()
-
-    monkeypatch.setattr(
-        "sylliptor_agent_cli.provider_model_catalog.discover_provider_models",
-        _discover,
-    )
-
-    config_menu_mod._provider_models_for_state(state)
     result = config_menu_mod._save_and_exit(
         state,
         cfg,
         SimpleNamespace(print=lambda *_args, **_kwargs: None),
     )
 
-    assert calls == [("anthropic", "anthropic-secret")]
     assert result.saved is True
     assert state.staged_api_key_target_profile() == "gemini"
     stored = load_persisted_profile_keys()
@@ -965,22 +984,6 @@ def test_removing_profile_discards_its_staged_api_key() -> None:
     assert discarded is True
     assert state.new_api_key == ""
     assert state.new_api_key_profile is None
-
-
-def test_changing_active_provider_endpoint_resets_router_overrides() -> None:
-    cfg = AppConfig(model="main", base_url="https://old.example/v1")
-    cfg.extra_fields = {
-        "role_models": {"router": "old-router", "coding": "coder"},
-        "forge_role_models": {"router": "old-forge-router", "review": "reviewer"},
-    }
-    state = ConfigMenuState.from_cfg(cfg)
-
-    state.set_field("base_url", "https://new.example/v1")
-
-    assert state.role_models["router"] == ""
-    assert state.forge_role_models["router"] == ""
-    assert state.role_models["coding"] == "coder"
-    assert state.forge_role_models["review"] == "reviewer"
 
 
 def test_config_reload_updates_gemini_cached_content_settings(
@@ -1084,7 +1087,7 @@ def test_config_reload_updates_gemini_cached_content_settings(
     ("fixed_step_override", "expected_max_steps"),
     [(None, 73), (19, 19)],
 )
-def test_config_reload_updates_router_model_and_live_limits(
+def test_config_reload_updates_main_model_and_leaves_router_client_untouched(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fixed_step_override: int | None,
@@ -1158,19 +1161,19 @@ def test_config_reload_updates_router_model_and_live_limits(
     chat_loop._apply_config_menu_changes_to_session(session=session, cfg=cfg)
 
     assert client.model == "coding-v2"
-    assert router_client.model == "router-v2"
-    assert router_client.temperature == 0.0
-    assert router_client.enable_thinking is False
-    assert router_client.reasoning_effort is None
+    # Router-free path: no router client participates in config reload; an
+    # embedder-supplied one is left exactly as it was.
+    assert router_client.model == "router-v1"
+    assert router_client.temperature == 0.8
+    assert router_client.enable_thinking is True
+    assert router_client.reasoning_effort == "high"
+    assert not hasattr(router_client, "route_identity")
     assert session.routing_mode == "auto"
     assert session.max_steps == expected_max_steps
 
     first_main_route = client.route_identity
-    first_router_route = router_client.route_identity
     assert first_main_route.model == "coding-v2"
-    assert first_router_route.model == "router-v2"
     assert first_main_route.credential_scope
-    assert first_main_route.fingerprint != first_router_route.fingerprint
 
     monkeypatch.setenv("SYLLIPTOR_API_KEY", "sk-next-credential")
     next_cfg = AppConfig(model="coding-v3", routing_mode="auto", max_steps=73)
@@ -1190,15 +1193,14 @@ def test_config_reload_updates_router_model_and_live_limits(
     chat_loop._apply_config_menu_changes_to_session(session=session, cfg=next_cfg)
 
     assert client.route_identity.model == "coding-v3"
-    assert router_client.route_identity.model == router_client.model
-    assert router_client.route_identity.model != first_router_route.model
+    assert not hasattr(router_client, "route_identity")
+    assert router_client.model == "router-v1"
     assert client.route_identity.profile_name == "alternate-route"
     assert client.route_identity.base_url == "https://openrouter.ai/api/v1"
     assert client.route_identity.provider_key == "openrouter"
     assert client.route_identity.credential_scope != first_main_route.credential_scope
     assert client.route_identity.routing_headers
     assert client.route_identity.fingerprint != first_main_route.fingerprint
-    assert router_client.route_identity.fingerprint != first_router_route.fingerprint
 
 
 @pytest.mark.parametrize(
@@ -1479,45 +1481,88 @@ def test_config_reload_failure_restores_session_and_all_client_routes(
         ("code_only", "auto", None),
     ],
 )
-def test_config_reload_requires_restart_for_routing_topology_change(
+def test_config_reload_applies_routing_mode_change_in_place(
     current_mode: str,
     next_mode: str,
     router_client: object | None,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Router-free path: routing_mode is a deprecated no-op field, so changing
+    # it is an ordinary live reload — no restart is required and the session
+    # simply tracks the configured value.
+    monkeypatch.setenv("SYLLIPTOR_CONFIG_DIR", os.fspath(tmp_path))
+    monkeypatch.setenv("SYLLIPTOR_API_KEY", "sk-test")
     monkeypatch.delenv("SYLLIPTOR_ROUTING_MODE", raising=False)
     current_cfg = AppConfig(model="coding-v1", routing_mode=current_mode, max_steps=25)
     next_cfg = AppConfig(model="coding-v2", routing_mode=next_mode, max_steps=73)
+    client = SimpleNamespace(
+        base_url="",
+        api_key="",
+        model="coding-v1",
+        timeout_s=0.0,
+        temperature=0.0,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
+        enable_thinking=None,
+        reasoning_effort=None,
+        extra_headers={},
+        provider_key=None,
+        provider_concurrency_caps={},
+        provider_retry_settings=None,
+    )
     session = SimpleNamespace(
         cfg=current_cfg,
-        client=SimpleNamespace(model="coding-v1"),
+        client=client,
         router_client=router_client,
+        conversation_compactor=None,
+        mode="review",
         routing_mode=current_mode,
         max_steps=25,
+        chat_turn_fixed_override=None,
+        root=tmp_path,
+    )
+    monkeypatch.setattr(
+        chat_loop,
+        "_rebuild_session_tools_for_mode",
+        lambda **_kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        chat_loop,
+        "refresh_session_environment_context_message",
+        lambda _session: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        chat_loop,
+        "_refresh_chat_hud_context_cache",
+        lambda _session: None,
+        raising=False,
     )
 
-    with pytest.raises(
-        chat_loop._ConfigReloadRequiresRestart,
-        match=f"{current_mode!r} to {next_mode!r}",
-    ):
-        chat_loop._apply_config_menu_changes_to_session(session=session, cfg=next_cfg)
+    chat_loop._apply_config_menu_changes_to_session(session=session, cfg=next_cfg)
 
-    assert session.cfg is current_cfg
-    assert session.routing_mode == current_mode
-    assert session.max_steps == 25
+    assert session.routing_mode == next_mode
+    assert session.cfg.routing_mode == next_mode
+    assert session.max_steps == 73
+    assert client.model == "coding-v2"
     assert session.router_client is router_client
 
 
-def test_classic_config_reload_closes_session_for_routing_topology_change(
+def test_classic_config_reload_applies_routing_mode_change_without_closing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Router-free path: a routing-mode-only save reloads live like any other
+    # config change instead of closing the chat session.
     current_cfg = AppConfig(model="coding", routing_mode="auto")
     next_cfg = AppConfig(model="coding", routing_mode="code_only")
     session = SimpleNamespace(
         cfg=current_cfg,
         routing_mode="auto",
-        router_client=object(),
+        router_client=None,
     )
+    applied: list[AppConfig] = []
     output: list[str] = []
     console = SimpleNamespace(print=lambda value="": output.append(str(value)))
     monkeypatch.delenv("SYLLIPTOR_ROUTING_MODE", raising=False)
@@ -1531,6 +1576,12 @@ def test_classic_config_reload_closes_session_for_routing_topology_change(
         ),
     )
     monkeypatch.setattr(chat_loop, "load_config", lambda: next_cfg, raising=False)
+    monkeypatch.setattr(
+        chat_loop,
+        "_apply_config_menu_changes_to_session",
+        lambda *, session, cfg: applied.append(cfg),
+        raising=False,
+    )
     monkeypatch.setattr(
         chat_loop,
         "_is_non_interactive_terminal",
@@ -1556,10 +1607,11 @@ def test_classic_config_reload_closes_session_for_routing_topology_change(
     )
 
     rendered = "\n".join(output)
-    assert result == "exit"
-    assert "Routing mode changed" in rendered
-    assert "session is closing" in rendered
-    assert "apply on the next user turn" not in rendered
+    assert result == "handled"
+    assert applied == [next_cfg]
+    assert "Routing mode changed" not in rendered
+    assert "session is closing" not in rendered
+    assert "apply on the next user turn" in rendered
 
 
 @pytest.mark.parametrize(

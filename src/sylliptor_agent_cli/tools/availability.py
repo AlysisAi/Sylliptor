@@ -148,16 +148,25 @@ def unavailable_tool_result(name: str) -> ToolUnavailableResult | None:
     }
 
 
-def web_unavailable_result(name: str) -> ToolUnavailableResult:
-    """Return a non-error observation for a failed optional web tool."""
+def web_unavailable_result(name: str, *, detail: str | None = None) -> ToolUnavailableResult:
+    """Return a non-error observation for a failed optional web tool.
+
+    ``detail`` carries the underlying failure summary so the model (and the
+    user reading the transcript) can see *why* web tools were disabled — e.g.
+    a configuration remedy — instead of a silent generic notice.
+    """
 
     clean_name = _clean_tool_name(name)
     if clean_name.casefold() not in WEB_TOOL_NAMES:
         raise ValueError(f"not a web tool: {clean_name}")
+    reason = WEB_UNAVAILABLE_OBSERVATION
+    clean_detail = str(detail or "").strip()
+    if clean_detail:
+        reason = f"{WEB_UNAVAILABLE_OBSERVATION} Cause: {clean_detail}"
     return {
         "status": "tool_unavailable",
         "tool": clean_name,
-        "reason": WEB_UNAVAILABLE_OBSERVATION,
+        "reason": reason,
     }
 
 

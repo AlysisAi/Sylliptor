@@ -142,6 +142,12 @@ def _agent_entrypoint_prefix(settings: ServerSettings) -> list[str]:
     return [sys.executable, "-m", "sylliptor_agent_cli"]
 
 
+def _append_forge_machine_flag(command: list[str], settings: ServerSettings) -> None:
+    """Ask Forge workers for the NDJSON event stream so job status is reported, not guessed."""
+    if settings.worker_machine_events:
+        command.append("--machine")
+
+
 def _validate_forge_exec_task_id(task_id: str) -> None:
     if task_id.startswith("-"):
         raise ValueError("Invalid task_id: must not start with '-'")
@@ -185,6 +191,7 @@ def _build_forge_exec_job_command(
         "--path",
         "/workspace",
     ]
+    _append_forge_machine_flag(command, settings)
     _append_common_agent_args(
         command,
         mode=req.mode,
@@ -209,6 +216,7 @@ def _build_forge_swarm_job_command(
         "--path",
         "/workspace",
     ]
+    _append_forge_machine_flag(command, settings)
     _append_common_agent_args(
         command,
         mode=req.mode,
@@ -320,7 +328,7 @@ def create_app(settings: ServerSettings):  # type: ignore[no-untyped-def]
         return {"job_id": job_id}
 
     @app.get("/v1/jobs/{job_id}", dependencies=[Depends(auth_dep)])
-    def get_job_status(job_id: str) -> dict[str, str | int | None]:
+    def get_job_status(job_id: str) -> dict[str, object]:
         try:
             status_obj = runner.get_status(job_id)
         except ServerStoreError as e:
@@ -329,11 +337,14 @@ def create_app(settings: ServerSettings):  # type: ignore[no-untyped-def]
             "job_id": status_obj.job_id,
             "run_id": status_obj.run_id,
             "status": status_obj.status,
+            # How the status was decided: the worker's terminal event, or the exit code.
+            "status_source": status_obj.status_source,
             "created_at": status_obj.created_at,
             "started_at": status_obj.started_at,
             "finished_at": status_obj.finished_at,
             "exit_code": status_obj.exit_code,
             "error": status_obj.error,
+            "terminal_event": status_obj.terminal_event,
         }
 
     @app.get("/v1/jobs/{job_id}/logs", dependencies=[Depends(auth_dep)])

@@ -2120,7 +2120,7 @@ def test_run_task_worker_refreshes_verify_commands_after_creating_test_surface(
     assert captured["post_change_verify_commands"] == ["pytest -q"]
 
 
-def test_run_task_worker_strict_verify_rejects_commit_when_no_authoritative_commands_exist(
+def test_run_task_worker_strict_verify_keeps_commit_unverified_when_no_commands_exist(
     tmp_path: Path, monkeypatch
 ) -> None:
     repo = tmp_path / "repo"
@@ -2203,13 +2203,18 @@ def test_run_task_worker_strict_verify_rejects_commit_when_no_authoritative_comm
         ),
     )
 
-    assert result.success is False
+    # Missing tooling is not a defect in the work: the commit is kept and reported as
+    # an unverified completion instead of a failure that would discard it.
+    assert result.success is True
+    assert result.verification_unavailable is True
     assert result.verify_failed is False
-    assert result.failure_reason == "verification_unavailable"
-    assert result.verify_summary == "verification skipped: no authoritative commands available"
+    assert result.failure_reason is None
+    assert result.commit_hash == "deadbeef"
+    assert "completed_unverified" in (result.verify_summary or "")
     assert result.verify_command_source == "task_refinement.no_authoritative_commands"
     assert captured["authoritative_verification_commands"] is None
-    assert "strict verification requires authoritative commands" in (result.error or "")
+    assert result.error is None
+    assert any("nothing checked it" in item for item in result.warnings)
 
 
 def test_run_task_worker_rejects_agent_exception_as_zero_diff_noop(

@@ -8,13 +8,14 @@ import json
 import os
 import re
 import subprocess
+import uuid
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from time import perf_counter
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 from ..approval_scope import (
@@ -70,6 +71,7 @@ from ..mcp.manager import ForgeTaskScopedMcpManager, McpManager
 from ..mcp.models import ResolvedMcpConfig, ResolvedMcpServer
 from ..model_registry import ModelRegistry
 from ..model_router import ROLE_CODING, resolve_model_for_role
+from ..personas import is_persona_name, persona_modes_enabled
 from ..pipeline_facts import resolve_pipeline_stage_status
 from ..policy import evaluate_shell_command
 from ..process_reaping import ProcessGroupRegistry
@@ -105,6 +107,10 @@ from ..terminal_manager import ProcessOutputSnapshot, TerminalLimitError, Termin
 from ..tools.availability import mark_available, mark_unavailable, register_tool_availability
 from ..tools.fs import (
     FsError,
+    StaleFileError,
+    assert_file_precondition,
+    capture_file_precondition,
+    classify_sensitive_path,
     fs_copy,
     fs_delete,
     fs_list,
@@ -112,9 +118,10 @@ from ..tools.fs import (
     fs_move,
     fs_read,
     fs_read_lines,
-    fs_write,
     prepare_fs_edit,
+    prepare_fs_write,
     write_prepared_fs_edit,
+    write_prepared_fs_write,
 )
 from ..tools.git import git_apply_patch, git_diff, git_history, git_status
 from ..tools.history import history_search
@@ -124,6 +131,7 @@ from ..tools.image_generation import (
     plan_image_output_paths,
 )
 from ..tools.registry import (
+    REPORT_BLOCKER_MAX_MESSAGE_CHARS,
     built_in_subagent_tool_names,
     copied_tool_parameters,
     iter_builtin_tool_metadata,
@@ -536,6 +544,18 @@ def _fullaccess_shell_audit_ts() -> str:
     return datetime.now(UTC).isoformat()
 
 
+class ToolDispatchGuard(Protocol):
+    """Host-supplied veto hook applied before every tool dispatch."""
+
+    def check_tool_call(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        resolve_rel_path: Callable[..., str] | None = None,
+    ) -> None: ...
+
+
 @dataclass(frozen=True)
 class ToolDef:
     name: str
@@ -639,7 +659,7 @@ def _drop_schema_descriptions(value: Any) -> Any:
 _BUILTIN_MODEL_DESCRIPTIONS: dict[str, str] = {
     "fs_read": "Read a text file under the workspace.",
     "fs_read_lines": "Read numbered lines from a text file.",
-    "fs_edit": "Apply exact-text edits to one UTF-8 file.",
+    "fs_edit": "Apply exact-text or line-range edits to one UTF-8 file.",
     "fs_move": "Move or rename one workspace file.",
     "fs_copy": "Copy one workspace file.",
     "fs_delete": "Delete one workspace file.",
@@ -650,7 +670,7 @@ _BUILTIN_MODEL_DESCRIPTIONS: dict[str, str] = {
     "symbol_search": "Find Python, JS/TS, or Java symbols; request details/snippets when planning edits.",
     "test_discover": "Suggest likely focused tests and commands for paths or failures.",
     "repo_map": "Map related files, imports, symbols, and likely tests before broad exploration.",
-    "search_rg": "Search workspace text with a ripgrep regex.",
+    "search_rg": "Search workspace text with regex or literal matching, globs, and optional context.",
     "history_search": "Search session history and tool artifacts.",
     "verify_run": "Run configured verifier; no pipes/filters or swapped tools.",
     "shell_run": "Run a policy-checked shell command.",
@@ -836,8 +856,8 @@ def _built_in_tool_exposed_in_mode(
     return subagent_depth == 0 and normalized_tool_name in _READONLY_TOP_LEVEL_WEB_TOOL_NAMES
 
 
-def _mcp_tool_exposed_in_mode(*, mode: str) -> bool:
-    return str(mode or "").strip().lower() != "readonly"
+def _mcp_tool_exposed_in_mode(*, mode: str, write_scope_restricted: bool = False) -> bool:
+    return str(mode or "").strip().lower() != "readonly" and not write_scope_restricted
 
 
 def _custom_tools_write_scope_restricted(
@@ -845,7 +865,10 @@ def _custom_tools_write_scope_restricted(
     mode: str,
     deny_write_prefixes: list[str] | None,
     allow_write_globs: list[str] | None,
+    persona_allow_write_globs: list[str] | None,
 ) -> bool:
+    if persona_allow_write_globs is not None:
+        return True
     if str(mode or "").strip().lower() == _MODE_FULLACCESS:
         return False
     if allow_write_globs is not None:
@@ -904,6 +927,7 @@ def build_tools(
     model_registry: ModelRegistry | None = None,
     deny_write_prefixes: list[str] | None = None,
     allow_write_globs: list[str] | None = None,
+    persona_allow_write_globs: list[str] | None = None,
     non_interactive: bool = False,
     shell_runner: Any | None = None,
     process_group_registry: ProcessGroupRegistry | None = None,
@@ -915,6 +939,7 @@ def build_tools(
     verify_command_selection: ResolvedVerifyCommands | None = None,
     get_verify_command_selection: Callable[[], ResolvedVerifyCommands | None] | None = None,
     one_shot_execution: bool = False,
+    completion_gate_tools_enabled: bool = False,
     skills_enabled: bool = True,
     skill_registry: dict[str, SkillBundle] | None = None,
     subagents_enabled: bool = False,
@@ -924,6 +949,7 @@ def build_tools(
     step_budget_runtime: Any | None = None,
     emit_web_search_runtime_diagnostics: bool = False,
     runtime_kind: RuntimeKind | str = RuntimeKind.ONE_SHOT,
+    persona_switch_state: Any | None = None,
     mcp_manager: McpManager | ForgeTaskScopedMcpManager | None = None,
     custom_tool_session_state: CustomToolSessionState | None = None,
     get_active_workdir_relpath: Callable[[], str] | None = None,
@@ -932,11 +958,15 @@ def build_tools(
     execution_deadline: ExecutionDeadline | None = None,
     crash_diagnostic_log_path: str | os.PathLike[str] | None = None,
     crash_diagnostics: CrashDiagnosticLogger | None = None,
+    tool_dispatch_guard: ToolDispatchGuard | None = None,
 ) -> dict[str, ToolDef]:
     root = root.resolve()
     workspace_context = resolve_workspace_context(root)
     surface = surface or NoopSurface()
-    host_managed_approvals = bool(getattr(surface, "host_managed_approvals", False))
+    host_managed_approvals = bool(
+        getattr(surface, "host_managed_approvals", False)
+        or getattr(getattr(surface, "_parent_surface", None), "host_managed_approvals", False)
+    )
     resolved_runtime_kind = normalize_runtime_kind(
         runtime_kind, fallback=RuntimeKind.INTERACTIVE_CHAT
     )
@@ -1078,8 +1108,11 @@ def build_tools(
         return None
 
     command_mutation_tracking_enabled = bool(
-        subagent_depth == 0
-        and (one_shot_execution or resolved_runtime_kind == RuntimeKind.INTERACTIVE_CHAT)
+        resolved_runtime_kind == RuntimeKind.SUBAGENT
+        or (
+            subagent_depth == 0
+            and (one_shot_execution or resolved_runtime_kind == RuntimeKind.INTERACTIVE_CHAT)
+        )
     )
     command_mutation_ignored_paths: list[Path] = []
     if command_mutation_tracking_enabled:
@@ -1097,21 +1130,31 @@ def build_tools(
     git_backed_workspace = workspace_context.git_root is not None
     resolved_skill_registry = dict(skill_registry or {})
     built_in_tool_names = {spec.name.casefold() for spec in iter_builtin_tool_metadata()}
-    if custom_tool_session_state is None:
-        custom_tool_session_state = build_custom_tool_session_state(
-            workspace_root=root,
-            custom_tools_enabled=bool(getattr(cfg, "custom_tools_enabled", True)) if cfg else True,
+    custom_tool_session_state = build_custom_tool_session_state(
+        workspace_root=root,
+        custom_tools_enabled=bool(getattr(cfg, "custom_tools_enabled", True)) if cfg else True,
+        mode=mode,
+        runtime_kind=resolved_runtime_kind,
+        built_in_tool_names=built_in_tool_names,
+        write_scope_restricted=_custom_tools_write_scope_restricted(
             mode=mode,
-            runtime_kind=resolved_runtime_kind,
-            built_in_tool_names=built_in_tool_names,
-            write_scope_restricted=_custom_tools_write_scope_restricted(
-                mode=mode,
-                deny_write_prefixes=deny_write_prefixes,
-                allow_write_globs=allow_write_globs,
-            ),
-        )
+            deny_write_prefixes=deny_write_prefixes,
+            allow_write_globs=allow_write_globs,
+            persona_allow_write_globs=persona_allow_write_globs,
+        ),
+        discovery=(
+            custom_tool_session_state.discovery if custom_tool_session_state is not None else None
+        ),
+        trust_state=(
+            custom_tool_session_state.trust_state if custom_tool_session_state is not None else None
+        ),
+    )
 
-    is_full_access_mode = mode == _MODE_FULLACCESS
+    persona_write_scope_active = persona_allow_write_globs is not None
+    # A persona scope remains a real host constraint even if a caller ever
+    # constructs an inconsistent fullaccess+scope session. Normal persona
+    # application also clamps that combination to review.
+    is_full_access_mode = mode == _MODE_FULLACCESS and not persona_write_scope_active
 
     deny_prefixes: list[str] = []
     if not is_full_access_mode:
@@ -1127,19 +1170,23 @@ def build_tools(
                     seen_deny_prefixes.add(normalized)
                     deny_prefixes.append(cleaned)
     deny_prefixes_cf = [pref.casefold() for pref in deny_prefixes]
-    allow_patterns: list[str] | None = None
-    allowed_ancestor_dirs_cf: set[str] = set()
-    if not is_full_access_mode and allow_write_globs is not None:
-        allow_patterns = []
-        for raw in allow_write_globs:
-            cleaned = _normalize_rel_match_path(str(raw))
-            if cleaned:
-                allow_patterns.append(cleaned)
-        allowed_ancestor_dirs_cf = {
-            _normalize_rel_match_path(path).casefold()
-            for path in ancestor_directory_scope_patterns(allow_write_globs)
-            if _normalize_rel_match_path(path)
-        }
+    allow_pattern_groups: list[list[str]] = []
+    allowed_ancestor_dir_groups_cf: list[set[str]] = []
+    if not is_full_access_mode:
+        for raw_group in (allow_write_globs, persona_allow_write_globs):
+            if raw_group is None:
+                continue
+            patterns = [
+                cleaned for raw in raw_group if (cleaned := _normalize_rel_match_path(str(raw)))
+            ]
+            allow_pattern_groups.append(patterns)
+            allowed_ancestor_dir_groups_cf.append(
+                {
+                    cleaned.casefold()
+                    for path in ancestor_directory_scope_patterns(raw_group)
+                    if (cleaned := _normalize_rel_match_path(path))
+                }
+            )
 
     def _is_denied_path(rel_path: str) -> bool:
         if not deny_prefixes_cf:
@@ -1151,13 +1198,145 @@ def build_tools(
                 return True
         return False
 
+    def _path_escape_recovery_payload(
+        *,
+        tool_name: str,
+        attempted_path: str,
+        field_name: str,
+        workspace_root: Path,
+        path_base: str | None = None,
+    ) -> dict[str, Any]:
+        base_note = f" with path_base={path_base}" if path_base else ""
+        normalized_tool = str(tool_name or "").strip().lower()
+        write_tools = {
+            "fs_write",
+            "fs_edit",
+            "fs_move",
+            "fs_copy",
+            "fs_delete",
+            "fs_mkdir",
+        }
+        shell_cwd_tools = {"shell_run", "shell_background", "shell_service_start"}
+
+        if normalized_tool in write_tools:
+            guidance = (
+                "Use a workspace-relative path for this filesystem write. If the user "
+                "explicitly requested an absolute path outside the workspace, explain that "
+                "filesystem write tools cannot do that. Use shell_run only when policy and "
+                "any required user approval allow the explicit external write."
+            )
+            suggested_next_actions = [
+                {
+                    "action": "use_workspace_relative_path",
+                    "description": "Retry with a path inside the workspace.",
+                    "requires_user_confirmation": False,
+                },
+                {
+                    "action": "use_shell_run_if_policy_allows",
+                    "description": (
+                        "Use a specific shell command for an explicitly requested external "
+                        "target only when policy and approvals allow it."
+                    ),
+                    "requires_user_confirmation": True,
+                },
+                {
+                    "action": "ask_or_explain_boundary",
+                    "description": "Explain the workspace boundary and ask how to proceed.",
+                    "requires_user_confirmation": False,
+                },
+            ]
+            can_use_other_allowed_tool = (
+                "shell_run may target an absolute path only when policy and any required "
+                "approval allow it"
+            )
+            requires_user_confirmation = True
+        elif normalized_tool in shell_cwd_tools or field_name == "cwd":
+            guidance = (
+                "Use a cwd inside the workspace. If the command needs an external path, keep "
+                "cwd workspace-relative and pass the path explicitly only when shell policy "
+                "and approvals allow that operation."
+            )
+            suggested_next_actions = [
+                {
+                    "action": "use_workspace_relative_cwd",
+                    "description": "Retry with cwd omitted or set inside the workspace.",
+                    "requires_user_confirmation": False,
+                },
+                {
+                    "action": "pass_external_path_as_argument_if_policy_allows",
+                    "description": (
+                        "Keep cwd inside the workspace and pass the external path explicitly "
+                        "only when policy and approvals allow it."
+                    ),
+                    "requires_user_confirmation": True,
+                },
+                {
+                    "action": "ask_or_explain_boundary",
+                    "description": "Explain the cwd boundary and ask how to proceed.",
+                    "requires_user_confirmation": False,
+                },
+            ]
+            can_use_other_allowed_tool = "Shell commands must start from a workspace-relative cwd"
+            requires_user_confirmation = True
+        else:
+            guidance = (
+                "Use a workspace-relative path. This tool cannot inspect arbitrary paths "
+                "outside the workspace; ask the user to move the input into the workspace or "
+                "provide its contents."
+            )
+            suggested_next_actions = [
+                {
+                    "action": "use_workspace_relative_path",
+                    "description": "Retry with a path inside the workspace.",
+                    "requires_user_confirmation": False,
+                },
+                {
+                    "action": "ask_user_for_accessible_input",
+                    "description": "Ask the user to provide the input inside the workspace.",
+                    "requires_user_confirmation": False,
+                },
+                {
+                    "action": "explain_boundary",
+                    "description": "Explain that the tool cannot access the external path.",
+                    "requires_user_confirmation": False,
+                },
+            ]
+            can_use_other_allowed_tool = (
+                "No filesystem read or search tool can access paths outside the workspace"
+            )
+            requires_user_confirmation = False
+
+        return {
+            "error": (
+                f"Path escapes root ({field_name}): {attempted_path}. Workspace path arguments "
+                f"are limited to {os.fspath(workspace_root)}{base_note}. Recovery: {guidance}"
+            ),
+            "error_code": "path_escapes_workspace",
+            "code": "path_escapes_workspace",
+            "attempted_path": attempted_path,
+            "path_field": field_name,
+            "tool_name": normalized_tool or tool_name,
+            "workspace_root": os.fspath(workspace_root),
+            "rule": "workspace path arguments must resolve under workspace_root",
+            "can_use_other_allowed_tool": can_use_other_allowed_tool,
+            "requires_user_confirmation": requires_user_confirmation,
+            "guidance": guidance,
+            "suggested_next_actions": suggested_next_actions,
+        }
+
     def _resolve_rel_path(rel_path: str) -> str:
         root_abs = root.resolve()
         target = (root_abs / rel_path).resolve()
         try:
             normalized = target.relative_to(root_abs)
         except ValueError as e:
-            raise AgentRuntimeError(f"Path escapes root: {rel_path}") from e
+            payload = _path_escape_recovery_payload(
+                tool_name="filesystem",
+                attempted_path=rel_path,
+                field_name="path",
+                workspace_root=root_abs,
+            )
+            raise AgentRuntimeError(str(payload["error"]), result_payload=payload) from e
         return os.fspath(normalized)
 
     def _resolve_rel_write_path(rel_path: str) -> str:
@@ -1168,27 +1347,106 @@ def build_tools(
             return
         if _is_denied_path(rel_path):
             raise AgentRuntimeError(f"Blocked write to protected path: {rel_path}")
-        if allow_patterns is not None:
-            rel_norm = _normalize_rel_match_path(rel_path)
+        rel_norm = _normalize_rel_match_path(rel_path)
+        rel_cf = rel_norm.casefold()
+        for patterns in allow_pattern_groups:
             in_scope = any(
-                scope_path_matches_pattern(rel_norm, pattern, root=root)
-                for pattern in allow_patterns
+                scope_path_matches_pattern(rel_norm, pattern, root=root) for pattern in patterns
             )
             if not in_scope:
-                rel_cf = rel_norm.casefold()
                 in_scope = any(
                     rel_cf == _normalize_rel_match_path(pattern).casefold()
-                    for pattern in allow_patterns
+                    for pattern in patterns
                     if not any(ch in pattern for ch in ["*", "?", "["])
                 )
             if not in_scope:
                 raise AgentRuntimeError(f"Blocked write outside allowed scope: {rel_path}")
 
     def _is_allowed_ancestor_dir_creation(rel_path: str) -> bool:
-        if is_full_access_mode or not allowed_ancestor_dirs_cf:
+        if is_full_access_mode or not allow_pattern_groups:
             return False
         rel_norm = _normalize_rel_match_path(rel_path).casefold()
-        return rel_norm in allowed_ancestor_dirs_cf
+        return all(rel_norm in ancestors for ancestors in allowed_ancestor_dir_groups_cf)
+
+    def _sensitive_path_findings(paths: list[str]) -> list[dict[str, str]]:
+        findings: list[dict[str, str]] = []
+        for path in paths:
+            classification = classify_sensitive_path(path)
+            if classification.sensitive:
+                findings.append(
+                    {
+                        "path": path,
+                        "category": str(classification.category or "sensitive_file"),
+                    }
+                )
+        return findings
+
+    def guard_sensitive_files(kind: str, *, files: list[str]) -> list[dict[str, str]]:
+        """Require one-time human consent that broad/session policy cannot satisfy."""
+
+        findings = _sensitive_path_findings(files)
+        if not findings:
+            return []
+        if non_interactive and not host_managed_approvals:
+            raise AgentRuntimeError(
+                f"Explicit one-time user approval is required for {kind} on a sensitive file."
+            )
+        categories = sorted({finding["category"] for finding in findings})
+        preview = "\n".join(
+            [
+                f"Sensitive file operation: {kind}",
+                *(f"path: {finding['path']} ({finding['category']})" for finding in findings),
+                "File contents are intentionally omitted from this approval preview.",
+            ]
+        )
+        decision = surface.request_approval(
+            ApprovalRequest(
+                kind=kind,
+                reason="sensitive files require an explicit one-time approval",
+                preview=preview,
+                files=[finding["path"] for finding in findings],
+                metadata={
+                    "mandatory_explicit_approval": True,
+                    "allow_for_session_disabled": True,
+                    "sensitive_categories": categories,
+                },
+                # Deliberately no allow_for_session_scope: stored grants must
+                # never authorize current or future sensitive-file access.
+                allow_for_session_scope=None,
+            )
+        )
+        if not decision.allow:
+            raise ApprovalDeclinedError(kind)
+        if decision.allow_for_session:
+            # Auto/YOLO surfaces and cached grants identify themselves through
+            # allow_for_session. Sensitive access only accepts the UI's one-time
+            # allow decision.
+            raise AgentRuntimeError(
+                f"Automatic or session approval cannot authorize {kind} on a sensitive file. "
+                "Switch approvals to ask and approve this operation once."
+            )
+        return findings
+
+    def _mark_sensitive_result(
+        result: dict[str, Any], findings: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        if findings:
+            result["_sylliptor_output_policy"] = {
+                "sensitive": True,
+                "persist": "redact",
+                "display": "redact",
+                "categories": sorted({finding["category"] for finding in findings}),
+            }
+        return result
+
+    def _stale_file_result(error: StaleFileError) -> dict[str, Any]:
+        return {
+            "error": "The file changed after this operation was prepared; no mutation was made.",
+            "error_code": "stale_file",
+            "code": "stale_file",
+            "path": error.path,
+            "recoverable": True,
+        }
 
     def guard_write(kind: str, preview: str, *, files: list[str] | None = None) -> None:
         if is_full_access_mode:
@@ -1233,6 +1491,11 @@ def build_tools(
                 raise ApprovalDeclinedError(kind)
 
     def guard_shell(cmd: str, *, tool_name: str = "shell_run") -> None:
+        if persona_write_scope_active:
+            raise AgentRuntimeError(
+                f"Blocked while persona write scope is active: {tool_name}. "
+                "Use scoped filesystem and inspection tools instead."
+            )
         if matched_pattern := _fullaccess_denylist_match(cmd):
             if tool_name != "shell_run" and not is_full_access_mode:
                 raise AgentRuntimeError(f"Blocked command: denylist pattern {matched_pattern}")
@@ -1288,6 +1551,11 @@ def build_tools(
             raise AgentRuntimeError(f"Blocked in readonly mode: {op_name}")
 
     def guard_verify(commands: list[str]) -> None:
+        if persona_write_scope_active:
+            raise AgentRuntimeError(
+                "Blocked while persona write scope is active: verify_run. "
+                "Verification commands can write paths the persona scope cannot constrain."
+            )
         if is_full_access_mode:
             return
         if mode == "readonly":
@@ -1607,10 +1875,12 @@ def build_tools(
         inherited_active_workdir_relpath = (
             get_active_workdir_relpath() if callable(get_active_workdir_relpath) else "."
         )
+        subagent_run_id = uuid.uuid4().hex
         subagent_surface = NestedSubagentSurface(
             surface,
             subagent_name=definition.name,
             subagent_mode=resolved_mode,
+            subagent_run_id=subagent_run_id,
         )
         subagent_started_at = perf_counter()
         subagent_surface.on_subagent_start(
@@ -1620,6 +1890,11 @@ def build_tools(
                 description=str(definition.description or ""),
             )
         )
+        child_deny_write_prefixes = deny_write_prefixes
+        trusted_prompt_parts: list[str] = []
+        if definition.prompt_trust == "trusted":
+            trusted_prompt_parts.append(definition.system_prompt)
+        trusted_prompt_append = "\n\n".join(trusted_prompt_parts) or None
 
         try:
             sub_session = _create_session_for_subagent(
@@ -1633,15 +1908,14 @@ def build_tools(
                 no_log=no_log,
                 api_key_override=api_key or None,
                 console=None,
-                deny_write_prefixes=deny_write_prefixes,
+                deny_write_prefixes=child_deny_write_prefixes,
                 allow_write_globs=allow_write_globs,
+                persona_allow_write_globs=persona_allow_write_globs,
                 non_interactive=non_interactive,
                 session_log_dir_override=session_log_dir_override,
                 surface=subagent_surface,
                 usage_role=f"{usage_role}:subagent:{definition.name}",
-                trusted_system_prompt_append=(
-                    definition.system_prompt if definition.prompt_trust == "trusted" else None
-                ),
+                trusted_system_prompt_append=trusted_prompt_append,
                 untrusted_prompt_prelude=(
                     definition.system_prompt if definition.prompt_trust != "trusted" else None
                 ),
@@ -1883,6 +2157,85 @@ def build_tools(
         exit_code = 1
         usage_replayed = False
 
+        child_workspace_reconciliation_enabled = resolved_mode != "readonly"
+        child_workspace_ignored_paths = [
+            candidate
+            for candidate in [
+                getattr(store, "path", None),
+                getattr(store, "session_artifact_root", None),
+                getattr(getattr(sub_session, "store", None), "path", None),
+                getattr(getattr(sub_session, "store", None), "session_artifact_root", None),
+                session_log_dir_override,
+            ]
+            if isinstance(candidate, Path)
+        ]
+        child_workspace_ignored = _normalize_snapshot_ignore_paths(
+            root,
+            child_workspace_ignored_paths,
+        )
+
+        def _child_workspace_snapshot() -> dict[str, str]:
+            if not child_workspace_reconciliation_enabled:
+                return {}
+            return {
+                rel_path: signature
+                for rel_path, signature in _snapshot_workspace_for_command_mutation_detection(
+                    root
+                ).items()
+                if not _path_matches_snapshot_ignore(
+                    rel_path,
+                    ignored_paths=child_workspace_ignored,
+                )
+            }
+
+        child_workspace_before_snapshot = _child_workspace_snapshot()
+        child_workspace_effect_payload: dict[str, Any] | None = None
+
+        def _reconcile_child_workspace_effects() -> dict[str, Any]:
+            nonlocal child_workspace_effect_payload
+            if child_workspace_effect_payload is not None:
+                return dict(child_workspace_effect_payload)
+
+            raw_child_touched_paths = getattr(sub_session, "workspace_touched_paths", set())
+            reported_paths = {
+                str(path or "").strip()
+                for path in (
+                    raw_child_touched_paths
+                    if isinstance(raw_child_touched_paths, (set, list, tuple))
+                    else ()
+                )
+                if str(path or "").strip()
+            }
+            reconciled_paths = set(reported_paths)
+            if child_workspace_reconciliation_enabled:
+                reconciled_paths.update(
+                    _detect_command_mutation_paths(
+                        before=child_workspace_before_snapshot,
+                        after=_child_workspace_snapshot(),
+                    )
+                )
+            touched_repo_paths = sorted(reconciled_paths)
+            mutation_metadata = (
+                _command_mutation_metadata(
+                    root=root,
+                    touched_repo_paths=touched_repo_paths,
+                )
+                if touched_repo_paths
+                else {}
+            )
+            material_paths = list(mutation_metadata.get("material_touched_repo_paths") or [])
+            if touched_repo_paths:
+                mutation_metadata["material_touched_repo_paths"] = material_paths
+            child_workspace_effect_payload = {
+                "effects": [
+                    "delegate",
+                    "write_workspace" if material_paths else "read_workspace",
+                ],
+                "touched_repo_paths": touched_repo_paths,
+                **mutation_metadata,
+            }
+            return dict(child_workspace_effect_payload)
+
         def _try_replay_subagent_usage_once() -> None:
             nonlocal usage_replayed
             if usage_replayed:
@@ -1915,6 +2268,7 @@ def build_tools(
             _try_replay_subagent_usage_once()
             elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
             error_message = "Subagent cancelled by the parent turn."
+            workspace_effects = _reconcile_child_workspace_effects()
             cancelled_payload = {
                 "name": definition.name,
                 "subagent_session_id": subagent_session_id,
@@ -1928,6 +2282,7 @@ def build_tools(
                 "elapsed_ms": elapsed_ms,
                 "steps_completed": subagent_surface.steps_completed,
                 **_child_deadline_telemetry_fields(),
+                **workspace_effects,
             }
             store.append("subagent_end", cancelled_payload)
             subagent_surface.on_subagent_end(
@@ -1967,6 +2322,7 @@ def build_tools(
                 "usage": usage_payload,
                 "elapsed_ms": elapsed_ms,
                 "steps_completed": subagent_surface.steps_completed,
+                **workspace_effects,
             }
 
         try:
@@ -2000,6 +2356,7 @@ def build_tools(
             elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
             safe_execution_error = sanitize_subagent_report(f"Subagent execution failed: {e}")
             report_safety_payload = safe_execution_error.metadata()
+            workspace_effects = _reconcile_child_workspace_effects()
             store.append(
                 "subagent_end",
                 {
@@ -2013,6 +2370,7 @@ def build_tools(
                     "elapsed_ms": elapsed_ms,
                     "steps_completed": subagent_surface.steps_completed,
                     **_child_deadline_telemetry_fields(),
+                    **workspace_effects,
                 },
             )
             subagent_surface.on_subagent_end(
@@ -2035,6 +2393,7 @@ def build_tools(
                 "usage": usage_payload,
                 "elapsed_ms": elapsed_ms,
                 "steps_completed": subagent_surface.steps_completed,
+                **workspace_effects,
             }
         finally:
             try:
@@ -2049,6 +2408,8 @@ def build_tools(
                         "error": str(e),
                     },
                 )
+
+        workspace_effects = _reconcile_child_workspace_effects()
 
         if internal_report_text:
             # The child produced a runtime stop report, not a deliverable. The
@@ -2095,6 +2456,7 @@ def build_tools(
                     "deadline_prevented_launch": False,
                     **_child_deadline_telemetry_fields(),
                     "report_safety": report_safety_payload,
+                    **workspace_effects,
                 },
             )
             subagent_surface.on_subagent_end(
@@ -2130,6 +2492,7 @@ def build_tools(
                 "deadline_exhausted": child_execution_deadline.is_exhausted(),
                 "deadline_prevented_launch": False,
                 "report_safety": report_safety_payload,
+                **workspace_effects,
             }
 
         if exit_code != 0:
@@ -2147,6 +2510,7 @@ def build_tools(
                 "deadline_prevented_launch": False,
                 **_child_deadline_telemetry_fields(),
                 "report_safety": report_safety_payload,
+                **workspace_effects,
             }
             if final_text:
                 error_payload["final_text"] = final_text
@@ -2176,19 +2540,105 @@ def build_tools(
                         **_child_deadline_telemetry_fields(),
                     },
                 )
-            return {
+            failure_result = {
                 "error": f"Subagent '{definition.name}' failed.",
                 "subagent": definition.name,
                 "subagent_session_id": subagent_session_id,
                 "exit_code": exit_code,
                 "usage": usage_payload,
-                "final_text": final_text,
-                "final_text_source": final_text_source,
                 "elapsed_ms": elapsed_ms,
                 "steps_completed": subagent_surface.steps_completed,
                 "deadline_exhausted": error_payload["deadline_exhausted"],
                 "deadline_prevented_launch": False,
                 "report_safety": report_safety_payload,
+                **workspace_effects,
+            }
+            failure_result["final_text"] = final_text
+            failure_result["final_text_source"] = final_text_source
+            return failure_result
+
+        unexpected_mutation_paths = list(workspace_effects.get("material_touched_repo_paths") or [])
+        if unexpected_mutation_paths and not definition.allow_workspace_writes:
+            _try_replay_subagent_usage_once()
+            elapsed_ms = int((perf_counter() - subagent_started_at) * 1000)
+            displayed_paths = ", ".join(unexpected_mutation_paths[:20])
+            if len(unexpected_mutation_paths) > 20:
+                displayed_paths += f", and {len(unexpected_mutation_paths) - 20} more"
+            error_message = (
+                f"Subagent '{definition.name}' modified the workspace despite its "
+                f"non-editing role contract: {displayed_paths}."
+            )
+            degraded_payload = {
+                "name": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "degraded",
+                "failure_category": "workspace_mutation",
+                "error_code": "unexpected_workspace_mutation",
+                "error": error_message,
+                "final_text": final_text,
+                "final_text_source": final_text_source,
+                "exit_code": exit_code,
+                "usage": usage_payload,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                "deadline_exhausted": child_execution_deadline.is_exhausted(),
+                "deadline_prevented_launch": False,
+                **_child_deadline_telemetry_fields(),
+                "report_safety": report_safety_payload,
+                "sandbox": {
+                    "mode": resolved_mode,
+                    "tools": list(filtered_tools),
+                },
+                **workspace_effects,
+            }
+            store.append("subagent_end", degraded_payload)
+            subagent_surface.on_subagent_end(
+                SubagentEndEvent(
+                    name=definition.name,
+                    mode=resolved_mode,
+                    status="degraded",
+                    elapsed_ms=elapsed_ms,
+                    steps_completed=subagent_surface.steps_completed,
+                    subagent_session_id=subagent_session_id,
+                    error=error_message,
+                )
+            )
+            if crash_diagnostics is not None:
+                crash_diagnostics.event(
+                    "subagent_completed",
+                    {
+                        "subagent": definition.name,
+                        "subagent_session_id": subagent_session_id,
+                        "status": "degraded",
+                        "failure_category": "workspace_mutation",
+                        "error_code": "unexpected_workspace_mutation",
+                        "exit_code": exit_code,
+                        "duration_ms": elapsed_ms,
+                        "steps_completed": subagent_surface.steps_completed,
+                        "touched_repo_paths": unexpected_mutation_paths,
+                        **_child_deadline_telemetry_fields(),
+                    },
+                )
+            return {
+                "error": error_message,
+                "subagent": definition.name,
+                "subagent_session_id": subagent_session_id,
+                "status": "degraded",
+                "failure_category": "workspace_mutation",
+                "error_code": "unexpected_workspace_mutation",
+                "usage": usage_payload,
+                "final_text": final_text,
+                "final_text_source": final_text_source,
+                "elapsed_ms": elapsed_ms,
+                "steps_completed": subagent_surface.steps_completed,
+                "deadline_exhausted": degraded_payload["deadline_exhausted"],
+                "deadline_prevented_launch": False,
+                "report_safety": report_safety_payload,
+                "sandbox": {
+                    "mode": resolved_mode,
+                    "tools": list(filtered_tools),
+                },
+                **workspace_effects,
             }
 
         final_report_problem = _subagent_final_report_problem(
@@ -2218,6 +2668,7 @@ def build_tools(
                 "error": error_message,
                 **_child_deadline_telemetry_fields(),
                 "report_safety": report_safety_payload,
+                **workspace_effects,
             }
             if final_text:
                 degraded_payload["final_text"] = final_text
@@ -2266,6 +2717,7 @@ def build_tools(
                     "mode": resolved_mode,
                     "tools": list(filtered_tools.keys()),
                 },
+                **workspace_effects,
             }
 
         required_success_event_types = set(
@@ -2309,6 +2761,7 @@ def build_tools(
                     "mode": resolved_mode,
                     "tools": list(filtered_tools),
                 },
+                **workspace_effects,
             }
             store.append("subagent_end", degraded_payload)
             subagent_surface.on_subagent_end(
@@ -2361,6 +2814,7 @@ def build_tools(
                     "mode": resolved_mode,
                     "tools": list(filtered_tools),
                 },
+                **workspace_effects,
             }
 
         _try_replay_subagent_usage_once()
@@ -2385,6 +2839,7 @@ def build_tools(
                 "usage": usage_payload,
                 "elapsed_ms": elapsed_ms,
                 "steps_completed": subagent_surface.steps_completed,
+                **workspace_effects,
                 "final_text_source": final_text_source,
                 "deadline_exhausted": child_execution_deadline.is_exhausted(),
                 "deadline_prevented_launch": False,
@@ -2424,6 +2879,7 @@ def build_tools(
             "usage": usage_payload,
             "elapsed_ms": elapsed_ms,
             "steps_completed": subagent_surface.steps_completed,
+            **workspace_effects,
             "deadline_exhausted": child_execution_deadline.is_exhausted(),
             "deadline_prevented_launch": False,
             "report_safety": report_safety_payload,
@@ -2464,6 +2920,7 @@ def build_tools(
 
     def _resolve_workspace_relative_path(
         *,
+        tool_name: str,
         raw_path: Any,
         raw_base: Any = None,
         field_name: str,
@@ -2493,7 +2950,14 @@ def build_tools(
         try:
             candidate.relative_to(workspace_root)
         except ValueError as e:
-            raise AgentRuntimeError(f"Path escapes root ({field_name}): {text}") from e
+            payload = _path_escape_recovery_payload(
+                tool_name=tool_name,
+                attempted_path=text,
+                field_name=field_name,
+                workspace_root=workspace_root,
+                path_base=base_kind,
+            )
+            raise AgentRuntimeError(str(payload["error"]), result_payload=payload) from e
         rel_path = _workspace_relpath_for_path(workspace_root=workspace_root, path=candidate)
         if rel_path == "README" and not (workspace_root / "README").exists():
             if (workspace_root / "README.md").exists():
@@ -2589,39 +3053,147 @@ def build_tools(
             return
         tools.append(_make_tool_def(name, run=run, parameters=parameters))
 
-    _append_builtin_tool(
-        "fs_read",
-        run=lambda args: _patchable("fs_read", fs_read)(
+    def _fs_read(args: dict[str, Any]) -> dict[str, Any]:
+        path = _resolve_workspace_relative_path(
+            tool_name="fs_read",
+            raw_path=args.get("path"),
+            raw_base=args.get("path_base"),
+            field_name="path",
+            base_field_name="path_base",
+        )
+        sensitive = guard_sensitive_files("fs_read", files=[path])
+        result = _patchable("fs_read", fs_read)(
             root=root,
-            path=_resolve_workspace_relative_path(
-                raw_path=args.get("path"),
-                raw_base=args.get("path_base"),
-                field_name="path",
-                base_field_name="path_base",
-            ),
+            path=path,
             max_bytes=int(args.get("max_bytes") or 20000),
-        ),
-    )
+            allow_derived=bool(args.get("allow_derived", False)),
+        )
+        return _mark_sensitive_result(result, sensitive)
 
-    _append_builtin_tool(
-        "fs_read_lines",
-        run=lambda args: _patchable("fs_read_lines", fs_read_lines)(
+    _append_builtin_tool("fs_read", run=_fs_read)
+
+    # report_blocker is a top-level completion-gate control signal, not a
+    # repository action. Keep the runtime-kind check here as a fail-closed
+    # boundary even though the session also computes gate eligibility.
+    if (
+        completion_gate_tools_enabled
+        and subagent_depth == 0
+        and resolved_runtime_kind
+        in {
+            RuntimeKind.INTERACTIVE_CHAT,
+            RuntimeKind.ONE_SHOT,
+            RuntimeKind.FORGE_EXEC,
+        }
+    ):
+
+        def _report_blocker(args: dict[str, Any]) -> dict[str, Any]:
+            raw_message = args.get("message")
+            if not isinstance(raw_message, str) or not raw_message.strip():
+                return {
+                    "error": "message must be a non-empty string",
+                    "error_code": "invalid_blocker_message",
+                    "reported": False,
+                }
+            message = raw_message.strip()
+            if len(message) > REPORT_BLOCKER_MAX_MESSAGE_CHARS:
+                return {
+                    "error": (
+                        "message exceeds the transport limit of "
+                        f"{REPORT_BLOCKER_MAX_MESSAGE_CHARS} characters"
+                    ),
+                    "error_code": "blocker_message_too_long",
+                    "reported": False,
+                }
+            return {"ok": True, "reported": True, "message": message}
+
+        _append_builtin_tool("report_blocker", run=_report_blocker)
+
+    # switch_mode: model-proposed persona switch, user-approved, applied by the
+    # chat loop at turn end (the tool surface is never swapped mid-turn). Only
+    # the top-level interactive chat runtime provides persona_switch_state, so
+    # one_shot/forge/swarm/subagent/conflict runtimes never see this tool and
+    # automation can never switch personas silently.
+    if (
+        persona_switch_state is not None
+        and resolved_runtime_kind == RuntimeKind.INTERACTIVE_CHAT
+        and not non_interactive
+        and subagent_depth == 0
+        and persona_modes_enabled(cfg)
+    ):
+
+        def _switch_mode(args: dict[str, Any]) -> dict[str, Any]:
+            persona_raw = str(args.get("persona") or "").strip().lower()
+            reason = " ".join(str(args.get("reason") or "").split())[:300]
+            if not is_persona_name(persona_raw):
+                return {
+                    "ok": False,
+                    "applied": False,
+                    "error": "unknown persona; valid: code, architect, ask, debug",
+                }
+            if persona_switch_state.last_declined == persona_raw:
+                return {
+                    "ok": True,
+                    "applied": False,
+                    "declined": True,
+                    "note": (
+                        "The user already declined switching to this persona in "
+                        "this session; continue in the current persona without "
+                        "asking again."
+                    ),
+                }
+            decision = surface.request_approval(
+                ApprovalRequest(
+                    kind="persona_switch",
+                    reason=f"model proposes a persona switch: {reason or 'no reason given'}",
+                    preview=f"Switch persona to {persona_raw} for the rest of the session?",
+                    metadata={"persona": persona_raw},
+                )
+            )
+            if not decision.allow:
+                persona_switch_state.last_declined = persona_raw
+                return {
+                    "ok": True,
+                    "applied": False,
+                    "declined": True,
+                    "note": "User declined; continue in the current persona.",
+                }
+            persona_switch_state.last_declined = None
+            persona_switch_state.pending = (persona_raw, reason)
+            return {
+                "ok": True,
+                "applied": False,
+                "scheduled": True,
+                "persona": persona_raw,
+                "note": "Approved. The persona switch applies when this turn ends.",
+            }
+
+        _append_builtin_tool("switch_mode", run=_switch_mode)
+
+    def _fs_read_lines(args: dict[str, Any]) -> dict[str, Any]:
+        path = _resolve_workspace_relative_path(
+            tool_name="fs_read_lines",
+            raw_path=args.get("path"),
+            raw_base=args.get("path_base"),
+            field_name="path",
+            base_field_name="path_base",
+        )
+        sensitive = guard_sensitive_files("fs_read_lines", files=[path])
+        result = _patchable("fs_read_lines", fs_read_lines)(
             root=root,
-            path=_resolve_workspace_relative_path(
-                raw_path=args.get("path"),
-                raw_base=args.get("path_base"),
-                field_name="path",
-                base_field_name="path_base",
-            ),
+            path=path,
             start_line=int(args["start_line"]) if args.get("start_line") is not None else 0,
             end_line=(int(args["end_line"]) if args.get("end_line") is not None else None),
             max_lines=(int(args["max_lines"]) if args.get("max_lines") is not None else 200),
             include_line_numbers=bool(args.get("include_line_numbers", True)),
-        ),
-    )
+            max_bytes=(int(args["max_bytes"]) if args.get("max_bytes") is not None else 48_000),
+        )
+        return _mark_sensitive_result(result, sensitive)
+
+    _append_builtin_tool("fs_read_lines", run=_fs_read_lines)
 
     def _fs_edit(args: dict[str, Any]) -> dict[str, Any]:
         path = _resolve_workspace_relative_path(
+            tool_name="fs_edit",
             raw_path=args.get("path"),
             raw_base=args.get("path_base"),
             field_name="path",
@@ -2631,29 +3203,66 @@ def build_tools(
         raw_edits = args.get("edits")
         if not isinstance(raw_edits, list):
             raise FsError("edits must be a non-empty array of edit objects")
-        prepared = prepare_fs_edit(root=root, path=path, edits=raw_edits)
-        diff = _unified_diff(prepared.original_content, prepared.updated_content, path)
-        store.append("diff_preview", {"path": path, "diff": diff[:20000]})
-        surface.on_patch_generated(
-            PatchEvent(
-                files=[path],
-                diff=diff,
-                summary=f"1 file changed via fs_edit ({path})",
-            )
+        sensitive_findings = _sensitive_path_findings([path])
+        stamped_precondition = (
+            capture_file_precondition(root=root, path=path) if sensitive_findings else None
         )
-        guard_write("fs_edit", diff[:20000] or f"(no diff) {path}", files=[path])
-        return write_prepared_fs_edit(prepared)
+        sensitive = guard_sensitive_files("fs_edit", files=[path])
+        if stamped_precondition is not None:
+            try:
+                assert_file_precondition(root=root, precondition=stamped_precondition)
+            except StaleFileError as error:
+                return _stale_file_result(error)
+        try:
+            prepared = prepare_fs_edit(root=root, path=path, edits=raw_edits)
+        except FsError:
+            if sensitive_findings:
+                try:
+                    assert_file_precondition(root=root, precondition=stamped_precondition)
+                except StaleFileError as error:
+                    return _stale_file_result(error)
+                raise AgentRuntimeError(
+                    "Sensitive file edit could not be prepared; content details were redacted."
+                ) from None
+            raise
+        if stamped_precondition is not None:
+            if prepared.precondition != stamped_precondition:
+                return _stale_file_result(StaleFileError(path))
+            prepared = replace(prepared, precondition=stamped_precondition)
+        if sensitive:
+            store.append(
+                "sensitive_change_preview",
+                {"path": path, "operation": "fs_edit", "content_redacted": True},
+            )
+        else:
+            diff = _unified_diff(prepared.original_content, prepared.updated_content, path)
+            store.append("diff_preview", {"path": path, "diff": diff[:20000]})
+            surface.on_patch_generated(
+                PatchEvent(
+                    files=[path],
+                    diff=diff,
+                    summary=f"1 file changed via fs_edit ({path})",
+                )
+            )
+            guard_write("fs_edit", diff[:20000] or f"(no diff) {path}", files=[path])
+        try:
+            result = write_prepared_fs_edit(prepared, root=root)
+        except StaleFileError as error:
+            return _stale_file_result(error)
+        return _mark_sensitive_result(result, sensitive)
 
     _append_builtin_tool("fs_edit", run=_fs_edit)
 
     def _fs_move(args: dict[str, Any]) -> dict[str, Any]:
         source_path = _resolve_workspace_relative_path(
+            tool_name="fs_move",
             raw_path=args.get("source_path"),
             raw_base=args.get("source_path_base"),
             field_name="source_path",
             base_field_name="source_path_base",
         )
         destination_path = _resolve_workspace_relative_path(
+            tool_name="fs_move",
             raw_path=args.get("destination_path"),
             raw_base=args.get("destination_path_base"),
             field_name="destination_path",
@@ -2662,30 +3271,42 @@ def build_tools(
         _guard_write_path(source_path)
         _guard_write_path(destination_path)
         overwrite = bool(args.get("overwrite", False))
+        source_precondition = capture_file_precondition(root=root, path=source_path)
+        destination_precondition = capture_file_precondition(root=root, path=destination_path)
+        sensitive = guard_sensitive_files("fs_move", files=[source_path, destination_path])
         preview = (
             "Move file\n"
             f"source: {source_path}\n"
             f"destination: {destination_path}\n"
             f"overwrite: {str(overwrite).lower()}"
         )
-        guard_write("fs_move", preview, files=[source_path, destination_path])
-        return fs_move(
-            root=root,
-            source_path=source_path,
-            destination_path=destination_path,
-            overwrite=overwrite,
-        )
+        if not sensitive:
+            guard_write("fs_move", preview, files=[source_path, destination_path])
+        try:
+            result = fs_move(
+                root=root,
+                source_path=source_path,
+                destination_path=destination_path,
+                overwrite=overwrite,
+                source_precondition=source_precondition,
+                destination_precondition=destination_precondition,
+            )
+        except StaleFileError as error:
+            return _stale_file_result(error)
+        return _mark_sensitive_result(result, sensitive)
 
     _append_builtin_tool("fs_move", run=_fs_move)
 
     def _fs_copy(args: dict[str, Any]) -> dict[str, Any]:
         source_path = _resolve_workspace_relative_path(
+            tool_name="fs_copy",
             raw_path=args.get("source_path"),
             raw_base=args.get("source_path_base"),
             field_name="source_path",
             base_field_name="source_path_base",
         )
         destination_path = _resolve_workspace_relative_path(
+            tool_name="fs_copy",
             raw_path=args.get("destination_path"),
             raw_base=args.get("destination_path_base"),
             field_name="destination_path",
@@ -2693,24 +3314,35 @@ def build_tools(
         )
         _guard_write_path(destination_path)
         overwrite = bool(args.get("overwrite", False))
+        source_precondition = capture_file_precondition(root=root, path=source_path)
+        destination_precondition = capture_file_precondition(root=root, path=destination_path)
+        sensitive = guard_sensitive_files("fs_copy", files=[source_path, destination_path])
         preview = (
             "Copy file\n"
             f"source: {source_path}\n"
             f"destination: {destination_path}\n"
             f"overwrite: {str(overwrite).lower()}"
         )
-        guard_write("fs_copy", preview, files=[source_path, destination_path])
-        return fs_copy(
-            root=root,
-            source_path=source_path,
-            destination_path=destination_path,
-            overwrite=overwrite,
-        )
+        if not sensitive:
+            guard_write("fs_copy", preview, files=[source_path, destination_path])
+        try:
+            result = fs_copy(
+                root=root,
+                source_path=source_path,
+                destination_path=destination_path,
+                overwrite=overwrite,
+                source_precondition=source_precondition,
+                destination_precondition=destination_precondition,
+            )
+        except StaleFileError as error:
+            return _stale_file_result(error)
+        return _mark_sensitive_result(result, sensitive)
 
     _append_builtin_tool("fs_copy", run=_fs_copy)
 
     def _fs_delete(args: dict[str, Any]) -> dict[str, Any]:
         path = _resolve_workspace_relative_path(
+            tool_name="fs_delete",
             raw_path=args.get("path"),
             raw_base=args.get("path_base"),
             field_name="path",
@@ -2719,16 +3351,28 @@ def build_tools(
         try:
             _guard_write_path(path)
         except AgentRuntimeError as exc:
-            if "outside allowed scope" not in str(exc) or not is_non_material_untracked_path(path):
+            if (
+                persona_write_scope_active
+                or "outside allowed scope" not in str(exc)
+                or not is_non_material_untracked_path(path)
+            ):
                 raise
+        precondition = capture_file_precondition(root=root, path=path)
+        sensitive = guard_sensitive_files("fs_delete", files=[path])
         preview = f"Delete file\npath: {path}"
-        guard_write("fs_delete", preview, files=[path])
-        return fs_delete(root=root, path=path)
+        if not sensitive:
+            guard_write("fs_delete", preview, files=[path])
+        try:
+            result = fs_delete(root=root, path=path, precondition=precondition)
+        except StaleFileError as error:
+            return _stale_file_result(error)
+        return _mark_sensitive_result(result, sensitive)
 
     _append_builtin_tool("fs_delete", run=_fs_delete)
 
     def _fs_write(args: dict[str, Any]) -> dict[str, Any]:
         path = _resolve_workspace_relative_path(
+            tool_name="fs_write",
             raw_path=args.get("path"),
             raw_base=args.get("path_base"),
             field_name="path",
@@ -2736,28 +3380,41 @@ def build_tools(
         )
         _guard_write_path(path)
         content = str(args.get("content", ""))
-        try:
-            old = _patchable("fs_read", fs_read)(root=root, path=path, max_bytes=2_000_000)[
-                "content"
-            ]
-        except (FsError, OSError):
-            old = ""
-        diff = _unified_diff(old, content, path)
-        store.append("diff_preview", {"path": path, "diff": diff[:20000]})
-        surface.on_patch_generated(
-            PatchEvent(
-                files=[path],
-                diff=diff,
-                summary=f"1 file changed via fs_write ({path})",
+        prepared = prepare_fs_write(root=root, path=path, content=content)
+        sensitive = guard_sensitive_files("fs_write", files=[path])
+        if sensitive:
+            store.append(
+                "sensitive_change_preview",
+                {"path": path, "operation": "fs_write", "content_redacted": True},
             )
-        )
-        guard_write("fs_write", diff[:20000] or f"(no diff) {path}", files=[path])
-        return fs_write(root=root, path=path, content=content)
+        else:
+            if prepared.precondition.exists:
+                old = _patchable("fs_read", fs_read)(root=root, path=path, max_bytes=2_000_000)[
+                    "content"
+                ]
+            else:
+                old = ""
+            diff = _unified_diff(old, content, path)
+            store.append("diff_preview", {"path": path, "diff": diff[:20000]})
+            surface.on_patch_generated(
+                PatchEvent(
+                    files=[path],
+                    diff=diff,
+                    summary=f"1 file changed via fs_write ({path})",
+                )
+            )
+            guard_write("fs_write", diff[:20000] or f"(no diff) {path}", files=[path])
+        try:
+            result = write_prepared_fs_write(prepared, root=root)
+        except StaleFileError as error:
+            return _stale_file_result(error)
+        return _mark_sensitive_result(result, sensitive)
 
     _append_builtin_tool("fs_write", run=_fs_write)
 
     def _fs_mkdir(args: dict[str, Any]) -> dict[str, Any]:
         path = _resolve_workspace_relative_path(
+            tool_name="fs_mkdir",
             raw_path=args.get("path"),
             raw_base=args.get("path_base"),
             field_name="path",
@@ -2839,6 +3496,7 @@ def build_tools(
         run=lambda args: _patchable("fs_list", fs_list)(
             root=root,
             root_path=_resolve_workspace_relative_path(
+                tool_name="fs_list",
                 raw_path=args.get("root_path"),
                 raw_base=args.get("path_base"),
                 field_name="root_path",
@@ -2851,10 +3509,8 @@ def build_tools(
     )
 
     # Master web-tools switch: when off (config field or SYLLIPTOR_WEB_TOOLS env),
-    # neither web_fetch nor web_search is registered at all — the model never sees
-    # them in its tool list. Required for benchmark/offline integrity.
+    # neither web_fetch nor web_search is registered at all.
     web_tools_enabled = resolve_web_tools_enabled(cfg)
-
     web_search_exposed_in_mode = (
         web_tools_enabled
         and _built_in_tool_exposed_in_mode(
@@ -3090,6 +3746,10 @@ def build_tools(
                     raw_requested_url=raw_requested_url,
                     finalization_suppressed=False,
                 )
+                # Make the rejection self-correcting: tell the model exactly which
+                # URLs it MAY fetch (prior trusted session evidence) so it retries
+                # against a real source instead of a guessed/restated one — without
+                # widening what is authorized.
                 fetchable_urls = store.fetchable_web_fetch_urls()
                 if fetchable_urls:
                     rejection["fetchable_urls"] = fetchable_urls
@@ -3149,6 +3809,7 @@ def build_tools(
             query=str(args.get("query", "")),
             kind=str(args["kind"]) if args.get("kind") is not None else None,
             root_path=_resolve_workspace_relative_path(
+                tool_name="symbol_search",
                 raw_path=args.get("root_path"),
                 raw_base=args.get("path_base"),
                 field_name="root_path",
@@ -3158,6 +3819,9 @@ def build_tools(
             globs=args.get("globs"),
             max_results=(int(args["max_results"]) if args.get("max_results") is not None else 100),
             exact=bool(args.get("exact", False)),
+            include_details=bool(args.get("include_details", False)),
+            include_snippet=bool(args.get("include_snippet", False)),
+            include_references=bool(args.get("include_references", False)),
         ),
     )
 
@@ -3198,6 +3862,7 @@ def build_tools(
             root=root,
             pattern=str(args.get("pattern", "")),
             root_path=_resolve_workspace_relative_path(
+                tool_name="search_rg",
                 raw_path=args.get("root_path"),
                 raw_base=args.get("path_base"),
                 field_name="root_path",
@@ -3205,6 +3870,16 @@ def build_tools(
                 allow_empty=True,
             ),
             globs=args.get("globs"),
+            before_context=(
+                int(args["before_context"]) if args.get("before_context") is not None else 0
+            ),
+            after_context=(
+                int(args["after_context"]) if args.get("after_context") is not None else 0
+            ),
+            literal=bool(args.get("literal", False)),
+            case_sensitive=bool(args.get("case_sensitive", True)),
+            include_hidden=bool(args.get("include_hidden", False)),
+            max_results=(int(args["max_results"]) if args.get("max_results") is not None else 200),
         ),
     )
 
@@ -3261,6 +3936,48 @@ def build_tools(
             "verify",
             f"step{verify_artifact_counter:03d}_verify_run.txt",
         )
+
+    def _workspace_services_before_verification() -> list[dict[str, Any]]:
+        """Sylliptor-managed processes already alive in this workspace.
+
+        Reported, never acted on. A dev server holding a port or writing into
+        the same build directory is a common source of confusing verification
+        output, and the host cannot tell a genuine conflict from a deliberate
+        setup. The agent decides whether it matters and stops anything through
+        the normal approval path.
+        """
+
+        services: list[dict[str, Any]] = []
+        if terminal_manager is not None:
+            try:
+                for summary in terminal_manager.list():
+                    if summary.status != "running":
+                        continue
+                    services.append(
+                        {
+                            "kind": "background_process",
+                            "process_id": summary.process_id,
+                            "command": summary.cmd,
+                            "cwd": str(summary.cwd),
+                            "runtime_s": round(float(summary.runtime_s), 1),
+                        }
+                    )
+            except Exception:  # noqa: BLE001 - reporting must never fail verification
+                pass
+        if durable_service_manager is not None:
+            try:
+                for entry in durable_service_manager.list_active():
+                    services.append(
+                        {
+                            "kind": "durable_service",
+                            "service_id": str(entry.get("service_id") or ""),
+                            "command": str(entry.get("command") or ""),
+                            "url": str(entry.get("url") or ""),
+                        }
+                    )
+            except Exception:  # noqa: BLE001 - reporting must never fail verification
+                pass
+        return services
 
     def _verify_run(args: dict[str, Any]) -> dict[str, Any]:
         deadline_decision = _deadline_start_decision(
@@ -3424,6 +4141,7 @@ def build_tools(
                     "verification commands must be single commands without shell control flow or chaining."
                 )
         guard_verify(commands)
+        workspace_services = _workspace_services_before_verification()
         artifact_path = _next_verify_artifact_path()
         result, touched_repo_paths = _run_with_command_mutation_detection(
             root=root,
@@ -3444,6 +4162,9 @@ def build_tools(
             ),
         )
         payload = verify_run_result_to_payload(root=root, result=result)
+        if workspace_services:
+            payload = dict(payload)
+            payload["workspace_services"] = workspace_services
         if ignored_model_verification_commands:
             payload["ignored_model_verification_commands"] = ignored_model_verification_commands
             payload["verification_skip_reason"] = "verification_contract_unavailable"
@@ -3550,6 +4271,7 @@ def build_tools(
             )
         cmd = str(args.get("cmd", ""))
         effective_cwd = _resolve_workspace_relative_path(
+            tool_name="shell_run",
             raw_path=args.get("cwd"),
             raw_base=args.get("cwd_base"),
             field_name="cwd",
@@ -3927,6 +4649,7 @@ def build_tools(
         manager = _require_terminal_manager()
         cmd = str(args.get("cmd", ""))
         effective_cwd_relpath = _resolve_workspace_relative_path(
+            tool_name="shell_background",
             raw_path=args.get("cwd"),
             raw_base=args.get("cwd_base"),
             field_name="cwd",
@@ -4101,6 +4824,7 @@ def build_tools(
         guard_shell(cmd, tool_name="shell_service_start")
         readiness = _guard_service_readiness_spec(args.get("readiness"))
         effective_cwd_relpath = _resolve_workspace_relative_path(
+            tool_name="shell_service_start",
             raw_path=args.get("cwd"),
             raw_base=args.get("cwd_base"),
             field_name="cwd",
@@ -4175,6 +4899,7 @@ def build_tools(
             except (TypeError, ValueError) as exc:
                 raise AgentRuntimeError("Preview port must be an integer") from exc
         effective_cwd_relpath = _resolve_workspace_relative_path(
+            tool_name="workspace_preview_start",
             raw_path=args.get("cwd"),
             raw_base=args.get("cwd_base"),
             field_name="cwd",
@@ -4287,20 +5012,38 @@ def build_tools(
 
     def _git_apply(args: dict[str, Any]) -> dict[str, Any]:
         patch = str(args.get("patch", ""))
-        patch_paths = iter_patch_paths(patch)
+        patch_paths = sorted(set(iter_patch_paths(patch)))
         for p in patch_paths:
             _guard_write_path(p)
+        preconditions = [capture_file_precondition(root=root, path=p) for p in patch_paths]
+        sensitive = guard_sensitive_files("git_apply_patch", files=patch_paths)
         preview = patch[:20000]
-        store.append("diff_preview", {"patch": preview})
-        surface.on_patch_generated(
-            PatchEvent(
-                files=sorted(set(patch_paths)),
-                diff=patch,
-                summary=f"{len(set(patch_paths))} file(s) changed via git_apply_patch",
+        if sensitive:
+            store.append(
+                "sensitive_change_preview",
+                {
+                    "paths": patch_paths,
+                    "operation": "git_apply_patch",
+                    "content_redacted": True,
+                },
             )
-        )
-        guard_write("git_apply_patch", preview or "(empty patch)", files=sorted(set(patch_paths)))
-        return git_apply_patch(root=root, patch=patch)
+        else:
+            store.append("diff_preview", {"patch": preview})
+            surface.on_patch_generated(
+                PatchEvent(
+                    files=patch_paths,
+                    diff=patch,
+                    summary=f"{len(patch_paths)} file(s) changed via git_apply_patch",
+                )
+            )
+            guard_write("git_apply_patch", preview or "(empty patch)", files=patch_paths)
+        try:
+            for precondition in preconditions:
+                assert_file_precondition(root=root, precondition=precondition)
+            result = git_apply_patch(root=root, patch=patch)
+        except StaleFileError as error:
+            return _stale_file_result(error)
+        return _mark_sensitive_result(result, sensitive)
 
     _append_builtin_tool("git_apply_patch", run=_git_apply)
 
@@ -4345,7 +5088,10 @@ def build_tools(
             )
         )
 
-    if mcp_manager is not None and _mcp_tool_exposed_in_mode(mode=mode):
+    if mcp_manager is not None and _mcp_tool_exposed_in_mode(
+        mode=mode,
+        write_scope_restricted=persona_write_scope_active,
+    ):
         for binding in mcp_manager.tool_bindings:
             bound_binding = binding.bind_session_mode(mode)
             tools.append(
@@ -4362,6 +5108,44 @@ def build_tools(
                 )
             )
     active_tools = {t.name: t for t in tools}
+    if tool_dispatch_guard is not None:
+
+        def _resolve_guard_rel_path(
+            *,
+            raw_path: Any,
+            raw_base: Any = None,
+            field_name: str,
+            base_field_name: str,
+        ) -> str:
+            return _resolve_workspace_relative_path(
+                tool_name="tool_dispatch_guard",
+                raw_path=raw_path,
+                raw_base=raw_base,
+                field_name=field_name,
+                base_field_name=base_field_name,
+            )
+
+        def _wrap_with_dispatch_guard(tool: ToolDef) -> ToolDef:
+            original_run = tool.run
+
+            def guarded_run(
+                arguments: dict[str, Any],
+                *,
+                _original_run: Callable[[dict[str, Any]], dict[str, Any]] = original_run,
+                _tool_name: str = tool.name,
+            ) -> dict[str, Any]:
+                tool_dispatch_guard.check_tool_call(
+                    _tool_name,
+                    arguments if isinstance(arguments, dict) else {},
+                    resolve_rel_path=_resolve_guard_rel_path,
+                )
+                return _original_run(arguments)
+
+            return replace(tool, run=guarded_run)
+
+        active_tools = {
+            name: _wrap_with_dispatch_guard(tool) for name, tool in active_tools.items()
+        }
     for metadata in iter_builtin_tool_metadata():
         register_tool_availability(metadata.name, optional=metadata.optional)
         if metadata.name in active_tools:

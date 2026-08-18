@@ -722,6 +722,38 @@ class ConversationCompactor:
                 },
             )
 
+    def reinject_context_messages(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Make restored memory/pins model-visible again after a resume.
+
+        ``_restore_state_from_artifacts`` runs in ``__init__``, before the
+        session has any messages, so restored context stays invisible until
+        the next compaction fires. The resume path calls this once after
+        replaying history. The emptiness guard matters:
+        ``_upsert_context_messages`` inserts a memory message unconditionally,
+        which would add an empty marker for sessions with nothing restored.
+        """
+
+        if not self.state.summary and not self.state.pins:
+            return messages
+        updated = self._upsert_context_messages(
+            messages,
+            summary=self.state.summary,
+            pins=self.state.pins,
+        )
+        self._store.append(
+            "compaction_context_reinjected",
+            {
+                "summary_restored": bool(self.state.summary),
+                "pins_count": len(self.state.pins),
+                "memory_message_index": self.state.memory_message_index,
+                "pins_message_index": self.state.pins_message_index,
+            },
+        )
+        return updated
+
     def _record_compactor_usage(
         self,
         *,

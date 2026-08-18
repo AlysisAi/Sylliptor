@@ -28,6 +28,8 @@ def _client(transport: httpx.BaseTransport) -> GeminiGenerateContentClient:
         api_key="test-key",
         model="gemini-3-flash-preview",
         transport=transport,
+        provider_retry_settings=ProviderRetrySettings(max_retries=0),
+        provider_sleep_fn=lambda _seconds: None,
     )
 
 
@@ -1109,7 +1111,7 @@ def test_chat_rejects_forced_google_search_tool_choice() -> None:
         )
 
 
-def test_chat_thinking_level_and_budget_are_mapped_deterministically() -> None:
+def test_chat_thinking_level_and_budget_are_emitted_for_the_model_contract() -> None:
     captured: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1155,6 +1157,53 @@ def test_chat_thinking_level_and_budget_are_mapped_deterministically() -> None:
             thinking_budget=1024,
             transport=httpx.MockTransport(handler),
         ).chat(messages=[{"role": "user", "content": "hello"}])
+
+
+@pytest.mark.parametrize(
+    ("client_kwargs", "expected_level"),
+    [
+        ({"thinking_level": "medium"}, "medium"),
+        ({"reasoning_effort": "medium"}, "medium"),
+        ({"reasoning_effort": "minimal"}, "medium"),
+        ({"enable_thinking": False}, "medium"),
+    ],
+)
+def test_gemini37_native_thinking_uses_the_documented_contract(
+    client_kwargs: dict[str, object],
+    expected_level: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={"candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}}]},
+        )
+
+    client = GeminiGenerateContentClient(
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+        api_key="test-key",
+        model="gemini-3.7-flash",
+        transport=httpx.MockTransport(handler),
+        **client_kwargs,
+    )
+
+    assert client.chat(messages=[{"role": "user", "content": "hello"}]).content == "ok"
+    assert captured["generationConfig"]["thinkingConfig"] == {"thinkingLevel": expected_level}
+
+
+def test_gemini37_native_rejects_explicit_minimal_thinking_level() -> None:
+    client = GeminiGenerateContentClient(
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+        api_key="test-key",
+        model="gemini-3.7-flash",
+        thinking_level="minimal",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+    )
+
+    with pytest.raises(LLMError, match="thinking_level must be one of: low, medium, high"):
+        client.chat(messages=[{"role": "user", "content": "hello"}])
 
 
 def test_chat_extracts_grounding_metadata_citations_sources_queries_and_tool_calls() -> None:
@@ -1498,6 +1547,52 @@ def test_chat_streams_single_function_call_with_id_and_thought_signature() -> No
     }
     metadata = response.provider_metadata["gemini_generate_content"]  # type: ignore[index]
     assert metadata["content"]["parts"][0]["thoughtSignature"] == "stream-thought"
+
+
+def test_chat_streams_function_call_without_provider_id_normalizes_metadata_id() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return _sse_response(
+            _sse_event(
+                {
+                    "responseId": "resp_stream_call_without_id",
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [
+                                    {"text": "I will read."},
+                                    {
+                                        "functionCall": {
+                                            "name": "fs_read",
+                                            "args": {"path": "README.md"},
+                                        },
+                                        "thoughtSignature": "stream-thought",
+                                    },
+                                ],
+                            },
+                            "finishReason": "STOP",
+                        }
+                    ],
+                }
+            )
+        )
+
+    response = _client(httpx.MockTransport(handler)).chat(
+        messages=[{"role": "user", "content": "read"}],
+        tools=[_fs_read_tool()],
+        stream=True,
+    )
+
+    assert response.content == "I will read."
+    assert [(tool.id, tool.name, tool.arguments) for tool in response.tool_calls] == [
+        ("call_1", "fs_read", {"path": "README.md"})
+    ]
+    metadata = response.provider_metadata["gemini_generate_content"]  # type: ignore[index]
+    function_call = metadata["content"]["parts"][1]["functionCall"]
+    assert function_call["id"] == "call_1"
+    assert response.tool_calls[0].provider_metadata == {
+        "gemini_generate_content": {"part_index": 1, "thoughtSignature": "stream-thought"}
+    }
 
 
 def test_chat_streams_parallel_function_calls_in_exact_part_order() -> None:
@@ -2724,6 +2819,8 @@ def test_chat_rejects_empty_malformed_and_unsupported_options() -> None:
             model="gemini-3-flash-preview",
             prompt_cache_key="cache-key",
             transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+            provider_retry_settings=ProviderRetrySettings(max_retries=0),
+            provider_sleep_fn=lambda _seconds: None,
         ).chat(messages=[{"role": "user", "content": "hello"}])
 
     with pytest.raises(LLMError, match="does not support response_format type"):
@@ -2739,6 +2836,8 @@ def test_chat_rejects_empty_malformed_and_unsupported_options() -> None:
             model="gemini-3-flash-preview",
             reasoning_effort="extreme",
             transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+            provider_retry_settings=ProviderRetrySettings(max_retries=0),
+            provider_sleep_fn=lambda _seconds: None,
         ).chat(messages=[{"role": "user", "content": "hello"}])
 
     def empty_handler(_request: httpx.Request) -> httpx.Response:

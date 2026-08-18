@@ -32,6 +32,20 @@ from .acceptance_contract import (
     extract_explicit_acceptance_commands,
     record_acceptance_tool_effect,
 )
+from .blast_radius import (
+    MAX_SCOPE_RUNS,
+    BlastRadiusAssessment,
+    BlastRadiusPolicy,
+    BlastRadiusScope,
+    BlastRadiusStatus,
+    ScopePhase,
+    ScopeRun,
+    assess_blast_radius,
+    blast_radius_blocks_finalization,
+    build_blast_radius_nudge_line,
+    classify_scope_phase,
+    command_path_selectors,
+)
 from .completion_certificate import (
     CompletionCertificateInput,
     evaluate_completion_certificate,
@@ -60,6 +74,20 @@ from .regression_baseline import (
     command_is_test_runner,
     parse_test_report,
 )
+from .reproduction_first import (
+    MAX_REPRO_ARTIFACTS,
+    MAX_REPRO_RUNS,
+    ReproAssessment,
+    ReproPhase,
+    ReproRun,
+    TaskShape,
+    assess_reproduction,
+    build_repro_artifacts_nudge_line,
+    build_repro_nudge_line,
+    classify_repro_phase,
+    match_repro_artifacts,
+    repro_blocks_finalization,
+)
 from .turn_contract import (
     AdvisoryCompletion,
     DispositionRecord,
@@ -81,7 +109,7 @@ from .verification_evidence import (
 )
 
 if TYPE_CHECKING:
-    from .routing import _OneShotRepoTurnIntent
+    from .turn_path import _OneShotRepoTurnIntent
 
 
 _COMMAND_LIKE_MUTATION_TOOL_NAMES = {"verify_run", "shell_run"}
@@ -176,6 +204,55 @@ REGRESSION_BASELINE_PRE_EDIT_ADVISORY = (
     "(your verification command) once before further edits. Advisory only - this "
     "does not block your edit."
 )
+# One-shot advisory emitted the first time a material edit lands inside a
+# generated or vendored tree (node_modules, vendor, externals, third_party, ...).
+# Advisory only - it never blocks the edit; legitimate vendored fixes exist, but
+# in practice edits there are usually a mistargeted change that breaks
+# neighboring tests wholesale.
+VENDORED_PATH_EDIT_ADVISORY = (
+    "Scope advisory: this edit changes files under a generated or vendored tree "
+    "({paths}). Vendored/generated code is almost never where the fix belongs - "
+    "it is overwritten by upstream syncs and edits there tend to break many "
+    "unrelated tests. Prefer the first-party source module; if the vendored copy "
+    "truly is the target, keep the change minimal and run the neighboring tests "
+    "before finalizing. Advisory only - this does not block your edit."
+)
+# One-shot finalize-time advisory for execute turns whose completion gate is
+# otherwise clear. Small diffs that satisfy the agent's own reproduction are the
+# dominant shape of "almost right" outcomes: the issue usually implies more
+# behavior (exact message wording, boundary inputs, interactions) than the first
+# repro covers. One adversarial pass converts a measurable share of these.
+ADVERSARIAL_FINALIZE_REVIEW_ADVISORY = (
+    "Adversarial review - one pass before you finish: re-read the original "
+    "request end to end and enumerate every behavior it implies, not just the "
+    "headline symptom: exact error/message wording, boundary and degenerate "
+    "inputs (zero, empty, None, negative), types and units, and every "
+    "interaction or API named anywhere in the report. For each implied "
+    "behavior, either point at evidence you already ran that covers it, or "
+    "extend your reproduction to cover it and run it now. Acceptance checks "
+    "usually probe edge semantics beyond the reported case. If everything is "
+    "already covered, finalize."
+)
+
+
+def _adversarial_finalize_enabled(cfg: Any | None) -> bool:
+    """Kill-switch for the adversarial finalize review (near-miss pass).
+
+    ``SYLLIPTOR_ADVERSARIAL_FINALIZE`` (off/0/false/no/disabled) wins over the
+    config value; default is on.
+    """
+    from ..branding import env_get
+
+    env_value = env_get("SYLLIPTOR_ADVERSARIAL_FINALIZE")
+    if env_value is not None:
+        normalized = str(env_value).strip().lower()
+        if normalized in {"off", "0", "false", "no", "disabled"}:
+            return False
+        if normalized in {"on", "1", "true", "yes", "enabled"}:
+            return True
+    return bool(getattr(cfg, "adversarial_finalize_review", True))
+
+
 # Maximum bounded repair rounds for a post-edit execution-evidence deficit before
 # the gate finalizes honestly-unverified rather than accepting prose in its place.
 EVIDENCE_REPAIR_ROUND_BOUND = 2
@@ -227,7 +304,6 @@ def build_unattributed_failures_marker(unattributed_ids: list[str] | tuple[str, 
 
 _COMPLETION_GATE_PROBLEM_LABELS = {
     "empty_final_response": "empty final response",
-    "clarification_requested": "clarification requested instead of action",
     "no_material_edits": "no material edits",
     "verification_not_attempted": "verification not attempted",
     "verification_incomplete": "verification coverage incomplete",
@@ -235,6 +311,10 @@ _COMPLETION_GATE_PROBLEM_LABELS = {
     "regressions_detected": "regressions introduced",
     "unattributed_failures": "failures not yet attributed",
     "expectations_unaddressed": "task expectations unaddressed",
+    "repro_unconfirmed": "reported symptom not reproduced",
+    "repro_artifacts_present": "reproduction scaffolding left in the tree",
+    "blast_radius_regressions": "neighbouring tests broken by the change",
+    "blast_radius_unverified": "blast radius not measured",
     "acceptance_criteria_unverified": "acceptance criteria unverified",
     "acceptance_criteria_failed": "acceptance criteria failed",
     "acceptance_evidence_insufficient": "acceptance evidence insufficient",
@@ -393,6 +473,7 @@ class TurnExecutionState:
     completion_gate_regression_repair_attempts: int = 0
     completion_gate_unattributed_repair_attempts: int = 0
     completion_gate_expectations_repair_attempts: int = 0
+    completion_gate_repro_repair_attempts: int = 0
     # Baseline-first regression protocol (step 3). Baselines are parsed per-test
     # outcomes of runs recorded before the first verification-relevant edit
     # (generation 0), keyed by the normalized executed command. Post-edit runs
@@ -418,6 +499,34 @@ class TurnExecutionState:
     recorded_advisory_completion: AdvisoryCompletion | None = None
     latest_expectation_assessment: dict[str, Any] = field(default_factory=dict)
     latest_expectation_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # Reproduction-first (step 5). ``repro_task_shape`` is set once at turn start;
+    # ``repro_runs`` are the observed executions of agent-created artifacts, each
+    # already phase-classified against the artifact set known at the time. The
+    # remaining fields carry the guardrail signals the summary must surface.
+    repro_task_shape: TaskShape = TaskShape.OTHER
+    repro_runs: list[ReproRun] = field(default_factory=list)
+    repro_artifact_paths: set[str] = field(default_factory=set)
+    repro_revision_rounds: int = 0
+    repro_artifacts_edited_after_fix: set[str] = field(default_factory=set)
+    repro_surviving_artifacts: tuple[str, ...] = ()
+    repro_pre_edit_nudge_sent: bool = False
+    repro_not_reproducing_nudge_sent: bool = False
+    repro_edited_after_fix_nudge_sent: bool = False
+    latest_repro_assessment: dict[str, Any] = field(default_factory=dict)
+    pending_repro_run_events: list[dict[str, Any]] = field(default_factory=list)
+    # Blast radius (step 6). ``blast_radius_scope`` is recomputed by the turn loop
+    # as the touched-path set grows; ``blast_radius_runs`` are every parsed test run
+    # observed this turn, each already tagged with what it selected and whether it
+    # ran on the clean tree. Capture is command-agnostic on purpose: the scope is
+    # matched by coverage at assessment time, so the agent may run it any way.
+    blast_radius_scope: BlastRadiusScope = field(default_factory=BlastRadiusScope)
+    blast_radius_runs: list[ScopeRun] = field(default_factory=list)
+    blast_radius_policy: BlastRadiusPolicy = field(default_factory=BlastRadiusPolicy)
+    blast_radius_scope_advisory_sent: bool = False
+    blast_radius_shrink_rounds: int = 0
+    completion_gate_blast_radius_repair_attempts: int = 0
+    latest_blast_radius_assessment: dict[str, Any] = field(default_factory=dict)
+    pending_blast_radius_events: list[dict[str, Any]] = field(default_factory=list)
     completion_gate_controller_state: CompletionGateControllerState = field(
         default_factory=CompletionGateControllerState
     )
@@ -677,6 +786,161 @@ class TurnExecutionState:
         ]
         return match_expectation_evidence(expectations, runs)
 
+    def note_repro_run(
+        self,
+        *,
+        command: str,
+        artifact_paths: tuple[str, ...],
+        exit_code: int | None,
+        passed: bool,
+    ) -> None:
+        """Record one observed execution of an agent-created artifact.
+
+        The phase is resolved *at record time* against the paths the agent created
+        this turn, so a run is pre-fix exactly when no pre-existing repo path has
+        been modified yet. Writing the repro is itself a material edit, which is
+        why the edit generation cannot decide this.
+        """
+        if not artifact_paths:
+            return
+        phase, product_paths = classify_repro_phase(
+            touched_repo_paths=self.touched_repo_paths,
+            created_paths=self.agent_created_paths,
+        )
+        self.repro_artifact_paths.update(artifact_paths)
+        if len(self.repro_artifact_paths) > MAX_REPRO_ARTIFACTS:
+            self.repro_artifact_paths = set(sorted(self.repro_artifact_paths)[:MAX_REPRO_ARTIFACTS])
+        run = ReproRun(
+            command=str(command or ""),
+            artifact_paths=tuple(artifact_paths),
+            phase=phase,
+            passed=bool(passed),
+            exit_code=exit_code,
+            product_paths=product_paths,
+        )
+        self.repro_runs.append(run)
+        self.repro_runs[:] = self.repro_runs[-MAX_REPRO_RUNS:]
+        self.pending_repro_run_events.append(run.as_payload())
+
+    def note_blast_radius_run(
+        self,
+        *,
+        command: str,
+        report: Any,
+        duration_seconds: float | None = None,
+    ) -> None:
+        """Record one observed test run for the blast-radius diff (step 6).
+
+        The phase is resolved *at record time* from the edits recorded so far, so a
+        run counts as a clean-tree baseline exactly when no pre-existing repo path
+        had been modified when it ran. A run made afterwards is never graced into a
+        baseline: by then the agent may already have finished its fix, and crediting
+        it would mask the very breakage this step exists to catch.
+        """
+        cleaned = str(command or "").strip()
+        if not cleaned:
+            return
+        phase = classify_scope_phase(
+            touched_repo_paths=self.touched_repo_paths,
+            created_paths=self.agent_created_paths,
+        )
+        run = ScopeRun(
+            command=cleaned,
+            selectors=command_path_selectors(cleaned),
+            phase=phase,
+            report=report,
+            duration_seconds=duration_seconds,
+        )
+        self.blast_radius_runs.append(run)
+        self.blast_radius_runs[:] = self.blast_radius_runs[-MAX_SCOPE_RUNS:]
+        self.pending_blast_radius_events.append(run.as_payload())
+
+    def has_blast_radius_baseline(self) -> bool:
+        """True when a usable clean-tree run already covers the selected scope."""
+        paths = self.blast_radius_scope.paths
+        if not paths:
+            return False
+        return any(
+            run.phase == ScopePhase.BASELINE and run.usable and run.covers(paths)
+            for run in self.blast_radius_runs
+        )
+
+    def compute_blast_radius_assessment(
+        self, *, enabled: bool, turn_intent: str
+    ) -> BlastRadiusAssessment:
+        """Assess the blast-radius gate mechanically (step 6).
+
+        With the feature disabled, on a non-execute turn, or with no scope selected
+        (nothing edited yet, or no test surface near the change), returns the empty
+        (non-applicable) assessment — the gate then behaves exactly as it did before
+        this step.
+        """
+        applicable = bool(enabled and str(turn_intent or "") == "execute")
+        assessment = assess_blast_radius(
+            scope=self.blast_radius_scope,
+            runs=self.blast_radius_runs,
+            applicable=applicable,
+            policy=self.blast_radius_policy,
+            agent_created_paths=self.agent_created_paths,
+        )
+        self.latest_blast_radius_assessment = (
+            assessment.as_payload() if assessment.applicable else {}
+        )
+        return assessment
+
+    def note_repro_revision_round(self) -> None:
+        self.repro_revision_rounds += 1
+
+    def note_repro_artifact_edited_after_fix(self, paths: set[str] | tuple[str, ...]) -> None:
+        for path in paths:
+            cleaned = str(path or "").strip()
+            if cleaned:
+                self.repro_artifacts_edited_after_fix.add(cleaned)
+
+    def repro_protocol_applicable(
+        self, *, enabled: bool, turn_intent: str, engagement_based: bool = False
+    ) -> bool:
+        if not enabled or str(turn_intent or "") != "execute":
+            return False
+        if self.repro_task_shape == TaskShape.BUG_FIX:
+            return True
+        if not engagement_based:
+            return False
+        # Router-free path: no pre-turn task-shape prediction exists. The
+        # protocol binds exactly when the agent demonstrably reproduced a
+        # failure on the unpatched tree — from then on "the same repro must
+        # pass after the fix" is enforceable without interpreting language.
+        # Helper scripts that only ever passed never engage the gate.
+        return any(run.phase is ReproPhase.PRE_FIX and not run.passed for run in self.repro_runs)
+
+    def compute_repro_assessment(
+        self, *, enabled: bool, turn_intent: str, engagement_based: bool = False
+    ) -> ReproAssessment:
+        """Assess the reproduction protocol mechanically (step 5).
+
+        With the feature disabled, on a non-execute turn, or on a task that reports
+        no symptom, returns the empty (non-applicable) assessment — the gate then
+        behaves exactly as it did before this step.
+        """
+        applicable = self.repro_protocol_applicable(
+            enabled=enabled,
+            turn_intent=turn_intent,
+            engagement_based=engagement_based,
+        )
+        if not applicable:
+            self.latest_repro_assessment = {}
+            return ReproAssessment()
+        assessment = assess_reproduction(
+            runs=self.repro_runs,
+            applicable=True,
+            artifact_paths=self.repro_artifact_paths,
+            revision_rounds=self.repro_revision_rounds,
+            edited_after_fix=sorted(self.repro_artifacts_edited_after_fix),
+            surviving_artifacts=self.repro_surviving_artifacts,
+        )
+        self.latest_repro_assessment = assessment.as_payload()
+        return assessment
+
     def compute_expectation_assessment(
         self, *, enabled: bool, turn_intent: str
     ) -> ExpectationAssessment:
@@ -740,6 +1004,13 @@ class TurnExecutionState:
             return self.completion_gate_unattributed_repair_attempts
         if stage == "expectations_unaddressed":
             return self.completion_gate_expectations_repair_attempts
+        if stage == "repro_unconfirmed":
+            return self.completion_gate_repro_repair_attempts
+        # Both blast-radius stages share one repair budget: they are two faces of the
+        # same protocol, and a run that alternates between them must not get double
+        # the rounds.
+        if stage in {"blast_radius_regressions", "blast_radius_unverified"}:
+            return self.completion_gate_blast_radius_repair_attempts
         return self.completion_gate_repair_attempts
 
     def increment_repair_attempts_for_stage(self, stage: str) -> None:
@@ -758,6 +1029,10 @@ class TurnExecutionState:
             self.completion_gate_unattributed_repair_attempts += 1
         elif stage == "expectations_unaddressed":
             self.completion_gate_expectations_repair_attempts += 1
+        elif stage == "repro_unconfirmed":
+            self.completion_gate_repro_repair_attempts += 1
+        elif stage in {"blast_radius_regressions", "blast_radius_unverified"}:
+            self.completion_gate_blast_radius_repair_attempts += 1
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -797,6 +1072,7 @@ class TurnExecutionState:
             "completion_gate_regression_repair_attempts": self.completion_gate_regression_repair_attempts,
             "completion_gate_unattributed_repair_attempts": self.completion_gate_unattributed_repair_attempts,
             "completion_gate_expectations_repair_attempts": self.completion_gate_expectations_repair_attempts,
+            "completion_gate_repro_repair_attempts": self.completion_gate_repro_repair_attempts,
             "test_baselines": {
                 key: record.as_payload() for key, record in sorted(self.test_baselines.items())
             },
@@ -806,6 +1082,19 @@ class TurnExecutionState:
             "regression_diff": dict(self.latest_regression_diff),
             "expectation_assessment": dict(self.latest_expectation_assessment),
             "expectation_evidence": list(self.latest_expectation_evidence),
+            "repro_task_shape": self.repro_task_shape.value,
+            "repro_runs": [run.as_payload() for run in self.repro_runs],
+            "repro_artifact_paths": sorted(self.repro_artifact_paths),
+            "repro_revision_rounds": self.repro_revision_rounds,
+            "repro_artifacts_edited_after_fix": sorted(self.repro_artifacts_edited_after_fix),
+            "repro_surviving_artifacts": list(self.repro_surviving_artifacts),
+            "repro_assessment": dict(self.latest_repro_assessment),
+            "completion_gate_blast_radius_repair_attempts": (
+                self.completion_gate_blast_radius_repair_attempts
+            ),
+            "blast_radius_scope": self.blast_radius_scope.as_payload(),
+            "blast_radius_runs": [run.as_payload() for run in self.blast_radius_runs],
+            "blast_radius_assessment": dict(self.latest_blast_radius_assessment),
             "advisory_completion": (
                 self.recorded_advisory_completion.as_payload()
                 if self.recorded_advisory_completion is not None
@@ -948,6 +1237,13 @@ def _extract_touched_repo_paths(
     elif normalized_tool == "git_apply_patch":
         patch = str(arguments.get("patch") or "")
         raw_paths.extend(iter_patch_paths(patch))
+    elif normalized_tool == "subagent_run":
+        touched_paths = result.get(
+            "material_touched_repo_paths",
+            result.get("touched_repo_paths"),
+        )
+        if isinstance(touched_paths, list):
+            raw_paths.extend(str(item) for item in touched_paths if isinstance(item, str))
     elif normalized_tool in _COMMAND_LIKE_MUTATION_TOOL_NAMES:
         touched_paths = result.get("touched_repo_paths")
         if isinstance(touched_paths, list):
@@ -1527,21 +1823,140 @@ def _iter_executed_test_commands(
     return pairs
 
 
+def _iter_executed_commands_with_outcome(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    status: str,
+    result: dict[str, Any],
+) -> list[tuple[str, int | None]]:
+    """Yield ``(command, exit_code)`` for every command this tool actually ran.
+
+    ``exit_code`` is ``None`` when the runner reported none; a failed tool status
+    with no exit code is reported as a non-zero sentinel so a crashed run is never
+    mistaken for a passing one.
+    """
+
+    def _exit_code(payload: dict[str, Any]) -> int | None:
+        raw = payload.get("exit_code")
+        if raw is None:
+            raw = payload.get("returncode")
+        if raw is None:
+            return 1 if status == "failed" else None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 1 if status == "failed" else None
+
+    pairs: list[tuple[str, int | None]] = []
+    if tool_name == "shell_run":
+        command = str(
+            result.get("effective_cmd") or result.get("cmd") or arguments.get("cmd") or ""
+        )
+        if command:
+            pairs.append((command, _exit_code(result)))
+        return pairs
+    if tool_name == "verify_run":
+        command_results = result.get("command_results")
+        if isinstance(command_results, list):
+            for item in command_results:
+                if not isinstance(item, dict):
+                    continue
+                command = str(item.get("command") or item.get("effective_command") or "")
+                if command:
+                    pairs.append((command, _exit_code(item)))
+    return pairs
+
+
+def _capture_repro_runs(
+    *,
+    state: TurnExecutionState,
+    tool_name: str,
+    arguments: dict[str, Any],
+    status: str,
+    result: dict[str, Any],
+) -> None:
+    """Record executions of files the agent created this turn (step 5).
+
+    A command "runs a reproduction" when one of its path tokens is a path the
+    agent created this turn — a fact, not an inference about the file's purpose.
+    A run with no resolvable exit code is not recorded at all: an unobservable
+    outcome can neither confirm nor refute the reproduction.
+    """
+    if tool_name not in _COMMAND_LIKE_MUTATION_TOOL_NAMES:
+        return
+    if not state.agent_created_paths:
+        return
+    for command, exit_code in _iter_executed_commands_with_outcome(
+        tool_name=tool_name,
+        arguments=arguments,
+        status=status,
+        result=result,
+    ):
+        artifacts = match_repro_artifacts(command, state.agent_created_paths)
+        if not artifacts or exit_code is None:
+            continue
+        state.note_repro_run(
+            command=command,
+            artifact_paths=artifacts,
+            exit_code=exit_code,
+            passed=exit_code == 0,
+        )
+
+
+def _capture_repro_artifact_edits(
+    *,
+    state: TurnExecutionState,
+    touched_paths: set[str],
+) -> None:
+    """Record edits to a recorded reproduction artifact made after a product edit.
+
+    Called before ``touched_repo_paths`` absorbs this edit, so the "product code
+    already changed" test reads only prior edits.
+    """
+    if not state.repro_artifact_paths or not touched_paths:
+        return
+    edited_artifacts = touched_paths & state.repro_artifact_paths
+    if not edited_artifacts:
+        return
+    if not (state.touched_repo_paths - state.agent_created_paths):
+        return
+    state.note_repro_artifact_edited_after_fix(edited_artifacts)
+
+
 def _capture_regression_test_runs(
     *,
     state: TurnExecutionState,
     tool_name: str,
     arguments: dict[str, Any],
     result: dict[str, Any],
+    elapsed_ms: int | None = None,
 ) -> None:
     timestamp = _regression_capture_timestamp()
-    for command, output in _iter_executed_test_commands(
+    pairs = _iter_executed_test_commands(
         tool_name=tool_name,
         arguments=arguments,
         result=result,
-    ):
+    )
+    # A tool call's elapsed time covers everything it ran, so attributing it to a
+    # single command is only honest when that call ran exactly one test command.
+    duration_seconds: float | None = None
+    if elapsed_ms is not None and len(pairs) == 1:
+        try:
+            duration_seconds = max(0.0, float(elapsed_ms) / 1000.0)
+        except (TypeError, ValueError):
+            duration_seconds = None
+    for command, output in pairs:
         report = parse_test_report(output)
         state.note_test_execution(command=command, report=report, timestamp=timestamp)
+        # Blast radius (step 6) reads the same parsed reports but keys them by what
+        # each run selected rather than by command identity, so a clean whole-suite
+        # run can baseline a scope the agent never named.
+        state.note_blast_radius_run(
+            command=command,
+            report=report,
+            duration_seconds=duration_seconds,
+        )
 
 
 def _capture_expectation_run_outputs(
@@ -1621,6 +2036,7 @@ def _record_tool_effect(
     known_verification_commands: list[str] | None,
     verification_authoritative: bool = False,
     evidence_v2: bool = True,
+    elapsed_ms: int | None = None,
 ) -> None:
     if is_tool_unavailable_result(result):
         return
@@ -1655,6 +2071,13 @@ def _record_tool_effect(
             arguments=arguments,
             result=result,
         )
+    elif normalized_tool == "subagent_run":
+        touched_paths = _extract_touched_repo_paths(
+            root=root,
+            tool_name=normalized_tool,
+            arguments=arguments,
+            result=result,
+        )
 
     if status != "failed" and normalized_tool == "fs_write" and result.get("created") is True:
         # A brand-new file the agent authored this turn: a failing test in it is
@@ -1663,7 +2086,15 @@ def _record_tool_effect(
         for created_path in touched_paths:
             state.note_agent_created_path(created_path)
 
+    # Reproduction-first guardrail (step 5): the reproduction is only evidence
+    # while it stays the one that failed before the fix. Editing a recorded
+    # artifact once product code has already changed is recorded and surfaced.
     if status != "failed" and normalized_tool in _MATERIAL_EDIT_TOOL_NAMES:
+        _capture_repro_artifact_edits(state=state, touched_paths=touched_paths)
+
+    if (status != "failed" and normalized_tool in _MATERIAL_EDIT_TOOL_NAMES) or (
+        normalized_tool == "subagent_run" and touched_paths
+    ):
         state.note_material_edit()
         state.material_edit_tools.add(normalized_tool)
         state.touched_repo_paths.update(touched_paths)
@@ -1744,6 +2175,7 @@ def _record_tool_effect(
         tool_name=normalized_tool,
         arguments=arguments,
         result=result,
+        elapsed_ms=elapsed_ms,
     )
     # Turn-contract v2 (step 4): capture post-edit run output for the expected-output
     # evidence linker. Like the regression capture above, this is unconditional
@@ -1752,6 +2184,17 @@ def _record_tool_effect(
         state=state,
         tool_name=normalized_tool,
         arguments=arguments,
+        result=result,
+    )
+    # Reproduction-first (step 5): capture every executed command that runs a file
+    # the agent created this turn, phase-classified against the product edits
+    # recorded so far. Unconditional telemetry, like the captures above — only the
+    # gate policy and the turn directives are kill-switched.
+    _capture_repro_runs(
+        state=state,
+        tool_name=normalized_tool,
+        arguments=arguments,
+        status=status,
         result=result,
     )
     if normalized_tool == "shell_run" and not verification_attempt:
@@ -1923,9 +2366,21 @@ def _completion_gate_problems(
     turn_intent: str = "",
     regression_baseline_enabled: bool = False,
     turn_contract_v2_enabled: bool = False,
+    reproduction_first_enabled: bool = False,
+    repro_engagement_based: bool = False,
+    blast_radius_enabled: bool = False,
 ) -> list[str]:
     expectation_assessment = state.compute_expectation_assessment(
         enabled=turn_contract_v2_enabled,
+        turn_intent=turn_intent,
+    )
+    repro_assessment = state.compute_repro_assessment(
+        enabled=reproduction_first_enabled,
+        turn_intent=turn_intent,
+        engagement_based=repro_engagement_based,
+    )
+    blast_radius_assessment = state.compute_blast_radius_assessment(
+        enabled=blast_radius_enabled,
         turn_intent=turn_intent,
     )
     execution_evidence_required = _execution_evidence_required_for_turn(
@@ -1979,6 +2434,36 @@ def _completion_gate_problems(
             ),
             turn_contract_v2_enabled=turn_contract_v2_enabled,
             expectations_unaddressed=expectation_assessment.unaddressed,
+            reproduction_first_enabled=reproduction_first_enabled,
+            repro_unconfirmed=repro_blocks_finalization(
+                repro_assessment,
+                material_edit_count=state.material_edit_count,
+            ),
+            repro_failing_after_fix=repro_assessment.contradicted,
+            repro_status=repro_assessment.status.value if repro_assessment.applicable else "",
+            repro_artifacts_present=repro_assessment.surviving_artifacts,
+            blast_radius_enabled=blast_radius_enabled,
+            # Failures step 3 already reports as regressions of the same command are
+            # dropped here: one fact, one blocker. What remains is the breakage only
+            # the selected scope saw — the tests the agent never chose to run.
+            blast_radius_new_failures=tuple(
+                test_id
+                for test_id in blast_radius_assessment.new_failures
+                if test_id not in set(regression_diff.regressions)
+            ),
+            # Only the "never measured" state feeds the weaker problem; a REGRESSED
+            # assessment whose ids step 3 already owns must not resurface here as a
+            # coverage complaint about a scope the agent demonstrably ran.
+            blast_radius_unverified=(
+                blast_radius_assessment.status == BlastRadiusStatus.GATE_MISSING
+                and blast_radius_blocks_finalization(
+                    blast_radius_assessment,
+                    material_edit_count=state.material_edit_count,
+                )
+            ),
+            blast_radius_status=(
+                blast_radius_assessment.status.value if blast_radius_assessment.applicable else ""
+            ),
         )
     )
     state.latest_completion_certificate = certificate.as_payload()
@@ -2002,6 +2487,11 @@ def _completion_gate_repair_stage(problems: list[str]) -> str:
     # generic verification_failed so the repair nudge names them concretely.
     if "regressions_detected" in problems:
         return "regressions_detected"
+    # Proven collateral damage ranks with the other regression stages and above the
+    # generic verification failure: it names concrete tests, and its repair is a
+    # different action (narrow the change) than "make your own check pass".
+    if "blast_radius_regressions" in problems:
+        return "blast_radius_regressions"
     if "verification_failed" in problems:
         return "verification_failed"
     if "verification_incomplete" in problems:
@@ -2010,6 +2500,18 @@ def _completion_gate_repair_stage(problems: list[str]) -> str:
         return "verification_not_attempted"
     if "unattributed_failures" in problems:
         return "unattributed_failures"
+    # An unmeasured blast radius ranks *below* the verification stages: when nothing
+    # has been run at all, "you ran no tests" is the more fundamental complaint and
+    # owns the repair loop. This stage takes over once that is satisfied and only the
+    # neighbouring tests are still unrun.
+    if "blast_radius_unverified" in problems:
+        return "blast_radius_unverified"
+    # Reproduction-first: an unvalidated reported symptom ranks above the
+    # task-expectation stage — a reproduction is the most direct evidence that the
+    # delivered change addresses what was reported, not the agent's reading of it.
+    # Scaffolding cleanup shares the stage; the nudge names whichever applies.
+    if "repro_unconfirmed" in problems or "repro_artifacts_present" in problems:
+        return "repro_unconfirmed"
     # Turn-contract v2: task-named expectations rank below verification/regression
     # deficits (broken behavior is more urgent) but above acceptance-criteria stages.
     if "expectations_unaddressed" in problems:
@@ -2021,8 +2523,6 @@ def _completion_gate_repair_stage(problems: list[str]) -> str:
         or "acceptance_evidence_insufficient" in problems
     ):
         return "acceptance_unverified"
-    if "clarification_requested" in problems:
-        return "clarification_requested"
     if "empty_final_response" in problems:
         return "empty_final_response"
     return "generic"
@@ -2070,6 +2570,8 @@ def _completion_gate_nudge_message(
     regression_baseline_command: str = "",
     unattributed_ids: list[str] | None = None,
     expectation_details: list[str] | None = None,
+    repro_assessment: ReproAssessment | None = None,
+    blast_radius_assessment: BlastRadiusAssessment | None = None,
 ) -> str:
     _ = (
         prefix_key,
@@ -2094,6 +2596,16 @@ def _completion_gate_nudge_message(
     # is addressed by editing the named locus or producing (and running) the expected
     # output — prose alone cannot clear it.
     expectation_deficit = "expectations_unaddressed" in problem_set
+    # Reproduction-first: an unvalidated reported symptom is action-only too — only
+    # a reproduction that failed before the fix and passes after it clears it.
+    repro_deficit = "repro_unconfirmed" in problem_set
+    repro_artifacts_deficit = "repro_artifacts_present" in problem_set
+    # Blast radius: both states are action-only. Only running the scope measures it,
+    # and only making the broken tests pass again (by narrowing the change) clears a
+    # regression; neither can be talked away.
+    blast_radius_deficit = bool(
+        problem_set & {"blast_radius_regressions", "blast_radius_unverified"}
+    )
     lines = ["Finalization check - one pass before you finish:"]
     if "no_material_edits" in problem_set:
         lines.append(
@@ -2152,6 +2664,18 @@ def _completion_gate_nudge_message(
             "(edit the named locus, or produce the expected output and run the command so it "
             "is observed), or explicitly state why the expectation no longer applies."
         )
+    if repro_deficit and repro_assessment is not None:
+        repro_line = build_repro_nudge_line(repro_assessment)
+        if repro_line:
+            lines.append(repro_line)
+    if repro_artifacts_deficit and repro_assessment is not None:
+        artifacts_line = build_repro_artifacts_nudge_line(repro_assessment.surviving_artifacts)
+        if artifacts_line:
+            lines.append(artifacts_line)
+    if blast_radius_deficit and blast_radius_assessment is not None:
+        blast_radius_line = build_blast_radius_nudge_line(blast_radius_assessment)
+        if blast_radius_line:
+            lines.append(blast_radius_line)
     if all_verification_evidence_self_authored:
         lines.append(f"- {SUPPLEMENTAL_VERIFICATION_ADVISORY}")
     if has_material_edits and diff_review_stale:
@@ -2169,7 +2693,14 @@ def _completion_gate_nudge_message(
         "- Re-read the task statement once and confirm every explicitly named output "
         "(paths, formats, values) exists exactly as requested."
     )
-    if evidence_deficit or regression_deficit or unattributed_deficit or expectation_deficit:
+    if (
+        evidence_deficit
+        or regression_deficit
+        or unattributed_deficit
+        or expectation_deficit
+        or repro_deficit
+        or blast_radius_deficit
+    ):
         lines.append(
             "Run the relevant tests now, then give your final answer once you have observed "
             "the result."

@@ -39,6 +39,7 @@ from ..llm.cache_capabilities import (
     resolve_effective_cache_capability,
 )
 from ..llm.cache_policy import ResolvedPromptCachePolicy, resolve_prompt_cache_policy
+from ..llm.metadata import credential_scope_fingerprint
 from ..llm.protocols import (
     OPENAI_COMPAT_PROTOCOL,
     get_provider_protocol_capabilities,
@@ -67,6 +68,16 @@ from ..profiles import (
     validate_base_url,
 )
 from ..provider_diagnostics import provider_diagnostic_warning_lines
+from ..provider_model_catalog import (
+    ProviderModelCatalogError,
+    ProviderModelOption,
+    discover_provider_models,
+)
+from ..reasoning_contracts import (
+    UNKNOWN_CONTRACT,
+    reasoning_contract_for,
+    reasoning_labels_allowed_by_contract,
+)
 from ..sandbox_settings import (
     apply_sandbox_mode_to_config,
     normalize_sandbox_mode,
@@ -87,7 +98,7 @@ ROLE_ORDER: tuple[str, ...] = (
     "conflict_review",
     "conflict_resolve",
 )
-ROLE_MODEL_ORDER: tuple[str, ...] = (*ROLE_ORDER, "router")
+ROLE_MODEL_ORDER: tuple[str, ...] = ROLE_ORDER
 FORGE_ROLE_ORDER: tuple[str, ...] = ROLE_MODEL_ORDER
 SECTION_VALUES: tuple[tuple[str, str], ...] = (
     ("profile", "Provider Profile"),
@@ -95,10 +106,10 @@ SECTION_VALUES: tuple[tuple[str, str], ...] = (
     ("default", "Default Model"),
     ("web_search", "Web Search"),
     ("cache", "Context & Cache"),
-    ("router", "Routing"),
     ("subagents", "Subagent model overrides"),
     ("forge", "Forge model overrides"),
     ("sandbox", "Sandbox"),
+    ("personas", "Personas"),
     ("execution", "Model Access"),
 )
 SANDBOX_MODES: tuple[str, ...] = ("strict", "warn", "off")
@@ -113,7 +124,6 @@ THINKING_LABELS: tuple[str, ...] = (
     "ultra",
     "auto",
 )
-ROUTING_MODES: tuple[str, ...] = ("auto", "code_only")
 STEP_BUDGET_POLICIES: tuple[str, ...] = ("autonomous", "limited", "adaptive", "fixed")
 PROMPT_CACHE_MODES: tuple[str, ...] = ("auto", "manual", "off")
 ANTHROPIC_PROMPT_CACHE_TTLS: tuple[str, ...] = ("5m", "1h")
@@ -133,7 +143,6 @@ _ROLE_DESCRIPTIONS: dict[str, str] = {
     "compactor": "summarizing long conversations",
     "conflict_review": "reviewing merge conflicts",
     "conflict_resolve": "resolving merge conflicts",
-    "router": "classifying chat, tool, and repository turns",
 }
 _FIELD_LABELS: dict[str, str] = {
     "max_steps": "Max steps per response",
@@ -145,7 +154,6 @@ _API_KEY_ENV_PROMPT = "API key env var name (NOT the key itself, e.g. 'ANTHROPIC
 _API_KEY_ENV_FIELD_NAME = "API key env var name"
 _SECRET_FORCE_TOKEN = "force"
 _CUSTOM_MODEL_VALUE = "__custom_model__"
-_INHERIT_DEFAULT_MODEL_VALUE = "__inherit_default_model__"
 _ADVANCED_PROVIDER_PRESETS_VALUE = "__advanced_provider_presets__"
 _EXECUTION_BACKENDS: tuple[str, ...] = ("native", "delegated")
 
@@ -211,16 +219,14 @@ class ConfigMenuState:
     clear_stored_key_confirmed: bool = False
     clear_stored_key_profile: str | None = None
     config_warning: str | None = None
-    model_catalog_warning: str | None = None
     subscription_selection_required: bool = False
     default_workspace_path: str = ""
     thinking_label_explicitly_set: bool = field(default=False, repr=False)
     _subscription_models_cache: tuple[Any, ...] = field(default=(), repr=False)
     _subscription_models_loaded: bool = field(default=False, repr=False)
-    _provider_models_cache: tuple[Any, ...] = field(default=(), repr=False)
-    _provider_models_loaded: bool = field(default=False, repr=False)
-    _router_models_by_profile: dict[str, str] = field(default_factory=dict, repr=False)
-    _forge_router_models_by_profile: dict[str, str] = field(default_factory=dict, repr=False)
+    _provider_models_cache_identity: tuple[str, str, str] | None = field(default=None, repr=False)
+    _provider_models_cache: tuple[ProviderModelOption, ...] = field(default=(), repr=False)
+    _provider_model_catalog_warning: str = field(default="", repr=False)
     _original: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -299,9 +305,6 @@ class ConfigMenuState:
                 "model": configured_model,
                 "base_url": str(getattr(cfg, "base_url", "") or ""),
                 "llm_timeout_s": _format_number(getattr(cfg, "llm_timeout_s", 60.0)),
-                "routing_mode": _normalize_routing_mode(
-                    getattr(cfg, "routing_mode", "auto") or "auto"
-                ),
                 "step_budget_policy": _normalize_step_budget_policy(
                     getattr(cfg, "step_budget_policy", "autonomous") or "autonomous"
                 ),
@@ -337,6 +340,7 @@ class ConfigMenuState:
                 "web_search_base_url": str(getattr(cfg, "web_search_base_url", "") or ""),
                 "web_search_model": str(getattr(cfg, "web_search_model", "") or ""),
                 "sandbox_mode": sandbox_mode_from_config(cfg),
+                "default_persona": str(getattr(cfg, "default_persona", "code") or "code"),
             },
             thinking_label=thinking_label,
             role_models=role_models,
@@ -353,13 +357,7 @@ class ConfigMenuState:
             subscription_selection_required=subscription_selection_required,
             default_workspace_path=default_workspace_path,
         )
-        if state.active_profile:
-            state._router_models_by_profile[state.active_profile] = str(
-                state.role_models.get("router", "") or ""
-            )
-            state._forge_router_models_by_profile[state.active_profile] = str(
-                state.forge_role_models.get("router", "") or ""
-            )
+        state._normalize_provider_thinking_label()
         state._original = state.snapshot()
         return state
 
@@ -436,16 +434,6 @@ class ConfigMenuState:
         self.thinking_label_explicitly_set = bool(
             self._original.get("thinking_label_explicitly_set", False)
         )
-        self._router_models_by_profile = {}
-        self._forge_router_models_by_profile = {}
-        if self.active_profile:
-            self._router_models_by_profile[self.active_profile] = str(
-                self.role_models.get("router", "") or ""
-            )
-            self._forge_router_models_by_profile[self.active_profile] = str(
-                self.forge_role_models.get("router", "") or ""
-            )
-        self._invalidate_provider_model_catalog()
         self.refresh_api_key_status()
 
     def set_field(self, name: str, value: str) -> None:
@@ -455,13 +443,11 @@ class ConfigMenuState:
             self.new_api_key_profile = self.active_profile or None
             self.clear_stored_key_confirmed = False
             self.clear_stored_key_profile = None
-            self._invalidate_provider_model_catalog()
             return
         if key not in {
             "model",
             "base_url",
             "llm_timeout_s",
-            "routing_mode",
             "step_budget_policy",
             "max_steps",
             "task_max_steps",
@@ -481,16 +467,13 @@ class ConfigMenuState:
             "web_search_model",
         }:
             raise KeyError(f"Unknown config menu field: {name}")
-        previous_value = str(self.fields.get(key, "") or "")
         self.fields[key] = str(value)
         if key == "model":
             profile = _active_subscription_profile(self)
             if profile is not None and str(value).strip() != profile.default_model:
                 self.subscription_selection_required = True
+            self._normalize_provider_thinking_label()
         if key == "base_url":
-            if previous_value.strip().rstrip("/") != str(value).strip().rstrip("/"):
-                self._clear_active_router_overrides()
-            self._invalidate_provider_model_catalog()
             self.refresh_api_key_status()
 
     def set_thinking_label(self, label: str) -> None:
@@ -500,8 +483,20 @@ class ConfigMenuState:
         if _active_subscription_profile(self) is not None:
             self.subscription_selection_required = True
 
-    def set_routing_mode(self, value: str) -> None:
-        self.fields["routing_mode"] = _normalize_routing_mode(value)
+    def _normalize_provider_thinking_label(self) -> None:
+        """Drop a stale effort inherited from another provider/model surface."""
+
+        preset = _active_preset(self)
+        if preset is None or preset.key not in {"nvidia", "zai-coding-plan"}:
+            return
+        allowed = _thinking_labels_for_state(
+            self,
+            model=str(self.fields.get("model") or ""),
+        )
+        if self.thinking_label in allowed:
+            return
+        self.thinking_label = "auto"
+        self.thinking_label_explicitly_set = True
 
     def set_step_budget_policy(self, value: str) -> None:
         self.fields["step_budget_policy"] = _normalize_step_budget_policy(value)
@@ -521,14 +516,10 @@ class ConfigMenuState:
     def set_role_model(self, role: str, model: str) -> None:
         role_key = _normalize_role(role)
         self.role_models[role_key] = str(model)
-        if role_key == "router" and self.active_profile:
-            self._router_models_by_profile[self.active_profile] = str(model)
 
     def set_forge_role_model(self, role: str, model: str) -> None:
         role_key = _normalize_role(role)
         self.forge_role_models[role_key] = str(model)
-        if role_key == "router" and self.active_profile:
-            self._forge_router_models_by_profile[self.active_profile] = str(model)
 
     def set_role_temperature(self, role: str, value: str) -> None:
         role_key = _normalize_role(role)
@@ -541,7 +532,6 @@ class ConfigMenuState:
         self.clear_stored_key_profile = self.active_profile or None
         self.new_api_key = ""
         self.new_api_key_profile = None
-        self._invalidate_provider_model_catalog()
 
     def set_default_workspace_path(self, path: str) -> None:
         self.default_workspace_path = str(path or "").strip()
@@ -633,16 +623,10 @@ class ConfigMenuState:
             executable=str(getattr(option, "default_executable", "") or "").strip(),
         )
 
-    def set_active_profile_name(self, name: str) -> bool:
+    def set_active_profile_name(self, name: str) -> None:
         profile_name = str(name or "").strip().lower()
         if profile_name not in self.profiles:
             raise KeyError(f"Unknown profile: {name}")
-        previous_profile_name = self.active_profile
-        previous_router = str(self.role_models.get("router", "") or "")
-        previous_forge_router = str(self.forge_role_models.get("router", "") or "")
-        if previous_profile_name:
-            self._router_models_by_profile[previous_profile_name] = previous_router
-            self._forge_router_models_by_profile[previous_profile_name] = previous_forge_router
         was_pending_for_profile = bool(
             self.subscription_selection_required and self.active_profile == profile_name
         )
@@ -653,21 +637,6 @@ class ConfigMenuState:
         self.active_profile = profile_name
         self._subscription_models_cache = ()
         self._subscription_models_loaded = False
-        self._invalidate_provider_model_catalog()
-        router_override_reset = False
-        if previous_profile_name != profile_name:
-            # Persisted role overrides are global rather than profile-scoped.
-            # Keep transient per-profile router values while this menu is open so
-            # switching back before Save restores the user's choice, but never
-            # carry one provider's id into another provider's requests.
-            next_router = self._router_models_by_profile.get(profile_name, "")
-            next_forge_router = self._forge_router_models_by_profile.get(profile_name, "")
-            self.role_models["router"] = next_router
-            self.forge_role_models["router"] = next_forge_router
-            router_override_reset = bool(
-                (previous_router.strip() and not next_router.strip())
-                or (previous_forge_router.strip() and not next_forge_router.strip())
-            )
         profile = ProfileSpec.from_dict(profile_name, self.profiles[profile_name])
         if profile.base_url:
             self.fields["base_url"] = profile.base_url
@@ -692,33 +661,8 @@ class ConfigMenuState:
                     "off" if profile.reasoning_effort == "none" else profile.reasoning_effort
                 )
             self.subscription_selection_required = False
+        self._normalize_provider_thinking_label()
         self.refresh_api_key_status()
-        return router_override_reset
-
-    def _invalidate_provider_model_catalog(self) -> None:
-        self._provider_models_cache = ()
-        self._provider_models_loaded = False
-        self.model_catalog_warning = None
-
-    def _sync_active_profile_router_maps(self) -> None:
-        if not self.active_profile:
-            return
-        self._router_models_by_profile[self.active_profile] = str(
-            self.role_models.get("router", "") or ""
-        )
-        self._forge_router_models_by_profile[self.active_profile] = str(
-            self.forge_role_models.get("router", "") or ""
-        )
-
-    def _clear_active_router_overrides(self) -> bool:
-        changed = bool(
-            str(self.role_models.get("router", "") or "").strip()
-            or str(self.forge_role_models.get("router", "") or "").strip()
-        )
-        self.role_models["router"] = ""
-        self.forge_role_models["router"] = ""
-        self._sync_active_profile_router_maps()
-        return changed
 
     def staged_api_key_target_profile(self) -> str | None:
         if not self.new_api_key.strip():
@@ -779,19 +723,7 @@ class ConfigMenuState:
                     "Subscription connection fields are provider-managed; use Default Model "
                     "for model and reasoning choices."
                 )
-        connection_fields = {
-            "protocol",
-            "base_url",
-            "auth_provider",
-            "extra_headers",
-            "reasoning_trace_adapter",
-        }
-        connection_changed = any(
-            key in fields and fields[key] != getattr(profile, key) for key in connection_fields
-        )
         self.profiles[self.active_profile] = replace(profile, **fields).to_dict()
-        if connection_changed:
-            self._clear_active_router_overrides()
         self.set_active_profile_name(self.active_profile)
 
     def remove_profile_name(self, name: str) -> bool:
@@ -811,10 +743,7 @@ class ConfigMenuState:
                 self.set_active_profile_name(next_profile)
             else:
                 self.active_profile = ""
-                self._invalidate_provider_model_catalog()
                 self.refresh_api_key_status()
-        self._router_models_by_profile.pop(profile_name, None)
-        self._forge_router_models_by_profile.pop(profile_name, None)
         return staged_key_discarded
 
     def _resolution_cfg(self) -> AppConfig:
@@ -955,11 +884,6 @@ class ConfigMenuState:
         if current_timeout != desired_timeout:
             set_config_value(cfg, "llm_timeout_s", _format_number(desired_timeout))
             changes["llm_timeout_s"] = desired_timeout
-
-        desired_routing_mode = _normalize_routing_mode(self.fields.get("routing_mode", "auto"))
-        if str(getattr(cfg, "routing_mode", "") or "") != desired_routing_mode:
-            set_config_value(cfg, "routing_mode", desired_routing_mode)
-            changes["routing_mode"] = desired_routing_mode
 
         desired_step_budget_policy = _normalize_step_budget_policy(
             self.fields.get("step_budget_policy", "autonomous")
@@ -1162,6 +1086,13 @@ class ConfigMenuState:
             apply_sandbox_mode_to_config(cfg, desired_sandbox_mode)
             changes["sandbox_mode"] = desired_sandbox_mode
 
+        desired_persona = str(self.fields.get("default_persona") or "code").strip().lower()
+        if desired_persona not in {"code", "architect", "ask", "debug"}:
+            desired_persona = "code"
+        if str(getattr(cfg, "default_persona", "code") or "code") != desired_persona:
+            set_config_value(cfg, "default_persona", desired_persona)
+            changes["default_persona"] = desired_persona
+
         active = get_active_profile(cfg)
         selection_confirmed = bool(
             active.default_model
@@ -1254,14 +1185,10 @@ class ConfigMenuState:
             _normalize_thinking_label(self.thinking_label)
         except ValueError as exc:
             return str(exc)
-        for key in ("routing_mode", "step_budget_policy"):
-            try:
-                if key == "routing_mode":
-                    _normalize_routing_mode(self.fields.get(key, "auto"))
-                else:
-                    _normalize_step_budget_policy(self.fields.get(key, "autonomous"))
-            except ValueError as exc:
-                return str(exc)
+        try:
+            _normalize_step_budget_policy(self.fields.get("step_budget_policy", "autonomous"))
+        except ValueError as exc:
+            return str(exc)
         for key in ("max_steps", "task_max_steps", "subagent_max_steps"):
             text = str(self.fields.get(key, "")).strip()
             label = _FIELD_LABELS.get(key, key)
@@ -1369,12 +1296,12 @@ def run_config_menu(
             _run_web_search_section(state, console)
         elif action == "cache":
             _run_cache_section(state, console)
-        elif action == "router":
-            _run_router_section(state, console)
         elif action == "subagents":
             _run_subagent_section(state, console)
         elif action == "forge":
             _run_forge_section(state, console)
+        elif action == "personas":
+            _run_personas_section(state, console)
         elif action == "sandbox":
             _run_sandbox_section(state, console)
         elif action == "save":
@@ -1436,11 +1363,6 @@ def _default_model_summary_text(state: ConfigMenuState) -> str:
     if not model:
         return _MISSING_REQUIRED
     return f"{model} · thinking {state.thinking_label}"
-
-
-def _limits_summary_text(state: ConfigMenuState) -> str:
-    router_model = str(state.role_models.get("router", "") or "").strip() or "inherit default"
-    return f"router {router_model} · routing {state.fields['routing_mode']} · autonomous execution"
 
 
 def _cache_summary_text(state: ConfigMenuState) -> str:
@@ -1699,7 +1621,6 @@ def _top_level_menu_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
         ("default", f"Default Model{native_suffix}", model_summary),
         ("web_search", "Web Search", _web_search_summary_text(state)),
         ("cache", "Context & Cache", _cache_summary_text(state)),
-        ("router", "Routing", _limits_summary_text(state)),
         ("subagents", "Subagent model overrides", _override_summary_text(subagent_values)),
         (
             "forge",
@@ -1707,6 +1628,7 @@ def _top_level_menu_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
             _override_summary_text(state.forge_role_models),
         ),
         ("sandbox", "Sandbox", _sandbox_summary_text(state)),
+        ("personas", "Personas", _persona_summary_text(state)),
         ("execution", "Model Access", _execution_summary_text(state)),
     ]
 
@@ -1895,6 +1817,41 @@ def _run_web_search_section(state: ConfigMenuState, console: Console) -> None:
         _print_section_cancelled(console, "Web Search")
         return
     console.print("[green]Web search settings updated.[/green] Save to apply.")
+
+
+def _persona_summary_text(state: ConfigMenuState) -> str:
+    persona = str(state.fields.get("default_persona") or "code").strip().lower()
+    labels = {
+        "code": "code · implementation (default)",
+        "architect": "architect · plans, writes markdown only",
+        "ask": "ask · read-only questions",
+        "debug": "debug · reproduce-before-fix",
+    }
+    return labels.get(persona, persona)
+
+
+def _run_personas_section(state: ConfigMenuState, console: Console) -> None:
+    current = str(state.fields.get("default_persona") or "code").strip().lower()
+    rows = [
+        ("code", "Code (default)", "Implementation work; keeps your execution mode."),
+        ("architect", "Architect", "Plans and designs; writes markdown documents only."),
+        ("ask", "Ask", "Read-only questions with inspection tools."),
+        ("debug", "Debug", "Reproduce-before-fix; keeps your execution mode."),
+    ]
+    value = _run_config_picker(
+        console=console,
+        title="Personas",
+        subtitle=(
+            "The persona chat starts in. Switch live with /persona or Tab; "
+            "per-persona model roles: config set persona_models.<persona> <role>."
+        ),
+        rows=rows,
+        current_value=current,
+    )
+    if value is None:
+        _print_section_cancelled(console, "Personas")
+        return
+    state.fields["default_persona"] = str(value).strip().lower()
 
 
 def _run_sandbox_section(state: ConfigMenuState, console: Console) -> None:
@@ -2514,12 +2471,7 @@ def _run_profile_switch(state: ConfigMenuState, console: Console) -> None:
         current_value=state.active_profile or rows[0][0],
     )
     if selected:
-        router_reset = state.set_active_profile_name(selected)
-        if router_reset:
-            console.print(
-                "[yellow]Router overrides (including Forge) now inherit the new provider's "
-                "default model.[/yellow]"
-            )
+        state.set_active_profile_name(selected)
         staged_profile = state.staged_api_key_target_profile()
         if staged_profile and staged_profile != selected:
             console.print(
@@ -3069,6 +3021,8 @@ def _prompt_cache_aware_min_trigger_ratio(console: Console, current: str) -> str
 
 def _prompt_default_model(console: Console, state: ConfigMenuState) -> str:
     rows = _default_model_rows(state)
+    if state._provider_model_catalog_warning:
+        console.print(f"[yellow]{state._provider_model_catalog_warning}[/yellow]")
     current_model = str(state.fields.get("model") or "").strip()
     row_values = {value for value, _label, _description in rows}
     current_value = current_model if current_model in row_values else rows[0][0]
@@ -3095,17 +3049,89 @@ def _default_model_picker_subtitle(state: ConfigMenuState) -> str:
     return f"Pick a supported model for {preset.label}."
 
 
-def _preset_model_option_rows(preset: ProfilePreset) -> list[tuple[str, str, str]]:
-    """Model picker rows for a preset, widened with live trial models for Sylliptor.
+def _provider_models_for_state(
+    state: ConfigMenuState,
+    preset: ProfilePreset,
+) -> tuple[ProviderModelOption, ...]:
+    if preset.key != "nvidia":
+        return ()
+    try:
+        profile_data = state.profiles[state.active_profile]
+        profile = ProfileSpec.from_dict(state.active_profile, profile_data)
+    except (KeyError, ConfigError):
+        return ()
+    api_key = state.staged_api_key_for_active_profile()
+    if not api_key:
+        try:
+            api_key = resolve_api_key(state._resolution_cfg()).key
+        except ConfigError:
+            api_key = ""
+    identity = (
+        profile.name,
+        str(profile.base_url or "").strip().rstrip("/"),
+        credential_scope_fingerprint(api_key),
+    )
+    if state._provider_models_cache_identity == identity:
+        return state._provider_models_cache
+    if not api_key:
+        state._provider_models_cache_identity = identity
+        state._provider_models_cache = ()
+        state._provider_model_catalog_warning = (
+            "Add the NVIDIA API key to load its live hosted-model catalog."
+        )
+        return ()
+    try:
+        options = discover_provider_models(profile=profile, api_key=api_key)
+    except ProviderModelCatalogError:
+        options = ()
+        state._provider_model_catalog_warning = (
+            "NVIDIA's live model catalog is unavailable; recommended and custom models "
+            "remain available."
+        )
+    else:
+        state._provider_model_catalog_warning = ""
+    state._provider_models_cache_identity = identity
+    state._provider_models_cache = tuple(sorted(options, key=lambda item: item.id.casefold()))
+    return state._provider_models_cache
 
-    Other providers expose a fixed ``suggested_models`` list. For the hosted MiMo
-    trial we also discover the proxy's live allowlist via ``/v1/models`` and append
-    any genuinely new models. A discovered id that only differs from a curated id by
-    a provider prefix (e.g. ``xiaomi/mimo-v2.5-pro`` vs ``mimo-v2.5-pro``) is the
-    same model and is not shown twice. Best-effort and offline-safe: on any failure
-    the static preset rows still render.
+
+def _preset_model_option_rows(
+    preset: ProfilePreset,
+    *,
+    state: ConfigMenuState | None = None,
+) -> list[tuple[str, str, str]]:
+    """Model picker rows for a preset, widened with provider-advertised live models.
+
+    NVIDIA's API catalog contains both NVIDIA and third-party models, so its live
+    ``/v1/models`` inventory is merged with a small curated recommendation set.
+    The Sylliptor account similarly appends its live model list. Discovery is
+    best-effort and offline-safe: on failure the static rows still render.
     """
     rows = list(model_options_for_preset(preset))
+
+    if preset.key == "nvidia" and state is not None:
+        known = {value for value, _label, _description in rows}
+        for option in _provider_models_for_state(state, preset):
+            if option.id in known:
+                continue
+            known.add(option.id)
+            owner = option.id.partition("/")[0]
+            description = str(option.description or "").strip()
+            if not description:
+                description = (
+                    f"live NVIDIA catalog · hosted model from {owner}"
+                    if owner and owner != option.id
+                    else "live NVIDIA catalog"
+                )
+            label = option.label or option.id
+            if option.chat_compatibility == "unknown":
+                label = f"{label} (chat compatibility unverified)"
+                description = (
+                    f"{description} · provider catalog does not declare endpoint compatibility; "
+                    "verify this model before relying on it"
+                )
+            rows.append((option.id, label, description))
+        return rows
 
     from ..sylliptor_cloud import PROFILE_KEY
 
@@ -3129,7 +3155,7 @@ def _preset_model_option_rows(preset: ProfilePreset) -> list[tuple[str, str, str
         if any(_same_model(model_id, existing) for existing in known):
             continue
         known.append(model_id)
-        rows.append((model_id, model_id, "available on your Sylliptor trial"))
+        rows.append((model_id, model_id, "available with your Sylliptor account"))
     return rows
 
 
@@ -3164,20 +3190,33 @@ def _default_model_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
         seen.add(current_model)
 
     preset = _active_preset(state)
+    custom_added = False
     if preset is not None:
-        for value, label, description in _preset_model_option_rows(preset):
+        preset_rows = _preset_model_option_rows(preset, state=state)
+        curated_count = len(model_options_for_preset(preset))
+        for index, (value, label, description) in enumerate(preset_rows):
+            if preset.key == "nvidia" and index == curated_count and not custom_added:
+                rows.append(
+                    (
+                        _CUSTOM_MODEL_VALUE,
+                        "Type a custom model name",
+                        "Use any model supported by the active provider",
+                    )
+                )
+                custom_added = True
             if value in seen:
                 continue
             seen.add(value)
             rows.append((value, label, description))
 
-    rows.append(
-        (
-            _CUSTOM_MODEL_VALUE,
-            "Type a custom model name",
-            "Use any model supported by the active provider",
+    if not custom_added:
+        rows.append(
+            (
+                _CUSTOM_MODEL_VALUE,
+                "Type a custom model name",
+                "Use any model supported by the active provider",
+            )
         )
-    )
     return rows
 
 
@@ -3194,178 +3233,6 @@ def _active_preset(state: ConfigMenuState) -> ProfilePreset | None:
             return base_url_preset or preset
 
     return find_preset_for_base_url(state.fields.get("base_url", ""))
-
-
-def _prompt_router_model(console: Console, state: ConfigMenuState) -> str:
-    rows = _router_model_rows(state)
-    current_model = str(state.role_models.get("router", "") or "").strip()
-    row_values = {value for value, _label, _description in rows}
-    if current_model in row_values:
-        current_value = current_model
-    elif current_model and _CUSTOM_MODEL_VALUE in row_values:
-        current_value = _CUSTOM_MODEL_VALUE
-    else:
-        current_value = _INHERIT_DEFAULT_MODEL_VALUE
-    selected = _run_config_picker(
-        console=console,
-        title="Router Model",
-        subtitle=_router_model_picker_subtitle(state),
-        rows=rows,
-        current_value=current_value,
-    )
-    if selected is None:
-        raise Abort()
-    if selected not in row_values:
-        raise Abort()
-    if selected == _INHERIT_DEFAULT_MODEL_VALUE:
-        return ""
-    if selected == _CUSTOM_MODEL_VALUE:
-        return _prompt_text("Router model", current_model)
-    return selected
-
-
-def _router_model_rows(state: ConfigMenuState) -> list[tuple[str, str, str]]:
-    rows: list[tuple[str, str, str]] = []
-    seen: set[str] = set()
-    default_model = str(state.fields.get("model") or "").strip()
-    inherit_description = (
-        f"Use default model {default_model}"
-        if default_model
-        else "Use the configured default model"
-    )
-    rows.append(
-        (
-            _INHERIT_DEFAULT_MODEL_VALUE,
-            "Same as default model (recommended)",
-            inherit_description,
-        )
-    )
-    seen.add(_INHERIT_DEFAULT_MODEL_VALUE)
-
-    current_model = str(state.role_models.get("router", "") or "").strip()
-
-    # Subscription transports must use a model advertised by the connected
-    # account.  Provider preset suggestions and arbitrary model ids are not a
-    # reliable capability signal for these managed endpoints.  When the live
-    # catalog cannot be loaded, keep the already-saved override selectable so an
-    # offline visit to /config cannot silently strand or erase it.
-    if _active_subscription_profile(state) is not None:
-        subscription_models = _subscription_models_for_state(state)
-        for model in subscription_models:
-            model_id = str(getattr(model, "id", "") or "").strip()
-            if not model_id or model_id in seen:
-                continue
-            seen.add(model_id)
-            rows.append(
-                (
-                    model_id,
-                    str(getattr(model, "label", "") or model_id).strip() or model_id,
-                    str(getattr(model, "description", "") or "").strip(),
-                )
-            )
-        if not subscription_models and current_model and current_model not in seen:
-            rows.append(
-                (
-                    current_model,
-                    current_model,
-                    "saved router override · live subscription catalog unavailable",
-                )
-            )
-        return rows
-
-    if current_model:
-        rows.append((current_model, current_model, "current router override"))
-        seen.add(current_model)
-
-    preset = _active_preset(state)
-    provider_models = _provider_models_for_state(state)
-    if not provider_models and preset is not None:
-        for value, label, description in _preset_model_option_rows(preset):
-            if value in seen:
-                continue
-            seen.add(value)
-            rows.append((value, label, description))
-
-    for model in provider_models:
-        model_id = str(getattr(model, "id", "") or "").strip()
-        if not model_id or model_id in seen:
-            continue
-        seen.add(model_id)
-        rows.append(
-            (
-                model_id,
-                str(getattr(model, "label", "") or model_id).strip() or model_id,
-                str(getattr(model, "description", "") or "live provider catalog").strip(),
-            )
-        )
-
-    rows.append(
-        (
-            _CUSTOM_MODEL_VALUE,
-            "Type a custom model name",
-            "Use any model supported by the active provider",
-        )
-    )
-    return rows
-
-
-def _router_model_picker_subtitle(state: ConfigMenuState) -> str:
-    default_model = str(state.fields.get("model") or "").strip()
-    current_override = str(state.role_models.get("router", "") or "").strip()
-    if current_override:
-        subtitle = (
-            f"The router currently uses {current_override}. Choose another active-provider model, "
-            "or select Same as default to keep it synchronized with the main model."
-        )
-    elif default_model:
-        subtitle = (
-            f"The router currently follows {default_model}. Choose an override from the active "
-            "provider, or keep it synchronized with the default model."
-        )
-    else:
-        subtitle = (
-            "The router follows the default model unless you choose an active-provider override."
-        )
-    warning = str(state.model_catalog_warning or "").strip()
-    if not warning and _active_subscription_profile(state) is not None:
-        warning = str(state.config_warning or "").strip()
-    if warning:
-        subtitle = f"{subtitle} {warning}"
-    return subtitle
-
-
-def _run_router_section(state: ConfigMenuState, console: Console) -> None:
-    console.print()
-    console.rule("[bold]Routing[/bold]")
-    console.print(
-        "[dim]Choose the model and behavior used for lightweight request routing. "
-        "Agent execution continues until completion unless an explicit safety limit is supplied.[/dim]"
-    )
-    role_model_snapshot = dict(state.role_models)
-    fields_snapshot = dict(state.fields)
-    try:
-        state.set_role_model("router", _prompt_router_model(console, state))
-        routing_mode_rows = [
-            ("auto", "Auto", "Pick code or chat path per request intent"),
-            ("code_only", "Code-only", "Always treat the request as a code task"),
-        ]
-        routing_mode = _run_config_picker(
-            console=console,
-            title="Request routing",
-            subtitle=f"Active: {state.fields['routing_mode']}",
-            rows=routing_mode_rows,
-            current_value=state.fields["routing_mode"],
-        )
-        if routing_mode is None:
-            raise Abort()
-        state.set_routing_mode(routing_mode)
-    except (Abort, EOFError, KeyboardInterrupt):
-        state.role_models = dict(role_model_snapshot)
-        state.fields = dict(fields_snapshot)
-        state._sync_active_profile_router_maps()
-        console.print("")
-        _print_section_cancelled(console, "Routing")
-        return
 
 
 def _run_subagent_section(state: ConfigMenuState, console: Console) -> None:
@@ -3430,7 +3297,6 @@ def _run_forge_section(state: ConfigMenuState, console: Console) -> None:
             state.set_forge_role_model(role, model)
     except (Abort, EOFError, KeyboardInterrupt):
         state.forge_role_models = dict(role_model_snapshot)
-        state._sync_active_profile_router_maps()
         console.print("")
         _print_section_cancelled(console, "Forge model overrides")
         return
@@ -3624,119 +3490,6 @@ def _temperature_controls_available(state: ConfigMenuState) -> bool:
     return bool(getattr(adapter, "supports_temperature", False))
 
 
-def _provider_catalog_profile_for_state(state: ConfigMenuState) -> ProfileSpec | None:
-    """Build the active API profile as currently staged in the config UI."""
-
-    if not state.active_profile or state.active_profile not in state.profiles:
-        return None
-    profile = ProfileSpec.from_dict(
-        state.active_profile,
-        state.profiles[state.active_profile],
-    )
-    if profile.auth_provider:
-        return None
-    staged_base_url = str(state.fields.get("base_url", "") or "").strip()
-    return ProfileSpec(
-        name=profile.name,
-        protocol=profile.protocol,
-        base_url=staged_base_url or profile.base_url,
-        api_key_env=profile.api_key_env,
-        auth_provider=None,
-        extra_headers=dict(profile.extra_headers),
-        default_model=str(state.fields.get("model", "") or profile.default_model).strip(),
-        reasoning_effort=profile.reasoning_effort,
-        web_search_adapter=profile.web_search_adapter,
-        web_search_model=profile.web_search_model,
-        notes=profile.notes,
-        cache_capability=profile.cache_capability,
-        reasoning_trace_adapter=profile.reasoning_trace_adapter,
-    )
-
-
-def _provider_models_for_state(state: ConfigMenuState) -> tuple[Any, ...]:
-    """Load and cache the active API provider's live router-capable models.
-
-    Curated preset rows remain the offline fallback. Discovery is deliberately
-    state-local so repeatedly repainting the TUI, or opening Default Model after
-    Router Model, never repeats a provider request.
-    """
-
-    if state._provider_models_loaded:
-        return state._provider_models_cache
-
-    state._provider_models_loaded = True
-    state._provider_models_cache = ()
-    state.model_catalog_warning = None
-    profile = _provider_catalog_profile_for_state(state)
-    if profile is None or not profile.base_url:
-        return ()
-
-    # The hosted trial has its own public, proxy-aware discovery path in
-    # _preset_model_option_rows; do not make a duplicate generic /models call.
-    preset = _active_preset(state)
-    try:
-        from ..sylliptor_cloud import PROFILE_KEY
-
-        if preset is not None and preset.key == PROFILE_KEY:
-            return ()
-    except Exception:  # noqa: BLE001 - optional cloud configuration cannot break /config
-        pass
-
-    api_key = state.staged_api_key_for_active_profile()
-    clearing_active_key = bool(
-        state.clear_stored_key_confirmed
-        and (not state.clear_stored_key_profile or state.clear_stored_key_profile == profile.name)
-    )
-    if not api_key and not clearing_active_key:
-        try:
-            api_key = str(resolve_api_key(state._resolution_cfg()).key or "").strip()
-        except ConfigError:
-            api_key = ""
-
-    # Avoid a guaranteed authentication failure for hosted profiles that require
-    # a key. Local/custom endpoints without api_key_env are still queried.
-    if not api_key and profile.api_key_env and not profile.extra_headers:
-        return ()
-
-    try:
-        from ..provider_model_catalog import (
-            ProviderModelCatalogError,
-            discover_provider_models,
-        )
-    except Exception:  # noqa: BLE001 - an optional catalog path cannot break /config
-        state.model_catalog_warning = (
-            "Live model catalog unavailable; showing saved and curated models."
-        )
-        return ()
-    try:
-        models = tuple(
-            discover_provider_models(
-                profile=profile,
-                api_key=api_key or None,
-                timeout_s=3.0,
-            )
-        )
-    except ProviderModelCatalogError as exc:
-        detail = str(exc).strip()
-        suffix = f" ({detail})" if detail and len(detail) <= 120 else ""
-        state.model_catalog_warning = (
-            f"Live model catalog unavailable{suffix}; showing saved and curated models."
-        )
-        return ()
-    except Exception:  # noqa: BLE001 - never surface third-party exception text or secrets
-        state.model_catalog_warning = (
-            "Live model catalog unavailable; showing saved and curated models."
-        )
-        return ()
-
-    state._provider_models_cache = models
-    if not models:
-        state.model_catalog_warning = (
-            "The provider returned no router-capable models; showing saved and curated models."
-        )
-    return models
-
-
 def _subscription_models_for_state(state: ConfigMenuState) -> tuple[Any, ...]:
     profile = _active_subscription_profile(state)
     if profile is None or not profile.auth_provider:
@@ -3765,7 +3518,28 @@ def _thinking_labels_for_state(
 ) -> tuple[str, ...]:
     profile = _active_subscription_profile(state)
     if profile is None:
-        return THINKING_LABELS
+        preset = _active_preset(state)
+        contract = reasoning_contract_for(
+            getattr(preset, "provider_key", None),
+            str(model or state.fields.get("model") or ""),
+            preset_key=getattr(preset, "key", None),
+        )
+        preset_key = getattr(preset, "key", None)
+        if preset_key == "nvidia" and contract is UNKNOWN_CONTRACT:
+            return ("auto",)
+        current = _normalize_thinking_label(state.thinking_label)
+        if preset_key in {"nvidia", "zai-coding-plan"}:
+            # A global effort may have been saved for the previously active
+            # provider. Do not preserve an invalid value merely because it is
+            # current; these controls are exact per hosted model and surface.
+            current = "auto"
+        return tuple(
+            reasoning_labels_allowed_by_contract(
+                contract,
+                THINKING_LABELS,
+                current=current,
+            )
+        )
     model_id = str(model or state.fields.get("model") or "").strip()
     selected = next(
         (item for item in _subscription_models_for_state(state) if item.id == model_id),
@@ -3923,14 +3697,6 @@ def _normalize_thinking_label(label: str) -> str:
     if normalized not in THINKING_LABELS:
         allowed = ", ".join(THINKING_LABELS)
         raise ValueError(f"thinking must be one of: {allowed}")
-    return normalized
-
-
-def _normalize_routing_mode(value: str) -> str:
-    normalized = str(value or "").strip().lower()
-    if normalized not in ROUTING_MODES:
-        allowed = ", ".join(ROUTING_MODES)
-        raise ValueError(f"Request routing must be one of: {allowed}")
     return normalized
 
 

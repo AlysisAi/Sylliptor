@@ -2087,3 +2087,128 @@ def test_verify_run_requires_review_mode_approval(
 
     with pytest.raises(AgentRuntimeError, match="User declined: verify_run"):
         tools["verify_run"].run({"commands": ["pytest -q"]})
+
+
+def test_host_runner_with_closed_stdin_fails_a_prompting_command(tmp_path: Path) -> None:
+    """A command that reads stdin must hit EOF, not wait for a human.
+
+    Regression: `npm run lint` opened an interactive ESLint prompt during
+    verification, inherited the terminal's stdin, and sat there for 13m41s.
+    """
+    from sylliptor_agent_cli.sandbox_runner import HostShellRunner
+
+    result = HostShellRunner(close_stdin=True).run(
+        root=tmp_path,
+        cwd=tmp_path,
+        cmd="read -r answer",
+        timeout_s=10,
+    )
+
+    assert result.returncode != 0
+
+
+def test_verification_builds_its_runner_with_stdin_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sylliptor_agent_cli.sandbox_runner import HostShellRunner
+
+    captured: dict[str, object] = {}
+
+    def _recording_host_runner(**kwargs: object) -> HostShellRunner:
+        captured.update(kwargs)
+        return HostShellRunner(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setenv("SYLLIPTOR_VERIFY_SANDBOX_MODE", "off")
+    monkeypatch.setattr(verify_gate_mod, "HostShellRunner", _recording_host_runner)
+
+    verify_gate_mod.run_task_verification(
+        root=tmp_path,
+        commands=["read -r answer"],
+        artifact_path=tmp_path / "verify.txt",
+        cfg=AppConfig(model=""),
+        timeout_s=30,
+    )
+
+    assert captured.get("close_stdin") is True
+
+
+def test_interactive_shell_execution_keeps_inherited_stdin() -> None:
+    """Normal shell work must be unaffected: only verification closes stdin."""
+    from sylliptor_agent_cli.sandbox_runner import HostShellRunner
+
+    assert HostShellRunner().close_stdin is False
+
+
+def test_verify_run_reports_workspace_services_without_stopping_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dev server already holding a port is reported, never stopped.
+
+    Regression context: a production build and a running dev server shared the
+    same `.next` directory, and the resulting stale-chunk 500s looked like a
+    code failure. The host cannot tell a real conflict from a deliberate setup,
+    so it reports and lets the agent decide through the normal approval path.
+    """
+    from sylliptor_agent_cli.terminal_manager import ProcessSummary
+
+    def fake_run(cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        _ = cmd
+        return _cp(returncode=0, stdout="ok\n")
+
+    _patch_host_execution(monkeypatch, fake_run)
+
+    class _StubTerminalManager:
+        def __init__(self) -> None:
+            self.kill_calls: list[str] = []
+
+        def list(self) -> tuple[ProcessSummary, ...]:
+            return (
+                ProcessSummary(
+                    process_id="bg1",
+                    cmd="npm run dev -- --port 3000",
+                    cwd=tmp_path,
+                    status="running",
+                    exit_code=None,
+                    runtime_s=42.5,
+                    started_at_wall=0.0,
+                ),
+                ProcessSummary(
+                    process_id="bg2",
+                    cmd="npm run dev -- --port 3002",
+                    cwd=tmp_path,
+                    status="exited",
+                    exit_code=0,
+                    runtime_s=3.0,
+                    started_at_wall=0.0,
+                ),
+            )
+
+        def kill(self, process_id: str) -> None:
+            self.kill_calls.append(process_id)
+
+    manager = _StubTerminalManager()
+    cfg = AppConfig(model="test-model")
+    cfg.verify_commands = ["pytest -q"]
+    tools = build_tools(
+        root=tmp_path,
+        console=Console(file=io.StringIO(), force_terminal=False),
+        surface=None,
+        store=_store(tmp_path),
+        mode="auto",
+        yes=True,
+        cfg=_host_verify_cfg(cfg),
+        non_interactive=True,
+        verification_enabled=True,
+        terminal_manager=manager,  # type: ignore[arg-type]
+    )
+
+    result = tools["verify_run"].run({})
+
+    services = result["workspace_services"]
+    assert [entry["command"] for entry in services] == ["npm run dev -- --port 3000"]
+    assert services[0]["process_id"] == "bg1"
+    assert services[0]["kind"] == "background_process"
+    # Reported only: an exited process is noise, and nothing was terminated.
+    assert manager.kill_calls == []

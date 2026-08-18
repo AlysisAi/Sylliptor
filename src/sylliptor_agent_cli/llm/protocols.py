@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from ..config import ConfigError
-from .types import ReasoningOutputKind, UsageConfidence, UsageContract
+from .types import BillingMode, ReasoningOutputKind, UsageConfidence, UsageContract
 
 OPENAI_COMPAT_PROTOCOL = "openai_compat"
 OPENAI_RESPONSES_PROTOCOL = "openai_responses"
@@ -180,6 +180,13 @@ _REASONING_TRACE_CAPABILITIES_BY_ADAPTER: dict[str, ReasoningTraceCapability] = 
         supports_buffered=True,
         continuation_state="sensitive",
     ),
+    "nvidia_reasoning": ReasoningTraceCapability(
+        adapter="nvidia_reasoning",
+        output_kind=ReasoningOutputKind.PROVIDER_REASONING,
+        supports_streaming=True,
+        supports_buffered=True,
+        continuation_state="sensitive",
+    ),
 }
 
 SUPPORTED_REASONING_TRACE_ADAPTERS: frozenset[str] = frozenset(
@@ -196,6 +203,7 @@ _REASONING_TRACE_ADAPTERS_BY_PROTOCOL: dict[str, frozenset[str]] = {
             "dashscope_thinking",
             "mistral_thinking",
             "moonshot_reasoning",
+            "nvidia_reasoning",
         }
     ),
     OPENAI_RESPONSES_PROTOCOL: frozenset({"auto", "none", "openai_responses_summary"}),
@@ -212,6 +220,7 @@ _OPENAI_COMPAT_REASONING_ADAPTER_BY_PROVIDER: dict[str, str] = {
     "dashscope": "dashscope_thinking",
     "mistral": "mistral_thinking",
     "moonshot": "moonshot_reasoning",
+    "nvidia": "nvidia_reasoning",
 }
 
 
@@ -344,6 +353,7 @@ PROVIDER_PROTOCOL_CAPABILITIES: tuple[ProviderProtocolCapabilities, ...] = (
         supports_prompt_cache_key=True,
         supports_prompt_cache_retention=True,
         reports_cache_read_tokens=True,
+        reports_cache_write_tokens=True,
         quirks=("Sylliptor's current chat runtime uses Chat Completions-compatible requests.",),
     ),
     ProviderProtocolCapabilities(
@@ -370,6 +380,7 @@ PROVIDER_PROTOCOL_CAPABILITIES: tuple[ProviderProtocolCapabilities, ...] = (
         supports_prompt_cache_key=True,
         supports_prompt_cache_retention=True,
         reports_cache_read_tokens=True,
+        reports_cache_write_tokens=True,
         quirks=("Native OpenAI Responses chat supports buffered and SSE streaming responses.",),
     ),
     ProviderProtocolCapabilities(
@@ -464,6 +475,57 @@ PROVIDER_PROTOCOL_CAPABILITIES: tuple[ProviderProtocolCapabilities, ...] = (
         supports_prompt_cache_key=True,
         reports_cache_read_tokens=True,
         quirks=("Kimi reasoning_content must be retained when assistant messages are replayed.",),
+    ),
+    ProviderProtocolCapabilities(
+        provider_key="nvidia",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+        reasoning_trace=ReasoningTraceCapability(
+            adapter="nvidia_reasoning",
+            output_kind=ReasoningOutputKind.PROVIDER_REASONING,
+            supports_streaming=True,
+            supports_buffered=True,
+            continuation_state="sensitive",
+        ),
+        usage_contract=UsageContract(
+            response_usage_confidence=UsageConfidence.REPORTED,
+            input_token_count_strategy="openai_compat_provider_payload",
+        ),
+        supports_streaming=True,
+        supports_tool_calling=True,
+        supports_structured_outputs=False,
+        supports_provider_hosted_web_search_adapter=False,
+        default_web_search_adapter="auto",
+        quirks=(
+            "Hosted NVIDIA NIM uses the OpenAI-compatible chat protocol.",
+            "Nemotron reasoning_content is retained only for same-route tool continuation.",
+            "Hosted Free Endpoints are rate-limited prototyping endpoints.",
+        ),
+    ),
+    ProviderProtocolCapabilities(
+        provider_key="zai_coding_plan",
+        protocol=OPENAI_COMPAT_PROTOCOL,
+        reasoning_trace=ReasoningTraceCapability(
+            adapter="openai_compat_passive",
+            supports_streaming=True,
+            supports_buffered=True,
+        ),
+        usage_contract=UsageContract(
+            response_usage_confidence=UsageConfidence.REPORTED,
+            input_token_count_strategy="openai_compat_provider_payload",
+            billing_mode=BillingMode.SUBSCRIPTION,
+        ),
+        supports_streaming=True,
+        supports_tool_calling=True,
+        supports_structured_outputs=True,
+        supports_provider_hosted_web_search_adapter=False,
+        default_web_search_adapter="auto",
+        cache_strategy="implicit_provider",
+        reports_cache_read_tokens=True,
+        quirks=(
+            "GLM Coding Plan uses a subscription key and a dedicated OpenAI-compatible endpoint.",
+            "GLM-5.3 has a reasoning floor: low is the minimum and off is not available.",
+            "Raw reasoning_content is not exposed as a user-visible reasoning summary.",
+        ),
     ),
     ProviderProtocolCapabilities(
         provider_key="gemini",

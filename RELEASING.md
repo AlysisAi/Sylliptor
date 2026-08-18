@@ -2,17 +2,53 @@
 
 This is the maintainer checklist for publishing Sylliptor packages and sandbox images.
 
-## Version And Tag
+## Prepare The Release
 
-1. Bump the package version in `pyproject.toml` and `src/sylliptor_agent_cli/__init__.py`.
-2. Update `CHANGELOG.md` with user-facing changes and known limitations.
-3. Commit the release changes.
-4. Create and push the release tag:
+1. Set the same semantic version in `pyproject.toml`,
+   `src/sylliptor_agent_cli/__init__.py`, and the Sylliptor project entry in
+   `uv.lock`.
+2. Move the completed public changes from `[Unreleased]` into a dated section in
+   `CHANGELOG.md`.
+3. Confirm that the lockfile is current and the release metadata agrees:
+
+```bash
+uv lock --check
+uv run pytest -q tests/test_release_smoke.py
+```
+
+4. Run the release-quality checks locally:
+
+```bash
+uv sync --frozen --no-editable --extra dev
+uv run python scripts/release/audit_locked_dependencies.py
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest -q
+```
+
+5. Build into an empty directory and validate both distributions:
+
+```bash
+uv build --no-create-gitignore --no-build-isolation --no-sources --out-dir dist/python
+uv run python scripts/release/validate_python_distributions.py dist/python
+```
+
+## Commit And Tag
+
+1. Put the complete public release in one reviewable commit named
+   `release: v0.x.y`. If changes arrived through another branch, squash or
+   fast-forward them so the public release does not introduce a merge commit.
+2. Make sure that exact commit is on the default branch before tagging it.
+3. Create and push the matching tag:
 
 ```bash
 git tag v0.x.y
 git push origin v0.x.y
 ```
+
+Pushing the tag starts the release workflow. It verifies the tag, version, default
+branch ancestry, tests, distributions, dependency audit, SBOM, and provenance before
+publishing.
 
 ## PyPI
 

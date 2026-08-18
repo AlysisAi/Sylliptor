@@ -262,9 +262,9 @@ def set_active_profile(cfg: AppConfig, name: str) -> None:
         _raise_config_error(f"Profile not found: {profile_name}")
     previous_profile = str((cfg.extra_fields or {}).get("active_profile") or "").strip()
     if previous_profile and previous_profile != profile.name:
-        # Router overrides are global rather than profile-scoped. Never carry a
-        # provider-specific router id into a different API profile; inheritance
-        # immediately selects the new profile's default model instead.
+        # Legacy-config hygiene: "router" is a deprecated role_models key from
+        # the removed semantic router. It stored a provider-specific model id,
+        # so never carry it into a different API profile; drop it on switch.
         for section in ("role_models", "forge_role_models"):
             raw_models = cfg.extra_fields.get(section)
             if not isinstance(raw_models, dict) or "router" not in raw_models:

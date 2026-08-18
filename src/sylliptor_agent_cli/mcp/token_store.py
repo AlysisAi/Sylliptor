@@ -9,6 +9,7 @@ import os
 import platform
 import secrets
 import tempfile
+import threading
 from contextlib import suppress
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -62,6 +63,179 @@ class _KeyMaterial:
 class TokenPayloadLoadResult:
     payload: dict[str, Any]
     legacy_plaintext: bool = False
+
+
+@dataclass(frozen=True)
+class KeyringOutcome:
+    """Whether the OS keyring could own the credential-store master key."""
+
+    available: bool
+    reason: str | None = None
+    error_type: str | None = None
+    backend: str | None = None
+    detail: str | None = None
+
+
+_KEYRING_OUTCOME: KeyringOutcome | None = None
+_KEYRING_OUTCOME_LOCK = threading.Lock()
+_WARNED_KEYRING_KEYS: set[tuple[str | None, str | None, str | None]] = set()
+# A backend whose priority is not positive is a placeholder rather than a real
+# secret service. ``keyring.backends.null`` silently discards writes and
+# ``keyring.backends.fail`` raises on every call; neither may own the envelope
+# key source, or the store becomes undecryptable on the next read. Both are named
+# explicitly because the priority check alone would not survive them gaining a
+# positive priority upstream.
+_UNUSABLE_BACKEND_NAMES = frozenset(
+    {
+        "keyring.backends.null.Keyring",
+        "keyring.backends.fail.Keyring",
+    }
+)
+
+
+def last_keyring_outcome() -> KeyringOutcome | None:
+    """Return the most recent keyring result observed by this process."""
+
+    return _KEYRING_OUTCOME
+
+
+def reset_keyring_observations() -> None:
+    """Forget recorded keyring results. For test isolation, not runtime use."""
+
+    global _KEYRING_OUTCOME
+    with _KEYRING_OUTCOME_LOCK:
+        _KEYRING_OUTCOME = None
+        _WARNED_KEYRING_KEYS.clear()
+
+
+def _record_keyring_outcome(outcome: KeyringOutcome) -> None:
+    """Remember the keyring result and warn once per distinct degradation.
+
+    Every store read and write consults the keyring, so an unconditional warning
+    would flood a long session. Keying on the reason still reports a *different*
+    degradation later in the same process.
+    """
+
+    global _KEYRING_OUTCOME
+    with _KEYRING_OUTCOME_LOCK:
+        _KEYRING_OUTCOME = outcome
+        should_warn = False
+        if not outcome.available:
+            key = (outcome.reason, outcome.error_type, outcome.backend)
+            should_warn = key not in _WARNED_KEYRING_KEYS
+            if should_warn:
+                _WARNED_KEYRING_KEYS.add(key)
+    if not should_warn:
+        return
+    logger.warning(
+        "OS keyring is unavailable for the Sylliptor credential store; using a local "
+        "encrypted master key instead. reason=%s error_type=%s backend=%s",
+        outcome.reason,
+        outcome.error_type,
+        outcome.backend,
+    )
+
+
+def keyring_backend_name() -> str | None:
+    """Return the active keyring backend's qualified class name, if resolvable."""
+
+    try:
+        import keyring
+
+        backend = keyring.get_keyring()
+    except Exception:  # noqa: BLE001 - keyring resolution varies by OS and install
+        return None
+    return f"{type(backend).__module__}.{type(backend).__name__}"
+
+
+def _keyring_backend_priority(backend: object) -> float | None:
+    try:
+        return float(type(backend).priority)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - unusable backends raise from `priority`
+        return None
+
+
+def keyring_availability(*, probe_read: bool = True) -> KeyringOutcome:
+    """Report whether the OS keyring can hold the master key. Never writes.
+
+    Resolving the backend is enough to catch the cases that matter in spawned,
+    headless, and CI contexts, where no real secret service exists. ``probe_read``
+    additionally attempts one read, which detects a backend that resolves but
+    cannot serve — at the cost of possibly prompting the user to unlock a locked
+    desktop keyring. Diagnostics ask for it; a status payload must not, or a
+    routine probe could block on a dialog.
+    """
+
+    try:
+        import keyring
+    except Exception as exc:  # noqa: BLE001 - keyring is optional at runtime
+        return KeyringOutcome(
+            available=False,
+            reason="import-failed",
+            error_type=exc.__class__.__name__,
+        )
+    try:
+        backend = keyring.get_keyring()
+    except Exception as exc:  # noqa: BLE001
+        return KeyringOutcome(
+            available=False,
+            reason="backend-unresolved",
+            error_type=exc.__class__.__name__,
+        )
+    name = f"{type(backend).__module__}.{type(backend).__name__}"
+    priority = _keyring_backend_priority(backend)
+    # An unresolvable priority is keyring's own signal that a backend is not
+    # viable, so treat it as unusable: falling back to a local encrypted key is
+    # always safe, while wrongly trusting the keyring loses the credentials.
+    if name in _UNUSABLE_BACKEND_NAMES or priority is None or priority <= 0:
+        return KeyringOutcome(
+            available=False,
+            reason="unusable-backend",
+            backend=name,
+            detail="The active keyring backend does not store secrets.",
+        )
+    if probe_read:
+        try:
+            _get_keyring_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+        except Exception as exc:  # noqa: BLE001
+            return KeyringOutcome(
+                available=False,
+                reason="read-failed",
+                error_type=exc.__class__.__name__,
+                backend=name,
+            )
+    return KeyringOutcome(available=True, backend=name)
+
+
+def fallback_key_source() -> str:
+    """Return the non-keyring key source this platform uses. Probes nothing."""
+
+    if _platform_system().lower() == "windows":
+        return KEY_SOURCE_DPAPI
+    return KEY_SOURCE_FILESYSTEM
+
+
+def planned_key_source() -> str:
+    """Return the key source a write would choose, creating no key material."""
+
+    if keyring_availability().available:
+        return KEY_SOURCE_KEYRING
+    return fallback_key_source()
+
+
+def stored_key_source(store_path: Path) -> str | None:
+    """Return the key source recorded in an existing envelope, without decrypting."""
+
+    if not store_path.exists():
+        return None
+    try:
+        raw_payload = _read_json_file(store_path)
+    except McpTokenStoreError:
+        return None
+    if not isinstance(raw_payload, dict):
+        return None
+    source = raw_payload.get("key_source")
+    return source if isinstance(source, str) and source else None
 
 
 def load_token_payload(path: Path) -> dict[str, Any]:
@@ -296,7 +470,18 @@ def _preferred_key_material(path: Path) -> _KeyMaterial:
 
 def _key_material_for_source(source: str, *, path: Path) -> _KeyMaterial:
     if source == KEY_SOURCE_KEYRING:
-        material = _try_keyring_material(required=True)
+        try:
+            material = _try_keyring_material(required=True)
+        except McpTokenStoreUnavailableError as exc:
+            _record_keyring_outcome(
+                KeyringOutcome(
+                    available=False,
+                    reason="entry-unavailable",
+                    backend=keyring_backend_name(),
+                    detail=str(exc),
+                )
+            )
+            raise
         if material is None:
             raise McpTokenStoreUnavailableError(
                 "OS keyring is unavailable for MCP OAuth token store."
@@ -312,6 +497,7 @@ def _key_material_for_source(source: str, *, path: Path) -> _KeyMaterial:
 
 
 def _try_keyring_material(*, required: bool) -> _KeyMaterial | None:
+    backend = keyring_backend_name()
     try:
         encoded = _get_keyring_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
     except Exception as exc:  # noqa: BLE001
@@ -319,8 +505,13 @@ def _try_keyring_material(*, required: bool) -> _KeyMaterial | None:
             raise McpTokenStoreUnavailableError(
                 "Failed to read MCP OAuth key from OS keyring."
             ) from exc
-        logger.debug(
-            "OS keyring read failed for MCP OAuth token store; falling back.", exc_info=exc
+        _record_keyring_outcome(
+            KeyringOutcome(
+                available=False,
+                reason="read-failed",
+                error_type=exc.__class__.__name__,
+                backend=backend,
+            )
         )
         return None
     if encoded:
@@ -330,21 +521,39 @@ def _try_keyring_material(*, required: bool) -> _KeyMaterial | None:
             raise McpTokenStoreUnavailableError("MCP OAuth keyring entry is invalid.") from exc
         if len(key) != _AES_KEY_BYTES:
             raise McpTokenStoreUnavailableError("MCP OAuth keyring entry has invalid length.")
+        _record_keyring_outcome(KeyringOutcome(available=True, backend=backend))
         return _KeyMaterial(KEY_SOURCE_KEYRING, key)
     if required:
         raise McpTokenStoreUnavailableError("MCP OAuth keyring entry is missing.")
     key = secrets.token_bytes(_AES_KEY_BYTES)
+    material = base64.b64encode(key).decode("ascii")
     try:
-        _set_keyring_password(
-            _KEYRING_SERVICE,
-            _KEYRING_ACCOUNT,
-            base64.b64encode(key).decode("ascii"),
-        )
+        _set_keyring_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT, material)
+        persisted = _get_keyring_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
     except Exception as exc:  # noqa: BLE001
-        logger.debug(
-            "OS keyring write failed for MCP OAuth token store; falling back.", exc_info=exc
+        _record_keyring_outcome(
+            KeyringOutcome(
+                available=False,
+                reason="write-failed",
+                error_type=exc.__class__.__name__,
+                backend=backend,
+            )
         )
         return None
+    if persisted != material:
+        # Placeholder backends such as ``keyring.backends.null`` accept writes and
+        # discard them. Claiming the keyring key source here would produce an
+        # envelope that no later process can decrypt, so fall back instead.
+        _record_keyring_outcome(
+            KeyringOutcome(
+                available=False,
+                reason="write-not-persisted",
+                backend=backend,
+                detail="The keyring backend accepted the master key but did not store it.",
+            )
+        )
+        return None
+    _record_keyring_outcome(KeyringOutcome(available=True, backend=backend))
     return _KeyMaterial(KEY_SOURCE_KEYRING, key)
 
 

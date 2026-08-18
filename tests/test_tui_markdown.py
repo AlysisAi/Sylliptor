@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from sylliptor_agent_cli.cli_impl.tui.app import _assistant_rows
 from sylliptor_agent_cli.cli_impl.tui.markdown import (
+    _render_ansi,
     looks_like_markdown,
     render_markdown_rows,
 )
@@ -55,8 +56,9 @@ def test_render_code_block_keeps_code_and_styles_it():
     joined = "\n".join(_row_text(r) for r in rows)
     assert "def f(x):" in joined
     assert "return x + 1" in joined
-    # The fenced block is syntax-highlighted on a background (monokai), so at
-    # least one fragment on the code row carries a non-empty style.
+    # The fenced block is syntax-highlighted, so at least one fragment on the
+    # code row carries a non-empty style even when the neutral palette inherits
+    # the terminal background.
     code_row = next(r for r in rows if "def f(x):" in _row_text(r))
     assert any(style for style, _text in code_row), "code row should be styled"
 
@@ -77,6 +79,73 @@ def test_render_never_raises_and_rows_fit_width():
     assert rows is not None
     for row in rows:
         assert len(_row_text(row)) <= width
+
+
+def test_render_strips_leaked_osc8_hyperlink_payload():
+    # A web-search answer that links a source. Rich turns the markdown link into an
+    # OSC 8 terminal hyperlink; prompt_toolkit's ANSI parser can't consume OSC and
+    # used to leak "8;id=…;https://…" and the closing "8;;" as visible text. The
+    # anchor text must survive, but none of the escape payload may.
+    reply = (
+        "The 4 teams remaining are:\n\n"
+        "- Argentina\n"
+        "- Spain "
+        "([apnews.com](https://apnews.com/article/d47ccb4ac5b3af67?utm_source=openai))\n"
+    )
+    rows = render_markdown_rows(reply, 58)
+    assert rows is not None
+    joined = "\n".join(_row_text(r) for r in rows)
+    assert "apnews.com" in joined  # anchor text preserved
+    assert "8;id=" not in joined  # OSC 8 open marker gone
+    assert "8;;" not in joined  # OSC 8 close marker gone
+    assert "https://apnews.com" not in joined  # raw URL payload not leaked
+    assert "\x1b]" not in joined  # no stray OSC introducer
+
+
+def test_render_markdown_rows_is_memoized():
+    # The transcript re-renders every completed reply on every redraw, so the
+    # result is cached per (text, width): a repeat call returns the SAME object
+    # (the cache hit). Callers therefore MUST treat the rows as read-only.
+    first = render_markdown_rows(_LIST_REPLY, 58)
+    second = render_markdown_rows(_LIST_REPLY, 58)
+    assert first is not None
+    assert first is second  # shared cache entry, not a fresh render
+    # A different width is a distinct cache entry (a real render, not the cached one).
+    assert render_markdown_rows(_LIST_REPLY, 44) is not first
+
+
+def test_markdown_render_cache_and_code_background_follow_theme(monkeypatch) -> None:
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    _render_ansi.cache_clear()
+    render_markdown_rows.cache_clear()
+
+    dark = render_markdown_rows(_CODE_REPLY, 58, "dark")
+    light = render_markdown_rows(_CODE_REPLY, 58, "light")
+    neutral = render_markdown_rows(_CODE_REPLY, 58, "neutral")
+
+    assert dark is not None and light is not None and neutral is not None
+    assert dark is not light and light is not neutral
+    dark_styles = {style for row in dark for style, _text in row if style}
+    light_styles = {style for row in light for style, _text in row if style}
+    neutral_styles = {style for row in neutral for style, _text in row if style}
+    assert any("bg:#272822" in style for style in dark_styles)
+    assert any("bg:#f0f0f0" in style for style in light_styles)
+    assert all("bg:" not in style for style in neutral_styles)
+
+
+def test_doc_panel_copies_rows_so_it_cannot_corrupt_the_cache():
+    # render_markdown_rows is memoized (shared objects), so a caller that aliases
+    # its rows must copy them. The doc panel does; a later transcript render of the
+    # same (text, width) must be unaffected even if the panel's rows are mutated.
+    from sylliptor_agent_cli.cli_impl.tui.app import _render_doc_panel_rows
+
+    panel_rows = _render_doc_panel_rows(_LIST_REPLY, 58)
+    for row in panel_rows:  # hostile in-place mutation of the panel's own rows
+        row.clear()
+    # _assistant_rows(width=60) renders markdown at width 60-2 == 58, the same key.
+    rows = _assistant_rows(_LIST_REPLY, width=60, markdown=True)
+    joined = "\n".join(_row_text(r) for r in rows)
+    assert "first" in joined and "Heading" in joined  # cache entry intact
 
 
 # ----------------------------- _assistant_rows -----------------------------

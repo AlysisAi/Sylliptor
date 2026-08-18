@@ -135,9 +135,6 @@ class OneShotSkillsEvalExecutor:
                 verification_credit_miss_count=int(
                     metrics.get("verification_credit_miss_count") or 0
                 ),
-                execution_posture_fallback_count=int(
-                    metrics.get("execution_posture_fallback_count") or 0
-                ),
                 session_log_path=session_log_path,
                 session_artifact_root=(
                     session.store.session_artifact_root if session.store.enabled else None

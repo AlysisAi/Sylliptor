@@ -133,7 +133,7 @@ def test_sylliptor_trial_error_message_maps_known_codes() -> None:
 def test_sylliptor_trial_error_message_handles_each_proxy_code() -> None:
     cases = {
         "invalid_key": "sylliptor login",
-        "quota_exhausted": "trial tokens",
+        "quota_exhausted": "available allowance",
         "email_not_verified": "confirm your email",
         "plan_inactive": "not active",
         "rate_limit_exceeded": "wait a moment",
@@ -1400,7 +1400,7 @@ def test_kimi_k3_uses_documented_request_shape_and_round_trips_reasoning() -> No
         assert "temperature" not in body
         assert "thinking" not in body
         assert "enable_thinking" not in body
-        assert body["reasoning_effort"] == "max"
+        assert body["reasoning_effort"] == "high"
         assert body["prompt_cache_key"] == "stable-session"
         if len(calls) == 1:
             assert body["tool_choice"] == "required"
@@ -1495,6 +1495,29 @@ def test_kimi_k27_omits_forced_tool_choice_because_thinking_is_always_on() -> No
         tool_choice="required",
     )
     assert response.content == "ok"
+
+
+def test_kimi_code_k3_uses_membership_surface_reasoning_contract() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.kimi.com/coding/v1",
+        api_key="test",
+        model="k3",
+        enable_thinking=False,
+        reasoning_effort="high",
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert captured["reasoning_effort"] == "high"
+    assert "thinking" not in captured
+    assert "enable_thinking" not in captured
 
 
 @pytest.mark.parametrize(
@@ -1602,6 +1625,75 @@ def test_kimi_top_level_cached_tokens_are_normalized(stream: bool) -> None:
         }
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_qwen38_reasoning_round_trips_for_normal_assistant_turns(stream: bool) -> None:
+    calls: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        calls.append(body)
+        if len(calls) == 1:
+            if stream:
+                events = [
+                    {"choices": [{"delta": {"reasoning_content": "private qwen state"}}]},
+                    {"choices": [{"delta": {"content": "Public answer."}}]},
+                ]
+                body_sse = "".join(f"data: {json.dumps(event)}\n" for event in events)
+                return httpx.Response(200, text=body_sse + "data: [DONE]\n")
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "reasoning_content": "private qwen state",
+                                "content": "Public answer.",
+                            }
+                        }
+                    ]
+                },
+            )
+
+        assistant_wire = body["messages"][1]
+        assert PROVIDER_METADATA_KEY not in assistant_wire
+        assert assistant_wire["content"] == "Public answer."
+        assert assistant_wire["reasoning_content"] == "private qwen state"
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        api_key="test",
+        model="qwen3.8-max",
+        enable_thinking=True,
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(
+        messages=[{"role": "user", "content": "reason"}],
+        tools=[],
+        stream=stream,
+    )
+    assert first.content == "Public answer."
+    assert first.provider_metadata is not None
+    assert first.provider_metadata["qwen"] == {"reasoning_content": "private qwen state"}
+    assistant_message = attach_provider_metadata_to_assistant_message(
+        {"role": "assistant", "content": first.content},
+        first,
+    )
+    assert PROVIDER_METADATA_KEY in assistant_message
+    assert "reasoning_content" not in assistant_message
+
+    second = client.chat(
+        messages=[
+            {"role": "user", "content": "reason"},
+            assistant_message,
+            {"role": "user", "content": "continue"},
+        ],
+        tools=[],
+    )
+    assert second.content == "ok"
+
+
 def test_qwen_streamed_reasoning_round_trips_opaquely_for_tool_calls() -> None:
     calls: list[dict[str, object]] = []
     reasoning_deltas: list[str] = []
@@ -1686,6 +1778,45 @@ def test_qwen_streamed_reasoning_round_trips_opaquely_for_tool_calls() -> None:
         tools=[],
     )
     assert second.content == "ok"
+
+
+def test_qwen38_normal_reasoning_never_crosses_credential_routes() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    producer = OpenAICompatClient(
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        api_key="credential-a",
+        model="qwen3.8-max",
+    )
+    consumer = OpenAICompatClient(
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        api_key="credential-b",
+        model="qwen3.8-max",
+        transport=httpx.MockTransport(handler),
+    )
+    assistant = {
+        "role": "assistant",
+        "content": "public answer",
+        PROVIDER_METADATA_KEY: stamp_provider_metadata_for_route(
+            {"qwen": {"reasoning_content": "private qwen state"}},
+            producer.route_identity,
+        ),
+    }
+
+    consumer.chat(
+        messages=[
+            {"role": "user", "content": "reason"},
+            assistant,
+            {"role": "user", "content": "continue"},
+        ]
+    )
+
+    assistant_wire = captured["messages"][1]
+    assert assistant_wire == {"role": "assistant", "content": "public answer"}
 
 
 def test_provider_metadata_is_stripped_for_non_deepseek_transports() -> None:
@@ -2058,7 +2189,10 @@ def test_mistral_stream_reconstructs_signed_thinking_chunks_for_opaque_replay() 
 @pytest.mark.parametrize(
     ("model", "effort", "expected"),
     [
-        ("gemini-3.1-pro-preview", "minimal", "minimal"),
+        ("gemini-3.7-flash", "minimal", "medium"),
+        ("gemini-3.7-flash", "none", "medium"),
+        ("gemini-3.7-flash", "medium", "medium"),
+        ("gemini-3.1-pro-preview", "minimal", None),
         ("gemini-3.1-pro-preview", "medium", "medium"),
         ("gemini-3.1-pro-preview", "high", "high"),
         ("gemini-3.1-pro-preview", "none", None),
@@ -2137,6 +2271,7 @@ def test_reasoning_effort_is_omitted_for_unsupported_transports(
         "dashscope_thinking",
         "openrouter_reasoning",
         "mistral_thinking",
+        "nvidia_reasoning",
     ],
 )
 def test_explicit_custom_reasoning_adapter_controls_stream_parse_replay_and_route_gate(
@@ -2184,7 +2319,11 @@ def test_explicit_custom_reasoning_adapter_controls_stream_parse_replay_and_rout
             "reasoning_content": sentinel,
             "tool_calls": [tool_call],
         }
-        metadata_namespace = "deepseek" if adapter == "deepseek_reasoning" else "qwen"
+        metadata_namespace = {
+            "deepseek_reasoning": "deepseek",
+            "dashscope_thinking": "qwen",
+            "nvidia_reasoning": "nvidia",
+        }[adapter]
 
     stream_body = "data: " + json.dumps({"choices": [{"delta": delta}]}) + "\n\ndata: [DONE]\n\n"
 
@@ -2194,7 +2333,13 @@ def test_explicit_custom_reasoning_adapter_controls_stream_parse_replay_and_rout
         if len(calls) == 1:
             reasoning_fields = {
                 key
-                for key in ("enable_thinking", "thinking", "reasoning", "reasoning_effort")
+                for key in (
+                    "enable_thinking",
+                    "thinking",
+                    "reasoning",
+                    "reasoning_effort",
+                    "chat_template_kwargs",
+                )
                 if key in body
             }
             expected_fields = {
@@ -2202,12 +2347,14 @@ def test_explicit_custom_reasoning_adapter_controls_stream_parse_replay_and_rout
                 "dashscope_thinking": {"enable_thinking"},
                 "openrouter_reasoning": {"reasoning"},
                 "mistral_thinking": {"reasoning_effort"},
+                "nvidia_reasoning": set(),
             }
             expected_payloads = {
                 "deepseek_reasoning": {"thinking": {"type": "enabled"}},
                 "dashscope_thinking": {"enable_thinking": True},
                 "openrouter_reasoning": {"reasoning": {"effort": "high"}},
                 "mistral_thinking": {"reasoning_effort": "high"},
+                "nvidia_reasoning": {},
             }
             assert reasoning_fields == expected_fields[adapter]
             assert all(body[key] == value for key, value in expected_payloads[adapter].items())
@@ -3145,6 +3292,461 @@ def test_includes_enable_thinking_when_configured() -> None:
     assert resp.content == "ok"
 
 
+@pytest.mark.parametrize("enable_thinking", [None, True, False])
+def test_nvidia_super_uses_flat_reasoning_contract_without_parser_rescue(
+    enable_thinking: bool | None,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert "chat_template_kwargs" not in body
+        assert "enable_thinking" not in body
+        if enable_thinking is False:
+            assert body["reasoning_effort"] == "none"
+        elif enable_thinking is True:
+            assert body["reasoning_effort"] == "high"
+        else:
+            assert "reasoning_effort" not in body
+        assert "reasoning_budget" not in body
+        # NVIDIA documents tool use with reasoning; do not inherit another
+        # provider's forced-tool restriction without evidence.
+        assert body["tool_choice"] == "required"
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key="test",
+        model="nvidia/nemotron-3-super-120b-a12b",
+        enable_thinking=enable_thinking,
+        reasoning_effort="high" if enable_thinking is True else None,
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "use a tool"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ],
+        tool_choice="required",
+    )
+    assert response.content == "ok"
+
+
+def test_nvidia_super_stream_keeps_structured_reasoning_out_of_tool_call_content() -> None:
+    private_reasoning = "PRIVATE_NVIDIA_REASONING"
+    public_deltas: list[str] = []
+    tool_call = {
+        "index": 0,
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": '{"query":"status"}'},
+    }
+    stream_body = (
+        "data: "
+        + json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "reasoning_content": private_reasoning,
+                            "content": None,
+                            "tool_calls": [tool_call],
+                        }
+                    }
+                ]
+            }
+        )
+        + "\n\ndata: [DONE]\n\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert "chat_template_kwargs" not in body
+        return httpx.Response(
+            200,
+            text=stream_body,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = OpenAICompatClient(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key="test",
+        model="nvidia/nemotron-3-super-120b-a12b",
+        reasoning_effort="high",
+        transport=httpx.MockTransport(handler),
+    )
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "use a tool"}],
+        tools=[{"type": "function", "function": {"name": "lookup", "parameters": {}}}],
+        stream=True,
+        on_text_delta=public_deltas.append,
+    )
+
+    assert response.content == ""
+    assert public_deltas == []
+    assert response.tool_calls[0].name == "lookup"
+    assert response.provider_metadata is not None
+    assert response.provider_metadata["nvidia"]["reasoning_content"] == private_reasoning
+
+
+def test_nvidia_nim_omits_thinking_controls_when_unconfigured() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert "chat_template_kwargs" not in body
+        assert "reasoning_budget" not in body
+        assert "reasoning_effort" not in body
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key="test",
+        model="nvidia/nemotron-3-super-120b-a12b",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert client.chat(messages=[{"role": "user", "content": "hi"}], tools=[]).content == "ok"
+
+
+@pytest.mark.parametrize(
+    ("model", "effort"),
+    [
+        ("nvidia/nemotron-3-super-120b-a12b", "low"),
+        ("nvidia/nemotron-3-super-120b-a12b", "high"),
+        ("nvidia/nemotron-3-ultra-550b-a55b", "medium"),
+        ("nvidia/nemotron-3-ultra-550b-a55b", "high"),
+        ("deepseek-ai/deepseek-v4-pro", "high"),
+        ("deepseek-ai/deepseek-v4-pro", "max"),
+        ("deepseek-ai/deepseek-v4-flash-0731", "high"),
+    ],
+)
+def test_nvidia_hosted_models_emit_only_their_documented_flat_effort(
+    model: str,
+    effort: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key="test",
+        model=model,
+        reasoning_effort=effort,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert captured["reasoning_effort"] == effort
+    assert "chat_template_kwargs" not in captured
+
+
+def test_nvidia_nano_uses_only_its_documented_nested_toggle() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key="test",
+        model="nvidia/nemotron-3-nano-30b-a3b",
+        enable_thinking=False,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert captured["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in captured
+
+
+def test_unknown_nvidia_hosted_model_never_inherits_nemotron_controls() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key="test",
+        model="third-party/new-model",
+        enable_thinking=True,
+        reasoning_effort="high",
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(
+        messages=[{"role": "user", "content": "use a tool"}],
+        tools=[{"type": "function", "function": {"name": "lookup", "parameters": {}}}],
+    )
+
+    assert "reasoning_effort" not in captured
+    assert "chat_template_kwargs" not in captured
+
+
+@pytest.mark.parametrize("effort", ["low", "high", "max"])
+def test_zai_coding_plan_emits_only_documented_reasoning_efforts(effort: str) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        api_key="test",
+        model="glm-5.3",
+        reasoning_effort=effort,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert captured["reasoning_effort"] == effort
+    assert "thinking" not in captured
+    assert "enable_thinking" not in captured
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "medium", "xhigh"])
+def test_zai_coding_plan_omits_unsupported_reasoning_efforts(effort: str) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        api_key="test",
+        model="glm-5.3",
+        reasoning_effort=effort,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert "reasoning_effort" not in captured
+    assert "thinking" not in captured
+    assert "enable_thinking" not in captured
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "xhigh"])
+def test_qwen38_emits_only_documented_reasoning_efforts(effort: str) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        api_key="test",
+        model="qwen3.8-max",
+        reasoning_effort=effort,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert captured["enable_thinking"] is True
+    assert captured["reasoning_effort"] == effort
+
+
+@pytest.mark.parametrize("effort", ["high", "max"])
+def test_deepseek_v4_emits_only_documented_reasoning_efforts(effort: str) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url="https://api.deepseek.com",
+        api_key="test",
+        model="deepseek-v4-pro",
+        reasoning_effort=effort,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert captured["thinking"] == {"type": "enabled"}
+    assert captured["reasoning_effort"] == effort
+
+
+@pytest.mark.parametrize(
+    ("base_url", "model", "effort", "toggle_field"),
+    [
+        (
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            "qwen3.8-max",
+            "high",
+            "enable_thinking",
+        ),
+        ("https://api.deepseek.com", "deepseek-v4-pro", "low", "thinking"),
+        ("https://api.deepseek.com", "deepseek-v4-pro", "medium", "thinking"),
+        ("https://api.deepseek.com", "deepseek-v4-pro", "xhigh", "thinking"),
+    ],
+)
+def test_provider_reasoning_contract_omits_undocumented_effort_values(
+    base_url: str,
+    model: str,
+    effort: str,
+    toggle_field: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url=base_url,
+        api_key="test",
+        model=model,
+        reasoning_effort=effort,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert toggle_field in captured
+    assert "reasoning_effort" not in captured
+
+
+@pytest.mark.parametrize(
+    ("base_url", "provider_key", "model", "effort"),
+    [
+        ("https://api.groq.com/openai/v1", "groq", "openai/gpt-oss-120b", "high"),
+        ("https://api.groq.com/openai/v1", "groq", "qwen/qwen3.6-27b", "default"),
+        ("https://api.cerebras.ai/v1", "cerebras", "gpt-oss-120b", "medium"),
+        (
+            "https://api.cohere.ai/compatibility/v1",
+            "cohere",
+            "command-a-reasoning-08-2025",
+            "high",
+        ),
+    ],
+)
+def test_contract_opted_in_providers_emit_exact_flat_reasoning_effort(
+    base_url: str,
+    provider_key: str,
+    model: str,
+    effort: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url=base_url,
+        api_key="test",
+        model=model,
+        provider_key=provider_key,
+        reasoning_effort=effort,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert captured["reasoning_effort"] == effort
+    assert "thinking" not in captured
+    assert "enable_thinking" not in captured
+    assert "reasoning" not in captured
+
+
+@pytest.mark.parametrize(
+    ("base_url", "provider_key", "model"),
+    [
+        ("https://api.cerebras.ai/v1", "cerebras", "zai-glm-4.7"),
+        (
+            "https://api.cohere.ai/compatibility/v1",
+            "cohere",
+            "command-a-reasoning-08-2025",
+        ),
+    ],
+)
+def test_contract_opted_in_providers_emit_documented_explicit_off(
+    base_url: str,
+    provider_key: str,
+    model: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url=base_url,
+        api_key="test",
+        model=model,
+        provider_key=provider_key,
+        enable_thinking=False,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert captured["reasoning_effort"] == "none"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "provider_key", "model", "effort"),
+    [
+        ("https://api.cerebras.ai/v1", "cerebras", "zai-glm-4.7", "high"),
+        ("https://api.cerebras.ai/v1", "cerebras", "gemma-4-31b", "high"),
+        ("https://api.x.ai/v1", "xai", "grok-4.6", "xhigh"),
+        (
+            "https://api.fireworks.ai/inference/v1",
+            "fireworks",
+            "accounts/fireworks/models/minimax-m3",
+            "high",
+        ),
+        (
+            "https://api.fireworks.ai/inference/v1",
+            "fireworks",
+            "accounts/fireworks/models/future",
+            "high",
+        ),
+    ],
+)
+def test_unverified_flat_effort_values_are_not_emitted(
+    base_url: str,
+    provider_key: str,
+    model: str,
+    effort: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = OpenAICompatClient(
+        base_url=base_url,
+        api_key="test",
+        model=model,
+        provider_key=provider_key,
+        reasoning_effort=effort,
+        transport=httpx.MockTransport(handler),
+    )
+
+    client.chat(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+    assert "reasoning_effort" not in captured
+
+
 def test_chat_sanitizes_surrogate_escaped_message_content() -> None:
     original = "θελω να φτιαξουμε ενα website με AI news"
     surrogate_text = _surrogate_escaped_text(original)
@@ -3915,20 +4517,41 @@ def test_stream_keeps_content_over_reasoning() -> None:
     assert resp.content == "real answer"
 
 
-def test_sylliptor_trial_proxy_resolves_to_openrouter_provider_key() -> None:
-    assert _provider_key_from_base_url(_SYLLIPTOR_TRIAL_BASE_URL) == "openrouter"
+def test_sylliptor_hosted_proxy_resolves_to_deepseek_provider_key() -> None:
+    # The proxy forwarded to OpenRouter only during the retired MiMo trial; it
+    # now forwards to DeepSeek.
+    assert _provider_key_from_base_url(_SYLLIPTOR_TRIAL_BASE_URL) == "deepseek"
     # A plain supabase host without the LLM proxy path must NOT be captured.
-    assert _provider_key_from_base_url("https://other.supabase.co/rest/v1") != "openrouter"
+    assert _provider_key_from_base_url("https://other.supabase.co/rest/v1") != "deepseek"
 
 
-def test_trial_proxy_captures_reasoning_into_provider_metadata() -> None:
-    # Because the trial proxy is classified as openrouter, a reasoning field on a
-    # normal (non-empty content) completion is preserved in provider_metadata.
-    handler = _content_handler({"content": "ok", "reasoning": "hidden reasoning"})
+def test_nvidia_hosted_nim_endpoint_resolves_exactly() -> None:
+    assert _provider_key_from_base_url("https://integrate.api.nvidia.com/v1") == "nvidia"
+    assert _provider_key_from_base_url("https://build.nvidia.com/v1") != "nvidia"
+
+
+def test_kimi_membership_endpoint_resolves_separately_from_moonshot_platform() -> None:
+    assert _provider_key_from_base_url("https://api.kimi.com/coding/v1") == "kimi-code"
+    assert _provider_key_from_base_url("https://api.moonshot.ai/v1") == "moonshot"
+
+
+def test_zai_coding_plan_endpoint_resolves_without_capturing_general_api() -> None:
+    assert _provider_key_from_base_url("https://api.z.ai/api/coding/paas/v4") == "zai_coding_plan"
+    assert _provider_key_from_base_url("https://api.z.ai/api/paas/v4") != "zai_coding_plan"
+    assert _provider_key_from_base_url("https://api.z.ai/api/coding/paas/v40") != (
+        "zai_coding_plan"
+    )
+
+
+def test_hosted_proxy_captures_reasoning_into_deepseek_provider_metadata() -> None:
+    # The hosted proxy is classified as deepseek (its upstream), so a
+    # reasoning_content field on a normal (non-empty content) completion is
+    # preserved under the deepseek provider_metadata key.
+    handler = _content_handler({"content": "ok", "reasoning_content": "hidden reasoning"})
     resp = _trial_client(handler).chat(messages=[{"role": "user", "content": "hi"}])
     assert resp.content == "ok"
     assert resp.provider_metadata is not None
-    assert resp.provider_metadata["openrouter"] == {"reasoning": "hidden reasoning"}
+    assert resp.provider_metadata["deepseek"] == {"reasoning_content": "hidden reasoning"}
     assert resp.provider_metadata["openai_compat"]["request_plan"]["input_mode"] == "full"
 
 
@@ -4052,12 +4675,14 @@ def test_openai_compat_count_gates_foreign_route_before_transport_projection(
         *,
         provider_key: str | None,
         reasoning_provider_key: str | None = None,
+        model: str | None = None,
     ) -> list[dict[str, object]]:
         projected_inputs.append(messages)
         return original(
             messages,
             provider_key=provider_key,
             reasoning_provider_key=reasoning_provider_key,
+            model=model,
         )
 
     monkeypatch.setattr(openai_compat_mod, "_messages_for_transport", capture_projection)

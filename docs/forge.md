@@ -1,132 +1,47 @@
 # Forge
 
-Forge is Sylliptor's plan-driven workflow for larger coding tasks. It turns a broad request into
-an explicit task plan, executes scoped tasks, and keeps verification and review evidence visible.
+Forge is Sylliptor's plan-driven workflow for larger coding tasks. It turns a
+broad request into scoped work, runs ready tasks, and keeps verification and
+review evidence together.
 
-Use it for multi-file implementation work, staged refactors, release cleanup, or any task where you
-want an explicit plan before changes are made.
+Use it for multi-file changes, staged refactors, or release work where you want
+to review the plan before implementation starts.
 
-## Start From Chat
+## Start Forge
 
-From a repository workspace:
+Open Sylliptor in the repository and enter `/forge`. Describe the outcome you
+want, then use the on-screen actions to refine the goal, inspect tasks, and
+approve execution.
 
-```bash
-sylliptor chat
-/forge
-```
+`/back` returns to the normal session without losing the current run. Use
+`/forge resume` when you want to reopen the active run for that workspace.
 
-Inside Forge, use the on-screen plan commands to refine the goal, inspect tasks, edit the plan,
-and execute approved work. `/back` returns to normal chat while preserving the current run pointer
-for the same workspace.
+## The Plan
 
-Use `/forge resume` when you want to attach explicitly to the current run pointer instead of
-starting a fresh run for the chat session.
+A good Forge task has:
 
-## Direct CLI Flow
+- one clear objective
+- a small, explicit write scope
+- useful acceptance criteria or verification commands
+- dependencies only where another task must finish first
 
-Create or open a plan:
-
-```bash
-sylliptor forge plan --path .
-sylliptor forge show --path .
-sylliptor forge status --path .
-```
-
-Execute one task from the plan:
-
-```bash
-sylliptor forge exec T01 --path . --mode review
-```
-
-Run a PR-style local flow for one task:
-
-```bash
-sylliptor forge exec T01 --path . --pr --verify strict --review
-```
-
-Run multiple ready tasks in batches:
-
-```bash
-sylliptor forge swarm --path . --parallel 3 --mode auto --verify warn
-```
-
-Preview the swarm schedule without executing:
-
-```bash
-sylliptor forge swarm --path . --dry-run
-```
-
-Review a task result:
-
-```bash
-sylliptor forge review T01 --path .
-```
-
-## Plan Artifacts
-
-Forge stores run state under the workspace's Sylliptor runtime directory. The important artifacts
-are the structured task plan, a human-readable plan summary, per-task execution logs, verification
-results, and review outputs.
-
-Tasks should stay small and scoped. A good task has:
-
-- a clear objective
-- explicit write paths
-- verification commands or acceptance criteria
-- dependencies on earlier tasks when needed
+Forge keeps the structured plan, a readable summary, task logs, verification
+results, and reviews under the workspace's local Sylliptor runtime directory.
+This makes interrupted work resumable and completed work easier to inspect.
 
 ## Execution And Review
 
-`forge exec` runs a single task. By default, write-scope enforcement is strict. Use `--scope warn`
-or `--scope off` only when a task legitimately needs broader edits.
+Ready tasks can run independently and in parallel. Forge respects their
+dependencies, keeps worker changes scoped, and integrates successful work in
+batches.
 
-`--pr` creates a local PR-style flow around the task: branch, execute, commit, verify, review, and
-merge back when the gates pass. `--keep-branch` keeps the task branch for debugging.
+Verification can be advisory or strict. In strict mode, a task does not pass
+without successful verification. Review results and failed checks stay with the
+run so they can guide a retry instead of being lost.
 
-`--verify` controls verification policy:
-
-- `off`: do not run the verification gate
-- `warn`: collect verification output without hard-failing normal execution; in `--pr` mode, failed
-  verification still blocks merge
-- `strict`: fail the task when verification fails
-
-Repeat `--verify-cmd` to provide explicit verification commands.
-
-## Swarm Runs
-
-`forge swarm` executes multiple ready tasks from the current plan. It respects dependencies and
-integrates successful task branches in batches.
-
-Useful controls:
-
-- `--parallel <n>` sets worker concurrency.
-- `--max-tasks <n>` limits one run.
-- `--only T01,T02` runs selected tasks while still enforcing dependencies.
-- `--retry-failed` and `--retry-changes-requested` include tasks that were previously not accepted.
-- `--integration-verify` controls the verification gate after a batch is integrated.
-- `--replan suggest|apply` enables between-batch replanning.
-
-Start with `--dry-run` when reviewing a plan for the first time.
-
-## Current Scope
-
-Forge is intentionally stricter than normal chat. It expects a concrete workspace, small scoped
-tasks, and clear verification commands for strict gates.
-
-- `forge exec --pr` is the strongest acceptance path because it wraps execution in branch, commit,
-  verification, review, and merge gates. Plain `forge exec` keeps a simpler local execution flow and
-  should be reviewed before you commit or merge results manually.
-- A PR-style merge requires verification and review gates to pass. `--verify warn` records a
-  non-strict verification failure as evidence, but it does not merge a failing task branch.
-- Sequential execution and swarm workers currently run without subagents. Use top-level
-  `sylliptor chat` or `sylliptor run` for delegated exploration before starting Forge execution, or
-  split the plan into smaller scoped tasks.
-- Strict verification needs explicit or inferable commands. If Sylliptor cannot determine what to
-  run, provide `--verify-cmd`.
-- Forge does not use a persistent partial-success task status. Incomplete work is represented by
-  task status, reports, verification output, review results, and execution artifacts.
-- Image handling uses conservative budget reserves; Sylliptor does not claim provider-exact vision
-  token accounting for Forge execution.
+Forge can also wrap a task in a local PR-style flow with its own branch, commit,
+verification, review, and merge gates. Nothing is pushed to a remote by that
+local flow.
 
 ## Modes And Safety
 
@@ -134,19 +49,24 @@ Forge follows the same execution modes as the rest of Sylliptor:
 
 - `readonly` inspects and plans only.
 - `review` asks before writes and shell commands.
-- `auto` can apply approved changes with fewer prompts.
-- `fullaccess` disables mode-level write and shell prompts; use only in trusted workspaces.
+- `auto` applies routine changes with fewer prompts.
+- `fullaccess` removes mode-level prompts in a trusted workspace.
 
-For public projects, start with `review` and move to `auto` only after the plan, write scopes, and
-verification commands are clear.
+Start in `review` when the plan or write scope still needs inspection. Move to
+`auto` only when the tasks and verification are clear.
 
 ## Practical Guidance
 
-- Keep the initial request specific enough to identify target behavior and files.
-- Review task scopes before execution.
-- Prefer smaller batches for unrelated subsystems.
-- Treat failed verification as review evidence, not as noise to hide.
-- Commit or merge only after reviewing the final diff and verification output.
+- Keep unrelated work in separate tasks.
+- Review write scopes before execution.
+- Use smaller batches when failures would be hard to untangle.
+- Treat failed verification as useful evidence.
+- Review the final diff before committing or merging.
 
-See [Execution modes](../README.md#execution-modes), [Shell sandbox](shell_sandbox.md), [Security model](security_model.md),
-and [MCP](mcp.md) for the lower-level controls Forge builds on.
+Forge also has commands for automation, including `forge exec` and
+`forge swarm`. They are listed in the [Reference](reference.md); the interactive
+workflow is the normal place to start.
+
+See [Execution modes](../README.md#execution-modes),
+[Shell sandbox](shell_sandbox.md), and [Security model](security_model.md) for
+the controls Forge builds on.

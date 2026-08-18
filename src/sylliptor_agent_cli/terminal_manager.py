@@ -21,6 +21,7 @@ from .background_runner import (
     BackgroundTerminationMode,
 )
 from .sandbox_settings import ShellSandboxSettings
+from .terminal_ownership import TerminalOwnershipHandle, TerminalOwnershipLedger
 
 _LOGGER = logging.getLogger("sylliptor_agent_cli.terminal_manager")
 _STREAM_READ_CHUNK_SIZE = 8192
@@ -123,6 +124,7 @@ class BackgroundProcess:
         cwd: Path,
         output_max_lines: int,
         output_max_bytes: int,
+        ownership_ledger: TerminalOwnershipLedger | None = None,
     ) -> None:
         self.process_id = uuid.uuid4().hex[:12]
         self.cmd = cmd
@@ -150,6 +152,16 @@ class BackgroundProcess:
             if self._termination_mode == "process_group"
             else None
         )
+        self._ownership_ledger = ownership_ledger
+        self._ownership_handle: TerminalOwnershipHandle | None = None
+        if ownership_ledger is not None:
+            self._ownership_handle = ownership_ledger.track(
+                child_pid=self._popen.pid,
+                termination_mode=self._termination_mode,
+                posix_pgid=self._posix_pgid,
+                cleanup_kind=spawn.orphan_cleanup_kind,
+                cleanup_id=spawn.orphan_cleanup_id,
+            )
         self._stdout_done = threading.Event()
         self._stderr_done = threading.Event()
 
@@ -364,6 +376,8 @@ class BackgroundProcess:
         self._stdout_done.wait()
         self._stderr_done.wait()
         cleanup_reason = self._run_cleanup_once()
+        if cleanup_reason is None and self._ownership_ledger is not None:
+            self._ownership_ledger.release(self._ownership_handle)
 
         with self._condition:
             self.exit_code = exit_code
@@ -477,9 +491,12 @@ class TerminalManager:
         *,
         runner: BackgroundShellRunner,
         settings: ShellSandboxSettings,
+        ownership_ledger: TerminalOwnershipLedger | None = None,
     ) -> None:
         self._runner = runner
         self._settings = settings
+        self._ownership_ledger = ownership_ledger or TerminalOwnershipLedger()
+        self._ownership_ledger.scavenge_stale()
         self._processes: dict[str, BackgroundProcess] = {}
         self._pending_starts = 0
         self._lock = threading.Lock()
@@ -529,6 +546,7 @@ class TerminalManager:
                     cwd=cwd_abs,
                     output_max_lines=self._settings.background_output_max_lines,
                     output_max_bytes=self._settings.background_output_max_bytes,
+                    ownership_ledger=self._ownership_ledger,
                 )
             except BaseException:
                 with self._lock:

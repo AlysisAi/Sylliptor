@@ -710,16 +710,12 @@ def test_natural_language_navigation_logs_active_workdir_changes(
         session.close()
 
 
-def test_router_client_forces_reasoning_off_while_coding_client_keeps_it(
+def test_session_provisions_no_router_client_and_coding_client_keeps_reasoning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Routing/classification calls (the strict-JSON router plus short non-repo
-    # replies) must run with model reasoning disabled: on slow reasoning models
-    # (e.g. Xiaomi MiMo via the hosted trial proxy) the extra thinking inflates
-    # latency/tokens enough to exceed the request timeout, which silently degrades
-    # the turn to the generic clarification fallback. Deep reasoning must remain
-    # enabled on the coding client.
+    # Router-free path: no router/classification client exists at all, and the
+    # coding client keeps the configured deep-reasoning settings.
     repo = tmp_path / "repo"
     repo.mkdir(parents=True, exist_ok=True)
     _fake_git_repo(repo)
@@ -748,10 +744,7 @@ def test_router_client_forces_reasoning_off_while_coding_client_keeps_it(
         # Coding client honors the configured reasoning settings...
         assert session.client.enable_thinking is True
         assert session.client.reasoning_effort == "high"
-        # ...but the router/classification client forces reasoning off so routing
-        # stays fast and deterministic.
-        assert session.router_client is not None
-        assert session.router_client.enable_thinking is False
-        assert session.router_client.reasoning_effort in (None, "")
+        # ...and no router/classification client is provisioned at all.
+        assert session.router_client is None
     finally:
         session.close()

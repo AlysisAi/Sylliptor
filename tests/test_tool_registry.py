@@ -14,6 +14,7 @@ from sylliptor_agent_cli.agent.tools_assembly import _BUILTIN_MODEL_DESCRIPTIONS
 from sylliptor_agent_cli.agent_loop import build_tools
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.llm.metadata import endpoint_descriptor
+from sylliptor_agent_cli.runtime_kind import RuntimeKind
 from sylliptor_agent_cli.session_store import SessionStore, read_session_events
 from sylliptor_agent_cli.subagents import built_in_subagents
 from sylliptor_agent_cli.tools.availability import (
@@ -27,6 +28,7 @@ from sylliptor_agent_cli.tools.availability import (
     unavailable_tool_result,
 )
 from sylliptor_agent_cli.tools.registry import (
+    REPORT_BLOCKER_MAX_MESSAGE_CHARS,
     built_in_subagent_tool_names,
     builtin_tool_names_with_category,
     get_builtin_tool_metadata,
@@ -80,6 +82,80 @@ def test_builtin_tool_registry_metadata_is_complete_and_unique() -> None:
         assert spec.rich.reasoning_hint.strip()
         assert spec.rich.action_hint.strip()
         assert spec.rich.fallback_hint.strip()
+
+
+def test_report_blocker_registry_contract_is_free_form_and_hidden_from_subagents() -> None:
+    metadata = get_builtin_tool_metadata("report_blocker")
+    properties = metadata.parameters["properties"]
+
+    assert set(properties) == {"message"}
+    assert metadata.parameters["required"] == ["message"]
+    assert properties["message"]["type"] == "string"
+    assert properties["message"]["maxLength"] == REPORT_BLOCKER_MAX_MESSAGE_CHARS
+    assert "enum" not in properties["message"]
+    assert "category" not in json.dumps(metadata.parameters).casefold()
+    assert metadata.built_in_subagent_exposure == "hidden"
+    assert "report_blocker" not in built_in_subagent_tool_names(exposure="readonly")
+
+
+def test_report_blocker_accepts_any_language_without_category_keywords(tmp_path: Path) -> None:
+    _fake_git_repo(tmp_path)
+    tools = build_tools(
+        root=tmp_path,
+        console=Console(file=io.StringIO()),
+        store=_store(tmp_path),
+        mode="auto",
+        yes=True,
+        non_interactive=True,
+        one_shot_execution=True,
+        completion_gate_tools_enabled=True,
+        runtime_kind=RuntimeKind.ONE_SHOT,
+    )
+
+    for message in (
+        "Δεν είναι διαθέσιμη η απαιτούμενη εξωτερική είσοδος.",
+        "لا يمكن الوصول إلى الخدمة الخارجية الآن.",
+        "必要な外部サービスに接続できません。",
+        "¿¡…?!",
+    ):
+        assert tools["report_blocker"].run({"message": message}) == {
+            "ok": True,
+            "reported": True,
+            "message": message,
+        }
+
+
+def test_report_blocker_is_exposed_only_to_eligible_top_level_runtimes(
+    tmp_path: Path,
+) -> None:
+    cases = (
+        (RuntimeKind.ONE_SHOT, 0, True, True),
+        (RuntimeKind.FORGE_EXEC, 0, True, True),
+        (RuntimeKind.INTERACTIVE_CHAT, 0, True, True),
+        (RuntimeKind.ONE_SHOT, 0, False, False),
+        (RuntimeKind.SUBAGENT, 1, True, False),
+        (RuntimeKind.SWARM_WORKER, 0, True, False),
+        (RuntimeKind.CONFLICT_AUTO_RESOLVE, 0, True, False),
+    )
+
+    for index, (runtime_kind, subagent_depth, enabled, expected) in enumerate(cases):
+        root = tmp_path / f"case-{index}"
+        root.mkdir()
+        _fake_git_repo(root)
+        tools = build_tools(
+            root=root,
+            console=Console(file=io.StringIO()),
+            store=_store(root),
+            mode="auto",
+            yes=True,
+            non_interactive=True,
+            one_shot_execution=runtime_kind in {RuntimeKind.ONE_SHOT, RuntimeKind.FORGE_EXEC},
+            completion_gate_tools_enabled=enabled,
+            subagent_depth=subagent_depth,
+            runtime_kind=runtime_kind,
+        )
+
+        assert ("report_blocker" in tools) is expected
 
 
 def test_shell_background_family_metadata_present() -> None:
@@ -483,7 +559,9 @@ def test_image_generate_metadata_is_billable_optional_write_tool() -> None:
     assert "never overwritten" in metadata.description
 
 
-def test_image_generate_tool_is_opt_in_and_respects_protected_paths(tmp_path: Path) -> None:
+def test_image_generate_tool_is_opt_in_and_protects_metadata(
+    tmp_path: Path,
+) -> None:
     disabled = build_tools(
         root=tmp_path,
         console=Console(file=io.StringIO()),

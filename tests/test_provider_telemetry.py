@@ -818,6 +818,53 @@ class _TelemetryTruncatedSseStream(httpx.SyncByteStream):
         raise httpx.RemoteProtocolError("incomplete chunked read")
 
 
+def test_stream_retry_fires_stream_restart_hook_after_emitted_tokens() -> None:
+    # The duck-typed reset channel: when a retry re-runs a streamed request
+    # AFTER tokens already reached the delta callback, the client must invoke
+    # callback.stream_restart before the restream so the surface can clear
+    # its live block (the visible half of the doubled-reply fix).
+    reset_provider_telemetry_for_tests()
+    attempts = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(200, stream=_TelemetryTruncatedSseStream())
+        body = 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+        return httpx.Response(200, content=body)
+
+    client = OpenAICompatClient(
+        base_url="https://api.openai.com/v1",
+        api_key="test-key",
+        model="gpt-test",
+        provider_key="openai",
+        transport=httpx.MockTransport(handler),
+        provider_retry_settings=ProviderRetrySettings(max_retries=1),
+        provider_sleep_fn=lambda _seconds: None,
+        provider_random_fn=lambda: 0.5,
+    )
+
+    deltas: list[str] = []
+    restarts: list[int] = []
+
+    def on_delta(text: str) -> None:
+        deltas.append(text)
+
+    on_delta.stream_restart = lambda: restarts.append(len(deltas))  # type: ignore[attr-defined]
+
+    response = client.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        on_text_delta=on_delta,
+    )
+    assert response.content == "ok"
+    # "partial" streamed before the failure: the hook fired exactly once,
+    # between the abandoned tokens and the restreamed reply.
+    assert deltas == ["partial", "ok"]
+    assert restarts == [1]
+
+
 def test_stream_retry_telemetry_records_restart_without_raw_content() -> None:
     reset_provider_telemetry_for_tests()
     attempts = 0

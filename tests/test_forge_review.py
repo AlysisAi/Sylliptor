@@ -80,7 +80,8 @@ def test_review_command_exit_zero_when_approved(tmp_path: Path, monkeypatch) -> 
     assert "Approved: yes" in result.output
 
 
-def test_review_command_exit_one_when_not_approved(tmp_path: Path, monkeypatch) -> None:
+def test_review_command_exit_zero_when_not_approved(tmp_path: Path, monkeypatch) -> None:
+    """A completed review that rejects work is not a failed command."""
     runner = CliRunner()
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -119,5 +120,5 @@ def test_review_command_exit_one_when_not_approved(tmp_path: Path, monkeypatch) 
         ],
         env=_env(tmp_path),
     )
-    assert result.exit_code == 1
+    assert result.exit_code == 0
     assert "Approved: no" in result.output

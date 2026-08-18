@@ -1,6 +1,6 @@
 # Quickstart
 
-This guide gets Sylliptor installed, configured, and running against a local workspace.
+This guide gets Sylliptor running in a local workspace.
 
 ## Install
 
@@ -33,63 +33,22 @@ cd /path/to/project
 sylliptor
 ```
 
-On a fresh install, the setup wizard guides you through connection, model, and
-workspace selection. Re-run setup anytime:
+On a fresh install, the setup wizard guides you through the connection, model,
+and workspace. Later, use `/login` to connect a different account or supported
+subscription, and `/config` to change the provider or model.
 
-```bash
-sylliptor setup
-```
+See [Providers and models](providers.md) for the available connection types.
 
-For manual configuration:
+## Start Working
 
-```bash
-export SYLLIPTOR_API_KEY="YOUR_KEY"
-sylliptor config set base_url "https://api.openai.com/v1"
-sylliptor config set model "gpt-4.1-mini"
-```
+Describe what you want in normal language. For example:
 
-To connect a supported ChatGPT subscription instead of configuring an API key:
+> Explain this repository and show me the main entry points.
 
-```bash
-sylliptor auth list
-sylliptor auth login openai-codex
-sylliptor chat
-```
+> Reproduce the failing test, fix it, and verify the result.
 
-After login, choose the model in `/config`. See
-[Providers and models](providers.md) for additional options.
-
-To avoid storing a key, pass it for one command:
-
-```bash
-sylliptor run --api-key-stdin "Explain this repository."
-```
-
-To switch providers with a different environment variable:
-
-```bash
-export OTHER_API_KEY="YOUR_KEY"
-sylliptor run --api-key-env OTHER_API_KEY --base-url "https://example.com/v1" --model "your-model" "Hello"
-```
-
-## Run And Chat
-
-Use `run` for one-shot work:
-
-```bash
-sylliptor run --mode readonly "Explain this repository and identify the main entrypoints."
-sylliptor run --mode review "Fix the failing test and show me the diff."
-```
-
-`sylliptor run` is a bounded one-shot flow. It includes guardrails for execution-style prompts, but
-it is still best for focused tasks that can be completed from one instruction. For exploratory or
-multi-step work, prefer `sylliptor chat` or Forge.
-
-Use `chat` for an interactive session:
-
-```bash
-sylliptor chat
-```
+Sylliptor stays in the same session, so you can inspect its work, refine the
+request, or ask a follow-up without starting over.
 
 Useful chat commands:
 
@@ -97,17 +56,31 @@ Useful chat commands:
 - `/status`: show mode, workspace, and active model
 - `/pwd`: show workspace root, focus directory, and active workdir
 - `/mode`: inspect or change execution mode
-- `/config`: open the inline configuration menu, including router model and limits
+- `/config`: change the connection, model, and session settings
+- `/login`: connect a Sylliptor account or supported subscription
+- `/persona`: switch between Code, Architect, Ask, and Debug
+- `/subagent`: delegate a focused task
 - `/forge`: start the plan-driven workflow for larger tasks
+
+## Choose A Persona
+
+Open `/persona` whenever you want to change how Sylliptor approaches the work:
+
+- **Code** implements changes.
+- **Architect** focuses on plans and design.
+- **Ask** answers with read-only inspection.
+- **Debug** reproduces a problem before fixing it.
+
+Personas never grant more access than the current execution mode.
 
 ## Workspace Binding
 
-`sylliptor run` and `sylliptor chat` bind a workspace before the session starts. The requested path is
-the current directory or `--path`. Inside a Git repository, Sylliptor binds to the repository root
-and keeps the starting subdirectory as the focus directory.
+Sylliptor binds the current directory as its workspace when the session starts.
+Inside a Git repository, it uses the repository root and keeps the starting
+subdirectory as the focus directory.
 
-Missing paths require `--create-path`. Broad paths such as `~` require an explicit override, and `/`
-is blocked as a workspace root.
+Broad paths such as your home directory require explicit confirmation. The
+filesystem root is blocked as a workspace.
 
 In chat, relative file/search/shell paths default to the active workdir. You can move within the
 bound workspace with natural-language requests, `/cd`, or tool calls. Sylliptor does not rebind to a
@@ -128,26 +101,11 @@ See [Shell sandbox](shell_sandbox.md) for backend selection, production image pi
 
 ## Images And Tools
 
-For multimodal-compatible models or providers:
-
-```bash
-sylliptor run --image ./screenshot.png "Describe this screenshot."
-```
-
-Inspect the built-in tool surface:
-
-```bash
-sylliptor tools
-```
+For a multimodal model, attach an image with `/image <path>` or paste it into
+the TUI, then describe what you need.
 
 Web search works through supported provider adapters, configured external
 backends, or the keyless DDGS fallback. The active model decides when to use it.
-
-Inspect custom tools discovered for the current workspace:
-
-```bash
-sylliptor tool list --path .
-```
 
 ## Updates
 

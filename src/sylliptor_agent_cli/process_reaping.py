@@ -28,8 +28,8 @@ Hard safety rule, enforced structurally by this module:
 
 The reaping guarantee is scoped to the session that did the spawning: a session
 never signals another session's groups, and an interactive session's own turn
-never kills groups that session started. A nested delegation (subagent, power
-candidate) still cleans up what *it* started when it ends -- its work is over,
+never kills groups that session started. A nested subagent still cleans up what
+*it* started when it ends -- its work is over,
 and the groups belong to it.
 
 Everything except the signalling helpers is pure and unit-testable without
@@ -140,8 +140,8 @@ def resolve_reap_decision(
     An interactive turn is never auto-killed: a user may have asked for a dev
     server and expects it to outlive the turn. Their still-running groups are
     reported instead, and reaped when the session itself ends. Every autonomous
-    runtime kind (one-shot, forge, swarm worker, subagent, conflict resolver,
-    power candidate) declares itself done at turn end, so anything it left
+    runtime kind (one-shot, forge, swarm worker, subagent, conflict resolver)
+    declares itself done at turn end, so anything it left
     running is a leak and is terminated.
     """
     if not enabled:
@@ -478,6 +478,7 @@ def run_in_tracked_process_group(
     registry: ProcessGroupRegistry | None = None,
     origin: str = "shell_run",
     command_label: str = "",
+    stdin: Any | None = None,
     popen_factory: Callable[..., subprocess.Popen[str]] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """``subprocess.run``-equivalent that starts the command in its own group.
@@ -500,6 +501,12 @@ def run_in_tracked_process_group(
         "text": True,
         **new_process_group_popen_kwargs(),
     }
+    # Left unset by default so interactive shell work keeps the caller's stdin.
+    # Automated callers pass ``subprocess.DEVNULL`` so a command that prompts
+    # reads EOF and fails immediately instead of waiting on a terminal nobody
+    # is watching.
+    if stdin is not None:
+        popen_kwargs["stdin"] = stdin
     if cwd is not None:
         popen_kwargs["cwd"] = cwd
     if env is not None:

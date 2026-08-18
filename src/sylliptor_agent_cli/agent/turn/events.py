@@ -6,6 +6,11 @@ from typing import Any
 from ...surface.base import Surface
 
 
+def _legacy_message_tool_events_required(surface: Surface | object) -> bool:
+    """Whether a surface still needs the legacy half of dual event delivery."""
+    return not bool(getattr(surface, "canonical_message_tool_events", False))
+
+
 def _event_preview(value: Any, *, max_chars: int = 500) -> str:
     try:
         text = json.dumps(value, ensure_ascii=True, default=str)

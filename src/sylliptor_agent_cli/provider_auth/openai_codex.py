@@ -33,6 +33,9 @@ from .store import (
     save_provider_token,
 )
 
+SESSION_EXPIRED_DETAIL = "session expired"
+"""Stable ``detail`` value meaning the stored session must be re-authorized."""
+
 _ISSUER = "https://auth.openai.com"
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _RESPONSES_URL = f"{_CODEX_BASE_URL}/responses"
@@ -89,7 +92,28 @@ class OpenAICodexSubscriptionAuth:
         self._models_cache: tuple[ProviderModel, ...] | None = None
 
     def account_status(self) -> ProviderAccountStatus:
-        record = load_provider_token(self.provider_id)
+        """Report account state without ever raising.
+
+        A supervising app polls this to decide what to show the user, so every
+        failure has to come back as data. Reading the credential store can fail
+        on its own — a spawned process may not reach the OS keyring holding the
+        store's master key — so the load is guarded too, not just the refresh.
+        """
+
+        try:
+            record = load_provider_token(self.provider_id)
+        except ProviderAuthError as exc:
+            return ProviderAccountStatus(
+                connected=False,
+                verified=False,
+                detail=str(exc),
+            )
+        except Exception as exc:  # noqa: BLE001 - a status probe must not crash its caller
+            return ProviderAccountStatus(
+                connected=False,
+                verified=False,
+                detail=f"Could not read stored ChatGPT credentials ({exc.__class__.__name__}).",
+            )
         if record is None:
             return ProviderAccountStatus(
                 connected=False,
@@ -97,12 +121,14 @@ class OpenAICodexSubscriptionAuth:
             )
         try:
             record = self._valid_record(record)
-        except ProviderLoginRequiredError as exc:
+        except ProviderLoginRequiredError:
+            # A stable marker, not the thrown message: this is the one state a
+            # supervising app must be able to branch on to prompt a re-login.
             return ProviderAccountStatus(
                 connected=False,
                 verified=True,
                 account_label=record.account_label,
-                detail=str(exc),
+                detail=SESSION_EXPIRED_DETAIL,
             )
         except ProviderAuthError as exc:
             return ProviderAccountStatus(
@@ -110,6 +136,13 @@ class OpenAICodexSubscriptionAuth:
                 verified=False,
                 account_label=record.account_label,
                 detail=str(exc),
+            )
+        except Exception as exc:  # noqa: BLE001 - a status probe must not crash its caller
+            return ProviderAccountStatus(
+                connected=False,
+                verified=False,
+                account_label=record.account_label,
+                detail=f"Could not verify ChatGPT credentials ({exc.__class__.__name__}).",
             )
         return ProviderAccountStatus(
             connected=True,
@@ -917,4 +950,4 @@ def _sanitize_openai_tool_schema(value: Any) -> Any:
     return result
 
 
-__all__ = ["OpenAICodexSubscriptionAuth"]
+__all__ = ["SESSION_EXPIRED_DETAIL", "OpenAICodexSubscriptionAuth"]

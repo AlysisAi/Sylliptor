@@ -2257,13 +2257,34 @@ def test_chat_function_call_and_output_round_trip_uses_exact_call_id() -> None:
     ]
 
 
-def test_chat_empty_output_without_refusal_is_explicit() -> None:
+def test_chat_completed_empty_output_routes_to_agent_recovery() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "resp_empty", "status": "completed", "output": []})
 
+    response = _client(httpx.MockTransport(handler)).chat(
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert response.content == ""
+    assert response.tool_calls == []
+    assert response.raw["status"] == "completed"
+    assert response.provider_metadata is not None
+    assert response.provider_metadata["openai_responses"]["output_items"] == []
+
+
+def test_chat_non_completed_empty_output_remains_explicit() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"id": "resp_incomplete", "status": "incomplete", "output": []},
+        )
+
     with pytest.raises(
         LLMError,
-        match="OpenAI Responses returned no assistant text or tool calls",
+        match=(
+            "OpenAI Responses returned no assistant text or tool calls "
+            r"\(status=incomplete\)"
+        ),
     ):
         _client(httpx.MockTransport(handler)).chat(
             messages=[{"role": "user", "content": "hello"}],
@@ -2529,6 +2550,254 @@ def test_web_search_rejects_unsupported_response_shape() -> None:
         client.web_search(query="httpx docs")
 
 
+@pytest.fixture
+def _include_capability_isolation() -> object:
+    """Keep the module-level include capability cache isolated per test."""
+    from sylliptor_agent_cli.llm.openai_responses import _RESPONSES_OMIT_INCLUDE_ENDPOINTS
+
+    saved = set(_RESPONSES_OMIT_INCLUDE_ENDPOINTS)
+    _RESPONSES_OMIT_INCLUDE_ENDPOINTS.clear()
+    yield _RESPONSES_OMIT_INCLUDE_ENDPOINTS
+    _RESPONSES_OMIT_INCLUDE_ENDPOINTS.clear()
+    _RESPONSES_OMIT_INCLUDE_ENDPOINTS.update(saved)
+
+
+def _include_rejecting_gateway_handler(
+    requests: list[dict[str, object]],
+    *,
+    success_json: dict[str, object],
+) -> object:
+    """Gateway that 400s any request carrying the optional ``include`` entries."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        requests.append(body)
+        if "include" in body:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": (
+                            "include value 'web_search_call.action.sources' "
+                            "cannot be produced by this gateway"
+                        ),
+                    }
+                },
+            )
+        return httpx.Response(200, json=success_json)
+
+    return handler
+
+
+def test_web_search_retries_without_include_when_gateway_rejects_it(
+    _include_capability_isolation: set[str],
+) -> None:
+    requests: list[dict[str, object]] = []
+    handler = _include_rejecting_gateway_handler(
+        requests,
+        success_json={
+            "id": "resp_no_include",
+            "model": "search-model",
+            "output_text": "Answer from a gateway without source metadata.",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Answer from a gateway without source metadata.",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "title": "Docs",
+                                    "url": "https://docs.example.com/answer",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+
+    response = _client(httpx.MockTransport(handler)).web_search(query="gateway docs")
+
+    assert len(requests) == 2
+    assert requests[0]["include"] == ["web_search_call.action.sources"]
+    assert "include" not in requests[1]
+    assert response.answer == "Answer from a gateway without source metadata."
+    assert [source.url for source in response.sources] == ["https://docs.example.com/answer"]
+
+
+def test_web_search_skips_include_after_gateway_rejected_it_once(
+    _include_capability_isolation: set[str],
+) -> None:
+    requests: list[dict[str, object]] = []
+    handler = _include_rejecting_gateway_handler(
+        requests,
+        success_json={
+            "id": "resp_cached_capability",
+            "model": "search-model",
+            "output_text": "ok",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "ok",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "title": "Docs",
+                                    "url": "https://docs.example.com/cached",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+
+    client = _client(httpx.MockTransport(handler))
+    client.web_search(query="first search")
+    assert len(requests) == 2  # include attempt + retry without it
+
+    client.web_search(query="second search")
+    assert len(requests) == 3  # exactly one more request, sent without include
+    assert "include" not in requests[2]
+
+    # The capability is remembered per endpoint, not per client instance.
+    fresh_client = _client(httpx.MockTransport(handler))
+    fresh_client.web_search(query="third search")
+    assert len(requests) == 4
+    assert "include" not in requests[3]
+
+
+def test_web_search_accepts_absent_sources_when_include_was_rejected(
+    _include_capability_isolation: set[str],
+) -> None:
+    """A gateway that searches but cannot produce source metadata still works."""
+
+    requests: list[dict[str, object]] = []
+    handler = _include_rejecting_gateway_handler(
+        requests,
+        success_json={
+            "id": "resp_sourceless",
+            "model": "search-model",
+            "output_text": "Answer without any source metadata.",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "action": {"queries": ["sourceless docs"]},
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "Answer without any source metadata."}
+                    ],
+                },
+            ],
+        },
+    )
+
+    response = _client(httpx.MockTransport(handler)).web_search(query="sourceless docs")
+
+    assert response.answer == "Answer without any source metadata."
+    assert response.sources == []
+    assert response.queries == ["sourceless docs"]
+
+
+def test_web_search_still_rejects_searchless_responses_after_include_was_rejected(
+    _include_capability_isolation: set[str],
+) -> None:
+    """Dropping the include must not accept answers where no search happened.
+
+    A response with no web_search_call output and no citations never searched;
+    accepting it would hand the caller an unsourced answer and prevent
+    auto-mode from falling back to a working backend.
+    """
+
+    requests: list[dict[str, object]] = []
+    handler = _include_rejecting_gateway_handler(
+        requests,
+        success_json={
+            "id": "resp_never_searched",
+            "model": "search-model",
+            "output_text": "A plain model answer with no search behind it.",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "A plain model answer with no search behind it.",
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+
+    client = _client(httpx.MockTransport(handler))
+    with pytest.raises(ResponsesError, match="did not return sources"):
+        client.web_search(query="searchless docs")
+
+    # The capability cache is set, so the next call skips the include — and
+    # still refuses the searchless response.
+    with pytest.raises(ResponsesError, match="did not return sources"):
+        client.web_search(query="searchless docs again")
+
+
+def test_chat_retries_without_include_when_gateway_rejects_it(
+    _include_capability_isolation: set[str],
+) -> None:
+    requests: list[dict[str, object]] = []
+    handler = _include_rejecting_gateway_handler(
+        requests,
+        success_json={
+            "id": "resp_chat_no_include",
+            "model": "gateway-model",
+            "output_text": "Done.",
+            "output": [],
+        },
+    )
+
+    client = OpenAIResponsesClient(
+        base_url="https://gateway.example.com/v1",
+        api_key="test-key",
+        model="gateway-model",
+        web_search_mode="native",
+        web_search_adapter="openai_responses",
+        transport=httpx.MockTransport(handler),
+    )
+
+    first = client.chat(
+        messages=[{"role": "user", "content": "Find current docs."}],
+        tools=[_web_search_function_tool()],
+    )
+    assert first.content == "Done."
+    assert len(requests) == 2
+    assert requests[0]["include"] == ["web_search_call.action.sources"]
+    assert "include" not in requests[1]
+    # The hosted web_search tool itself stays enabled; only the optional
+    # source-metadata enhancement is dropped.
+    assert requests[1]["tools"] == [{"type": "web_search", "external_web_access": True}]
+
+    second = client.chat(
+        messages=[{"role": "user", "content": "Search again."}],
+        tools=[_web_search_function_tool()],
+    )
+    assert second.content == "Done."
+    assert len(requests) == 3
+    assert "include" not in requests[2]
+
+
 def test_chat_drops_temperature_when_model_rejects_it() -> None:
     """GPT-5-class models reject a non-default temperature; the client must omit
     it and retry (and remember the model), so validation + chat both succeed."""
@@ -2669,3 +2938,21 @@ def test_responses_extra_headers_override_defaults_case_insensitively() -> None:
     assert headers["authorization"] == "Bearer override"
     assert headers["content-type"] == "application/custom+json"
     assert len({name.casefold() for name in headers}) == len(headers)
+
+
+def test_responses_usage_keeps_cost_only_and_cache_write_only_payloads() -> None:
+    from sylliptor_agent_cli.llm.openai_responses import _parse_usage
+
+    cost_only = _parse_usage({"cost": {"currency": "USD", "total_cost": 0.0125}})
+    cache_write_only = _parse_usage(
+        {"input_tokens_details": {"cache_write_tokens": 40}},
+    )
+    empty = _parse_usage({})
+
+    # Provider-reported charges are authoritative, so a payload carrying only a
+    # cost must not be discarded for lacking token counts.
+    assert cost_only is not None
+    assert cost_only.provider_cost_usd == 0.0125
+    assert cache_write_only is not None
+    assert cache_write_only.cache_creation_input_tokens == 40
+    assert empty is None

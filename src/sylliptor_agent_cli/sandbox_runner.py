@@ -10,7 +10,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
@@ -427,7 +427,9 @@ def _hardened_java_config_ro_bind_paths(*, etc_root: Path = Path("/etc")) -> tup
 
 def _add_hardened_java_config_bindings(args: list[str]) -> None:
     for path in _hardened_java_config_ro_bind_paths():
-        path_s = os.fspath(path)
+        # bwrap consumes Linux namespace paths even when this pure argv builder
+        # is exercised by the Windows test harness.
+        path_s = path.as_posix()
         args.extend(["--ro-bind", path_s, path_s])
 
 
@@ -443,6 +445,7 @@ def _bwrap_path_value(path_value: str | None) -> str:
 @dataclass(frozen=True)
 class HostShellRunner:
     process_group_registry: ProcessGroupRegistry | None = None
+    close_stdin: bool = False
 
     def run(
         self,
@@ -460,6 +463,7 @@ class HostShellRunner:
             registry=self.process_group_registry,
             origin="shell_run:host",
             command_label=cmd,
+            stdin=subprocess.DEVNULL if self.close_stdin else None,
         )
 
 
@@ -628,6 +632,7 @@ class BwrapShellRunner:
     clear_env: bool = True
     profile: str = "hardened"
     process_group_registry: ProcessGroupRegistry | None = None
+    close_stdin: bool = False
 
     def run(
         self,
@@ -654,6 +659,7 @@ class BwrapShellRunner:
             registry=self.process_group_registry,
             origin="shell_run:bwrap",
             command_label=cmd,
+            stdin=subprocess.DEVNULL if self.close_stdin else None,
         )
 
 
@@ -811,6 +817,7 @@ class DockerShellRunner:
     protect_repo_meta: bool = True
     env_allowlist: tuple[str, ...] = ()
     warning_callback: Callable[[str], None] | None = None
+    close_stdin: bool = False
 
     def run(
         self,
@@ -873,6 +880,7 @@ class DockerShellRunner:
                 text=True,
                 cwd=os.fspath(root_abs),
                 env=run_env,
+                **({"stdin": subprocess.DEVNULL} if self.close_stdin else {}),
             )
             stdout, stderr = proc.communicate(timeout=timeout_s)
             return subprocess.CompletedProcess(
@@ -901,6 +909,20 @@ def _emit_warning(message: str, *, warning_callback: Callable[[str], None] | Non
         warning_callback(message)
         return
     print(f"[sylliptor] {message}", file=sys.stderr)
+
+
+def with_closed_stdin(runner: ShellRunner) -> ShellRunner:
+    """Return an equivalent runner that never inherits the caller's stdin.
+
+    Automated callers such as verification must not be able to block on an
+    interactive prompt: nobody is watching the terminal, so a command that asks
+    a question would otherwise wait until its timeout. Runners that do not
+    execute anything (disabled/lazy) are returned unchanged.
+    """
+
+    if is_dataclass(runner) and any(field.name == "close_stdin" for field in fields(runner)):
+        return replace(runner, close_stdin=True)  # type: ignore[type-var]
+    return runner
 
 
 def build_shell_runner_from_settings(

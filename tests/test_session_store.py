@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.execution_deadline import ExecutionDeadline
@@ -1633,6 +1635,17 @@ def test_local_session_owner_is_deterministic_and_nonempty() -> None:
     assert "@" in owner
     # Deterministic: two calls on the same account/host agree.
     assert local_session_owner() == owner
+
+
+def test_local_session_owner_uses_direct_nonshell_hostname(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sylliptor_agent_cli.session_store as session_store_module
+
+    monkeypatch.setattr(session_store_module.getpass, "getuser", lambda: "Alice")
+    monkeypatch.setattr(session_store_module.socket, "gethostname", lambda: "Workstation")
+
+    assert session_store_module.local_session_owner() == "Alice@Workstation"
 
 
 def test_session_store_stamps_owner_on_events(tmp_path: Path) -> None:

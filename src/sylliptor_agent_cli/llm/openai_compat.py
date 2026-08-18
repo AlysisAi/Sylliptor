@@ -7,13 +7,22 @@ import re
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 
 from ..error_text import sanitize_error_text_for_output
 from ..failure_category import provider_unavailable_retry_reason
 from ..provider_telemetry import ProviderCallTelemetryRecorder
+from ..provider_url import known_provider_key_from_base_url
+from ..reasoning_contracts import (
+    ALWAYS_ON,
+    OFF_EXPLICIT,
+    WIRE_CHAT_TEMPLATE_ENABLE_THINKING,
+    WIRE_REASONING_EFFORT,
+    WIRE_THINKING_LEVEL,
+    WIRE_THINKING_TYPE,
+    reasoning_contract_for,
+)
 from ..request_estimation import estimate_provider_payload_tokens
 from .cache_capabilities import (
     CACHE_CONTROL_FIELD,
@@ -42,6 +51,7 @@ from .metadata import (
 )
 from .metadata import (
     PROVIDER_METADATA_KEY,
+    QWEN_PROVIDER_METADATA_KEY,
     ProviderRouteIdentity,
     build_provider_route_identity,
     canonicalize_extra_headers,
@@ -91,13 +101,15 @@ from .types import (
     UsageContract,
     UsageSource,
 )
+from .usage_normalization import parse_compatible_usage
 
 _TEXT_LIKE_CONTENT_PART_TYPES = {"text", "output_text"}
 _DEEPSEEK_PROVIDER_KEY = "deepseek"
 _OPENROUTER_PROVIDER_KEY = "openrouter"
-_QWEN_PROVIDER_KEY = "qwen"
+_QWEN_PROVIDER_KEY = QWEN_PROVIDER_METADATA_KEY
 _GEMINI_PROVIDER_KEY = "gemini"
 _MOONSHOT_PROVIDER_KEY = "moonshot"
+_NVIDIA_PROVIDER_KEY = "nvidia"
 _GEMINI_EXTRA_CONTENT_KEY = "extra_content"
 _OPENAI_STYLE_REASONING_EFFORT_PROVIDERS = frozenset({"openai", "azure", "mistral"})
 _REASONING_PROVIDER_BY_ADAPTER: dict[str, str] = {
@@ -106,6 +118,7 @@ _REASONING_PROVIDER_BY_ADAPTER: dict[str, str] = {
     "dashscope_thinking": _QWEN_PROVIDER_KEY,
     "mistral_thinking": _MISTRAL_PROVIDER_KEY,
     "moonshot_reasoning": _MOONSHOT_PROVIDER_KEY,
+    "nvidia_reasoning": _NVIDIA_PROVIDER_KEY,
 }
 _GEMINI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 _DEFAULT_ACCEPT_ENCODING = "identity"
@@ -335,61 +348,8 @@ def _normalize_provider_key(provider_key: str | None) -> str:
     return "".join(char if char.isalnum() else "_" for char in normalized).strip("_")
 
 
-_SYLLIPTOR_TRIAL_PROXY_PATH_MARKER = "/functions/v1/llm"
-
-
-def _is_sylliptor_trial_proxy(*, host: str, path: str) -> bool:
-    """True for the hosted Sylliptor MiMo trial proxy (a Supabase Edge Function).
-
-    Match the ``/functions/v1/llm`` proxy path so unrelated ``*.supabase.co``
-    apps are never misclassified.
-    """
-    if _SYLLIPTOR_TRIAL_PROXY_PATH_MARKER not in path:
-        return False
-    return host == "supabase.co" or host.endswith(".supabase.co")
-
-
 def _provider_key_from_base_url(base_url: str | None) -> str | None:
-    raw = str(base_url or "").strip()
-    if not raw:
-        return None
-    try:
-        parsed = urlparse(raw)
-        host = (parsed.hostname or "").rstrip(".").casefold()
-        path = (parsed.path or "").casefold()
-    except Exception:
-        return None
-    if not host:
-        return None
-    if _is_sylliptor_trial_proxy(host=host, path=path):
-        # Hosted Sylliptor MiMo trial: a Supabase Edge Function that forwards to
-        # OpenRouter/Xiaomi and speaks the OpenRouter reasoning shape. Classifying
-        # it as openrouter activates reasoning capture/round-trip so a MiMo turn
-        # that answers only in the reasoning channel is not lost.
-        return _OPENROUTER_PROVIDER_KEY
-    if "dashscope" in host:
-        return "qwen"
-    if host == "openrouter.ai" or host.endswith(".openrouter.ai"):
-        return _OPENROUTER_PROVIDER_KEY
-    if host == "api.openai.com":
-        return "openai"
-    if (
-        host.endswith(".openai.azure.com")
-        or host.endswith(".cognitiveservices.azure.com")
-        or host.endswith(".services.ai.azure.com")
-    ):
-        return "azure"
-    if host == "api.deepseek.com" or host.endswith(".deepseek.com"):
-        return _DEEPSEEK_PROVIDER_KEY
-    if host == "generativelanguage.googleapis.com":
-        return "gemini"
-    if host == "api.mistral.ai" or host.endswith(".mistral.ai"):
-        return "mistral"
-    if host in {"api.moonshot.ai", "api.moonshot.cn"}:
-        return _MOONSHOT_PROVIDER_KEY
-    if host == "api.x.ai" or host == "x.ai" or host.endswith(".x.ai"):
-        return "xai"
-    return None
+    return known_provider_key_from_base_url(base_url)
 
 
 def _transport_provider_key(
@@ -451,7 +411,11 @@ def _is_mistral_provider(provider_key: str | None) -> bool:
 
 
 def _is_moonshot_provider(provider_key: str | None) -> bool:
-    return _normalize_provider_key(provider_key) == _MOONSHOT_PROVIDER_KEY
+    return _normalize_provider_key(provider_key) in {_MOONSHOT_PROVIDER_KEY, "kimi_code"}
+
+
+def _is_nvidia_provider(provider_key: str | None) -> bool:
+    return _normalize_provider_key(provider_key) == _NVIDIA_PROVIDER_KEY
 
 
 def _uses_reasoning_effort(provider_key: str | None) -> bool:
@@ -461,23 +425,6 @@ def _uses_reasoning_effort(provider_key: str | None) -> bool:
 def _model_name_parts(model: str | None) -> set[str]:
     normalized = str(model or "").strip().casefold()
     return {part for part in re.split(r"[^a-z0-9]+", normalized) if part}
-
-
-_KIMI_K3_RE = re.compile(r"(?:^|[/.:_-])kimi[-_.]?k3(?:[-_.]|$)")
-_KIMI_K27_RE = re.compile(r"(?:^|[/.:_-])kimi[-_.]?k2[-_.]?7(?:[-_.]|$)")
-_KIMI_K26_RE = re.compile(r"(?:^|[/.:_-])kimi[-_.]?k2[-_.]?6(?:[-_.]|$)")
-
-
-def _is_kimi_k3_model(model: str | None) -> bool:
-    return _KIMI_K3_RE.search(str(model or "").strip().casefold()) is not None
-
-
-def _is_kimi_k27_model(model: str | None) -> bool:
-    return _KIMI_K27_RE.search(str(model or "").strip().casefold()) is not None
-
-
-def _is_kimi_k26_model(model: str | None) -> bool:
-    return _KIMI_K26_RE.search(str(model or "").strip().casefold()) is not None
 
 
 def _gemini_model_allows_none_reasoning_effort(model: str | None) -> bool:
@@ -497,6 +444,11 @@ def _gemini_reasoning_effort(
     effort = str(reasoning_effort or "").strip().casefold()
     if not effort:
         return None
+    contract = reasoning_contract_for("gemini", model)
+    if contract.wire == WIRE_THINKING_LEVEL:
+        if contract.allows_value(effort):
+            return effort
+        return contract.default or None
     if effort in _GEMINI_REASONING_EFFORTS:
         return effort
     if effort == "none" and _gemini_model_allows_none_reasoning_effort(model):
@@ -509,6 +461,51 @@ def _reasoning_effort_enables_thinking(reasoning_effort: str | None) -> bool | N
     if not normalized:
         return None
     return normalized != "none"
+
+
+def _documented_reasoning_effort(
+    *,
+    provider_key: str | None,
+    model: str | None,
+    reasoning_effort: str | None,
+) -> str | None:
+    """Return an exact provider-documented effort value, never a guessed alias."""
+
+    normalized = str(reasoning_effort or "").strip().casefold()
+    if not normalized or normalized == "none":
+        return None
+    contract = reasoning_contract_for(provider_key, model)
+    if contract.wire != WIRE_REASONING_EFFORT or not contract.allows_value(normalized):
+        return None
+    return normalized
+
+
+def _documented_flat_reasoning_effort(
+    *,
+    provider_key: str | None,
+    model: str | None,
+    enable_thinking: bool | None,
+    reasoning_effort: str | None,
+) -> str | None:
+    """Return the contract-approved flat value, including an explicit off value.
+
+    ``_documented_reasoning_effort`` intentionally treats ``none`` as omission
+    for transports with a separate thinking toggle. Generic Chat Completions
+    providers may instead document ``reasoning_effort='none'`` as their only
+    off wire shape, so this path preserves that structural distinction.
+    """
+
+    contract = reasoning_contract_for(provider_key, model)
+    if not contract.emits_flat_reasoning_effort or contract.wire != WIRE_REASONING_EFFORT:
+        return None
+    if enable_thinking is False:
+        return "none" if contract.off == OFF_EXPLICIT and contract.allows_value("none") else None
+    normalized = str(reasoning_effort or "").strip().casefold()
+    if not normalized:
+        return None
+    if normalized == "none" and enable_thinking is True:
+        return None
+    return normalized if contract.allows_value(normalized) else None
 
 
 def _deepseek_reasoning_payload_enabled(
@@ -581,6 +578,17 @@ def _moonshot_reasoning_provider_metadata(reasoning_content: str) -> dict[str, A
         return None
     return {
         _MOONSHOT_PROVIDER_KEY: {
+            _DEEPSEEK_REASONING_CONTENT_KEY: reasoning,
+        }
+    }
+
+
+def _nvidia_reasoning_provider_metadata(reasoning_content: str) -> dict[str, Any] | None:
+    reasoning = str(reasoning_content or "")
+    if not reasoning:
+        return None
+    return {
+        _NVIDIA_PROVIDER_KEY: {
             _DEEPSEEK_REASONING_CONTENT_KEY: reasoning,
         }
     }
@@ -677,6 +685,9 @@ def _provider_metadata_for_reasoning(
         return _moonshot_reasoning_provider_metadata(
             reasoning if isinstance(reasoning, str) else ""
         )
+    if _is_nvidia_provider(provider_key):
+        reasoning = message.get(_DEEPSEEK_REASONING_CONTENT_KEY)
+        return _nvidia_reasoning_provider_metadata(reasoning if isinstance(reasoning, str) else "")
     if _is_openrouter_provider(provider_key):
         reasoning = message.get(_OPENROUTER_REASONING_KEY)
         reasoning_details = message.get(_OPENROUTER_REASONING_DETAILS_KEY)
@@ -730,6 +741,16 @@ def _moonshot_reasoning_from_provider_metadata(metadata: Any) -> str:
     if not isinstance(moonshot, dict):
         return ""
     reasoning = moonshot.get(_DEEPSEEK_REASONING_CONTENT_KEY)
+    return reasoning if isinstance(reasoning, str) else ""
+
+
+def _nvidia_reasoning_from_provider_metadata(metadata: Any) -> str:
+    if not isinstance(metadata, dict):
+        return ""
+    nvidia = metadata.get(_NVIDIA_PROVIDER_KEY)
+    if not isinstance(nvidia, dict):
+        return ""
+    reasoning = nvidia.get(_DEEPSEEK_REASONING_CONTENT_KEY)
     return reasoning if isinstance(reasoning, str) else ""
 
 
@@ -837,6 +858,7 @@ def _message_for_transport(
     *,
     provider_key: str | None,
     reasoning_provider_key: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     metadata = message.get(PROVIDER_METADATA_KEY)
     copied = strip_provider_metadata_from_message(message)
@@ -854,7 +876,9 @@ def _message_for_transport(
         reasoning = _deepseek_reasoning_from_provider_metadata(metadata)
         if reasoning:
             copied[_DEEPSEEK_REASONING_CONTENT_KEY] = reasoning
-    elif has_tool_calls and _is_dashscope_provider(reasoning_provider_key):
+    elif _is_dashscope_provider(reasoning_provider_key) and (
+        has_tool_calls or reasoning_contract_for(_QWEN_PROVIDER_KEY, model).replay_reasoning_content
+    ):
         reasoning = _qwen_reasoning_from_provider_metadata(metadata)
         if reasoning:
             copied[_DEEPSEEK_REASONING_CONTENT_KEY] = reasoning
@@ -864,6 +888,10 @@ def _message_for_transport(
             copied[_OPENROUTER_REASONING_KEY] = reasoning
         if reasoning_details:
             copied[_OPENROUTER_REASONING_DETAILS_KEY] = reasoning_details
+    elif has_tool_calls and _is_nvidia_provider(reasoning_provider_key):
+        reasoning = _nvidia_reasoning_from_provider_metadata(metadata)
+        if reasoning:
+            copied[_DEEPSEEK_REASONING_CONTENT_KEY] = reasoning
     elif _is_moonshot_provider(reasoning_provider_key):
         reasoning = _moonshot_reasoning_from_provider_metadata(metadata)
         if reasoning:
@@ -880,12 +908,14 @@ def _messages_for_transport(
     *,
     provider_key: str | None,
     reasoning_provider_key: str | None = None,
+    model: str | None = None,
 ) -> list[dict[str, Any]]:
     return [
         _message_for_transport(
             message,
             provider_key=provider_key,
             reasoning_provider_key=reasoning_provider_key,
+            model=model,
         )
         for message in messages
         if isinstance(message, dict)
@@ -1017,57 +1047,8 @@ def _parse_stream_tool_calls(tool_chunks: dict[int, dict[str, Any]]) -> list[Too
     return out
 
 
-def _parse_usage(raw: Any) -> LLMUsage | None:
-    if not isinstance(raw, dict):
-        return None
-
-    def _as_non_negative_int(value: Any) -> int | None:
-        try:
-            parsed = int(value) if value is not None else None
-        except (TypeError, ValueError):
-            return None
-        if parsed is None or parsed >= 0:
-            return parsed
-        return None
-
-    prompt = raw.get("prompt_tokens")
-    completion = raw.get("completion_tokens")
-    total = raw.get("total_tokens")
-    prompt_i = _as_non_negative_int(prompt)
-    completion_i = _as_non_negative_int(completion)
-    total_i = _as_non_negative_int(total)
-    cached_prompt_tokens_raw = raw.get("cached_prompt_tokens")
-    if cached_prompt_tokens_raw is None:
-        cached_prompt_tokens_raw = raw.get("cached_tokens")
-    prompt_tokens_details = raw.get("prompt_tokens_details")
-    if cached_prompt_tokens_raw is None and isinstance(prompt_tokens_details, dict):
-        cached_prompt_tokens_raw = prompt_tokens_details.get("cached_tokens")
-    cached_prompt_tokens_i = _as_non_negative_int(cached_prompt_tokens_raw)
-    completion_tokens_details = raw.get("completion_tokens_details")
-    reasoning_tokens_i = None
-    if isinstance(completion_tokens_details, dict):
-        reasoning_tokens_i = _as_non_negative_int(completion_tokens_details.get("reasoning_tokens"))
-    if (
-        prompt_i is None
-        and completion_i is None
-        and total_i is None
-        and cached_prompt_tokens_i is None
-        and reasoning_tokens_i is None
-    ):
-        return None
-    input_tokens_uncached = None
-    if prompt_i is not None and cached_prompt_tokens_i is not None:
-        input_tokens_uncached = max(0, prompt_i - cached_prompt_tokens_i)
-    return LLMUsage(
-        prompt_tokens=prompt_i,
-        completion_tokens=completion_i,
-        total_tokens=total_i,
-        cached_prompt_tokens=cached_prompt_tokens_i,
-        input_tokens_uncached=input_tokens_uncached,
-        cache_read_input_tokens=cached_prompt_tokens_i,
-        reasoning_tokens=reasoning_tokens_i,
-        raw_provider_usage=copy.deepcopy(raw),
-    )
+def _parse_usage(raw: Any, *, provider_key: str | None = None) -> LLMUsage | None:
+    return parse_compatible_usage(raw, provider_key=provider_key)
 
 
 def _is_stream_options_unsupported_error(err: LLMError) -> bool:
@@ -1106,7 +1087,7 @@ def _json_error_payload(body: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-# Friendly, user-facing copy for the Sylliptor MiMo trial proxy's error codes.
+# Friendly, user-facing copy for Sylliptor account error codes.
 # The proxy (Supabase Edge Function) returns an OpenAI-shaped envelope
 # {"error": {"message": ..., "type": ..., "code": "<reason>"}} with these string
 # codes; upstream/other-provider errors use different codes and fall through.
@@ -1116,15 +1097,14 @@ _SYLLIPTOR_PROXY_ERROR_MESSAGES: dict[str, str] = {
         "Run `sylliptor login` to reconnect your account."
     ),
     "trial_expired": (
-        "Your 10-day free MiMo trial has ended. "
-        "See your options at https://sylliptor.alysisai.com/account"
+        "Your Sylliptor trial has ended. See your options at https://sylliptor.alysisai.com/account"
     ),
     "quota_exhausted": (
-        "You've used all of your free MiMo trial tokens. "
+        "You've used the available allowance for your Sylliptor account. "
         "See your options at https://sylliptor.alysisai.com/account"
     ),
     "email_not_verified": (
-        "Please confirm your email to use the MiMo trial — "
+        "Please confirm your email to use your Sylliptor account — "
         "check your inbox for the verification link."
     ),
     "plan_inactive": (
@@ -1135,14 +1115,16 @@ _SYLLIPTOR_PROXY_ERROR_MESSAGES: dict[str, str] = {
         "You're sending requests too quickly. Please wait a moment and try again."
     ),
     "global_budget_exceeded": (
-        "The free MiMo trial is at capacity right now. Please try again shortly."
+        "The Sylliptor service is at capacity right now. Please try again shortly."
     ),
-    "proxy_unconfigured": ("The MiMo service is temporarily unavailable. Please try again later."),
+    "proxy_unconfigured": (
+        "The Sylliptor service is temporarily unavailable. Please try again later."
+    ),
 }
 
 
 def sylliptor_trial_error_message(err: LLMError) -> str | None:
-    """Friendly message for a Sylliptor MiMo proxy error, or None if not ours.
+    """Friendly message for a Sylliptor account error, or None if not ours.
 
     Maps the proxy's known error ``code`` (trial_expired, quota_exhausted, ...) to
     human copy so a user whose trial ended sees a clear next step instead of a raw
@@ -1716,6 +1698,7 @@ class OpenAICompatClient:
             messages,
             provider_key=transport_provider_key,
             reasoning_provider_key=reasoning_provider_key,
+            model=self.model,
         )
         if CACHE_CONTROL_FIELD in active_cache_field_values:
             cache_policy = merge_cache_policy_metadata(
@@ -1829,6 +1812,7 @@ class OpenAICompatClient:
                 messages,
                 provider_key=transport_provider_key,
                 reasoning_provider_key=reasoning_provider_key,
+                model=self.model,
             ),
         }
         if documented_temperature_reason is not None:
@@ -1873,18 +1857,29 @@ class OpenAICompatClient:
         # forced choice, so those branches leave this False.
         thinking_active = False
         if _is_moonshot_provider(transport_provider_key):
-            if _is_kimi_k3_model(self.model):
-                # K3 always reasons and currently accepts only the maximum effort.
-                payload["reasoning_effort"] = "max"
-            elif _is_kimi_k27_model(self.model):
-                # K2.7 thinking is always enabled and cannot be disabled.
+            # Moonshot Platform and Kimi Code share response-state behavior but
+            # expose different request contracts. Resolve the endpoint surface
+            # first, then shape the request from its contract rather than from a
+            # model-name heuristic.
+            contract = reasoning_contract_for(transport_provider_key, self.model)
+            if contract.wire == WIRE_REASONING_EFFORT:
+                reasoning_effort = _documented_reasoning_effort(
+                    provider_key=transport_provider_key,
+                    model=self.model,
+                    reasoning_effort=self.reasoning_effort,
+                )
+                if not reasoning_effort and contract.mode == ALWAYS_ON:
+                    reasoning_effort = contract.default or None
+                if reasoning_effort:
+                    payload["reasoning_effort"] = reasoning_effort
+            elif contract.wire == WIRE_THINKING_TYPE and contract.mode == ALWAYS_ON:
                 thinking_active = True
-            elif _is_kimi_k26_model(self.model):
+            elif contract.wire == WIRE_THINKING_TYPE:
                 thinking_enabled = self.enable_thinking
                 if thinking_enabled is None:
                     thinking_enabled = _reasoning_effort_enables_thinking(self.reasoning_effort)
-                # The API defaults K2.6 to thinking; preserve that default while
-                # still accounting for its forced-tool restriction.
+                # Optional Moonshot thinking defaults on when the toggle is
+                # omitted; preserve that default for forced-tool handling.
                 thinking_active = thinking_enabled is not False
                 if thinking_enabled is not None:
                     payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
@@ -1894,11 +1889,25 @@ class OpenAICompatClient:
                 enable_thinking = _reasoning_effort_enables_thinking(self.reasoning_effort)
             if enable_thinking is not None:
                 payload["enable_thinking"] = enable_thinking
+            reasoning_effort = _documented_reasoning_effort(
+                provider_key=reasoning_provider_key,
+                model=self.model,
+                reasoning_effort=self.reasoning_effort,
+            )
+            if enable_thinking is not False and reasoning_effort:
+                payload["reasoning_effort"] = reasoning_effort
             thinking_active = enable_thinking is True
         elif _is_deepseek_provider(reasoning_provider_key):
             thinking_enabled = deepseek_thinking_enabled
             if thinking_enabled is not None:
                 payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
+            reasoning_effort = _documented_reasoning_effort(
+                provider_key=reasoning_provider_key,
+                model=self.model,
+                reasoning_effort=self.reasoning_effort,
+            )
+            if thinking_enabled is not False and reasoning_effort:
+                payload["reasoning_effort"] = reasoning_effort
             thinking_active = thinking_enabled is True
         elif _is_openrouter_provider(reasoning_provider_key):
             reasoning = _openrouter_reasoning_payload(
@@ -1915,8 +1924,48 @@ class OpenAICompatClient:
             )
             if reasoning_effort:
                 payload["reasoning_effort"] = reasoning_effort
-        elif _uses_reasoning_effort(reasoning_provider_key):
-            if self.reasoning_effort:
+        elif _is_nvidia_provider(reasoning_provider_key):
+            # NVIDIA hosts models from many vendors behind one endpoint. Request
+            # shaping is therefore model-contract-driven: the host alone never
+            # implies Nemotron controls, and unknown models receive no guessed
+            # reasoning parameter.
+            contract = reasoning_contract_for(_NVIDIA_PROVIDER_KEY, self.model)
+            thinking_enabled = self.enable_thinking
+            if thinking_enabled is None:
+                thinking_enabled = _reasoning_effort_enables_thinking(self.reasoning_effort)
+            chat_template_kwargs: dict[str, bool] = {}
+            if contract.wire == WIRE_REASONING_EFFORT:
+                if thinking_enabled is False and contract.off == OFF_EXPLICIT:
+                    payload["reasoning_effort"] = "none"
+                elif thinking_enabled is not False:
+                    reasoning_effort = _documented_reasoning_effort(
+                        provider_key=_NVIDIA_PROVIDER_KEY,
+                        model=self.model,
+                        reasoning_effort=self.reasoning_effort,
+                    )
+                    if reasoning_effort:
+                        payload["reasoning_effort"] = reasoning_effort
+            elif (
+                contract.wire == WIRE_CHAT_TEMPLATE_ENABLE_THINKING and thinking_enabled is not None
+            ):
+                chat_template_kwargs["enable_thinking"] = thinking_enabled
+            if chat_template_kwargs:
+                payload["chat_template_kwargs"] = chat_template_kwargs
+        else:
+            # Any researched provider contract that uses the flat Chat
+            # Completions effort field can opt in here without another
+            # provider-specific request branch. Unknown routes retain the
+            # legacy OpenAI/Azure/Mistral behavior and receive no newly guessed
+            # controls.
+            documented_effort = _documented_flat_reasoning_effort(
+                provider_key=reasoning_provider_key,
+                model=self.model,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self.reasoning_effort,
+            )
+            if documented_effort:
+                payload["reasoning_effort"] = documented_effort
+            elif _uses_reasoning_effort(reasoning_provider_key) and self.reasoning_effort:
                 payload["reasoning_effort"] = self.reasoning_effort
         # A reasoning model in thinking mode can 400 on any tool_choice parameter.
         # Omitting it preserves the default "auto" behavior while keeping tools
@@ -2062,6 +2111,28 @@ class OpenAICompatClient:
         telemetry_on_reasoning_delta = telemetry.wrap_reasoning_delta(on_reasoning_delta)
         stream_restart_count = 0
         stream_restart_reason = ""
+        any_text_delta_emitted = False
+
+        def _record_retry(attempt: int, reason: str, wait_seconds: float) -> None:
+            nonlocal stream_restart_count, stream_restart_reason, any_text_delta_emitted
+            telemetry.on_retry(attempt, reason, wait_seconds)
+            if stream and str(reason).startswith("provider_stream_"):
+                stream_restart_count += 1
+                stream_restart_reason = str(reason)
+                transport_metadata["stream_restart_count"] = stream_restart_count
+                transport_metadata["stream_restart_reason"] = stream_restart_reason
+            if stream and any_text_delta_emitted:
+                # Tokens from the abandoned attempt already rendered; give the
+                # surface a chance to reset its live block before the retry
+                # restreams the reply (duck-typed hook — see the chat loop's
+                # _on_text_delta). Observers must never change retry behavior.
+                any_text_delta_emitted = False
+                restart_hook = getattr(on_text_delta, "stream_restart", None)
+                if callable(restart_hook):
+                    try:
+                        restart_hook()
+                    except Exception:  # noqa: BLE001
+                        _LOGGER.debug("stream_restart_hook_failed", exc_info=True)
 
         def _send_request() -> LLMResponse:
             nonlocal cache_policy, request_plan_metadata, request_shape, token_reconciliation
@@ -2088,7 +2159,10 @@ class OpenAICompatClient:
                                         *,
                                         _attempt_deltas: list[str] = attempt_deltas,
                                     ) -> None:
+                                        nonlocal any_text_delta_emitted
                                         _attempt_deltas.append(delta)
+                                        if delta:
+                                            any_text_delta_emitted = True
                                         if telemetry_on_text_delta is not None:
                                             telemetry_on_text_delta(delta)
 
@@ -2118,19 +2192,13 @@ class OpenAICompatClient:
                                             ),
                                             provider_key=reasoning_provider_key,
                                             cancellation_token=cancellation_token,
-                                            allow_reasoning_only_answer=(
-                                                _normalize_provider_key(self.provider_key)
-                                                == "sylliptor"
-                                            ),
                                         )
                                     except Exception as stream_error:
-                                        retry_reason = provider_unavailable_retry_reason(
-                                            stream_error
-                                        )
                                         if attempt_deltas or attempt_reasoning_deltas:
                                             stream_restart_count += 1
                                             stream_restart_reason = (
-                                                retry_reason or "provider_stream_interrupted"
+                                                provider_unavailable_retry_reason(stream_error)
+                                                or "provider_stream_interrupted"
                                             )
                                             transport_metadata["stream_restart_count"] = (
                                                 stream_restart_count
@@ -2139,7 +2207,18 @@ class OpenAICompatClient:
                                                 stream_restart_reason
                                             )
                                             # Once public output reached the UI, replaying the
-                                            # request would duplicate text/trace content.
+                                            # request would duplicate text/trace content —
+                                            # UNLESS the delta callback carries the
+                                            # stream_restart reset channel, in which case the
+                                            # surface erases the partial output right before
+                                            # the retry restreams (the hook fires from
+                                            # _record_retry, i.e. only when a retry actually
+                                            # runs), and replaying is safe.
+                                            surface_can_reset = callable(
+                                                getattr(on_text_delta, "stream_restart", None)
+                                            )
+                                            if surface_can_reset:
+                                                raise
                                             if isinstance(stream_error, LLMError):
                                                 mark_provider_call_non_retryable(stream_error)
                                                 raise
@@ -2149,15 +2228,6 @@ class OpenAICompatClient:
                                             )
                                             mark_provider_call_non_retryable(interrupted)
                                             raise interrupted from stream_error
-                                        if retry_reason == "provider_stream_truncated":
-                                            stream_restart_count += 1
-                                            stream_restart_reason = retry_reason
-                                            transport_metadata["stream_restart_count"] = (
-                                                stream_restart_count
-                                            )
-                                            transport_metadata["stream_restart_reason"] = (
-                                                stream_restart_reason
-                                            )
                                         raise
                                     if stream_restart_count:
                                         response = _response_with_stream_restart_metadata(
@@ -2405,7 +2475,7 @@ class OpenAICompatClient:
                     operation="chat_completions",
                     sleep_fn=self._provider_sleep_fn,
                     random_fn=self._provider_random_fn,
-                    on_retry=telemetry.on_retry,
+                    on_retry=_record_retry,
                     retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
                     retry_wall_clock_cap_seconds=getattr(
                         self,
@@ -2422,7 +2492,6 @@ class OpenAICompatClient:
         resp: httpx.Response,
         *,
         provider_key: str | None,
-        allow_reasoning_only_answer: bool = False,
     ) -> LLMResponse:
         try:
             data = resp.json()
@@ -2448,7 +2517,7 @@ class OpenAICompatClient:
             tool_calls=tool_calls,
             raw=data,
             response_model=response_model,
-            usage=_parse_usage(data.get("usage")),
+            usage=_parse_usage(data.get("usage"), provider_key=provider_key),
             provider_metadata=_provider_metadata_for_reasoning(
                 provider_key=provider_key,
                 message=msg,
@@ -2472,7 +2541,6 @@ class OpenAICompatClient:
         on_reasoning_delta: Callable[[str], None] | None = None,
         provider_key: str | None,
         cancellation_token: Any | None = None,
-        allow_reasoning_only_answer: bool = False,
     ) -> LLMResponse:
         if resp.status_code >= 400:
             body = self._safe_error_body(resp)
@@ -2539,7 +2607,7 @@ class OpenAICompatClient:
             model = event.get("model")
             if isinstance(model, str) and model:
                 response_model = model
-            parsed_usage = _parse_usage(event.get("usage"))
+            parsed_usage = _parse_usage(event.get("usage"), provider_key=provider_key)
             if parsed_usage is not None:
                 usage = parsed_usage
 

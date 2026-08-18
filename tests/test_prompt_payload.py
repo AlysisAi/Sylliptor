@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from sylliptor_agent_cli import agent_loop as agent_loop_mod
 from sylliptor_agent_cli.agent_loop import create_session
 from sylliptor_agent_cli.config import AppConfig
 from sylliptor_agent_cli.session_store import read_session_events
@@ -210,10 +209,10 @@ def test_interactive_bootstrap_payload_stays_bounded(tmp_path: Path) -> None:
     try:
         messages_json = json.dumps(session.messages, ensure_ascii=True)
         tools_json = json.dumps(session.tool_list, ensure_ascii=True)
-        # Budget tripwire, not a correctness bound. Rebased after the turn-contract
-        # v2 apply-and-verify norms were added to the base prompt; keep ~5% headroom
-        # over the measured size (7440).
-        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 7800
+        # Budget tripwire, not a correctness bound. Rebased after the tool-necessity /
+        # single-answer norms and derived-artifact read guards were added; keep ~5%
+        # headroom over the measured size (8058).
+        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 8450
     finally:
         session.close()
 
@@ -284,10 +283,10 @@ def test_one_shot_bootstrap_payload_stays_bounded(tmp_path: Path) -> None:
     try:
         messages_json = json.dumps(session.messages, ensure_ascii=True)
         tools_json = json.dumps(session.tool_list, ensure_ascii=True)
-        # Budget tripwire, not a correctness bound. Rebased after the turn-contract
-        # v2 apply-and-verify norms were added to the base prompt; keep ~5% headroom
-        # over the measured size (8176).
-        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 8600
+        # Budget tripwire, not a correctness bound. Rebased after the tool-necessity /
+        # single-answer norms and derived-artifact read guards were added; keep ~5%
+        # headroom over the measured size (8653).
+        assert _estimated_tokens(messages_json) + _estimated_tokens(tools_json) < 9100
     finally:
         session.close()
 
@@ -419,82 +418,6 @@ def test_create_session_kimi_auto_cache_key_is_resume_stable_and_session_scoped(
         different.close()
 
 
-def test_route_context_payload_stays_compact_and_structured(tmp_path: Path) -> None:
-    _fake_git_repo(tmp_path)
-    (tmp_path / "README.md").write_text("notes cli\n", encoding="utf-8")
-    session = create_session(
-        cfg=AppConfig(model="test-model", web_search_mode="off"),
-        root=tmp_path,
-        mode="auto",
-        yes=True,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        route_context = agent_loop_mod._turn_route_context(
-            session,
-            had_active_workspace_task_before_turn=False,
-        )
-        message = agent_loop_mod._route_context_system_message(route_context)
-        assert message is not None
-        marker, _newline, payload_raw = message.partition("\n")
-        payload = json.loads(payload_raw)
-        assert marker == agent_loop_mod._ROUTE_CONTEXT_MARKER
-        assert payload["workspace_kind"] == "git_repo"
-        assert payload["stable_grounding_available"] is True
-        assert payload["workspace_hint"] == "notes cli"
-        assert payload["active_workspace_task"] is False
-        assert payload["artifact_capabilities"] == [
-            {
-                "name": "image_generation",
-                "status": "unavailable",
-                "description": (
-                    "Create production raster images and save validated image files in the "
-                    "workspace."
-                ),
-                "reason": "Image generation is disabled for this session.",
-                "resolution": (
-                    "Set an image-provider credential, run `sylliptor config set "
-                    "image_generation.enabled true`, then start a new chat session."
-                ),
-            }
-        ]
-        assert len(message) < 1300
-    finally:
-        session.close()
-
-
-def test_route_context_payload_keeps_workspace_hint_without_repo_scan(tmp_path: Path) -> None:
-    _fake_git_repo(tmp_path)
-    (tmp_path / "README.md").write_text("notes cli\n", encoding="utf-8")
-    session = create_session(
-        cfg=AppConfig(
-            model="test-model",
-            web_search_mode="off",
-            verify_commands=["pytest tests/test_prompt_payload.py -q"],
-        ),
-        root=tmp_path,
-        mode="auto",
-        yes=True,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        route_context = agent_loop_mod._turn_route_context(
-            session,
-            had_active_workspace_task_before_turn=False,
-        )
-        assert route_context is not None
-        payload = route_context.to_payload()
-        assert payload["grounding_source"] == "top_level"
-        assert payload["stable_grounding_available"] is True
-        assert payload["workspace_hint"] == "notes cli"
-    finally:
-        session.close()
-
-
 def test_session_start_logs_workspace_grounding_descriptor(tmp_path: Path) -> None:
     _fake_git_repo(tmp_path)
     (tmp_path / "README.md").write_text("notes cli\n", encoding="utf-8")
@@ -599,36 +522,3 @@ def test_explicit_skill_context_payload_stays_structurally_closed_with_oversized
     assert payload.startswith("<explicit_skill_context>\n")
     assert payload.endswith("</explicit_skill_context>\n")
     assert "\n</skill_instructions>\n</explicit_skill_context>\n" in payload
-
-
-def test_parse_route_decision_requires_execution_posture() -> None:
-    payload = json.dumps(
-        {
-            "route": "repo",
-            "execution_posture": "execute",
-            "confidence": 0.9,
-            "reply": "",
-            "language": "English",
-            "script": "Latin",
-            "explicit_language_override": False,
-        }
-    )
-    decision = agent_loop_mod._parse_route_decision(payload)
-    assert decision is not None
-    assert decision.route == "repo"
-    assert decision.execution_posture == "execute"
-    assert (
-        agent_loop_mod._parse_route_decision(
-            json.dumps(
-                {
-                    "route": "repo",
-                    "confidence": 0.9,
-                    "reply": "",
-                    "language": "English",
-                    "script": "Latin",
-                    "explicit_language_override": False,
-                }
-            )
-        )
-        is None
-    )

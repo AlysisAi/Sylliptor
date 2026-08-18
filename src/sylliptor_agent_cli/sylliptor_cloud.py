@@ -1,9 +1,14 @@
-"""Endpoints and identifiers for the hosted Sylliptor MiMo service (Xiaomi trial).
+"""Endpoints and identifiers for the hosted Sylliptor Pro service.
 
-The CLI talks to a Supabase-hosted proxy that holds the OpenRouter/Xiaomi BYOK
-key server-side; the CLI only ever holds the user's own ``access_key``. These
-values can be overridden via environment variables to point at a different
-deployment (e.g. a staging project) during testing.
+`sylliptor login` runs an RFC 8628-style device flow against Supabase Edge
+Functions (`device-code` / `device-token`); the user approves the code on the
+account website's /activate page. The CLI receives a gateway key (``slk_…``)
+and talks to the Sylliptor LLM gateway — an OpenAI-compatible proxy that meters
+the subscription's credits server-side. The CLI never holds upstream provider
+keys for Pro; BYOK profiles are configured separately and take precedence.
+
+Values can be overridden via environment variables to point at a different
+deployment (e.g. a staging project or local stubs) during testing.
 """
 
 from __future__ import annotations
@@ -11,20 +16,32 @@ from __future__ import annotations
 import os
 from urllib.parse import urlsplit
 
-# Supabase project hosting the `llm` proxy + `cli-auth` edge functions.
+# Supabase project hosting the device-login edge functions.
 _DEFAULT_SUPABASE_URL = "https://vzigujbcjjmpntxhmyvr.supabase.co"
-# Marketing/account site that serves the /cli-login approval page.
+# Marketing/account site that serves the /activate approval page.
 _DEFAULT_SITE_URL = "https://sylliptor.alysisai.com"
 
-# The profile/preset key used for the hosted MiMo provider.
+# Supabase "anon" key: a PUBLIC client identifier (shipped in the website's
+# browser bundle too). It grants nothing by itself — the edge functions are
+# either public-by-design (device flow) or JWT/secret-guarded server-side.
+ANON_KEY = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ6aWd1amJjamptcG50eGhteXZyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA5Mzc0NTIsImV4cCI6MjA5NjUxMzQ1Mn0."
+    "vLH9q-BNO8IWIZrVlvCw8pZWXdLgmKG4Tl9toTTD3pg"
+)
+
+# The profile/preset key used for the hosted Pro provider.
 PROFILE_KEY = "sylliptor"
 
-# Default proxy base URL (kept in sync with the `sylliptor` profile preset).
+# LEGACY: base URL of the retired MiMo-trial proxy (an OpenRouter-forwarding
+# Supabase Edge Function). The service is gone, but URL classifiers (web
+# search / provider limits) still recognize it so configs from that era keep
+# loading with sensible behavior instead of misclassifying.
 DEFAULT_PROXY_BASE_URL = f"{_DEFAULT_SUPABASE_URL}/functions/v1/llm/v1"
 
 
 # Loopback hosts may use http:// (local stubs / tests); every other host must
-# be https so the one-time code and access_key never travel in cleartext.
+# be https so device codes and the gateway key never travel in cleartext.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -39,9 +56,9 @@ def _clean(url: str) -> str:
 def _checked(url: str) -> str:
     """Clean a URL and reject cleartext http:// for non-loopback hosts.
 
-    The one-time login code and the long-lived access_key travel to these
-    endpoints, so a downgraded (http://) origin from an env override would leak
-    them. https is required unless the host is loopback (local stubs / tests) or
+    Device codes and the long-lived gateway key travel to these endpoints, so a
+    downgraded (http://) origin from an env override would leak them. https is
+    required unless the host is loopback (local stubs / tests) or
     SYLLIPTOR_ALLOW_INSECURE_URLS is explicitly set.
     """
     cleaned = _clean(url)
@@ -67,34 +84,34 @@ def site_url() -> str:
     return _checked(os.environ.get("SYLLIPTOR_SITE_URL") or _DEFAULT_SITE_URL)
 
 
-def proxy_base_url() -> str:
-    """OpenAI-compatible base URL; the LLM client appends ``/chat/completions``."""
-    override = os.environ.get("SYLLIPTOR_PROXY_BASE_URL")
+def gateway_base_url() -> str:
+    """OpenAI-compatible base URL; the LLM client appends ``/chat/completions``.
+
+    The hosted proxy runs as the `llm` Supabase Edge Function (the same shape
+    the MiMo-trial proxy used), holding the upstream DeepSeek key server-side
+    and metering each account's allowance/credits.
+    """
+    override = os.environ.get("SYLLIPTOR_GATEWAY_URL")
     if override:
         return _checked(override)
     return f"{supabase_url()}/functions/v1/llm/v1"
 
 
-def cli_login_url() -> str:
-    """The website page that approves a CLI login and mints a one-time code."""
-    return f"{site_url()}/cli-login"
+def device_code_url() -> str:
+    """POST here to start a device login (returns user_code + device_code)."""
+    return f"{supabase_url()}/functions/v1/device-code"
 
 
-def token_exchange_url() -> str:
-    """The edge-function endpoint that swaps a one-time code for the access_key."""
-    return f"{supabase_url()}/functions/v1/cli-auth/exchange"
+def device_token_url() -> str:
+    """POST device_code here until the user approves (returns the slk_ key)."""
+    return f"{supabase_url()}/functions/v1/device-token"
 
 
-def status_url() -> str:
-    """Read-only endpoint returning the caller's trial status (days + tokens)."""
-    return f"{proxy_base_url()}/status"
+def activate_url() -> str:
+    """The website page where a signed-in user approves a device code."""
+    return f"{site_url()}/activate"
 
 
 def models_url() -> str:
-    """OpenAI-style discovery endpoint listing the model ids the proxy will serve.
-
-    The proxy returns ``{"object": "list", "data": [{"id": ...}, ...]}`` reflecting
-    its server-side allowlist, so the CLI can offer the trial's real models instead
-    of guessing. Public (no access_key required).
-    """
-    return f"{proxy_base_url()}/models"
+    """The gateway's OpenAI-shaped model listing."""
+    return f"{gateway_base_url()}/models"

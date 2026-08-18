@@ -151,54 +151,29 @@ def test_thinking_pick_uses_inline_picker(monkeypatch, tmp_path: Path) -> None:
     assert inline.calls[0]["title"] == "Default Model"
 
 
-def test_router_section_persists_changes(monkeypatch, tmp_path: Path) -> None:
-    _seed_config(tmp_path, monkeypatch)
-    _patch_console(monkeypatch)
-    prompt = PromptScript(["6", "s"])
-    inline = InlineChoiceScript([config_menu_mod._INHERIT_DEFAULT_MODEL_VALUE, "code_only"])
-    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
-    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
-
-    result = config_menu_mod.run_config_menu()
-    cfg = load_config()
-
-    assert result.saved is True
-    assert cfg.routing_mode == "code_only"
-    assert cfg.step_budget_policy == "autonomous"
-    assert cfg.max_steps == AppConfig().max_steps
-    assert cfg.task_max_steps == AppConfig().task_max_steps
-    assert cfg.subagent_max_steps == AppConfig().subagent_max_steps
-    assert "router" not in cfg.extra_fields.get("role_models", {})
-
-
-def test_router_section_persists_router_model(monkeypatch, tmp_path: Path) -> None:
-    _seed_config(tmp_path, monkeypatch)
-    _patch_console(monkeypatch)
-    prompt = PromptScript(["6", "cheap-router-model", "s"])
-    inline = InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE, "auto"])
-    monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
-    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
-
-    result = config_menu_mod.run_config_menu()
-
-    assert result.saved is True
-    assert load_config().extra_fields["role_models"]["router"] == "cheap-router-model"
-
-
-def test_router_section_preserves_unexposed_role_model_keys(
+def test_save_preserves_unexposed_role_model_keys(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    # Keys the menu does not expose — including the deprecated "router" key
+    # from the removed semantic router — must survive an unrelated save.
     _seed_config(tmp_path, monkeypatch)
     cfg = load_config()
-    cfg.extra_fields["role_models"] = {"comprehension": "vision-reader-model"}
+    cfg.extra_fields["role_models"] = {
+        "comprehension": "vision-reader-model",
+        "router": "legacy-router-model",
+    }
     cfg.extra_fields["forge_role_models"] = {"comprehension": "forge-vision-reader-model"}
     save_config(cfg)
     _patch_console(monkeypatch)
-    prompt = PromptScript(["6", "cheap-router-model", "s"])
-    inline = InlineChoiceScript([config_menu_mod._CUSTOM_MODEL_VALUE, "auto"])
+    answers: list[str] = ["6"]
+    for role in ROLE_ORDER:
+        answers.append("anthropic/claude-sonnet-4-6" if role == "coding" else "")
+        if role in config_menu_mod._ROLE_TEMPERATURE_FIELDS:
+            answers.append("")
+    answers.append("s")
+    prompt = PromptScript(answers)
     monkeypatch.setattr(config_menu_mod.typer, "prompt", prompt)
-    monkeypatch.setattr(config_menu_mod, "_prompt_inline_choice", inline)
 
     result = config_menu_mod.run_config_menu()
     saved_cfg = load_config()
@@ -206,7 +181,8 @@ def test_router_section_preserves_unexposed_role_model_keys(
     assert result.saved is True
     assert saved_cfg.extra_fields["role_models"] == {
         "comprehension": "vision-reader-model",
-        "router": "cheap-router-model",
+        "router": "legacy-router-model",
+        "coding": "anthropic/claude-sonnet-4-6",
     }
     assert saved_cfg.extra_fields["forge_role_models"] == {
         "comprehension": "forge-vision-reader-model"
@@ -216,7 +192,7 @@ def test_router_section_preserves_unexposed_role_model_keys(
 def test_subagent_role_override(monkeypatch, tmp_path: Path) -> None:
     _seed_config(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
-    answers: list[str] = ["7"]
+    answers: list[str] = ["6"]
     for role in ROLE_ORDER:
         answers.append("anthropic/claude-sonnet-4-6" if role == "coding" else "")
         if role in config_menu_mod._ROLE_TEMPERATURE_FIELDS:
@@ -236,7 +212,7 @@ def test_subagent_role_override(monkeypatch, tmp_path: Path) -> None:
 def test_forge_role_override(monkeypatch, tmp_path: Path) -> None:
     _seed_config(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
-    answers = ["8"]
+    answers = ["7"]
     answers.extend(
         "anthropic/claude-opus-4-7" if role == "planner" else ""
         for role in config_menu_mod.FORGE_ROLE_ORDER
@@ -253,7 +229,7 @@ def test_forge_role_override(monkeypatch, tmp_path: Path) -> None:
     assert set(forge_role_models) == {"planner"}
 
 
-def test_router_override_stays_out_of_subagent_summary() -> None:
+def test_legacy_router_override_has_no_menu_row_and_stays_out_of_summaries() -> None:
     base_state = config_menu_mod.ConfigMenuState.from_cfg(AppConfig(model="default"))
     cfg = AppConfig(model="default")
     cfg.extra_fields = {"role_models": {"router": "cheap-router-model"}}
@@ -268,8 +244,8 @@ def test_router_override_stays_out_of_subagent_summary() -> None:
         for value, label, summary in config_menu_mod._top_level_menu_rows(state)
     }
 
-    assert rows["router"][0] == "Routing"
-    assert "router cheap-router-model" in rows["router"][1]
+    assert "router" not in rows
+    assert all("Routing" not in label for label, _summary in rows.values())
     assert rows["subagents"][1] == base_rows["subagents"][1]
 
 
@@ -355,13 +331,17 @@ def test_config_menu_preset_rows_explain_compatibility_and_native_modes() -> Non
     advanced_keys = [preset.key for preset in advanced]
 
     # The /config "add preset" picker mirrors setup: native first-party
-    # providers lead, every other hosted provider follows, and only
-    # compatibility/local/custom/legacy presets stay behind the advanced picker.
-    assert keys[:4] == ["openai-responses", "anthropic", "gemini", "deepseek"]
+    # providers lead and every other hosted provider follows in registration
+    # order; the account-gated Sylliptor preset stays behind the advanced
+    # picker.
+    assert keys[:3] == ["openai-responses", "anthropic", "gemini"]
+    assert "sylliptor" not in keys
+    assert "xiaomi-mimo" not in keys
     assert "deepseek" in keys
     assert "anthropic-compat" not in keys
     assert "gemini-compat" not in keys
     assert "ollama" not in keys
+    assert "sylliptor" in advanced_keys
     assert "deepseek" not in advanced_keys
     assert "anthropic-compat" in advanced_keys
     assert "gemini-compat" in advanced_keys
@@ -403,8 +383,8 @@ def test_config_menu_add_preset_surfaces_provider_diagnostic_warnings(monkeypatc
 
     config_menu_mod._run_profile_add_preset(state, console)
 
-    # The picker highlights the first primary row (OpenAI Responses) by
-    # default; the diagnostic warnings below are what this test actually guards.
+    # The picker highlights the first native provider by default; the diagnostic
+    # warnings below are what this test actually guards.
     assert picker.calls[0]["current_value"] == "openai-responses"
     rendered = output.getvalue()
     assert "Provider diagnostic:" in rendered

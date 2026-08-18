@@ -145,6 +145,76 @@ def test_run_turn_blocks_repeated_identical_failed_tool_calls(tmp_path: Path) ->
     assert warnings
 
 
+def test_repeated_path_escape_preserves_structured_recovery_guidance(tmp_path: Path) -> None:
+    cfg = AppConfig(model="test-model", routing_mode="code_only")
+    sessions_dir = tmp_path / "sessions"
+    session = create_session(
+        cfg=cfg,
+        root=tmp_path,
+        mode="auto",
+        yes=True,
+        max_steps=8,
+        no_log=False,
+        api_key_override="override-key",
+        session_log_dir_override=sessions_dir,
+        session_id_override="retry-path-escape",
+    )
+
+    escaped_path = "/git/server/hooks/post-receive"
+    repeated_call = {"path": escaped_path, "content": "#!/bin/sh\n"}
+    responses = [
+        LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id=f"tc{index}", name="fs_write", arguments=repeated_call)],
+            raw={},
+        )
+        for index in range(1, 5)
+    ]
+    responses.append(
+        LLMResponse(
+            content="blocked: filesystem writes are workspace-scoped. category: policy",
+            tool_calls=[],
+            raw={},
+        )
+    )
+    fake_client = _FakeClient(responses)
+    session.client = fake_client  # type: ignore[assignment]
+
+    try:
+        exit_code = session.run_turn("Install a post-receive hook at /git/server/hooks.")
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    events = list(read_session_events(sessions_dir / "retry-path-escape.jsonl"))
+    tool_results = [
+        event.get("payload", {}).get("result", {})
+        for event in events
+        if event.get("type") == "tool_result"
+    ]
+    assert len(tool_results) == 4
+    assert tool_results[0]["error_code"] == "path_escapes_workspace"
+    assert tool_results[0]["attempted_path"] == escaped_path
+
+    repeated_result = tool_results[2]
+    assert repeated_result["error_code"] == "repeated_tool_failure_guard"
+    assert repeated_result["previous_error_code"] == "path_escapes_workspace"
+    assert "Do not retry the same blocked tool call" in repeated_result["guidance"]
+    assert any(
+        action["action"] == "ask_or_explain_boundary"
+        for action in repeated_result["suggested_next_actions"]
+    )
+
+    warnings = [
+        event
+        for event in events
+        if event.get("type") == "warning"
+        and event.get("payload", {}).get("warning") == "repeated_tool_failure_guard"
+    ]
+    assert warnings
+    assert warnings[0]["payload"]["previous_error_code"] == "path_escapes_workspace"
+
+
 def test_run_turn_returns_tool_result_when_tool_arguments_are_invalid_json(
     tmp_path: Path,
 ) -> None:
@@ -327,7 +397,28 @@ def test_run_turn_successful_turn_keeps_refreshed_task_brief(tmp_path: Path) -> 
         no_log=True,
         api_key_override="override-key",
     )
-    session.client = _FakeClient([LLMResponse(content="done", tool_calls=[], raw={})])  # type: ignore[assignment]
+    # Observed-facts rule: only a turn that demonstrably produced material
+    # edits pins its instruction into the task brief, so the fake turn edits
+    # a file before finalizing.
+    session.client = _FakeClient(  # type: ignore[assignment]
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc1",
+                        name="fs_write",
+                        arguments={
+                            "path": "src/parser.py",
+                            "content": "def parse():\n    return []\n",
+                        },
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="done", tool_calls=[], raw={}),
+        ]
+    )
     baseline_task_brief = _session_task_brief_content(session)
 
     try:
@@ -355,7 +446,27 @@ def test_run_turn_llm_error_restores_existing_active_task_brief_without_duplicat
         no_log=True,
         api_key_override="override-key",
     )
-    session.client = _FakeClient([LLMResponse(content="done", tool_calls=[], raw={})])  # type: ignore[assignment]
+    # A material-edit turn pins the instruction as the active task brief on
+    # the router-free path.
+    session.client = _FakeClient(  # type: ignore[assignment]
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="tc1",
+                        name="fs_write",
+                        arguments={
+                            "path": "src/parser.py",
+                            "content": "def parse():\n    return []\n",
+                        },
+                    )
+                ],
+                raw={},
+            ),
+            LLMResponse(content="done", tool_calls=[], raw={}),
+        ]
+    )
 
     try:
         assert session.run_turn("Fix src/parser.py without changing the CSV shape.") == 0

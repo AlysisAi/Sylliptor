@@ -19,6 +19,7 @@ from .llm.protocols import (
 from .profiles import ProfileSpec
 
 ProviderModelCatalogStrategy = Literal["gemini", "anthropic", "openai"]
+ModelChatCompatibility = Literal["chat", "unknown"]
 
 _DEFAULT_TIMEOUT_S = 6.0
 _MAX_RESPONSE_BYTES = 5 * 1024 * 1024
@@ -63,14 +64,6 @@ _CHAT_CAPABILITY_NAMES = frozenset(
         "text_generation",
     }
 )
-_NON_CHAT_ID_TOKEN_RE = re.compile(
-    r"(?:^|[/_.:-])(?:"
-    r"dall-e|embedding|embeddings|gpt-image|image-generation|imagen|live|moderation|"
-    r"native-audio|realtime|rerank|reranker|speech|transcribe|transcription|tts|"
-    r"veo|video-generation|whisper"
-    r")(?:$|[/_.:-])",
-    re.IGNORECASE,
-)
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
 _TERMINAL_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
@@ -82,6 +75,7 @@ class ProviderModelOption:
     id: str
     label: str
     description: str = ""
+    chat_compatibility: ModelChatCompatibility = "unknown"
 
 
 class ProviderModelCatalogError(RuntimeError):
@@ -237,6 +231,7 @@ def _discover_gemini_models(
                     id=model_id,
                     label=_clean_text(raw.get("displayName")) or model_id,
                     description=_clean_text(raw.get("description")),
+                    chat_compatibility="chat",
                 ),
             )
             _enforce_model_bound(options)
@@ -304,6 +299,7 @@ def _discover_anthropic_models(
                     id=model_id,
                     label=_clean_text(raw.get("display_name")) or model_id,
                     description=_anthropic_description(raw),
+                    chat_compatibility="chat",
                 ),
             )
             _enforce_model_bound(options)
@@ -360,7 +356,7 @@ def _discover_openai_models(
     for raw in raw_models:
         if isinstance(raw, str):
             model_id = _clean_model_id(raw)
-            if model_id and not _obvious_modality_only_id(model_id):
+            if model_id:
                 _append_option(
                     options,
                     seen_ids,
@@ -371,7 +367,7 @@ def _discover_openai_models(
         if not isinstance(raw, dict):
             continue
         model_id = _clean_model_id(raw.get("id") or raw.get("model") or raw.get("name"))
-        if not model_id or _generic_model_is_non_chat(raw, model_id=model_id):
+        if not model_id or _generic_model_is_non_chat(raw):
             continue
         _append_option(
             options,
@@ -380,6 +376,7 @@ def _discover_openai_models(
                 id=model_id,
                 label=_clean_text(raw.get("display_name") or raw.get("displayName")) or model_id,
                 description=_clean_text(raw.get("description")),
+                chat_compatibility=("chat" if _has_explicit_chat_capability(raw) else "unknown"),
             ),
         )
         _enforce_model_bound(options)
@@ -469,13 +466,11 @@ def _anthropic_description(raw: dict[str, Any]) -> str:
     return " · ".join(details)
 
 
-def _generic_model_is_non_chat(raw: dict[str, Any], *, model_id: str) -> bool:
+def _generic_model_is_non_chat(raw: dict[str, Any]) -> bool:
     explicit_chat = _has_explicit_chat_capability(raw)
     if _has_explicit_non_chat_capability(raw, explicit_chat=explicit_chat):
         return True
-    if explicit_chat:
-        return False
-    return _obvious_modality_only_id(model_id)
+    return False
 
 
 def _has_explicit_chat_capability(raw: dict[str, Any]) -> bool:
@@ -584,10 +579,6 @@ def _endpoint_is_clearly_non_chat(endpoint: str) -> bool:
     )
 
 
-def _obvious_modality_only_id(model_id: str) -> bool:
-    return _NON_CHAT_ID_TOKEN_RE.search(model_id) is not None
-
-
 def _merged_headers(
     defaults: dict[str, str],
     extra_headers: dict[str, str] | None,
@@ -685,6 +676,7 @@ def _url_hostname(value: str) -> str:
 
 
 __all__ = [
+    "ModelChatCompatibility",
     "ProviderModelCatalogError",
     "ProviderModelCatalogStrategy",
     "ProviderModelOption",

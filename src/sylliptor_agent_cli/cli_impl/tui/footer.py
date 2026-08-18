@@ -2,8 +2,8 @@
 
 Two lines, each split left/right against the terminal width::
 
-    ◇ sylliptor · <Model>              context <P>% · <N> tokens · $<cost>
-    <user> · <workspace> · ⎇ <branch>            approvals: auto · shift+tab
+    ◇ sylliptor · <Model>            context: <P>% left · <N> tokens · $<cost>
+    <user> · <workspace> · ⎇ <branch>                          sensitive: auto
 
 The left side is clipped (with an ellipsis) when it would collide with the
 right side, so the layout never wraps. Returned as prompt_toolkit
@@ -31,11 +31,41 @@ _MODE_SHORT = {
     "fullaccess": "full",
 }
 
+# Full-word labels for the persona badge (state.persona is empty when persona
+# modes are disabled, which hides the half entirely). All four personas render
+# so the Tab cycle is always visible — including landing back on code. Full
+# words by deliberate choice: "dbg·fast" read as noise, "debug · fast" reads
+# as state.
+_PERSONA_SHORT = {
+    "code": "code",
+    "architect": "architect",
+    "ask": "ask",
+    "debug": "debug",
+}
+
 Fragments = list[tuple[str, str]]
 
 
 def _visible_len(fragments: Fragments) -> int:
     return sum(len(text) for _style, text in fragments)
+
+
+def _format_context_left(pct: float | None) -> str:
+    """Render the context gauge honestly at integer resolution.
+
+    ``None`` (no successful measurement yet) reads ``n/a`` rather than a
+    fabricated number. ``100``/``0`` appear only when the window is genuinely
+    full/empty; any partially-used window reads 1–99, so a live session never
+    rounds up to a misleading ``100`` — the honesty the sibling ``.1f`` HUD
+    keeps, made integer-clean for the footer.
+    """
+    if pct is None:
+        return "context: n/a"
+    if pct >= 100.0:
+        return "context: 100% left"
+    if pct <= 0.0:
+        return "context: 0% left"
+    return f"context: {min(99, max(1, round(pct)))}% left"
 
 
 def _format_cost(state: TuiState) -> str:
@@ -44,6 +74,8 @@ def _format_cost(state: TuiState) -> str:
     A dollar figure when pricing is known, else ``n/a`` — so an unmetered/free
     model with real usage never reads as a fake ``$0.0000``. A trailing ``+N``
     flags calls whose cost could not be metered (partial total)."""
+    if state.cost_display:
+        return state.cost_display
     cost = state.cost_usd
     base = "n/a" if cost is None else f"${cost:.4f}"
     if state.cost_unknown_calls > 0:
@@ -82,9 +114,9 @@ def _line1(state: TuiState) -> tuple[Fragments, Fragments]:
     if state.usage_hud_enabled:
         right.extend(
             [
-                ("class:tui.footer.context", f"ctx {state.context_pct:.0f}% left"),
+                ("class:tui.footer.context", _format_context_left(state.context_pct)),
                 ("class:tui.footer.dim", _DOT),
-                ("class:tui.footer.value", f"session {state.tokens:,} tok"),
+                ("class:tui.footer.value", f"{state.tokens:,} processed"),
                 ("class:tui.footer.dim", _DOT),
                 ("class:tui.footer.value", _format_cost(state)),
             ]
@@ -104,7 +136,12 @@ def _line2(state: TuiState) -> tuple[Fragments, Fragments]:
         left.append(("class:tui.footer.forge", label))
     if state.exec_mode:
         # Glanceable execution-mode badge; amber when in the unguarded full mode.
+        # A non-default persona prefixes it (e.g. "arch·read") so the gate half
+        # of the badge is never hidden by the persona half.
         short = _MODE_SHORT.get(state.exec_mode, state.exec_mode)
+        persona_short = _PERSONA_SHORT.get(state.persona, "")
+        if persona_short:
+            short = f"{persona_short} · {short}"
         mode_style = (
             "class:tui.footer.mode.warn"
             if state.exec_mode == "fullaccess"
@@ -115,9 +152,10 @@ def _line2(state: TuiState) -> tuple[Fragments, Fragments]:
         left.append((mode_style, short))
     if state.active_subagent:
         # A nested agent is doing the work right now — keep its name pinned so
-        # the user always knows who they are talking through. The ↪ glyph is the
-        # same one the transcript's subagent trace uses (single-width, so the
-        # no-wrap math stays exact).
+        # the user always knows who they are talking through, tinted with that
+        # subagent's own accent so WHICH agent is glanceable, not just that one
+        # is running. The ↪ glyph is the same one the transcript's subagent
+        # trace uses (single-width, so the no-wrap math stays exact).
         name = state.active_subagent
         if len(name) > 16:
             name = name[:15] + "…"
@@ -138,15 +176,15 @@ def _line2(state: TuiState) -> tuple[Fragments, Fragments]:
             left.append(("class:tui.footer.dim", _DOT))
         left.append(("class:tui.footer.branch", f"{_BRANCH_MARK} {state.branch}"))
 
-    # Right tail: sensitive-action approval policy + the global shift+tab hint.
-    # This is deliberately separate from the execution mode badge: "fast" can
-    # auto-run normal operations while approval-gated sensitive actions still ask.
+    # Right tail: sensitive-action approval policy. This is deliberately separate
+    # from the execution mode badge: "fast" can auto-run normal operations while
+    # approval-gated sensitive actions still ask. Shift+Tab still toggles it live;
+    # the hint is intentionally not advertised in the footer.
     right: Fragments = []
     if state.auto_approve:
         right.append(("class:tui.footer.autoapprove.on", "sensitive: auto"))
     else:
         right.append(("class:tui.footer.autoapprove.off", "sensitive: ask"))
-    right.append(("class:tui.footer.dim", f"{_DOT}shift+tab"))
     return left, right
 
 

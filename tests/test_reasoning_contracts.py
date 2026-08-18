@@ -16,6 +16,7 @@ from sylliptor_agent_cli.reasoning_contracts import (
     UNKNOWN,
     UNKNOWN_CONTRACT,
     reasoning_contract_for,
+    reasoning_labels_allowed_by_contract,
     reasoning_off_hazard,
     reasoning_off_is_safe,
 )
@@ -86,12 +87,126 @@ def test_anthropic_adaptive_vs_haiku() -> None:
     assert sonnet.off == OFF_OMIT and sonnet.toggleable
 
 
+def test_anthropic_opus_5_omitting_the_param_is_not_off() -> None:
+    # Opus 5 thinks by default, so 'off' needs an explicit disable value —
+    # the OFF_OMIT semantics its 4.x predecessors carry would be a silent lie.
+    opus5 = reasoning_contract_for("anthropic", "claude-opus-5")
+    opus48 = reasoning_contract_for("anthropic", "claude-opus-4-8")
+
+    assert opus5 is not opus48
+    assert opus5.mode == OPTIONAL
+    assert opus5.wire == "thinking_adaptive"
+    assert opus5.off == OFF_EXPLICIT
+    assert opus48.off == OFF_OMIT
+    assert opus5.toggleable and reasoning_off_is_safe("anthropic", "claude-opus-5")
+    assert opus5.allows_value("xhigh") and opus5.allows_value("max")
+    assert opus5.default == "high"
+    assert "high" in opus5.notes  # the disable-only-at-effort<=high constraint
+
+
 def test_gemini_pro_lacks_minimal() -> None:
     pro = reasoning_contract_for("gemini", "gemini-3.1-pro-preview")
     assert not pro.allows_value("minimal")
     flash = reasoning_contract_for("gemini", "gemini-3.5-flash")
     assert flash.allows_value("minimal")
     assert flash.off == OFF_IMPOSSIBLE
+
+    flash37 = reasoning_contract_for("gemini", "gemini-3.7-flash")
+    assert flash37.default == "medium"
+    assert not flash37.allows_value("minimal")
+    assert flash37.values == ("low", "medium", "high")
+
+
+def test_grok_46_supports_xhigh_but_cannot_disable_reasoning() -> None:
+    contract = reasoning_contract_for("xai", "grok-4.6")
+
+    assert contract.mode == ALWAYS_ON
+    assert contract.values == ("low", "medium", "high", "xhigh")
+    assert contract.default == "high"
+    assert contract.off == OFF_IMPOSSIBLE
+    assert contract.allows_value("xhigh")
+    assert not contract.allows_value("none")
+
+
+def test_qwen38_and_deepseek_use_their_exact_documented_effort_values() -> None:
+    qwen = reasoning_contract_for("qwen", "qwen3.8-max")
+    qwen37 = reasoning_contract_for("qwen", "qwen3.7-plus")
+    deepseek = reasoning_contract_for("deepseek", "deepseek-v4-pro")
+
+    assert qwen.wire == "reasoning_effort"
+    assert qwen.values == ("low", "medium", "xhigh")
+    assert qwen.default == "xhigh"
+    assert qwen.replay_reasoning_content is True
+    assert not qwen.allows_value("high")
+    assert qwen37.replay_reasoning_content is False
+
+    assert deepseek.wire == "reasoning_effort"
+    assert deepseek.values == ("high", "max")
+    assert deepseek.default == "high"
+    assert not deepseek.allows_value("low")
+    assert not deepseek.allows_value("medium")
+
+
+def test_cerebras_glm_exposes_only_its_documented_disable_value() -> None:
+    contract = reasoning_contract_for("cerebras", "zai-glm-4.7")
+
+    assert contract.mode == OPTIONAL
+    assert contract.values == ("none",)
+    assert contract.off == OFF_EXPLICIT
+    assert contract.emits_flat_reasoning_effort is True
+    assert contract.allows_value("none")
+    assert not contract.allows_value("high")
+
+
+def test_flat_reasoning_effort_emission_requires_explicit_transport_verification() -> None:
+    assert reasoning_contract_for("groq", "openai/gpt-oss-120b").emits_flat_reasoning_effort
+    assert reasoning_contract_for(
+        "cohere", "command-a-reasoning-08-2025"
+    ).emits_flat_reasoning_effort
+    assert not reasoning_contract_for("xai", "grok-4.6").emits_flat_reasoning_effort
+    assert not reasoning_contract_for(
+        "fireworks", "accounts/fireworks/models/minimax-m3"
+    ).emits_flat_reasoning_effort
+
+
+def test_nvidia_hosted_models_expose_surface_specific_reasoning_contracts() -> None:
+    super_contract = reasoning_contract_for(
+        "nvidia",
+        "nvidia/nemotron-3-super-120b-a12b",
+    )
+    ultra = reasoning_contract_for("nvidia", "nvidia/nemotron-3-ultra-550b-a55b")
+    nano = reasoning_contract_for("nvidia", "nvidia/nemotron-3-nano-30b-a3b")
+    deepseek = reasoning_contract_for("nvidia", "deepseek-ai/deepseek-v4-pro")
+
+    assert super_contract.mode == OPTIONAL
+    assert super_contract.wire == "reasoning_effort"
+    assert super_contract.values == ("low", "high")
+    assert ultra.values == ("medium", "high")
+    assert nano.wire == "chat_template_enable_thinking"
+    assert nano.values == ()
+    assert deepseek.values == ("high", "max")
+    assert all(contract.off == OFF_EXPLICIT for contract in (super_contract, ultra, nano, deepseek))
+    assert reasoning_labels_allowed_by_contract(
+        deepseek,
+        ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"],
+        current="auto",
+    ) == ["off", "high", "max", "auto"]
+
+
+def test_zai_coding_plan_exposes_its_reasoning_floor_without_inventing_off() -> None:
+    contract = reasoning_contract_for("zai_coding_plan", "glm-5.3")
+
+    assert contract.mode == ALWAYS_ON
+    assert contract.values == ("low", "high", "max")
+    assert contract.default == "max"
+    assert contract.off == OFF_IMPOSSIBLE
+    assert not contract.allows_value("none")
+    assert not contract.allows_value("medium")
+    assert reasoning_labels_allowed_by_contract(
+        contract,
+        ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"],
+        current="auto",
+    ) == ["low", "high", "max", "auto"]
 
 
 def test_catalog_models_resolve_beyond_unknown_where_researched() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import traceback
 from dataclasses import replace
 from pathlib import Path
 
@@ -89,30 +90,58 @@ def test_index_atomic_add_update_delete_and_dedupe(tmp_path: Path) -> None:
 def test_index_concurrent_adds_keep_json_valid(tmp_path: Path) -> None:
     paths = create_plan_run(tmp_path)
     index = AssetIndex(paths)
-    errors: list[Exception] = []
+    errors: list[str] = []
 
-    def add_record(i: int) -> None:
+    def add_record(batch: int, i: int) -> None:
         try:
+            ordinal = (batch * 8) + i
             index.add(
                 _record(
-                    f"ast_{i:08x}",
-                    f"{i:064x}"[-64:],
-                    added_at=f"2026-05-03T00:00:{i:02d}+00:00",
+                    f"ast_{ordinal:08x}",
+                    f"{ordinal:064x}"[-64:],
+                    added_at=f"2026-05-03T00:{batch:02d}:{i:02d}+00:00",
                 )
             )
-        except Exception as exc:  # noqa: BLE001
-            errors.append(exc)
+        except Exception:  # noqa: BLE001
+            errors.append(traceback.format_exc())
 
-    threads = [threading.Thread(target=add_record, args=(i,)) for i in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    for batch in range(20):
+        threads = [threading.Thread(target=add_record, args=(batch, i)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
 
     assert errors == []
     payload = json.loads(paths.assets_index_path.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 2
-    assert len(payload["assets"]) == 8
+    assert len(payload["assets"]) == 160
+    assert not paths.assets_index_lock_path.exists()
+
+
+def test_lock_release_retries_windows_reader_delete_contention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = create_plan_run(tmp_path)
+    lock = _AssetIndexLock(paths.assets_index_lock_path)
+    lock.__enter__()
+    real_unlink = Path.unlink
+    attempts = 0
+
+    def flaky_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        if path == paths.assets_index_lock_path and attempts < 3:
+            attempts += 1
+            raise PermissionError(13, "lock file is temporarily open by a reader")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+
+    lock.release()
+
+    assert attempts == 3
+    assert not paths.assets_index_lock_path.exists()
 
 
 def test_add_with_publish_rolls_back_partial_artifacts(tmp_path: Path) -> None:

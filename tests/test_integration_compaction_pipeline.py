@@ -177,7 +177,7 @@ def test_run_turn_compaction_and_offload_creates_artifacts_and_pins(
         mode="auto",
         yes=True,
         max_steps=6,
-        no_log=True,
+        no_log=False,
         api_key_override="override-key",
         session_log_dir_override=tmp_path / ".sylliptor" / "sessions",
         session_id_override="integration-sid",
@@ -258,10 +258,13 @@ def test_run_turn_compaction_and_offload_creates_artifacts_and_pins(
         assert offload_files, "Expected offloaded tool output artifact(s)"
         offload_data = json.loads(offload_files[0].read_text(encoding="utf-8"))
         assert offload_data.get("tool_name") == "fs_read"
-        assert isinstance(offload_data.get("result"), dict)
-        full_content = str((offload_data.get("result") or {}).get("content") or "")
+        assert "result" not in offload_data
+        canonical_result = json.loads(str(offload_data.get("content_json") or "{}"))
+        full_content = str(canonical_result.get("content") or "")
         assert len(full_content) > 10000
         assert "A" * 1000 in full_content
+        session_log_text = session.store.path.read_text(encoding="utf-8")
+        assert full_content not in session_log_text
 
         tool_messages = [m for m in session.messages if str(m.get("role")) == "tool"]
         assert tool_messages, "Expected tool message in conversation"
@@ -271,6 +274,7 @@ def test_run_turn_compaction_and_offload_creates_artifacts_and_pins(
             "session_artifacts/tool_outputs/step1_fs_read_tc-read.json"
         )
         assert tool_stub.get("artifact_readable_via_fs") is True
+        assert tool_stub.get("raw_saved_in_session_log") is False
         assert "use fs_read on that path" in str(tool_stub.get("full_output") or "")
 
         pins_data = json.loads(pins_path.read_text(encoding="utf-8"))

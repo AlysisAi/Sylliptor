@@ -870,14 +870,15 @@ def test_no_task_hint_explains_capability_gated_visual_role() -> None:
 
 
 def test_identity_accents_never_impersonate_fixed_marks() -> None:
-    # Violet is Forge, green the chat accent, and cyan the brand. No subagent
-    # may wear any of them, or a running agent would read as a mode indicator.
+    # Gold is reserved, violet is Forge, green the chat accent, cyan the
+    # brand. No subagent may wear any of them, or a running agent would read as
+    # a mode indicator.
     from sylliptor_agent_cli.cli_impl.tui.subagent_identity import (
         _BUILTIN_IDENTITIES,
         _FALLBACK_COLORS,
     )
 
-    reserved_colors = {"#bc8cff", "#3fb950", "#56b6c2"}
+    reserved_colors = {"#e3b341", "#bc8cff", "#3fb950", "#56b6c2"}
     for name, ident in _BUILTIN_IDENTITIES.items():
         assert ident.color.lower() not in reserved_colors, name
     for color in _FALLBACK_COLORS:

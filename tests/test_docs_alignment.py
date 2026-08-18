@@ -5,6 +5,21 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+_ARTIFACT_SCAN_IGNORED_DIRS = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".qa-results",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "qa_reports",
+}
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -14,8 +29,7 @@ def _read(path: str) -> str:
     return (_repo_root() / path).read_text(encoding="utf-8")
 
 
-def test_tracked_paths_are_case_unique_for_cross_platform_checkout() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
+def _checkout_paths(repo_root: Path) -> list[str]:
     result = subprocess.run(
         ["git", "ls-files", "-z"],
         cwd=repo_root,
@@ -23,9 +37,24 @@ def test_tracked_paths_are_case_unique_for_cross_platform_checkout() -> None:
         text=True,
         check=False,
     )
+    if result.returncode == 0:
+        return [path for path in result.stdout.split("\0") if path]
 
-    assert result.returncode == 0, result.stderr
-    tracked_paths = [path for path in result.stdout.split("\0") if path]
+    # Release artifacts and clean source mirrors intentionally omit .git. In that
+    # environment, validate the exported tree while excluding generated caches.
+    return sorted(
+        path.relative_to(repo_root).as_posix()
+        for path in repo_root.rglob("*")
+        if path.is_file()
+        and not any(
+            part in _ARTIFACT_SCAN_IGNORED_DIRS for part in path.relative_to(repo_root).parts
+        )
+    )
+
+
+def test_tracked_paths_are_case_unique_for_cross_platform_checkout() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    tracked_paths = _checkout_paths(repo_root)
     by_casefold: dict[str, str] = {}
     collisions: list[str] = []
     for path in tracked_paths:
@@ -124,18 +153,8 @@ def test_public_docs_cover_core_user_and_contributor_topics() -> None:
     assert "workspace_root" in architecture
     assert "active_workdir" in architecture
     assert "Subagents" in subagents
-    for name in (
-        "explorer",
-        "implementer",
-        "frontend-engineer",
-        "debugger",
-        "code-reviewer",
-        "test-strategist",
-        "visual-designer",
-    ):
-        assert name in subagents
-    assert "image_generation.enabled" in subagents
-    assert "Visual QA" in subagents
+    assert "explorer" in subagents
+    assert "reviewer" in subagents
     assert "Streamable HTTP" in mcp
     assert "OAuth" in mcp
     assert "Skills" in skills
@@ -164,9 +183,13 @@ def test_internal_cleanup_artifacts_stay_absent() -> None:
         "docs/forge_swarm.md",
     ]
 
-    existing_paths = {path.relative_to(repo_root).as_posix() for path in repo_root.rglob("*")}
+    source_paths = set(_checkout_paths(repo_root))
     for path in absent_paths:
-        assert path not in existing_paths, path
+        path_prefix = f"{path.rstrip('/')}/"
+        assert not any(
+            source_path == path or source_path.startswith(path_prefix)
+            for source_path in source_paths
+        ), path
 
     terminals = _read("docs/terminals.md")
     assert "shell_background" in terminals

@@ -95,6 +95,19 @@ def test_absolute_workspace_output_resolves_to_relative_path() -> None:
     assert contract.allowed_output_paths == {"regex.txt"}
 
 
+def test_windows_absolute_workspace_output_is_parsed_cross_platform() -> None:
+    contract = build_acceptance_contract(
+        root=Path("C:/workspace/app"),
+        instruction=r"Create C:\workspace\app\regex.txt.",
+    )
+
+    criterion = _first_criterion(contract, AcceptanceCriterionKind.REQUIRED_ARTIFACT_PATH)
+    assert criterion.paths == ("regex.txt",)
+    assert criterion.path_refs[0].path_kind == AcceptancePathKind.ABSOLUTE_WITHIN_WORKSPACE
+    assert criterion.path_refs[0].workspace_relative_path == "regex.txt"
+    assert criterion.path_refs[0].absolute_path == "C:/workspace/app/regex.txt"
+
+
 def test_absolute_workspace_output_finalization_uses_workspace_relative_path(
     tmp_path: Path,
 ) -> None:

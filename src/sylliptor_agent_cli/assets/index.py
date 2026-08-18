@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import socket
+import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
@@ -28,6 +30,18 @@ from .paths import (
 ASSET_INDEX_SCHEMA_VERSION = 2
 _LOCK_POLL_SECONDS = 0.02
 _LOCK_TIMEOUT_SECONDS = 5.0
+_PROCESS_LOCKS_GUARD = threading.Lock()
+_PROCESS_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
+
+
+def _process_lock_for_path(path: Path) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(os.fspath(path)))
+    with _PROCESS_LOCKS_GUARD:
+        lock = _PROCESS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PROCESS_LOCKS[key] = lock
+        return lock
 
 
 class AssetIndex:
@@ -369,35 +383,46 @@ class _AssetIndexLock:
         self.path = path
         self.recovery_path = path.with_name(f"{path.name}.recovering")
         self.owner_token = uuid.uuid4().hex
+        self._process_lock = _process_lock_for_path(path) if os.name == "nt" else None
+        self._process_lock_acquired = False
 
     def __enter__(self) -> _AssetIndexLock:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = _build_lock_metadata(owner_token=self.owner_token, kind="lock")
-        payload_text = _metadata_text(payload)
-        deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
-        while True:
-            _clear_stale_recovery_claim(self.recovery_path)
-            try:
-                _write_exclusive(self.path, payload_text)
-                return self
-            except FileExistsError:
-                existing_metadata, existing_text = _read_lock_metadata_with_text(self.path)
-                if (
-                    existing_metadata is not None
-                    and existing_text is not None
-                    and _lock_metadata_is_stale(existing_metadata)
-                    and self._recover_stale_lock(
-                        existing_metadata=existing_metadata,
-                        existing_text=existing_text,
-                        replacement_text=payload_text,
-                    )
-                ):
+        if self._process_lock is not None:
+            self._process_lock.acquire()
+            self._process_lock_acquired = True
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = _build_lock_metadata(owner_token=self.owner_token, kind="lock")
+            payload_text = _metadata_text(payload)
+            deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+            while True:
+                _clear_stale_recovery_claim(self.recovery_path)
+                try:
+                    _write_exclusive(self.path, payload_text)
                     return self
-                if time.monotonic() >= deadline:
-                    raise AssetError(
-                        f"Timed out waiting for asset index lock: {self.path}"
-                    ) from None
-                time.sleep(_LOCK_POLL_SECONDS)
+                except OSError as exc:
+                    if not _is_existing_lock_contention(exc, self.path):
+                        raise
+                    existing_metadata, existing_text = _read_lock_metadata_with_text(self.path)
+                    if (
+                        existing_metadata is not None
+                        and existing_text is not None
+                        and _lock_metadata_is_stale(existing_metadata)
+                        and self._recover_stale_lock(
+                            existing_metadata=existing_metadata,
+                            existing_text=existing_text,
+                            replacement_text=payload_text,
+                        )
+                    ):
+                        return self
+                    if time.monotonic() >= deadline:
+                        raise AssetError(
+                            f"Timed out waiting for asset index lock: {self.path}"
+                        ) from None
+                    time.sleep(_LOCK_POLL_SECONDS)
+        except BaseException:
+            self._release_process_lock()
+            raise
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         _ = exc_type
@@ -406,11 +431,52 @@ class _AssetIndexLock:
         self.release()
 
     def release(self) -> None:
-        metadata = _read_lock_metadata(self.path)
-        if str((metadata or {}).get("owner_token") or "") != self.owner_token:
+        try:
+            deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    text = self.path.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    return
+                except PermissionError:
+                    if time.monotonic() >= deadline:
+                        raise AssetError(
+                            f"Timed out releasing asset index lock: {self.path}"
+                        ) from None
+                    time.sleep(_LOCK_POLL_SECONDS / 4)
+                    continue
+                try:
+                    metadata = json.loads(text)
+                except json.JSONDecodeError:
+                    return
+                if not isinstance(metadata, dict):
+                    return
+                if str(metadata.get("owner_token") or "") != self.owner_token:
+                    return
+                try:
+                    self.path.unlink()
+                    return
+                except FileNotFoundError:
+                    return
+                except PermissionError:
+                    # Windows readers do not share delete access by default. A
+                    # waiter inspecting this lock can therefore make unlink
+                    # fail briefly even after the creating file descriptor is
+                    # closed.
+                    if time.monotonic() >= deadline:
+                        raise AssetError(
+                            f"Timed out releasing asset index lock: {self.path}"
+                        ) from None
+                    time.sleep(_LOCK_POLL_SECONDS / 4)
+        finally:
+            self._release_process_lock()
+
+    def _release_process_lock(self) -> None:
+        if not self._process_lock_acquired:
             return
-        with suppress(FileNotFoundError):
-            self.path.unlink()
+        self._process_lock_acquired = False
+        if self._process_lock is not None:
+            self._process_lock.release()
 
     def _recover_stale_lock(
         self,
@@ -427,7 +493,9 @@ class _AssetIndexLock:
         )
         try:
             _write_exclusive(self.recovery_path, _metadata_text(recovery_payload))
-        except FileExistsError:
+        except OSError as exc:
+            if not _is_existing_lock_contention(exc, self.recovery_path):
+                raise
             _clear_stale_recovery_claim(self.recovery_path)
             return False
         try:
@@ -442,7 +510,9 @@ class _AssetIndexLock:
                 return False
             try:
                 _write_exclusive(self.path, replacement_text)
-            except FileExistsError:
+            except OSError as exc:
+                if not _is_existing_lock_contention(exc, self.path):
+                    raise
                 return False
             return True
         finally:
@@ -464,6 +534,21 @@ def _write_exclusive(path: Path, text: str) -> None:
         with suppress(FileNotFoundError):
             path.unlink()
         raise
+
+
+def _is_existing_lock_contention(error: OSError, path: Path) -> bool:
+    """Return true when exclusive-create lost a race to an existing lock.
+
+    POSIX reports ``EEXIST``/``FileExistsError`` for this case. Windows can
+    instead report ``EACCES``/``PermissionError`` while the winning thread is
+    still writing the newly created file. Treat that Windows-only shape as
+    normal contention only when the target now exists; genuine permission
+    failures on an absent target must continue to propagate.
+    """
+
+    return isinstance(error, FileExistsError) or (
+        os.name == "nt" and isinstance(error, PermissionError) and path.exists()
+    )
 
 
 def _build_lock_metadata(
